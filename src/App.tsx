@@ -298,7 +298,7 @@ function App() {
         <div className="sidebar-bottom">
           <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}><Settings size={18} />Settings</button>
           <div className="client-card"><span><ShieldCheck size={16} /></span><div><strong>Local protection</strong><small>Keys secured by Windows</small></div></div>
-          <div className="version">Client 0.1.4 <i /> Alpha build</div>
+          <div className="version">Client 0.1.5 <i /> Alpha build</div>
         </div>
       </aside>
 

@@ -194,6 +194,7 @@ mod gamepath_service {
                         .lease_deadline
                         .is_some_and(|deadline| Instant::now() >= deadline)
                     {
+                        log_event("session lease expired; stopping packet capture");
                         runtime.lease_deadline = None;
                         runtime.session_status = "idle".into();
                         runtime.route_count = 0;

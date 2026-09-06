@@ -406,9 +406,12 @@ function registerIpc() {
     if (state.session.status === 'connected' && serviceBridge?.status.status === 'ready') {
       try {
         const runtime = await serviceBridge.request('session-status')
-        if (runtime.state === 'connected') updateSessionMetrics(runtime)
-        else state.session = { status: 'error', message: 'The multipath workers stopped unexpectedly.' }
+        updateSessionMetrics(runtime)
+        if (runtime.state !== 'connected') {
+          state.session.message = 'Relay paths are temporarily unavailable; selected traffic is using the normal Internet connection.'
+        }
       } catch (error) {
+        try { await serviceBridge.request('stop-session') } catch {}
         state.session = { status: 'error', message: error.message }
       }
     }

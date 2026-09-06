@@ -40,7 +40,7 @@ struct SocketData {
     _local_address: [u32; 4],
     _remote_address: [u32; 4],
     local_port: u16,
-    _remote_port: u16,
+    remote_port: u16,
     protocol: u8,
     _padding: [u8; 3],
 }
@@ -466,8 +466,14 @@ fn spawn_process_tracker(
                     17 => "udp",
                     _ => continue,
                 };
+                let remote_port = u16::from_be(event.remote_port);
+                let remote_term = if remote_port == 0 {
+                    String::new()
+                } else {
+                    format!(" and {protocol}.DstPort == {remote_port}")
+                };
                 let _ = spawn_capture(
-                    format!("{protocol}.SrcPort == {port}"),
+                    format!("{protocol}.SrcPort == {port}{remote_term}"),
                     Arc::clone(&worker_registry),
                     Arc::clone(&worker_stop),
                     Arc::clone(&sessions),

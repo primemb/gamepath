@@ -472,6 +472,9 @@ impl WireGuardSessionManager {
             .active
             .as_mut()
             .ok_or("start the WireGuard session before sending packets")?;
+        if !session.paths.lock().unwrap().iter().any(|path| path.reachable) {
+            return Err("no relay path is currently reachable".into());
+        }
         let sequence = session.sequences.fetch_add(1, Ordering::Relaxed);
         let header = FrameHeader {
             flags: 0,
@@ -552,7 +555,7 @@ impl WireGuardSessionManager {
             return json!({ "state": "idle", "paths": [] });
         };
         let paths = session.paths.lock().unwrap().clone();
-        let state = if paths.iter().all(|path| path.reachable) {
+        let state = if paths.iter().any(|path| path.reachable) {
             "connected"
         } else {
             "connecting"
