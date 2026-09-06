@@ -246,8 +246,8 @@ function registerIpc() {
     const enabledRules = state.rules.filter((rule) => rule.enabled)
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     const encryptedRelayToken = relay && state.encryptedRelayTokens[relay.id]
-    if (enabledTunnels.length < 2) {
-      state.session = { status: 'error', message: 'Enable at least two WireGuard routes.' }
+    if (enabledTunnels.length < 1) {
+      state.session = { status: 'error', message: 'Enable at least one WireGuard route.' }
     } else if (state.trafficMode === 'split' && !enabledRules.length) {
       state.session = { status: 'error', message: 'Add at least one split-tunnel target.' }
     } else if (!relay || relay.status !== 'ready' || !encryptedRelayToken) {
@@ -276,18 +276,34 @@ function registerIpc() {
           trafficMode: state.trafficMode,
           wireguardConfigs,
         })
-        const paths = await engineBridge.request('probe-wireguard-routes', {
+        const paths = await engineBridge.request('start-wireguard-session', {
           relayHost: relay.address,
           relayPort: relay.port,
           enrollmentToken,
           wireguardConfigs,
         }, 25000)
-        const routeLatencies = paths.routes.map((route) => Math.max(1, Math.round(route.latencyMs)))
-        state.session = { status: 'prepared', routeLatencies, message: `Session plan ${plan.planId} validated; ${runtime.routeCount} encrypted WireGuard paths reached the relay.` }
+        const dataPlane = await engineBridge.request('probe-data-plane', {}, 15000)
+        const routeLatencies = paths.paths.map((route) => Math.max(1, Math.round(route.latencyMs)))
+        const standbyNote = paths.skippedRoutes.length ? ` ${paths.skippedRoutes.length} overlapping config${paths.skippedRoutes.length === 1 ? ' is' : 's are'} held as standby.` : ''
+        state.session = { status: 'connected', routeLatencies, message: `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; relay packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${standbyNote}` }
       } catch (error) {
+        try { await engineBridge.request('stop-wireguard-session') } catch {}
         state.session = { status: 'error', message: error.message }
       }
     }
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('engine:stop', async () => {
+    try {
+      if (engineBridge?.status.status === 'ready') await engineBridge.request('stop-wireguard-session')
+      if (serviceBridge?.status.status === 'ready') await serviceBridge.request('stop-session')
+      state.session = { status: 'idle' }
+    } catch (error) {
+      state.session = { status: 'error', message: error.message }
+    }
+    saveState()
     return publicState()
   })
 }

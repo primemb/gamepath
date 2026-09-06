@@ -35,11 +35,13 @@ cargo test --manifest-path ..\relay\Cargo.toml
 - Compute adaptive route decisions in the Rust engine.
 - Load and verify the WinDivert WFP capture runtime before activation.
 - Encrypt and send identical sequenced frames over multiple UDP paths.
-- Run duplicate provider configurations through independent user-space WireGuard instances, including configs that reuse the same client key and tunnel address.
+- Keep a direct ISP path and distinct provider routes alive through persistent authenticated health checks.
+- Duplicate authenticated IP frames across the live paths and verify the complete Windows-to-relay-TUN return loop.
+- Detect configs that resolve to the same WireGuard endpoint and reuse the same client identity, then hold overlaps as standby instead of allowing their handshakes to replace each other.
 - Install an authenticated, auto-start Windows network service for the future Wintun and WFP data plane.
 - Provision an idempotent Debian 13 relay with systemd, nftables NAT, TUN forwarding, per-client enrollment, authenticated probes, replay protection, and multipath reply fan-out.
 
-The Windows packet adapter and privileged service boundary are the next implementation milestones. A prepared session does not modify routes until those components are active.
+The Windows service and persistent user-space WireGuard path workers are active. Packet capture and reinjection through Wintun for all-traffic mode and WinDivert/WFP policy capture for split mode are the next implementation milestones.
 
 The repository includes the official signed Wintun 0.14.1 AMD64 DLL and its redistribution license under `vendor/wintun`. The downloaded archive is verified against the SHA-256 published by the Wintun project before the binary is copied into the project.
 

@@ -233,8 +233,8 @@ mod gamepath_service {
         if input.traffic_mode != "all" && input.traffic_mode != "split" {
             return Err("traffic mode must be all or split".into());
         }
-        if input.wireguard_configs.len() < 2 {
-            return Err("at least two WireGuard configurations are required".into());
+        if input.wireguard_configs.is_empty() {
+            return Err("at least one WireGuard configuration is required".into());
         }
         let routes = input
             .wireguard_configs

@@ -11,7 +11,7 @@ app.whenReady().then(async () => {
   const relay = state.relays.find((item) => item.id === state.activeRelayId)
   const tunnels = state.tunnels.filter((item) => item.enabled)
   if (!relay?.address) throw new Error('The active relay is not configured')
-  if (tunnels.length < 2) throw new Error('At least two WireGuard routes must be enabled')
+  if (tunnels.length < 1) throw new Error('At least one WireGuard route must be enabled')
   if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows secure storage is unavailable')
   const addresses = await dns.lookup(relay.address, { all: true })
   const relayIp = addresses.find((entry) => entry.family === 4)?.address ?? addresses[0]?.address

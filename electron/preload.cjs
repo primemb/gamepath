@@ -17,4 +17,5 @@ contextBridge.exposeInMainWorld('gamepath', {
   refreshService: () => ipcRenderer.invoke('service:refresh'),
   installService: () => ipcRenderer.invoke('service:install'),
   startSession: () => ipcRenderer.invoke('engine:start'),
+  stopSession: () => ipcRenderer.invoke('engine:stop'),
 })

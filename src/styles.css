@@ -67,6 +67,8 @@ main { min-width: 0; overflow: auto; }
 .connect-panel > p { max-width: 410px; min-height: 35px; margin: 0 0 18px; color: var(--muted); font-size: 11px; line-height: 1.55; }
 .connect-button { min-width: 176px; height: 44px; padding: 0 18px; border: 0; border-radius: 10px; display: flex; justify-content: center; align-items: center; gap: 10px; color: #06110f; background: var(--cyan); box-shadow: 0 10px 28px rgba(38,230,205,.12); cursor: pointer; font-size: 12px; font-weight: 720; transition: transform .15s ease, box-shadow .15s ease; }
 .connect-button:hover { transform: translateY(-1px); box-shadow: 0 13px 32px rgba(38,230,205,.2); }
+.connect-button.connected { color: #dffcf7; background: rgba(38,230,205,.13); box-shadow: inset 0 0 0 1px rgba(38,230,205,.4); }
+.connect-button:disabled { cursor: wait; opacity: .72; transform: none; }
 .session-mode { margin-top: 14px; display: flex; align-items: center; gap: 6px; color: #677284; font-size: 9px; }
 .session-mode svg:first-child { color: var(--violet); }
 

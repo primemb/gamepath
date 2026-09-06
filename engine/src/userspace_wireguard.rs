@@ -2,6 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use rand::Rng;
+use sha2::{Digest, Sha256};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
@@ -11,6 +12,7 @@ pub struct UserSpaceWireGuardPath {
     tunnel: Tunn,
     address: Ipv4Addr,
     endpoint: SocketAddr,
+    identity_fingerprint: [u8; 32],
 }
 
 impl UserSpaceWireGuardPath {
@@ -61,6 +63,7 @@ impl UserSpaceWireGuardPath {
             tunnel,
             address,
             endpoint,
+            identity_fingerprint: Sha256::digest(private_key).into(),
         })
     }
 
@@ -70,6 +73,10 @@ impl UserSpaceWireGuardPath {
 
     pub fn endpoint(&self) -> SocketAddr {
         self.endpoint
+    }
+
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint && self.identity_fingerprint == other.identity_fingerprint
     }
 
     pub fn transact(&mut self, inner_packet: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
@@ -84,16 +91,20 @@ impl UserSpaceWireGuardPath {
         while Instant::now() < deadline {
             match self.socket.recv(&mut network) {
                 Ok(length) => {
-                    let next = action(self.tunnel.decapsulate(
+                    let next = decapsulation_action(self.tunnel.decapsulate(
                         None,
                         &network[..length],
                         &mut destination,
-                    ))?;
+                    ));
                     if let Some(packet) = self.apply(next)? {
                         return Ok(packet);
                     }
                     loop {
-                        let drained = action(self.tunnel.decapsulate(None, &[], &mut destination))?;
+                        let drained = decapsulation_action(self.tunnel.decapsulate(
+                            None,
+                            &[],
+                            &mut destination,
+                        ));
                         if matches!(drained, Action::Done) {
                             break;
                         }
@@ -145,6 +156,15 @@ fn action(result: TunnResult<'_>) -> Result<Action, String> {
         TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
             Ok(Action::Tunnel(packet.to_vec()))
         }
+    }
+}
+
+fn decapsulation_action(result: TunnResult<'_>) -> Action {
+    // A connected UDP socket can still receive delayed packets from an older
+    // WireGuard session. They are untrusted input and must not tear down a path.
+    match action(result) {
+        Ok(action) => action,
+        Err(_) => Action::Done,
     }
 }
 
@@ -252,6 +272,7 @@ fn section_value<'a>(source: &'a str, wanted_section: &str, wanted_key: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boringtun::noise::errors::WireGuardError;
 
     #[test]
     fn ipv4_udp_round_trips() {
@@ -272,5 +293,37 @@ mod tests {
             (40000, 51821, b"hello".as_slice())
         );
         assert_eq!(ipv4_checksum(&packet[..20]), 0);
+    }
+
+    #[test]
+    fn stale_wireguard_packets_are_ignored() {
+        assert!(matches!(
+            decapsulation_action(TunnResult::Err(WireGuardError::NoCurrentSession)),
+            Action::Done
+        ));
+    }
+
+    #[test]
+    fn same_identity_and_endpoint_conflict() {
+        let private = STANDARD.encode([3_u8; 32]);
+        let other_private = STANDARD.encode([4_u8; 32]);
+        let public = STANDARD.encode([5_u8; 32]);
+        let config = |private: &str, endpoint: &str| {
+            format!(
+                "[Interface]\nPrivateKey = {private}\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = {public}\nEndpoint = {endpoint}\nAllowedIPs = 0.0.0.0/0"
+            )
+        };
+        let first =
+            UserSpaceWireGuardPath::from_config(&config(&private, "127.0.0.1:51820")).unwrap();
+        let duplicate =
+            UserSpaceWireGuardPath::from_config(&config(&private, "127.0.0.1:51820")).unwrap();
+        let other_endpoint =
+            UserSpaceWireGuardPath::from_config(&config(&private, "127.0.0.1:51821")).unwrap();
+        let other_identity =
+            UserSpaceWireGuardPath::from_config(&config(&other_private, "127.0.0.1:51820"))
+                .unwrap();
+        assert!(first.conflicts_with(&duplicate));
+        assert!(!first.conflicts_with(&other_endpoint));
+        assert!(!first.conflicts_with(&other_identity));
     }
 }

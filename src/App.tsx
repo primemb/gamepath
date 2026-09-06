@@ -184,7 +184,7 @@ function App() {
   const relay = state?.relays.find((item) => item.id === state.activeRelayId)
   const trafficMode = state?.trafficMode ?? 'split'
   const bestRouteLatency = state?.session.routeLatencies?.length ? Math.min(...state.session.routeLatencies) : null
-  const readiness = useMemo(() => ({ routes: enabledRoutes >= 2, rules: trafficMode === 'all' || enabledRules >= 1, relay: relay?.status === 'ready' }), [enabledRoutes, enabledRules, relay, trafficMode])
+  const readiness = useMemo(() => ({ routes: enabledRoutes >= 1, rules: trafficMode === 'all' || enabledRules >= 1, relay: relay?.status === 'ready' }), [enabledRoutes, enabledRules, relay, trafficMode])
   const readyCount = Object.values(readiness).filter(Boolean).length
 
   if (!state) return <div className="loading"><div className="brand-mark"><Zap size={22} /></div><span>Loading GamePath…</span></div>
@@ -197,8 +197,11 @@ function App() {
     if (result.errors?.length) setNotice(result.errors.join('\n'))
   }
 
-  const start = async () => {
-    const next = await api.startSession()
+  const toggleSession = async () => {
+    if (state.session.status !== 'connected') {
+      setState({ ...state, session: { status: 'starting' } })
+    }
+    const next = state.session.status === 'connected' ? await api.stopSession() : await api.startSession()
     setState(next)
     if (next.session.message) setNotice(next.session.message)
   }
@@ -245,9 +248,9 @@ function App() {
                   <div className="connection-core"><Zap size={28} fill="currentColor" /></div>
                 </div>
                 <span className="eyebrow">Multipath session</span>
-                <h2>{state.session.status === 'prepared' ? 'Session plan ready' : readyCount === 3 ? 'Ready to accelerate' : 'Complete your setup'}</h2>
-                <p>{state.session.status === 'prepared' ? 'The native engine accepted this route plan. Packet transport will activate when the relay service is connected.' : readyCount === 3 ? `${enabledRoutes} routes will carry matching game traffic through ${relay?.city}.` : `${readyCount} of 3 requirements ready. Configure the remaining items below.`}</p>
-                <button className="connect-button" onClick={start}><span>{state.session.status === 'starting' ? 'Starting…' : state.session.status === 'prepared' ? 'Plan prepared' : 'Start session'}</span>{state.session.status === 'prepared' ? <Check size={18} /> : <ArrowUpRight size={18} />}</button>
+                <h2>{state.session.status === 'connected' ? 'Paths connected' : readyCount === 3 ? 'Ready to accelerate' : 'Complete your setup'}</h2>
+                <p>{state.session.status === 'connected' ? `${enabledRoutes} encrypted paths are connected through ${relay?.city}.` : readyCount === 3 ? `${enabledRoutes} routes will carry matching game traffic through ${relay?.city}.` : `${readyCount} of 3 requirements ready. Configure the remaining items below.`}</p>
+                <button className={`connect-button ${state.session.status === 'connected' ? 'connected' : ''}`} disabled={state.session.status === 'starting'} onClick={toggleSession}><span>{state.session.status === 'starting' ? 'Starting…' : state.session.status === 'connected' ? 'Stop session' : 'Start session'}</span>{state.session.status === 'connected' ? <Check size={18} /> : <ArrowUpRight size={18} />}</button>
                 <div className="session-mode"><Sparkles size={14} /> Adaptive duplication <Info size={13} /></div>
               </section>
 
@@ -261,7 +264,7 @@ function App() {
                 <div className="section-heading"><div><span className="eyebrow">Quick setup</span><h2>Get ready to play</h2></div><span className="progress-label">{readyCount}/3 complete</span></div>
                 <div className="progress-track"><span style={{ width: `${(readyCount / 3) * 100}%` }} /></div>
                 <div className="setup-list">
-                  <SetupStep done={readiness.routes} number={1} title="Add two or more routes" detail={`${state.tunnels.length} WireGuard configuration${state.tunnels.length === 1 ? '' : 's'} imported`} action="Configure" onClick={() => setView('routes')} />
+                  <SetupStep done={readiness.routes} number={1} title="Add a WireGuard route" detail={`${state.tunnels.length} WireGuard configuration${state.tunnels.length === 1 ? '' : 's'} imported; direct ISP is automatic`} action="Configure" onClick={() => setView('routes')} />
                   <SetupStep done={readiness.rules} number={2} title="Choose traffic mode" detail={state.trafficMode === 'all' ? 'All system traffic' : `${enabledRules} active split-tunnel target${enabledRules === 1 ? '' : 's'}`} action="Configure" onClick={() => setView('split')} />
                   <SetupStep done={readiness.relay} number={3} title="Configure a relay" detail={relay ? `${relay.city}, ${relay.country}` : 'No relay selected'} action="Set up" onClick={() => setView('relays')} />
                 </div>

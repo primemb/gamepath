@@ -68,8 +68,12 @@ export const mockApi: GamePathApi = {
   startSession: async () => {
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     state.session = relay?.status === 'ready'
-      ? { status: 'prepared', message: 'Session plan is ready for the packet adapter.' }
+      ? { status: 'connected', message: 'Two encrypted paths are connected to the relay.', routeLatencies: [34, 39] }
       : { status: 'error', message: 'The Istanbul relay needs its server component and address.' }
+    return snapshot()
+  },
+  stopSession: async () => {
+    state.session = { status: 'idle' }
     return snapshot()
   },
 }

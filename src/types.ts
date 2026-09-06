@@ -80,4 +80,5 @@ export type GamePathApi = {
   refreshService: () => Promise<AppState>
   installService: () => Promise<{ launched: boolean }>
   startSession: () => Promise<AppState>
+  stopSession: () => Promise<AppState>
 }
