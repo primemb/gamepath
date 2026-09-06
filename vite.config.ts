@@ -7,6 +7,6 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
-    watch: { ignored: ['**/engine/target/**'] },
+    watch: { ignored: ['**/engine/target/**', '**/work/**'] },
   },
 })
