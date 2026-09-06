@@ -276,7 +276,7 @@ function App() {
                   <div className="map-node origin"><Gamepad2 size={19} /><span>Your game</span></div>
                   <div className="map-lines"><i /><i /></div>
                   <div className="path-stack">
-                    {(state.tunnels.length ? state.tunnels.slice(0, 2) : [{ name: 'Route one', enabled: false }, { name: 'Route two', enabled: false }]).map((item, index) => <div key={item.name}><span className={item.enabled ? 'active' : ''}>{index + 1}</span><p>{item.name}</p><small>{item.enabled ? 'Available' : 'Not configured'}</small></div>)}
+                    {[{ name: 'Direct ISP', enabled: true }, { name: enabledRoutes ? `${enabledRoutes} WireGuard route${enabledRoutes === 1 ? '' : 's'}` : 'WireGuard pool', enabled: enabledRoutes > 0 }].map((item, index) => <div key={item.name}><span className={item.enabled ? 'active' : ''}>{index + 1}</span><p>{item.name}</p><small>{item.enabled ? 'Available' : 'Not configured'}</small></div>)}
                   </div>
                   <div className="map-lines inbound"><i /><i /></div>
                   <div className="map-node relay"><MapPin size={19} /><span>{relay?.city ?? 'Relay'}</span></div>
@@ -287,7 +287,7 @@ function App() {
 
           {view === 'routes' && (
             <section className="page-section">
-              <div className="toolbar"><div><span className="count-badge">{enabledRoutes} active</span><span className="muted">Use at least two routes for multipath mode.</span></div><button className="button primary" onClick={importTunnels}><Import size={16} />Import .conf</button></div>
+              <div className="toolbar"><div><span className="count-badge">{enabledRoutes} active</span><span className="muted">One provider route pairs with Direct ISP; distinct configs add more paths.</span></div><button className="button primary" onClick={importTunnels}><Import size={16} />Import .conf</button></div>
               {state.tunnels.length ? <div className="route-list">{state.tunnels.map((tunnel) => <Endpoint key={tunnel.id} tunnel={tunnel} onToggle={async (enabled) => setState(await api.setTunnelEnabled(tunnel.id, enabled))} onRemove={async () => setState(await api.removeTunnel(tunnel.id))} />)}</div> : (
                 <div className="empty-state"><span><HardDrive size={28} /></span><h2>No WireGuard routes yet</h2><p>Import your purchased VPN configuration files. Private keys are encrypted using Windows secure storage.</p><button className="button primary" onClick={importTunnels}><Import size={16} />Import configurations</button></div>
               )}
