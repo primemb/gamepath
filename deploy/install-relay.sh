@@ -121,7 +121,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=gamepath
 Group=gamepath
 EnvironmentFile=/etc/gamepath/relay.env
 ExecStart=/usr/local/bin/gamepath-relay serve --bind ${GAMEPATH_BIND} --clients-dir ${GAMEPATH_CLIENTS} --tun-name gptun0 --tun-address 10.203.0.1 --tun-prefix 24
