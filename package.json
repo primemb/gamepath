@@ -1,6 +1,6 @@
 {
   "name": "gamepath-client",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "author": "GamePath",
   "private": true,
   "type": "module",
@@ -58,11 +58,26 @@
       "package.json"
     ],
     "extraResources": [
-      { "from": "engine/target/release/gamepath-engine.exe", "to": "engine/target/release/gamepath-engine.exe" },
-      { "from": "service/target/release/gamepath-service.exe", "to": "service/target/release/gamepath-service.exe" },
-      { "from": "vendor/wintun", "to": "vendor/wintun" },
-      { "from": "vendor/windivert", "to": "vendor/windivert" },
-      { "from": "deploy", "to": "deploy" }
+      {
+        "from": "engine/target/release/gamepath-engine.exe",
+        "to": "engine/target/release/gamepath-engine.exe"
+      },
+      {
+        "from": "service/target/release/gamepath-service.exe",
+        "to": "service/target/release/gamepath-service.exe"
+      },
+      {
+        "from": "vendor/wintun",
+        "to": "vendor/wintun"
+      },
+      {
+        "from": "vendor/windivert",
+        "to": "vendor/windivert"
+      },
+      {
+        "from": "deploy",
+        "to": "deploy"
+      }
     ],
     "win": {
       "target": "nsis",

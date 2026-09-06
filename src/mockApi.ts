@@ -64,7 +64,10 @@ export const mockApi: GamePathApi = {
     return { state: snapshot(), result: { reachable: true, latencyMs: 31, virtualIpv4: '10.203.0.2' } }
   },
   refreshService: async () => snapshot(),
-  installService: async () => ({ launched: true }),
+  installService: async () => {
+    state.service = { status: 'ready', version: '0.1.0', message: 'Privileged network service ready', elevated: true }
+    return snapshot()
+  },
   startSession: async () => {
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     state.session = relay?.status === 'ready'

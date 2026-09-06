@@ -18,6 +18,7 @@ if (-not $isAdministrator) {
     exit $elevated.ExitCode
 }
 
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) | Out-Null
 Start-Transcript -LiteralPath $LogPath -Force | Out-Null
 trap {
     Write-Error $_

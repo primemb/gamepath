@@ -253,16 +253,26 @@ function registerIpc() {
     return publicState()
   })
 
-  ipcMain.handle('service:install', () => {
+  ipcMain.handle('service:install', async () => {
     const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
     const installer = path.join(projectRoot, 'deploy', 'install-windows-service.ps1')
-    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', installer, '-ProjectRoot', projectRoot, '-SkipBuild'], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
+    await new Promise((resolve, reject) => {
+      const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', installer, '-ProjectRoot', projectRoot, '-SkipBuild'], {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let output = ''
+      child.stdout.on('data', (chunk) => { output += chunk.toString() })
+      child.stderr.on('data', (chunk) => { output += chunk.toString() })
+      child.once('error', reject)
+      child.once('exit', (code) => {
+        if (code === 0) resolve()
+        else reject(new Error(output.trim() || `Service installer exited with code ${code}`))
+      })
     })
-    child.unref()
-    return { launched: true }
+    await serviceBridge.inspect()
+    if (serviceBridge.status.status !== 'ready') throw new Error(serviceBridge.status.message)
+    return publicState()
   })
 
   ipcMain.handle('engine:start', async () => {

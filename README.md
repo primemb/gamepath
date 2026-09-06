@@ -15,9 +15,11 @@ Build the Windows installer with:
 npm run package:windows
 ```
 
-The installer is written to `release\GamePath-Setup-0.1.0.exe`. The installed
-application requests administrator access at launch. Its uninstaller removes
-the Windows service, privileged runtime, control token, routes, and local app data.
+The installer is written to `release\GamePath-Setup-<version>.exe`. It installs
+and starts the network service automatically, and the application requests
+administrator access at launch. Its uninstaller removes the Windows service,
+privileged runtime, control token, routes, and local app data. Settings includes
+a manual service reinstall action for repair.
 
 Imported WireGuard configuration bodies are encrypted with Electron `safeStorage`, backed by Windows cryptography. Only non-secret metadata is sent to the renderer.
 
