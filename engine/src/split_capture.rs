@@ -437,7 +437,9 @@ fn spawn_process_tracker(
     return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
     virtual_ipv4: Ipv4Addr,
 ) -> Result<(), String> {
-    let handle = Arc::new(Handle::open(&registry.dll, "true", 3, 0x0004)?);
+    // SOCKET events are observation-only. SNIFF|RECV_ONLY copies events while
+    // allowing Windows to create every socket normally.
+    let handle = Arc::new(Handle::open(&registry.dll, "true", 3, 0x0005)?);
     registry.handles.lock().unwrap().push(Arc::clone(&handle));
     let applications = plan.application_paths.clone();
     let folders = plan.folder_prefixes.clone();

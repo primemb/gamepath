@@ -48,6 +48,19 @@ if ($existing -and $existing.Status -ne 'Stopped') {
 # A service upgrade must never leave its separately spawned capture engine
 # intercepting traffic if Service Control Manager terminates the parent early.
 Get-Process -Name 'gamepath-engine' -ErrorAction SilentlyContinue | Stop-Process -Force
+# WinDivert's demand-start kernel service can outlive a force-stopped capture
+# process briefly and keep the old driver image locked during an upgrade.
+& sc.exe stop WinDivert | Out-Null
+for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    $driver = Get-CimInstance Win32_SystemDriver -Filter "Name='WinDivert'" -ErrorAction SilentlyContinue
+    if (-not $driver -or $driver.State -ne 'Running') { break }
+    Start-Sleep -Milliseconds 250
+}
+$driver = Get-CimInstance Win32_SystemDriver -Filter "Name='WinDivert'" -ErrorAction SilentlyContinue
+if ($driver -and $driver.State -eq 'Running') {
+    throw 'The previous WinDivert driver is still busy. Close applications using WinDivert or restart Windows, then run setup again.'
+}
+& sc.exe delete WinDivert | Out-Null
 if ($gamePathInterfaceIndexes.Count) {
     Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.InterfaceIndex -in $gamePathInterfaceIndexes -and $_.DestinationPrefix -in @('0.0.0.0/1', '128.0.0.0/1') } |

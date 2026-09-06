@@ -1,6 +1,6 @@
 {
   "name": "gamepath-client",
-  "version": "0.1.5",
+  "version": "0.1.7",
   "author": "GamePath",
   "private": true,
   "type": "module",
@@ -19,6 +19,7 @@
     "wireguard:session-test": "electron scripts/test-wireguard-session.cjs",
     "service:session-test": "electron scripts/test-service-session.cjs",
     "service:split-test": "electron scripts/test-service-session.cjs --split-ip",
+    "service:stability-test": "electron scripts/test-split-stability.cjs",
     "native:release": "node scripts/build-release.cjs",
     "package:windows": "npm run check && npm run native:release && node scripts/package-windows.cjs",
     "build": "tsc -b && vite build",

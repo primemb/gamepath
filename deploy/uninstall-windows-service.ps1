@@ -9,6 +9,8 @@ $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($service) {
     $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
 }
+& sc.exe stop WinDivert | Out-Null
+& sc.exe delete WinDivert | Out-Null
 
 # Remove only routes attached to GamePath-created interfaces.
 $interfaceIndexes = @(Get-NetAdapter -Name 'GamePath*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ifIndex)
