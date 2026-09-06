@@ -186,7 +186,7 @@ function registerIpc() {
         const plan = await engineBridge.request('prepare-session', {
           routeIds: enabledTunnels.map((tunnel) => tunnel.id),
           trafficMode: state.trafficMode,
-          ruleCount: enabledRules.length,
+          rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
           relayHost: relay.address,
           relayPort: relay.port,
         })

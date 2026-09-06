@@ -31,8 +31,11 @@ cargo test
 - Start and monitor the Rust engine through private JSON-line IPC.
 - Detect the installed WireGuard client and active interfaces.
 - Validate complete session plans before any route mutation.
+- Compile application, folder, hostname, and IP targets into a process-aware WFP interception plan.
 - Compute adaptive route decisions in the Rust engine.
 
 The Windows packet adapter, privileged service boundary, encrypted client-to-relay transport, and Debian relay are the next implementation milestones. A prepared session does not modify routes until those components are installed and reachable.
 
 The repository includes the official signed Wintun 0.14.1 AMD64 DLL and its redistribution license under `vendor/wintun`. The downloaded archive is verified against the SHA-256 published by the Wintun project before the binary is copied into the project.
+
+See `docs/architecture.md` for the WFP, Winsock, Wintun, and optional WireSock backend design.

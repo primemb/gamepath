@@ -1,4 +1,5 @@
 use gamepath_engine::adapter::inspect_library;
+use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -30,7 +31,7 @@ struct Response {
 struct PrepareRequest {
     route_ids: Vec<String>,
     traffic_mode: String,
-    rule_count: usize,
+    rules: Vec<RuleSpec>,
     relay_host: String,
     relay_port: u16,
 }
@@ -126,12 +127,7 @@ fn prepare_session(payload: Value) -> Result<Value, String> {
     if input.route_ids.len() < 2 {
         return Err("at least two active routes are required".into());
     }
-    if input.traffic_mode != "all" && input.traffic_mode != "split" {
-        return Err("traffic mode must be all or split".into());
-    }
-    if input.traffic_mode == "split" && input.rule_count == 0 {
-        return Err("split mode requires at least one target".into());
-    }
+    let interception = compile_policy(&input.traffic_mode, &input.rules)?;
     if input.relay_host.trim().is_empty() || input.relay_port == 0 {
         return Err("a relay host and port are required".into());
     }
@@ -144,6 +140,7 @@ fn prepare_session(payload: Value) -> Result<Value, String> {
         "planId": plan_id,
         "routeCount": input.route_ids.len(),
         "trafficMode": input.traffic_mode,
+        "interception": interception,
         "relay": { "host": input.relay_host, "port": input.relay_port },
         "state": "prepared",
     }))
@@ -165,7 +162,7 @@ mod tests {
     #[test]
     fn prepare_rejects_one_route() {
         let result = prepare_session(json!({
-            "routeIds": ["one"], "trafficMode": "all", "ruleCount": 0,
+            "routeIds": ["one"], "trafficMode": "all", "rules": [],
             "relayHost": "relay.example", "relayPort": 51821
         }));
         assert!(result.is_err());
@@ -174,7 +171,7 @@ mod tests {
     #[test]
     fn prepare_accepts_all_traffic_without_rules() {
         let result = prepare_session(json!({
-            "routeIds": ["one", "two"], "trafficMode": "all", "ruleCount": 0,
+            "routeIds": ["one", "two"], "trafficMode": "all", "rules": [],
             "relayHost": "relay.example", "relayPort": 51821
         }))
         .unwrap();

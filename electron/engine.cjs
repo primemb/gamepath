@@ -1,4 +1,5 @@
 const { spawn } = require('node:child_process')
+const fs = require('node:fs')
 const path = require('node:path')
 const readline = require('node:readline')
 
@@ -8,23 +9,30 @@ class EngineBridge {
     this.process = null
     this.nextId = 1
     this.pending = new Map()
+    this.runtimeBinary = null
     this.status = { status: 'offline', version: '', message: 'Native engine is not running', capabilities: null }
   }
 
   async start() {
     if (this.process) return this.status
     const binary = path.join(this.projectRoot, 'engine', 'target', 'debug', 'gamepath-engine.exe')
-    this.process = spawn(binary, [], { cwd: this.projectRoot, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    const runtimeDirectory = path.join(this.projectRoot, '.runtime')
+    fs.mkdirSync(runtimeDirectory, { recursive: true })
+    this.runtimeBinary = path.join(runtimeDirectory, `gamepath-engine-${process.pid}-${Date.now()}.exe`)
+    fs.copyFileSync(binary, this.runtimeBinary)
+    this.process = spawn(this.runtimeBinary, [], { cwd: this.projectRoot, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
     this.process.once('error', (error) => {
       this.status = { status: 'error', version: '', message: error.message, capabilities: null }
       this.rejectPending(error)
       this.process = null
+      this.cleanupRuntime()
     })
     this.process.once('exit', (code) => {
       const error = new Error(`Native engine exited with code ${code}`)
       this.status = { status: 'offline', version: '', message: error.message, capabilities: null }
       this.rejectPending(error)
       this.process = null
+      this.cleanupRuntime()
     })
     readline.createInterface({ input: this.process.stdout }).on('line', (line) => this.handleLine(line))
 
@@ -73,6 +81,12 @@ class EngineBridge {
   stop() {
     this.process?.kill()
     this.process = null
+  }
+
+  cleanupRuntime() {
+    if (!this.runtimeBinary) return
+    try { fs.unlinkSync(this.runtimeBinary) } catch {}
+    this.runtimeBinary = null
   }
 }
 
