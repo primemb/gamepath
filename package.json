@@ -9,6 +9,8 @@
     "predev": "npm run engine:build",
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && electron .\"",
     "engine:build": "node scripts/build-engine.cjs",
+    "relay:configure": "electron scripts/configure-relay.cjs",
+    "relay:test": "electron scripts/test-relay.cjs",
     "build": "tsc -b && vite build",
     "start": "electron .",
     "typecheck": "tsc -b --pretty false",

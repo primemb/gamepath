@@ -10,7 +10,7 @@ let state: AppState = {
     { id: 'rule-2', kind: 'hostname', value: '*.riotgames.com', label: 'Riot game services', enabled: true },
   ],
   trafficMode: 'split',
-  relays: [{ id: 'tr-istanbul-01', city: 'Istanbul', country: 'Turkey', code: 'TR', address: '', port: 51821, status: 'setup-required', latency: 38 }],
+  relays: [{ id: 'tr-istanbul-01', city: 'Istanbul', country: 'Turkey', code: 'TR', address: '', port: 51821, status: 'setup-required', hasEnrollmentToken: false, latency: 38 }],
   activeRelayId: 'tr-istanbul-01',
   session: { status: 'idle' },
   engine: { status: 'ready', version: '0.1.0', message: 'Native engine ready', capabilities: { platform: 'windows', architecture: 'x86_64', wireGuardInstalled: true, activeWireGuardInterfaces: [], packetAdapterInstalled: false, packetAdapter: { libraryAvailable: true, libraryLoaded: true, message: 'Signed Wintun library is ready' }, interception: { backend: 'windivert-2.2.2', libraryAvailable: true, libraryLoaded: true, driverAvailable: true, administratorRequired: true, message: 'Signed WFP capture runtime is ready' } } },
@@ -51,8 +51,16 @@ export const mockApi: GamePathApi = {
     return snapshot()
   },
   configureRelay: async (id, input) => {
-    state.relays = state.relays.map((relay) => relay.id === id ? { ...relay, ...input, status: 'ready' } : relay)
+    state.relays = state.relays.map((relay) => relay.id === id ? { ...relay, address: input.address, port: input.port, hasEnrollmentToken: relay.hasEnrollmentToken || Boolean(input.enrollmentToken), status: relay.hasEnrollmentToken || input.enrollmentToken ? 'ready' : 'setup-required' } : relay)
     return snapshot()
+  },
+  importRelayEnrollment: async (id) => {
+    state.relays = state.relays.map((relay) => relay.id === id ? { ...relay, hasEnrollmentToken: true, status: relay.address ? 'ready' : 'setup-required' } : relay)
+    return { canceled: false, state: snapshot() }
+  },
+  testRelay: async (id) => {
+    state.relays = state.relays.map((relay) => relay.id === id ? { ...relay, latency: 31, status: 'ready' } : relay)
+    return { state: snapshot(), result: { reachable: true, latencyMs: 31, virtualIpv4: '10.203.0.2' } }
   },
   startSession: async () => {
     const relay = state.relays.find((item) => item.id === state.activeRelayId)

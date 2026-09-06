@@ -1,10 +1,14 @@
 pub const MAGIC: u32 = 0x4750_5448;
 pub const VERSION: u8 = 1;
-pub const HEADER_LEN: usize = 24;
+pub const HEADER_LEN: usize = 40;
+
+pub const FLAG_CONTROL: u8 = 1;
+pub const FLAG_SERVER_TO_CLIENT: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     pub flags: u8,
+    pub client_id: [u8; 16],
     pub session_id: u64,
     pub sequence: u64,
 }
@@ -24,8 +28,9 @@ impl FrameHeader {
         bytes[4] = VERSION;
         bytes[5] = self.flags;
         bytes[6..8].copy_from_slice(&(HEADER_LEN as u16).to_be_bytes());
-        bytes[8..16].copy_from_slice(&self.session_id.to_be_bytes());
-        bytes[16..24].copy_from_slice(&self.sequence.to_be_bytes());
+        bytes[8..24].copy_from_slice(&self.client_id);
+        bytes[24..32].copy_from_slice(&self.session_id.to_be_bytes());
+        bytes[32..40].copy_from_slice(&self.sequence.to_be_bytes());
         bytes
     }
 
@@ -44,8 +49,9 @@ impl FrameHeader {
         }
         Ok(Self {
             flags: bytes[5],
-            session_id: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
-            sequence: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+            client_id: bytes[8..24].try_into().unwrap(),
+            session_id: u64::from_be_bytes(bytes[24..32].try_into().unwrap()),
+            sequence: u64::from_be_bytes(bytes[32..40].try_into().unwrap()),
         })
     }
 }
@@ -58,6 +64,7 @@ mod tests {
     fn frame_header_round_trips() {
         let header = FrameHeader {
             flags: 3,
+            client_id: [7; 16],
             session_id: 42,
             sequence: 9_001,
         };
@@ -68,6 +75,7 @@ mod tests {
     fn invalid_magic_is_rejected() {
         let mut bytes = FrameHeader {
             flags: 0,
+            client_id: [0; 16],
             session_id: 1,
             sequence: 1,
         }

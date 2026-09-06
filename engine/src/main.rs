@@ -1,10 +1,13 @@
+use base64::Engine as _;
 use gamepath_engine::adapter::inspect_library;
+use gamepath_engine::auth::EnrollmentToken;
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
 use gamepath_engine::wfp::inspect_backend;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +38,15 @@ struct PrepareRequest {
     rules: Vec<RuleSpec>,
     relay_host: String,
     relay_port: u16,
+    enrollment_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeRequest {
+    relay_host: String,
+    relay_port: u16,
+    enrollment_token: String,
 }
 
 fn main() {
@@ -72,6 +84,7 @@ fn handle_request(request: Request) -> Response {
         })),
         "inspect-system" => Ok(inspect_system()),
         "prepare-session" => prepare_session(request.payload),
+        "probe-relay" => probe_relay(request.payload),
         "scheduler-demo" => Ok(scheduler_demo()),
         _ => Err(format!("unknown command: {}", request.command)),
     };
@@ -89,6 +102,66 @@ fn handle_request(request: Request) -> Response {
             error: Some(error),
         },
     }
+}
+
+fn probe_relay(payload: Value) -> Result<Value, String> {
+    use gamepath_engine::auth::SessionCrypto;
+    use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
+    use std::time::{Duration, Instant};
+
+    let input: ProbeRequest =
+        serde_json::from_value(payload).map_err(|error| format!("invalid relay probe: {error}"))?;
+    let enrollment = EnrollmentToken::decode(&input.enrollment_token)?;
+    let (client_id, key) = enrollment.material()?;
+    let relay: SocketAddr = format!("{}:{}", input.relay_host, input.relay_port)
+        .to_socket_addrs()
+        .map_err(|error| format!("could not resolve relay: {error}"))?
+        .next()
+        .ok_or("relay address did not resolve")?;
+    let bind = if relay.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket =
+        UdpSocket::bind(bind).map_err(|error| format!("could not open probe socket: {error}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| error.to_string())?;
+    let session_id = rand::random::<u64>();
+    let header = FrameHeader {
+        flags: FLAG_CONTROL,
+        client_id,
+        session_id,
+        sequence: 1,
+    };
+    let crypto = SessionCrypto::new(&key, session_id)?;
+    let frame = crypto.seal_client(header, b"ping")?;
+    let started = Instant::now();
+    socket
+        .send_to(&frame, relay)
+        .map_err(|error| format!("relay probe send failed: {error}"))?;
+    let mut response = [0_u8; 2048];
+    let (length, source) = socket
+        .recv_from(&mut response)
+        .map_err(|error| format!("relay did not answer: {error}"))?;
+    if source.ip() != relay.ip() {
+        return Err("relay probe came from an unexpected address".into());
+    }
+    let (response_header, plaintext) = crypto.open_server(&response[..length])?;
+    if response_header.client_id != client_id
+        || response_header.session_id != session_id
+        || response_header.flags & (FLAG_CONTROL | FLAG_SERVER_TO_CLIENT)
+            != (FLAG_CONTROL | FLAG_SERVER_TO_CLIENT)
+        || plaintext != b"pong"
+    {
+        return Err("relay returned an invalid authenticated probe".into());
+    }
+    Ok(json!({
+        "reachable": true,
+        "latencyMs": started.elapsed().as_secs_f64() * 1000.0,
+        "virtualIpv4": enrollment.virtual_ipv4,
+    }))
 }
 
 fn inspect_system() -> Value {
@@ -137,6 +210,8 @@ fn prepare_session(payload: Value) -> Result<Value, String> {
     if input.relay_host.trim().is_empty() || input.relay_port == 0 {
         return Err("a relay host and port are required".into());
     }
+    let enrollment = EnrollmentToken::decode(&input.enrollment_token)?;
+    let (client_id, _) = enrollment.material()?;
     let plan_id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -148,6 +223,8 @@ fn prepare_session(payload: Value) -> Result<Value, String> {
         "trafficMode": input.traffic_mode,
         "interception": interception,
         "relay": { "host": input.relay_host, "port": input.relay_port },
+        "clientId": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(client_id),
+        "virtualIpv4": enrollment.virtual_ipv4,
         "state": "prepared",
     }))
 }
@@ -169,16 +246,19 @@ mod tests {
     fn prepare_rejects_one_route() {
         let result = prepare_session(json!({
             "routeIds": ["one"], "trafficMode": "all", "rules": [],
-            "relayHost": "relay.example", "relayPort": 51821
+            "relayHost": "relay.example", "relayPort": 51821, "enrollmentToken": "bad"
         }));
         assert!(result.is_err());
     }
 
     #[test]
     fn prepare_accepts_all_traffic_without_rules() {
+        let enrollment = EnrollmentToken::generate("10.203.0.2".parse().unwrap())
+            .encode()
+            .unwrap();
         let result = prepare_session(json!({
             "routeIds": ["one", "two"], "trafficMode": "all", "rules": [],
-            "relayHost": "relay.example", "relayPort": 51821
+            "relayHost": "relay.example", "relayPort": 51821, "enrollmentToken": enrollment
         }))
         .unwrap();
         assert_eq!(result["state"], "prepared");

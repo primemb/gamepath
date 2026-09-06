@@ -8,6 +8,7 @@ const { EngineBridge } = require('./engine.cjs')
 const defaultState = () => ({
   tunnels: [],
   encryptedConfigs: {},
+  encryptedRelayTokens: {},
   rules: [],
   trafficMode: 'split',
   relays: [
@@ -19,6 +20,7 @@ const defaultState = () => ({
       address: '',
       port: 51821,
       status: 'setup-required',
+      hasEnrollmentToken: false,
     },
   ],
   activeRelayId: 'tr-istanbul-01',
@@ -33,7 +35,7 @@ function statePath() {
 }
 
 function publicState() {
-  const { encryptedConfigs, ...safeState } = state
+  const { encryptedConfigs, encryptedRelayTokens, ...safeState } = state
   return structuredClone({ ...safeState, engine: engineBridge?.status ?? { status: 'offline', version: '', message: 'Native engine is starting', capabilities: null } })
 }
 
@@ -41,7 +43,13 @@ function loadState() {
   try {
     const loaded = JSON.parse(fs.readFileSync(statePath(), 'utf8'))
     state = { ...defaultState(), ...loaded, session: { status: 'idle' } }
-    state.relays = state.relays.map((relay) => ({ port: 51821, ...relay }))
+    state.encryptedRelayTokens ??= {}
+    state.relays = state.relays.map((relay) => {
+      const hasEnrollmentToken = Boolean(state.encryptedRelayTokens[relay.id])
+      const normalized = { port: 51821, ...relay, hasEnrollmentToken }
+      normalized.status = normalized.address && hasEnrollmentToken ? 'ready' : 'setup-required'
+      return normalized
+    })
   } catch {
     state = defaultState()
   }
@@ -162,23 +170,65 @@ function registerIpc() {
     const port = Number(input.port)
     if (!address || /\s|:\/\//.test(address)) throw new Error('Enter a hostname or IP address without http://')
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Port must be between 1 and 65535')
+    const enrollmentToken = String(input.enrollmentToken ?? '').trim()
+    if (enrollmentToken && (!enrollmentToken.startsWith('gpe1_') || enrollmentToken.length < 80)) {
+      throw new Error('The enrollment token is not a valid GamePath token')
+    }
+    if (enrollmentToken) state.encryptedRelayTokens[id] = encryptConfig(enrollmentToken)
+    if (!state.encryptedRelayTokens[id]) throw new Error('Import or paste the relay enrollment token')
     relay.address = address
     relay.port = port
     relay.status = 'ready'
+    relay.hasEnrollmentToken = true
     saveState()
     return publicState()
+  })
+
+  ipcMain.handle('relay:import-enrollment', async (_event, id) => {
+    const relay = state.relays.find((item) => item.id === id)
+    if (!relay) throw new Error('Relay not found')
+    const result = await dialog.showOpenDialog({
+      title: 'Import GamePath enrollment token',
+      buttonLabel: 'Import token',
+      properties: ['openFile'],
+      filters: [{ name: 'GamePath enrollment', extensions: ['enroll'] }],
+    })
+    if (result.canceled) return { canceled: true }
+    const token = fs.readFileSync(result.filePaths[0], 'utf8').trim()
+    if (!token.startsWith('gpe1_') || token.length < 80) throw new Error('The selected file is not a valid GamePath enrollment token')
+    state.encryptedRelayTokens[id] = encryptConfig(token)
+    relay.hasEnrollmentToken = true
+    relay.status = relay.address ? 'ready' : 'setup-required'
+    saveState()
+    return { canceled: false, state: publicState() }
+  })
+
+  ipcMain.handle('relay:test', async (_event, id) => {
+    const relay = state.relays.find((item) => item.id === id)
+    const encryptedToken = state.encryptedRelayTokens[id]
+    if (!relay?.address || !encryptedToken) throw new Error('Configure the relay address and enrollment token first')
+    const result = await engineBridge.request('probe-relay', {
+      relayHost: relay.address,
+      relayPort: relay.port,
+      enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedToken, 'base64')),
+    })
+    relay.latency = Math.max(1, Math.round(result.latencyMs))
+    relay.status = 'ready'
+    saveState()
+    return { state: publicState(), result }
   })
 
   ipcMain.handle('engine:start', async () => {
     const enabledTunnels = state.tunnels.filter((tunnel) => tunnel.enabled)
     const enabledRules = state.rules.filter((rule) => rule.enabled)
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
+    const encryptedRelayToken = relay && state.encryptedRelayTokens[relay.id]
     if (enabledTunnels.length < 2) {
       state.session = { status: 'error', message: 'Enable at least two WireGuard routes.' }
     } else if (state.trafficMode === 'split' && !enabledRules.length) {
       state.session = { status: 'error', message: 'Add at least one split-tunnel target.' }
-    } else if (!relay || relay.status !== 'ready') {
-      state.session = { status: 'error', message: 'The Istanbul relay needs its server component and address.' }
+    } else if (!relay || relay.status !== 'ready' || !encryptedRelayToken) {
+      state.session = { status: 'error', message: 'The Istanbul relay needs its address and enrollment token.' }
     } else if (engineBridge?.status.status !== 'ready') {
       state.session = { status: 'error', message: 'The native routing engine is unavailable.' }
     } else {
@@ -189,6 +239,7 @@ function registerIpc() {
           rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
           relayHost: relay.address,
           relayPort: relay.port,
+          enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedRelayToken, 'base64')),
         })
         state.session = { status: 'prepared', message: `Session plan ${plan.planId} is ready for the packet adapter.` }
       } catch (error) {

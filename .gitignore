@@ -2,6 +2,8 @@ node_modules/
 .runtime/
 dist/
 work/
+.secrets/
+*.enroll
 target/
 *.tsbuildinfo
 vite.config.js

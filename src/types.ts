@@ -27,6 +27,7 @@ export type Relay = {
   address: string
   port: number
   status: 'ready' | 'setup-required' | 'offline'
+  hasEnrollmentToken: boolean
   latency?: number
 }
 
@@ -66,6 +67,8 @@ export type GamePathApi = {
   removeRule: (id: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
   setRelay: (id: string) => Promise<AppState>
-  configureRelay: (id: string, input: { address: string; port: number }) => Promise<AppState>
+  configureRelay: (id: string, input: { address: string; port: number; enrollmentToken?: string }) => Promise<AppState>
+  importRelayEnrollment: (id: string) => Promise<{ canceled: boolean; state?: AppState }>
+  testRelay: (id: string) => Promise<{ state: AppState; result: { reachable: boolean; latencyMs: number; virtualIpv4: string } }>
   startSession: () => Promise<AppState>
 }

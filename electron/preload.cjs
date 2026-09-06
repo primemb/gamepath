@@ -12,5 +12,7 @@ contextBridge.exposeInMainWorld('gamepath', {
   setTrafficMode: (mode) => ipcRenderer.invoke('traffic:set-mode', mode),
   setRelay: (id) => ipcRenderer.invoke('relay:set', id),
   configureRelay: (id, input) => ipcRenderer.invoke('relay:configure', id, input),
+  importRelayEnrollment: (id) => ipcRenderer.invoke('relay:import-enrollment', id),
+  testRelay: (id) => ipcRenderer.invoke('relay:test', id),
   startSession: () => ipcRenderer.invoke('engine:start'),
 })

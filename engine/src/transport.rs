@@ -1,3 +1,4 @@
+use crate::auth::SessionCrypto;
 use crate::protocol::{FrameHeader, HEADER_LEN};
 use crate::scheduler::Decision;
 use std::collections::HashMap;
@@ -43,6 +44,10 @@ impl UdpPath {
         frame.extend_from_slice(payload);
         self.socket.send(&frame)
     }
+
+    fn send_datagram(&self, frame: &[u8]) -> io::Result<usize> {
+        self.socket.send(frame)
+    }
 }
 
 pub struct MultipathSender {
@@ -79,6 +84,35 @@ impl MultipathSender {
                 )
             })?;
             path.send_frame(header, payload)?;
+            sent.push(id.to_owned());
+        }
+        Ok(sent)
+    }
+
+    pub fn send_encrypted(
+        &self,
+        decision: &Decision,
+        crypto: &SessionCrypto,
+        header: FrameHeader,
+        payload: &[u8],
+    ) -> io::Result<Vec<String>> {
+        let frame = crypto
+            .seal_client(header, payload)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let selected: Vec<&str> = match decision {
+            Decision::Drop => return Ok(Vec::new()),
+            Decision::Single { path_id } => vec![path_id],
+            Decision::Duplicate { path_ids } => path_ids.iter().map(String::as_str).collect(),
+        };
+        let mut sent = Vec::with_capacity(selected.len());
+        for id in selected {
+            let path = self.paths.get(id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("route socket not found: {id}"),
+                )
+            })?;
+            path.send_datagram(&frame)?;
             sent.push(id.to_owned());
         }
         Ok(sent)
@@ -161,6 +195,7 @@ mod tests {
         let sender = MultipathSender::new([path_one, path_two]);
         let header = FrameHeader {
             flags: 0,
+            client_id: [4; 16],
             session_id: 7,
             sequence: 99,
         };
@@ -180,5 +215,64 @@ mod tests {
             assert_eq!(FrameHeader::decode(&buffer[..length]), Ok(header));
             assert_eq!(&buffer[HEADER_LEN..length], b"game-packet");
         }
+    }
+
+    #[test]
+    fn secure_duplication_sends_one_authenticated_ciphertext_on_both_paths() {
+        let receiver_one = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let receiver_two = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        for receiver in [&receiver_one, &receiver_two] {
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+        }
+        let path_one = UdpPath::connect(
+            "one",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            None,
+            receiver_one.local_addr().unwrap(),
+        )
+        .unwrap();
+        let path_two = UdpPath::connect(
+            "two",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            None,
+            receiver_two.local_addr().unwrap(),
+        )
+        .unwrap();
+        let sender = MultipathSender::new([path_one, path_two]);
+        let header = FrameHeader {
+            flags: 0,
+            client_id: [8; 16],
+            session_id: 55,
+            sequence: 2,
+        };
+        let crypto = SessionCrypto::new(&[9; 32], header.session_id).unwrap();
+        sender
+            .send_encrypted(
+                &Decision::Duplicate {
+                    path_ids: vec!["one".into(), "two".into()],
+                },
+                &crypto,
+                header,
+                b"private-game-packet",
+            )
+            .unwrap();
+        let mut frames = Vec::new();
+        for receiver in [receiver_one, receiver_two] {
+            let mut buffer = [0_u8; 256];
+            let length = receiver.recv(&mut buffer).unwrap();
+            frames.push(buffer[..length].to_vec());
+        }
+        assert_eq!(frames[0], frames[1]);
+        assert!(
+            !frames[0]
+                .windows(b"private-game-packet".len())
+                .any(|window| window == b"private-game-packet")
+        );
+        assert_eq!(
+            crypto.open_client(&frames[0]).unwrap(),
+            (header, b"private-game-packet".to_vec())
+        );
     }
 }

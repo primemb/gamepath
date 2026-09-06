@@ -141,9 +141,10 @@ function RuleModal({ onClose, onSave }: { onClose: () => void; onSave: (input: A
   )
 }
 
-function RelayModal({ relay, onClose, onSave }: { relay: Relay; onClose: () => void; onSave: (input: { address: string; port: number }) => Promise<void> }) {
+function RelayModal({ relay, onClose, onSave, onImport }: { relay: Relay; onClose: () => void; onSave: (input: { address: string; port: number; enrollmentToken?: string }) => Promise<void>; onImport: () => Promise<void> }) {
   const [address, setAddress] = useState(relay.address)
   const [port, setPort] = useState(String(relay.port || 51821))
+  const [enrollmentToken, setEnrollmentToken] = useState('')
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section className="modal relay-modal" onMouseDown={(event) => event.stopPropagation()} role="dialog" aria-modal="true" aria-label="Configure relay">
@@ -151,14 +152,18 @@ function RelayModal({ relay, onClose, onSave }: { relay: Relay; onClose: () => v
           <div><span className="eyebrow">{relay.city}, {relay.country}</span><h2>Configure relay endpoint</h2></div>
           <button className="icon-button" onClick={onClose}><X size={18} /></button>
         </div>
-        <p className="modal-intro">Enter the public address assigned to the GamePath relay service. This is stored locally and sent only to the native engine.</p>
+        <p className="modal-intro">Set the public endpoint and its unique client credential. The credential is encrypted by Windows and is never shown again after saving.</p>
         <div className="relay-fields">
           <label className="field-label">Hostname or IP address<input autoFocus value={address} onChange={(event) => setAddress(event.target.value)} placeholder="relay.example.com" /></label>
           <label className="field-label port-field">UDP port<input value={port} onChange={(event) => setPort(event.target.value.replace(/\D/g, '').slice(0, 5))} placeholder="51821" /></label>
         </div>
+        <label className="field-label enrollment-field">Enrollment token
+          <input type="password" value={enrollmentToken} onChange={(event) => setEnrollmentToken(event.target.value)} placeholder={relay.hasEnrollmentToken ? 'Credential already protected — leave blank to keep it' : 'Paste gpe1_… token'} />
+        </label>
+        <button className="file-import-button" onClick={onImport}><ShieldCheck size={15} />Import a .enroll file<span>{relay.hasEnrollmentToken ? 'Credential protected' : 'Recommended'}</span></button>
         <div className="modal-actions">
           <button className="button secondary" onClick={onClose}>Cancel</button>
-          <button className="button primary" disabled={!address.trim() || !port} onClick={() => onSave({ address: address.trim(), port: Number(port) })}><Check size={16} />Save relay</button>
+          <button className="button primary" disabled={!address.trim() || !port || (!relay.hasEnrollmentToken && !enrollmentToken.trim())} onClick={() => onSave({ address: address.trim(), port: Number(port), enrollmentToken: enrollmentToken.trim() || undefined })}><Check size={16} />Save relay</button>
         </div>
       </section>
     </div>
@@ -313,7 +318,7 @@ function App() {
           {view === 'relays' && (
             <section className="page-section">
               <div className="relay-intro"><div><span className="eyebrow">Available region</span><h2>Turkey</h2><p>The relay combines your active paths and forwards clean traffic to the game server.</p></div><div className="flag-orb">TR</div></div>
-              <div className="relay-grid">{state.relays.map((item) => <article key={item.id} className={`relay-card ${state.activeRelayId === item.id ? 'selected' : ''}`}><button className="relay-choice" onClick={async () => setState(await api.setRelay(item.id))}><span className="relay-radio">{state.activeRelayId === item.id && <Check size={14} />}</span><div className="relay-location"><span><MapPin size={19} /></span><div><strong>{item.city}</strong><small>{item.address ? `${item.address}:${item.port}` : `${item.country} · Primary relay`}</small></div></div><div className="relay-stat"><small>Latency</small><strong>{item.latency ?? '—'}<em> ms</em></strong></div><div className={`relay-status ${item.status}`}><i />{item.status === 'ready' ? 'Configured' : 'Setup required'}</div></button><button className="button secondary relay-configure" onClick={() => { setState({ ...state, activeRelayId: item.id }); setShowRelayModal(true) }}>{item.status === 'ready' ? 'Edit' : 'Configure'}</button></article>)}</div>
+              <div className="relay-grid">{state.relays.map((item) => <article key={item.id} className={`relay-card ${state.activeRelayId === item.id ? 'selected' : ''}`}><button className="relay-choice" onClick={async () => setState(await api.setRelay(item.id))}><span className="relay-radio">{state.activeRelayId === item.id && <Check size={14} />}</span><div className="relay-location"><span><MapPin size={19} /></span><div><strong>{item.city}</strong><small>{item.address ? `${item.address}:${item.port}` : `${item.country} · Primary relay`}</small></div></div><div className="relay-stat"><small>Latency</small><strong>{item.latency ?? '—'}<em> ms</em></strong></div><div className={`relay-status ${item.status}`}><i />{item.status === 'ready' ? 'Configured' : 'Setup required'}</div></button><div className="relay-actions">{item.status === 'ready' && <button className="button secondary" onClick={async () => { try { const tested = await api.testRelay(item.id); setState(tested.state); setNotice(`Authenticated relay ready · ${Math.round(tested.result.latencyMs)} ms · ${tested.result.virtualIpv4}`) } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) } }}>Test</button>}<button className="button secondary relay-configure" onClick={() => { setState({ ...state, activeRelayId: item.id }); setShowRelayModal(true) }}>{item.status === 'ready' ? 'Edit' : 'Configure'}</button></div></article>)}</div>
               <div className="coming-regions"><span>More regions are planned</span><div><i>DE</i><i>NL</i><i>AE</i></div></div>
             </section>
           )}
@@ -331,7 +336,7 @@ function App() {
       </main>
 
       {showRuleModal && <RuleModal onClose={() => setShowRuleModal(false)} onSave={async (input) => { setState(await api.addRule(input)); setShowRuleModal(false) }} />}
-      {showRelayModal && relay && <RelayModal relay={relay} onClose={() => setShowRelayModal(false)} onSave={async (input) => { try { setState(await api.configureRelay(relay.id, input)); setShowRelayModal(false) } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) } }} />}
+      {showRelayModal && relay && <RelayModal relay={relay} onClose={() => setShowRelayModal(false)} onImport={async () => { try { const result = await api.importRelayEnrollment(relay.id); if (result.state) setState(result.state) } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) } }} onSave={async (input) => { try { setState(await api.configureRelay(relay.id, input)); setShowRelayModal(false) } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) } }} />}
       {notice && <div className="toast"><Info size={17} /><span>{notice}</span><button onClick={() => setNotice(null)}><X size={15} /></button></div>}
     </div>
   )
