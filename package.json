@@ -1,0 +1,35 @@
+{
+  "name": "gamepath-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A multipath gaming tunnel client for Windows",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "predev": "npm run engine:build",
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && electron .\"",
+    "engine:build": "node scripts/build-engine.cjs",
+    "build": "tsc -b && vite build",
+    "start": "electron .",
+    "typecheck": "tsc -b --pretty false",
+    "test": "node --test electron/*.test.cjs",
+    "check": "npm test && npm run build && npm run engine:build"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "latest",
+    "concurrently": "latest",
+    "electron": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "wait-on": "latest"
+  }
+}
