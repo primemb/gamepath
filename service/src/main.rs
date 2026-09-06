@@ -26,7 +26,7 @@ mod gamepath_service {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use windows_service::{
         Result as ServiceResult, define_windows_service,
         service::{
@@ -47,6 +47,7 @@ mod gamepath_service {
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
     const DEFAULT_PORT: u16 = 47_983;
     const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
+    const SESSION_LEASE: Duration = Duration::from_secs(10);
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -74,6 +75,7 @@ mod gamepath_service {
         route_count: usize,
         traffic_mode: String,
         engine: Option<EngineProcess>,
+        lease_deadline: Option<Instant>,
     }
 
     struct EngineProcess {
@@ -182,6 +184,29 @@ mod gamepath_service {
             session_status: "idle".into(),
             ..RuntimeState::default()
         }));
+        let watchdog_state = Arc::clone(&state);
+        let watchdog_stop = Arc::clone(&stop);
+        let watchdog = thread::spawn(move || {
+            while !watchdog_stop.load(Ordering::Acquire) {
+                let expired_engine = {
+                    let mut runtime = watchdog_state.lock().unwrap();
+                    if runtime
+                        .lease_deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        runtime.lease_deadline = None;
+                        runtime.session_status = "idle".into();
+                        runtime.route_count = 0;
+                        runtime.traffic_mode.clear();
+                        runtime.engine.take()
+                    } else {
+                        None
+                    }
+                };
+                drop(expired_engine);
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
         while !stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -195,6 +220,7 @@ mod gamepath_service {
                 Err(error) => return Err(error),
             }
         }
+        let _ = watchdog.join();
         Ok(())
     }
 
@@ -249,6 +275,7 @@ mod gamepath_service {
                 state.session_status = "idle".into();
                 state.route_count = 0;
                 state.traffic_mode.clear();
+                state.lease_deadline = None;
                 Ok(json!({ "sessionStatus": "idle" }))
             }
             _ => Err(format!("unknown service command: {}", request.command)),
@@ -414,6 +441,7 @@ mod gamepath_service {
         log_event("Windows packet capture started");
         runtime.session_status = "connected".into();
         runtime.route_count = paths["paths"].as_array().map_or(0, Vec::len);
+        runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
         runtime.engine = Some(engine);
         Ok(json!({ "paths": paths, "dataPlane": data_plane, "capture": capture }))
     }
@@ -435,7 +463,9 @@ mod gamepath_service {
     fn session_status(state: &Mutex<RuntimeState>) -> Result<Value, String> {
         let mut runtime = state.lock().unwrap();
         let engine = runtime.engine.as_mut().ok_or("no active network session")?;
-        engine.request("wireguard-session-status", json!({}))
+        let result = engine.request("wireguard-session-status", json!({}))?;
+        runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
+        Ok(result)
     }
 
     fn validate_runtime(payload: Value, state: &Mutex<RuntimeState>) -> Result<Value, String> {
