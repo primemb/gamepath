@@ -46,14 +46,14 @@ class EngineBridge {
     return this.status
   }
 
-  request(command, payload = {}) {
+  request(command, payload = {}, timeoutMs = 5000) {
     if (!this.process?.stdin?.writable) return Promise.reject(new Error('Native engine is unavailable'))
     const id = this.nextId++
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id)
         reject(new Error(`Engine request timed out: ${command}`))
-      }, 5000)
+      }, timeoutMs)
       this.pending.set(id, { resolve, reject, timeout })
       this.process.stdin.write(`${JSON.stringify({ id, command, payload })}\n`)
     })

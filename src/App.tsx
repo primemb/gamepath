@@ -183,11 +183,13 @@ function App() {
   const enabledRules = state?.rules.filter((item) => item.enabled).length ?? 0
   const relay = state?.relays.find((item) => item.id === state.activeRelayId)
   const trafficMode = state?.trafficMode ?? 'split'
+  const bestRouteLatency = state?.session.routeLatencies?.length ? Math.min(...state.session.routeLatencies) : null
   const readiness = useMemo(() => ({ routes: enabledRoutes >= 2, rules: trafficMode === 'all' || enabledRules >= 1, relay: relay?.status === 'ready' }), [enabledRoutes, enabledRules, relay, trafficMode])
   const readyCount = Object.values(readiness).filter(Boolean).length
 
   if (!state) return <div className="loading"><div className="brand-mark"><Zap size={22} /></div><span>Loading GamePath…</span></div>
   const engineState = state.engine ?? { status: 'offline' as const, version: '', message: 'Native engine is starting', capabilities: null }
+  const serviceState = state.service ?? { status: 'not-installed' as const, version: '', message: 'Network service is not installed', elevated: false }
 
   const importTunnels = async () => {
     const result = await api.importWireGuard()
@@ -251,7 +253,7 @@ function App() {
 
               <section className="stats-strip">
                 <div><span className="stat-icon cyan"><Route size={18} /></span><p>Active routes</p><strong>{enabledRoutes}<small> / {state.tunnels.length}</small></strong></div>
-                <div><span className="stat-icon violet"><CircleGauge size={18} /></span><p>Best route</p><strong>—<small> ms</small></strong></div>
+                <div><span className="stat-icon violet"><CircleGauge size={18} /></span><p>Best route</p><strong>{bestRouteLatency ?? '—'}<small> ms</small></strong></div>
                 <div><span className="stat-icon green"><Activity size={18} /></span><p>Packet recovery</p><strong>—<small> %</small></strong></div>
               </section>
 
@@ -330,6 +332,7 @@ function App() {
               <div className="settings-card"><div><span className="setting-icon"><Activity size={18} /></span><div><strong>Local diagnostics</strong><p>Keep route latency and packet-loss history for troubleshooting.</p></div></div><Toggle checked={true} onChange={() => undefined} label="Local diagnostics" /></div>
               <div className="settings-card capability-card"><div><span className="setting-icon"><ShieldCheck size={18} /></span><div><strong>Windows network capabilities</strong><p>WireGuard {engineState.capabilities?.wireGuardInstalled ? 'detected' : 'not found'} · Wintun library {engineState.capabilities?.packetAdapter?.libraryLoaded ? 'ready' : 'missing'} · Driver {engineState.capabilities?.packetAdapterInstalled ? 'active' : 'not created'}</p></div></div><span className={`status-pill ${engineState.status === 'ready' ? 'online' : ''}`}><i />{engineState.status}</span></div>
               <div className="settings-card capability-card"><div><span className="setting-icon"><Network size={18} /></span><div><strong>Split-tunnel interception</strong><p>WFP backend {engineState.capabilities?.interception?.libraryLoaded && engineState.capabilities?.interception?.driverAvailable ? 'ready' : 'missing'} · Winsock transport · Administrator service required to activate</p></div></div><span className={`status-pill ${engineState.capabilities?.interception?.libraryLoaded ? 'online' : ''}`}><i />WFP</span></div>
+              <div className="settings-card capability-card"><div><span className="setting-icon"><Server size={18} /></span><div><strong>GamePath Network Service</strong><p>{serviceState.message}{serviceState.version ? ` · Version ${serviceState.version}` : ''}</p></div></div><div className="service-actions">{serviceState.status !== 'ready' && <button className="button primary" onClick={async () => { await api.installService(); setNotice('Windows will ask for administrator approval. After installation, select Refresh status.') }}>Install service</button>}<button className="button secondary" onClick={async () => setState(await api.refreshService())}>Refresh status</button><span className={`status-pill ${serviceState.status === 'ready' ? 'online' : ''}`}><i />{serviceState.status}</span></div></div>
             </section>
           )}
         </div>

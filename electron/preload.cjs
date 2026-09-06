@@ -14,5 +14,7 @@ contextBridge.exposeInMainWorld('gamepath', {
   configureRelay: (id, input) => ipcRenderer.invoke('relay:configure', id, input),
   importRelayEnrollment: (id) => ipcRenderer.invoke('relay:import-enrollment', id),
   testRelay: (id) => ipcRenderer.invoke('relay:test', id),
+  refreshService: () => ipcRenderer.invoke('service:refresh'),
+  installService: () => ipcRenderer.invoke('service:install'),
   startSession: () => ipcRenderer.invoke('engine:start'),
 })

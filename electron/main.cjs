@@ -1,9 +1,11 @@
 const { app, BrowserWindow, dialog, ipcMain, safeStorage } = require('electron')
+const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { parseWireGuardConfig } = require('./wireguard.cjs')
 const { EngineBridge } = require('./engine.cjs')
+const { ServiceBridge } = require('./service.cjs')
 
 const defaultState = () => ({
   tunnels: [],
@@ -29,6 +31,7 @@ const defaultState = () => ({
 
 let state
 let engineBridge
+let serviceBridge
 
 function statePath() {
   return path.join(app.getPath('userData'), 'gamepath-state.json')
@@ -36,7 +39,11 @@ function statePath() {
 
 function publicState() {
   const { encryptedConfigs, encryptedRelayTokens, ...safeState } = state
-  return structuredClone({ ...safeState, engine: engineBridge?.status ?? { status: 'offline', version: '', message: 'Native engine is starting', capabilities: null } })
+  return structuredClone({
+    ...safeState,
+    engine: engineBridge?.status ?? { status: 'offline', version: '', message: 'Native engine is starting', capabilities: null },
+    service: serviceBridge?.status ?? { status: 'offline', version: '', message: 'Network service is starting', elevated: false },
+  })
 }
 
 function loadState() {
@@ -218,6 +225,22 @@ function registerIpc() {
     return { state: publicState(), result }
   })
 
+  ipcMain.handle('service:refresh', async () => {
+    await serviceBridge.inspect()
+    return publicState()
+  })
+
+  ipcMain.handle('service:install', () => {
+    const installer = path.join(__dirname, '..', 'deploy', 'install-windows-service.ps1')
+    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', installer, '-ProjectRoot', path.join(__dirname, '..')], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    child.unref()
+    return { launched: true }
+  })
+
   ipcMain.handle('engine:start', async () => {
     const enabledTunnels = state.tunnels.filter((tunnel) => tunnel.enabled)
     const enabledRules = state.rules.filter((rule) => rule.enabled)
@@ -231,17 +254,36 @@ function registerIpc() {
       state.session = { status: 'error', message: 'The Istanbul relay needs its address and enrollment token.' }
     } else if (engineBridge?.status.status !== 'ready') {
       state.session = { status: 'error', message: 'The native routing engine is unavailable.' }
+    } else if (serviceBridge?.status.status !== 'ready') {
+      state.session = { status: 'error', message: 'Install and start the GamePath Network Service in Settings.' }
     } else {
       try {
+        const enrollmentToken = safeStorage.decryptString(Buffer.from(encryptedRelayToken, 'base64'))
+        const wireguardConfigs = enabledTunnels.map((tunnel) => safeStorage.decryptString(Buffer.from(state.encryptedConfigs[tunnel.id], 'base64')))
         const plan = await engineBridge.request('prepare-session', {
           routeIds: enabledTunnels.map((tunnel) => tunnel.id),
           trafficMode: state.trafficMode,
           rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
           relayHost: relay.address,
           relayPort: relay.port,
-          enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedRelayToken, 'base64')),
+          enrollmentToken,
         })
-        state.session = { status: 'prepared', message: `Session plan ${plan.planId} is ready for the packet adapter.` }
+        const relayAddresses = await require('node:dns').promises.lookup(relay.address, { all: true })
+        const relayIp = relayAddresses.find((entry) => entry.family === 4)?.address ?? relayAddresses[0]?.address
+        if (!relayIp) throw new Error('The relay hostname did not resolve')
+        const runtime = await serviceBridge.request('validate-runtime', {
+          relayIp,
+          trafficMode: state.trafficMode,
+          wireguardConfigs,
+        })
+        const paths = await engineBridge.request('probe-wireguard-routes', {
+          relayHost: relay.address,
+          relayPort: relay.port,
+          enrollmentToken,
+          wireguardConfigs,
+        }, 25000)
+        const routeLatencies = paths.routes.map((route) => Math.max(1, Math.round(route.latencyMs)))
+        state.session = { status: 'prepared', routeLatencies, message: `Session plan ${plan.planId} validated; ${runtime.routeCount} encrypted WireGuard paths reached the relay.` }
       } catch (error) {
         state.session = { status: 'error', message: error.message }
       }
@@ -278,7 +320,9 @@ function createWindow() {
 app.whenReady().then(async () => {
   loadState()
   engineBridge = new EngineBridge(path.join(__dirname, '..'))
+  serviceBridge = new ServiceBridge()
   await engineBridge.start()
+  await serviceBridge.inspect()
   registerIpc()
   createWindow()
   app.on('activate', () => {

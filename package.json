@@ -9,13 +9,17 @@
     "predev": "npm run engine:build",
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && electron .\"",
     "engine:build": "node scripts/build-engine.cjs",
+    "service:build": "node scripts/build-service.cjs",
     "relay:configure": "electron scripts/configure-relay.cjs",
     "relay:test": "electron scripts/test-relay.cjs",
+    "wireguard:import": "electron scripts/import-wireguard.cjs",
+    "runtime:test": "electron scripts/test-runtime.cjs",
+    "wireguard:probe": "electron scripts/probe-wireguard-routes.cjs",
     "build": "tsc -b && vite build",
     "start": "electron .",
     "typecheck": "tsc -b --pretty false",
     "test": "node --test electron/*.test.cjs",
-    "check": "npm test && npm run build && npm run engine:build"
+    "check": "npm test && npm run build && npm run engine:build && npm run service:build"
   },
   "dependencies": {
     "@fontsource-variable/inter": "latest",

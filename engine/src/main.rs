@@ -49,6 +49,15 @@ struct ProbeRequest {
     enrollment_token: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireGuardProbeRequest {
+    relay_host: String,
+    relay_port: u16,
+    enrollment_token: String,
+    wireguard_configs: Vec<String>,
+}
+
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -85,6 +94,7 @@ fn handle_request(request: Request) -> Response {
         "inspect-system" => Ok(inspect_system()),
         "prepare-session" => prepare_session(request.payload),
         "probe-relay" => probe_relay(request.payload),
+        "probe-wireguard-routes" => probe_wireguard_routes(request.payload),
         "scheduler-demo" => Ok(scheduler_demo()),
         _ => Err(format!("unknown command: {}", request.command)),
     };
@@ -102,6 +112,81 @@ fn handle_request(request: Request) -> Response {
             error: Some(error),
         },
     }
+}
+
+fn probe_wireguard_routes(payload: Value) -> Result<Value, String> {
+    use gamepath_engine::auth::SessionCrypto;
+    use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
+    use gamepath_engine::userspace_wireguard::{
+        UserSpaceWireGuardPath, ipv4_udp_packet, ipv4_udp_payload,
+    };
+    use rand::Rng;
+    use std::time::{Duration, Instant};
+
+    let input: WireGuardProbeRequest = serde_json::from_value(payload)
+        .map_err(|error| format!("invalid WireGuard probe: {error}"))?;
+    if input.wireguard_configs.len() < 2 {
+        return Err("at least two WireGuard configurations are required".into());
+    }
+    let enrollment = EnrollmentToken::decode(&input.enrollment_token)?;
+    let (client_id, key) = enrollment.material()?;
+    let relay_ip = format!("{}:{}", input.relay_host, input.relay_port)
+        .to_socket_addrs()
+        .map_err(|error| format!("could not resolve relay: {error}"))?
+        .find_map(|address| match address.ip() {
+            std::net::IpAddr::V4(ip) => Some(ip),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .ok_or("relay did not resolve to IPv4")?;
+    let session_id = rand::random::<u64>();
+    let crypto = SessionCrypto::new(&key, session_id)?;
+    let mut results = Vec::new();
+    for (index, source) in input.wireguard_configs.iter().enumerate() {
+        let mut path = UserSpaceWireGuardPath::from_config(source)?;
+        let sequence = index as u64 + 1;
+        let header = FrameHeader {
+            flags: FLAG_CONTROL,
+            client_id,
+            session_id,
+            sequence,
+        };
+        let overlay = crypto.seal_client(header, b"ping")?;
+        let source_port = rand::rng().random_range(49_152..=65_535);
+        let inner = ipv4_udp_packet(
+            path.address(),
+            relay_ip,
+            source_port,
+            input.relay_port,
+            &overlay,
+        )?;
+        let started = Instant::now();
+        let reply = path.transact(&inner, Duration::from_secs(8))?;
+        let (source_ip, destination_ip, reply_source_port, reply_destination_port, response_frame) =
+            ipv4_udp_payload(&reply).ok_or("WireGuard path returned a non-UDP packet")?;
+        if source_ip != relay_ip
+            || destination_ip != path.address()
+            || reply_source_port != input.relay_port
+            || reply_destination_port != source_port
+        {
+            return Err("WireGuard path returned an unexpected UDP flow".into());
+        }
+        let (response_header, plaintext) = crypto.open_server(response_frame)?;
+        if response_header.client_id != client_id
+            || response_header.session_id != session_id
+            || response_header.flags & (FLAG_CONTROL | FLAG_SERVER_TO_CLIENT)
+                != (FLAG_CONTROL | FLAG_SERVER_TO_CLIENT)
+            || plaintext != b"pong"
+        {
+            return Err("WireGuard path returned an invalid authenticated relay response".into());
+        }
+        results.push(json!({
+            "route": index + 1,
+            "endpoint": path.endpoint().to_string(),
+            "latencyMs": started.elapsed().as_secs_f64() * 1000.0,
+            "reachable": true,
+        }));
+    }
+    Ok(json!({ "reachable": true, "routes": results }))
 }
 
 fn probe_relay(payload: Value) -> Result<Value, String> {

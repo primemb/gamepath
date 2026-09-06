@@ -4,4 +4,6 @@ pub mod policy;
 pub mod protocol;
 pub mod scheduler;
 pub mod transport;
+pub mod userspace_wireguard;
 pub mod wfp;
+pub mod wireguard_runtime;

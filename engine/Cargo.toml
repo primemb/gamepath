@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = "0.22"
+boringtun = "0.7.1"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 rand = "0.9"

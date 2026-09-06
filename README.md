@@ -34,7 +34,9 @@ cargo test --manifest-path ..\relay\Cargo.toml
 - Compile application, folder, hostname, and IP targets into a process-aware WFP interception plan.
 - Compute adaptive route decisions in the Rust engine.
 - Load and verify the WinDivert WFP capture runtime before activation.
-- Encrypt and send identical sequenced frames over multiple Winsock UDP sockets bound to distinct interface indexes.
+- Encrypt and send identical sequenced frames over multiple UDP paths.
+- Run duplicate provider configurations through independent user-space WireGuard instances, including configs that reuse the same client key and tunnel address.
+- Install an authenticated, auto-start Windows network service for the future Wintun and WFP data plane.
 - Provision an idempotent Debian 13 relay with systemd, nftables NAT, TUN forwarding, per-client enrollment, authenticated probes, replay protection, and multipath reply fan-out.
 
 The Windows packet adapter and privileged service boundary are the next implementation milestones. A prepared session does not modify routes until those components are active.

@@ -19,13 +19,17 @@ All traffic is routed into the signed Wintun adapter. This avoids process correl
 
 ## Multipath transport
 
-Winsock UDP sockets carry GamePath frames to the relay. Each socket is bound to one active WireGuard interface and its source address. Packets receive a session ID and monotonically increasing sequence number before adaptive scheduling sends them on one or two routes.
+Each imported configuration creates an independent user-space WireGuard protocol instance. This allows two provider endpoints to run simultaneously even when the purchased files reuse the same private key and tunnel address, a combination Windows rejects as duplicate adapters. The implementation uses BoringTun's portable WireGuard protocol core and ordinary Winsock UDP sockets for the outer provider connections.
 
-On Windows, the transport applies `IP_UNICAST_IF` or `IPV6_UNICAST_IF` to each socket in addition to binding its WireGuard source address. This prevents equal relay host routes from collapsing both copies onto the same interface.
+Authenticated GamePath frames are wrapped in an inner IPv4/UDP packet addressed to the relay, then encrypted independently by each WireGuard instance. Packets receive a session ID and monotonically increasing sequence number before adaptive scheduling sends them on one or two routes. The relay sees two authenticated endpoints and fans replies back across both.
 
 ## WireGuard routes
 
-Each purchased configuration is transformed only in memory for the active session. Its runtime `AllowedIPs` is narrowed to the resolved relay address, and DNS settings are omitted, so multiple providers can run without competing for the system default route. Original encrypted configurations are never modified.
+Each purchased configuration is parsed only in memory for the active session. The private key, peer key, optional pre-shared key, endpoint, and assigned address feed its isolated WireGuard protocol instance. Original encrypted configurations are never modified. A validation-only transformer also proves that adapter-based backends would narrow `AllowedIPs` to the resolved relay address and omit DNS and route side effects.
+
+## Privileged service
+
+The Electron UI and native engine remain unprivileged. `GamePathService` runs through Windows Service Control Manager and exposes a token-authenticated loopback API on `127.0.0.1`. The installer creates a random 256-bit control token under `%ProgramData%\GamePath`, protects it for Local System, administrators, and the installing user, and installs the signed Wintun and WinDivert runtime files beside the service. Adapter and WFP activation will live behind this boundary.
 
 ## WireSock option
 

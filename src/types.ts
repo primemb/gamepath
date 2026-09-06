@@ -37,7 +37,7 @@ export type AppState = {
   trafficMode: 'all' | 'split'
   relays: Relay[]
   activeRelayId: string
-  session: { status: 'idle' | 'starting' | 'prepared' | 'connected' | 'error'; message?: string }
+  session: { status: 'idle' | 'starting' | 'prepared' | 'connected' | 'error'; message?: string; routeLatencies?: number[] }
   engine: {
     status: 'offline' | 'ready' | 'error'
     version: string
@@ -51,6 +51,13 @@ export type AppState = {
       packetAdapter?: { libraryAvailable: boolean; libraryLoaded: boolean; driverVersion?: string; message: string }
       interception?: { backend: string; libraryAvailable: boolean; libraryLoaded: boolean; driverAvailable: boolean; administratorRequired: boolean; message: string }
     }
+  }
+  service: {
+    status: 'not-installed' | 'offline' | 'ready'
+    version: string
+    message: string
+    elevated: boolean
+    sessionStatus?: string
   }
 }
 
@@ -70,5 +77,7 @@ export type GamePathApi = {
   configureRelay: (id: string, input: { address: string; port: number; enrollmentToken?: string }) => Promise<AppState>
   importRelayEnrollment: (id: string) => Promise<{ canceled: boolean; state?: AppState }>
   testRelay: (id: string) => Promise<{ state: AppState; result: { reachable: boolean; latencyMs: number; virtualIpv4: string } }>
+  refreshService: () => Promise<AppState>
+  installService: () => Promise<{ launched: boolean }>
   startSession: () => Promise<AppState>
 }

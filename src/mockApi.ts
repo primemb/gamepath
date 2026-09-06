@@ -14,6 +14,7 @@ let state: AppState = {
   activeRelayId: 'tr-istanbul-01',
   session: { status: 'idle' },
   engine: { status: 'ready', version: '0.1.0', message: 'Native engine ready', capabilities: { platform: 'windows', architecture: 'x86_64', wireGuardInstalled: true, activeWireGuardInterfaces: [], packetAdapterInstalled: false, packetAdapter: { libraryAvailable: true, libraryLoaded: true, message: 'Signed Wintun library is ready' }, interception: { backend: 'windivert-2.2.2', libraryAvailable: true, libraryLoaded: true, driverAvailable: true, administratorRequired: true, message: 'Signed WFP capture runtime is ready' } } },
+  service: { status: 'not-installed', version: '', message: 'Network service is not installed', elevated: false },
 }
 
 const snapshot = () => structuredClone(state)
@@ -62,6 +63,8 @@ export const mockApi: GamePathApi = {
     state.relays = state.relays.map((relay) => relay.id === id ? { ...relay, latency: 31, status: 'ready' } : relay)
     return { state: snapshot(), result: { reachable: true, latencyMs: 31, virtualIpv4: '10.203.0.2' } }
   },
+  refreshService: async () => snapshot(),
+  installService: async () => ({ launched: true }),
   startSession: async () => {
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     state.session = relay?.status === 'ready'
