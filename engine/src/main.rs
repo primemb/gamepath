@@ -1,6 +1,7 @@
 use gamepath_engine::adapter::inspect_library;
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
+use gamepath_engine::wfp::inspect_backend;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -94,6 +95,10 @@ fn inspect_system() -> Value {
     let wireguard_exe = r"C:\Program Files\WireGuard\wireguard.exe";
     let wg_exe = r"C:\Program Files\WireGuard\wg.exe";
     let adapter = inspect_library(Path::new(r"vendor\wintun\wintun.dll"));
+    let interception = inspect_backend(
+        Path::new(r"vendor\windivert\WinDivert.dll"),
+        Path::new(r"vendor\windivert\WinDivert64.sys"),
+    );
     let interfaces = if Path::new(wg_exe).exists() {
         Command::new(wg_exe)
             .args(["show", "interfaces"])
@@ -118,6 +123,7 @@ fn inspect_system() -> Value {
         "activeWireGuardInterfaces": interfaces,
         "packetAdapter": adapter,
         "packetAdapterInstalled": adapter.driver_version.is_some(),
+        "interception": interception,
     })
 }
 

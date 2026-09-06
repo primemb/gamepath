@@ -13,7 +13,7 @@ let state: AppState = {
   relays: [{ id: 'tr-istanbul-01', city: 'Istanbul', country: 'Turkey', code: 'TR', address: '', port: 51821, status: 'setup-required', latency: 38 }],
   activeRelayId: 'tr-istanbul-01',
   session: { status: 'idle' },
-  engine: { status: 'ready', version: '0.1.0', message: 'Native engine ready', capabilities: { platform: 'windows', architecture: 'x86_64', wireGuardInstalled: true, activeWireGuardInterfaces: [], packetAdapterInstalled: false, packetAdapter: { libraryAvailable: true, libraryLoaded: true, message: 'Signed Wintun library is ready' } } },
+  engine: { status: 'ready', version: '0.1.0', message: 'Native engine ready', capabilities: { platform: 'windows', architecture: 'x86_64', wireGuardInstalled: true, activeWireGuardInterfaces: [], packetAdapterInstalled: false, packetAdapter: { libraryAvailable: true, libraryLoaded: true, message: 'Signed Wintun library is ready' }, interception: { backend: 'windivert-2.2.2', libraryAvailable: true, libraryLoaded: true, driverAvailable: true, administratorRequired: true, message: 'Signed WFP capture runtime is ready' } } },
 }
 
 const snapshot = () => structuredClone(state)

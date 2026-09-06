@@ -48,6 +48,7 @@ export type AppState = {
       activeWireGuardInterfaces: string[]
       packetAdapterInstalled: boolean
       packetAdapter?: { libraryAvailable: boolean; libraryLoaded: boolean; driverVersion?: string; message: string }
+      interception?: { backend: string; libraryAvailable: boolean; libraryLoaded: boolean; driverAvailable: boolean; administratorRequired: boolean; message: string }
     }
   }
 }

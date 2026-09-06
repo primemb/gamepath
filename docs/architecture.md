@@ -21,6 +21,8 @@ All traffic is routed into the signed Wintun adapter. This avoids process correl
 
 Winsock UDP sockets carry GamePath frames to the relay. Each socket is bound to one active WireGuard interface and its source address. Packets receive a session ID and monotonically increasing sequence number before adaptive scheduling sends them on one or two routes.
 
+On Windows, the transport applies `IP_UNICAST_IF` or `IPV6_UNICAST_IF` to each socket in addition to binding its WireGuard source address. This prevents equal relay host routes from collapsing both copies onto the same interface.
+
 ## WireGuard routes
 
 Each purchased configuration is transformed only in memory for the active session. Its runtime `AllowedIPs` is narrowed to the resolved relay address, and DNS settings are omitted, so multiple providers can run without competing for the system default route. Original encrypted configurations are never modified.
