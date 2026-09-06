@@ -77,6 +77,29 @@ function encryptConfig(source) {
   return safeStorage.encryptString(source).toString('base64')
 }
 
+function updateSessionMetrics(runtime, dataPlane) {
+  const paths = runtime.paths ?? []
+  const wireGuard = paths.find((path) => path.pathKind === 'wireguard')
+  const sent = paths.reduce((total, path) => total + path.packetsSent, 0)
+  const received = paths.reduce((total, path) => total + path.packetsReceived, 0)
+  const userToNode = wireGuard?.nodeLatencyMs ?? null
+  const nodeToRelay = userToNode != null && wireGuard?.latencyMs != null ? Math.max(0, wireGuard.latencyMs - userToNode) : null
+  state.session.pathMetrics = paths
+  state.session.routeLatencies = paths.filter((path) => path.latencyMs != null).map((path) => Math.max(1, Math.round(path.latencyMs)))
+  state.session.metrics = {
+    userToNodeMs: userToNode,
+    nodeToRelayMs: nodeToRelay,
+    relayToServerMs: dataPlane?.relayToServerMs ?? state.session.metrics?.relayToServerMs ?? null,
+    endToEndMs: dataPlane?.latencyMs ?? state.session.metrics?.endToEndMs ?? null,
+    benchmarkServer: dataPlane?.benchmarkServer ?? state.session.metrics?.benchmarkServer ?? '',
+    bytesSent: paths.reduce((total, path) => total + path.bytesSent, 0),
+    bytesReceived: paths.reduce((total, path) => total + path.bytesReceived, 0),
+    packetsSent: sent,
+    packetsReceived: received,
+    packetLossPercent: sent ? Math.max(0, ((sent - received) / sent) * 100) : 0,
+  }
+}
+
 function registerIpc() {
   ipcMain.handle('app:bootstrap', () => publicState())
 
@@ -276,18 +299,21 @@ function registerIpc() {
           trafficMode: state.trafficMode,
           wireguardConfigs,
         })
-        const paths = await engineBridge.request('start-wireguard-session', {
+        const serviceSession = await serviceBridge.request('start-session', {
           relayHost: relay.address,
           relayPort: relay.port,
           enrollmentToken,
           wireguardConfigs,
-        }, 25000)
-        const dataPlane = await engineBridge.request('probe-data-plane', {}, 15000)
-        const routeLatencies = paths.paths.map((route) => Math.max(1, Math.round(route.latencyMs)))
+          trafficMode: state.trafficMode,
+          rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
+        }, 30000)
+        const paths = serviceSession.paths
+        const dataPlane = serviceSession.dataPlane
         const standbyNote = paths.skippedRoutes.length ? ` ${paths.skippedRoutes.length} overlapping config${paths.skippedRoutes.length === 1 ? ' is' : 's are'} held as standby.` : ''
-        state.session = { status: 'connected', routeLatencies, message: `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; relay packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${standbyNote}` }
+        state.session = { status: 'connected', message: `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${standbyNote}` }
+        updateSessionMetrics(paths, dataPlane)
       } catch (error) {
-        try { await engineBridge.request('stop-wireguard-session') } catch {}
+        try { await serviceBridge.request('stop-session') } catch {}
         state.session = { status: 'error', message: error.message }
       }
     }
@@ -304,6 +330,19 @@ function registerIpc() {
       state.session = { status: 'error', message: error.message }
     }
     saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('engine:session-status', async () => {
+    if (state.session.status === 'connected' && serviceBridge?.status.status === 'ready') {
+      try {
+        const runtime = await serviceBridge.request('session-status')
+        if (runtime.state === 'connected') updateSessionMetrics(runtime)
+        else state.session = { status: 'error', message: 'The multipath workers stopped unexpectedly.' }
+      } catch (error) {
+        state.session = { status: 'error', message: error.message }
+      }
+    }
     return publicState()
   })
 }

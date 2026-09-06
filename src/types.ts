@@ -37,7 +37,13 @@ export type AppState = {
   trafficMode: 'all' | 'split'
   relays: Relay[]
   activeRelayId: string
-  session: { status: 'idle' | 'starting' | 'prepared' | 'connected' | 'error'; message?: string; routeLatencies?: number[] }
+  session: {
+    status: 'idle' | 'starting' | 'prepared' | 'connected' | 'error'
+    message?: string
+    routeLatencies?: number[]
+    pathMetrics?: Array<{ route: number; pathKind: string; label: string; endpoint: string; reachable: boolean; latencyMs: number | null; nodeLatencyMs: number | null; packetsSent: number; packetsReceived: number; bytesSent: number; bytesReceived: number; lastError: string | null }>
+    metrics?: { userToNodeMs: number | null; nodeToRelayMs: number | null; relayToServerMs: number | null; endToEndMs: number | null; benchmarkServer: string; bytesSent: number; bytesReceived: number; packetsSent: number; packetsReceived: number; packetLossPercent: number }
+  }
   engine: {
     status: 'offline' | 'ready' | 'error'
     version: string
@@ -81,4 +87,5 @@ export type GamePathApi = {
   installService: () => Promise<{ launched: boolean }>
   startSession: () => Promise<AppState>
   stopSession: () => Promise<AppState>
+  refreshSession: () => Promise<AppState>
 }

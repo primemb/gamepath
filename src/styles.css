@@ -55,7 +55,7 @@ main { min-width: 0; overflow: auto; }
 .content { padding: 28px 44px 48px; max-width: 1400px; margin: auto; }
 
 .dashboard-grid { display: grid; grid-template-columns: minmax(420px, 1.25fr) minmax(340px, .85fr); gap: 16px; }
-.connect-panel, .setup-panel, .route-preview, .stats-strip { border: 1px solid var(--line); border-radius: 15px; background: linear-gradient(155deg, rgba(255,255,255,.026), rgba(255,255,255,.008)); }
+.connect-panel, .setup-panel, .route-preview, .stats-strip, .telemetry-panel { border: 1px solid var(--line); border-radius: 15px; background: linear-gradient(155deg, rgba(255,255,255,.026), rgba(255,255,255,.008)); }
 .connect-panel { min-height: 324px; grid-row: span 2; padding: 30px; position: relative; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
 .panel-glow { position: absolute; width: 370px; height: 230px; top: -150px; border-radius: 50%; background: rgba(38,230,205,.11); filter: blur(65px); pointer-events: none; }
 .connection-orbit { width: 112px; height: 112px; position: relative; display: grid; place-items: center; margin-bottom: 19px; }
@@ -103,6 +103,22 @@ main { min-width: 0; overflow: auto; }
 .path-stack { display: grid; gap: 7px; }.path-stack > div { height: 40px; padding: 0 9px; border: 1px solid var(--line); border-radius: 8px; display: grid; grid-template-columns: 24px 1fr; grid-template-rows: 1fr 1fr; align-items: center; background: #0b0f17; }
 .path-stack > div > span { grid-row: span 2; width: 18px; height: 18px; display: grid; place-items: center; border-radius: 6px; color: #566071; background: rgba(255,255,255,.04); font-size: 8px; }.path-stack > div > span.active { color: var(--cyan); background: var(--cyan-soft); }
 .path-stack p { margin: 4px 0 -2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }.path-stack small { color: #5e6879; font-size: 7px; }
+
+.telemetry-panel { grid-column: 1 / -1; padding: 23px; }
+.telemetry-head { display: flex; align-items: center; justify-content: space-between; }
+.telemetry-head h2 { margin: 4px 0 0; font-size: 15px; }
+.journey-grid { margin-top: 18px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }
+.journey-stage { min-height: 77px; padding: 13px; border: 1px solid var(--line); border-radius: 10px; display: flex; align-items: center; gap: 11px; background: rgba(255,255,255,.014); }
+.journey-stage > span { width: 28px; height: 28px; flex: 0 0 auto; border-radius: 9px; display: grid; place-items: center; color: var(--cyan); background: var(--cyan-soft); font-size: 9px; font-weight: 700; }
+.journey-stage div { min-width: 0; display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 3px 10px; }
+.journey-stage small { color: #788396; font-size: 8px; }.journey-stage strong { font-size: 16px; }.journey-stage em { grid-column: 1 / -1; color: #515c6d; font-size: 7px; font-style: normal; }
+.telemetry-lower { margin-top: 10px; display: grid; grid-template-columns: minmax(320px, 1.25fr) minmax(320px, 1fr); gap: 10px; }
+.chart-card, .transfer-grid { min-height: 126px; border: 1px solid var(--line); border-radius: 11px; background: #0b0f17; }
+.chart-card { padding: 14px 15px 7px; overflow: hidden; }.chart-card > div { display: flex; align-items: baseline; justify-content: space-between; }.chart-card span { color: #747f91; font-size: 8px; }.chart-card strong { font-size: 14px; }
+.latency-chart { width: 100%; height: 76px; margin-top: 7px; overflow: visible; }
+.transfer-grid { padding: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.transfer-grid > div { padding: 8px 9px; border-radius: 8px; display: flex; align-items: center; gap: 8px; color: var(--violet); background: rgba(255,255,255,.018); }
+.transfer-grid span { display: flex; flex-direction: column; gap: 3px; color: #667183; font-size: 7px; }.transfer-grid strong { color: #dce2ec; font-size: 10px; }
 
 .page-section { max-width: 1050px; margin: auto; }
 .toolbar { min-height: 52px; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; }

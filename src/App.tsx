@@ -86,6 +86,44 @@ function SetupStep({ done, number, title, detail, action, onClick }: { done: boo
   )
 }
 
+const formatMetric = (value: number | null | undefined) => value == null ? '—' : `${Math.round(value)} ms`
+const formatBytes = (bytes: number | undefined) => {
+  const value = bytes ?? 0
+  if (value < 1024) return `${value} B`
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / 1024 ** 2).toFixed(2)} MB`
+}
+
+function LatencyChart({ values }: { values: number[] }) {
+  const samples = values.length > 1 ? values : [values[0] ?? 0, values[0] ?? 0]
+  const maximum = Math.max(...samples, 1)
+  const minimum = Math.min(...samples)
+  const spread = Math.max(maximum - minimum, 8)
+  const points = samples.map((value, index) => {
+    const x = (index / (samples.length - 1)) * 300
+    const y = 62 - ((value - minimum) / spread) * 48
+    return `${x},${y}`
+  }).join(' ')
+  return <svg className="latency-chart" viewBox="0 0 300 70" preserveAspectRatio="none" role="img" aria-label="End-to-end ping history"><defs><linearGradient id="latencyFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#26e6cd" stopOpacity=".25" /><stop offset="1" stopColor="#26e6cd" stopOpacity="0" /></linearGradient></defs><polygon points={`0,70 ${points} 300,70`} fill="url(#latencyFill)" /><polyline points={points} fill="none" stroke="#26e6cd" strokeWidth="2" vectorEffect="non-scaling-stroke" /></svg>
+}
+
+function TelemetryPanel({ state, history }: { state: AppState; history: number[] }) {
+  const metrics = state.session.metrics
+  const stages = [
+    ['User → VPN node', metrics?.userToNodeMs, 'WireGuard handshake RTT'],
+    ['Node → relay', metrics?.nodeToRelayMs, 'Tunnel segment estimate'],
+    ['Relay → server', metrics?.relayToServerMs, metrics?.benchmarkServer ? `Benchmark ${metrics.benchmarkServer}` : 'Awaiting target'],
+  ] as const
+  return <section className="telemetry-panel">
+    <div className="telemetry-head"><div><span className="eyebrow">Live telemetry</span><h2>Network journey</h2></div><span className={`status-pill ${state.session.status === 'connected' ? 'online' : ''}`}><i />{state.session.status === 'connected' ? 'Live' : 'Waiting'}</span></div>
+    <div className="journey-grid">{stages.map(([label, value, detail], index) => <div className="journey-stage" key={label}><span>{index + 1}</span><div><small>{label}</small><strong>{formatMetric(value)}</strong><em>{detail}</em></div></div>)}</div>
+    <div className="telemetry-lower">
+      <div className="chart-card"><div><span>End-to-end ping</span><strong>{formatMetric(metrics?.endToEndMs)}</strong></div><LatencyChart values={history} /></div>
+      <div className="transfer-grid"><div><ArrowUpRight size={16} /><span>Data sent<strong>{formatBytes(metrics?.bytesSent)}</strong></span></div><div><ArrowDownRight size={16} /><span>Data received<strong>{formatBytes(metrics?.bytesReceived)}</strong></span></div><div><Activity size={16} /><span>Packet loss<strong>{metrics ? `${metrics.packetLossPercent.toFixed(1)}%` : '—'}</strong></span></div><div><Radio size={16} /><span>Packets<strong>{metrics ? `${metrics.packetsReceived} / ${metrics.packetsSent}` : '—'}</strong></span></div></div>
+    </div>
+  </section>
+}
+
 function RuleModal({ onClose, onSave }: { onClose: () => void; onSave: (input: AddRuleInput) => Promise<void> }) {
   const [kind, setKind] = useState<RuleKind>('application')
   const [value, setValue] = useState('')
@@ -176,8 +214,19 @@ function App() {
   const [showRuleModal, setShowRuleModal] = useState(false)
   const [showRelayModal, setShowRelayModal] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  const [latencyHistory, setLatencyHistory] = useState<number[]>([])
 
   useEffect(() => { api.bootstrap().then(setState) }, [])
+  useEffect(() => {
+    if (state?.session.status !== 'connected') return
+    const timer = window.setInterval(() => api.refreshSession().then(setState), 2000)
+    return () => window.clearInterval(timer)
+  }, [state?.session.status])
+  useEffect(() => {
+    const latency = state?.session.metrics?.endToEndMs
+    if (latency != null) setLatencyHistory((values) => [...values.slice(-29), latency])
+    else if (state?.session.status === 'idle') setLatencyHistory([])
+  }, [state?.session.metrics?.endToEndMs])
 
   const enabledRoutes = state?.tunnels.filter((item) => item.enabled).length ?? 0
   const enabledRules = state?.rules.filter((item) => item.enabled).length ?? 0
@@ -257,7 +306,7 @@ function App() {
               <section className="stats-strip">
                 <div><span className="stat-icon cyan"><Route size={18} /></span><p>Active routes</p><strong>{enabledRoutes}<small> / {state.tunnels.length}</small></strong></div>
                 <div><span className="stat-icon violet"><CircleGauge size={18} /></span><p>Best route</p><strong>{bestRouteLatency ?? '—'}<small> ms</small></strong></div>
-                <div><span className="stat-icon green"><Activity size={18} /></span><p>Packet recovery</p><strong>—<small> %</small></strong></div>
+                <div><span className="stat-icon green"><Activity size={18} /></span><p>Packet loss</p><strong>{state.session.metrics ? state.session.metrics.packetLossPercent.toFixed(1) : '—'}<small> %</small></strong></div>
               </section>
 
               <section className="setup-panel">
@@ -282,6 +331,8 @@ function App() {
                   <div className="map-node relay"><MapPin size={19} /><span>{relay?.city ?? 'Relay'}</span></div>
                 </div>
               </section>
+
+              <TelemetryPanel state={state} history={latencyHistory} />
             </div>
           )}
 

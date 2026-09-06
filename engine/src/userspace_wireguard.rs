@@ -13,6 +13,7 @@ pub struct UserSpaceWireGuardPath {
     address: Ipv4Addr,
     endpoint: SocketAddr,
     identity_fingerprint: [u8; 32],
+    handshake_latency_ms: Option<f64>,
 }
 
 impl UserSpaceWireGuardPath {
@@ -64,6 +65,7 @@ impl UserSpaceWireGuardPath {
             address,
             endpoint,
             identity_fingerprint: Sha256::digest(private_key).into(),
+            handshake_latency_ms: None,
         })
     }
 
@@ -79,6 +81,10 @@ impl UserSpaceWireGuardPath {
         self.endpoint == other.endpoint && self.identity_fingerprint == other.identity_fingerprint
     }
 
+    pub fn handshake_latency_ms(&self) -> Option<f64> {
+        self.handshake_latency_ms
+    }
+
     pub fn transact(&mut self, inner_packet: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
         self.socket
             .set_read_timeout(Some(Duration::from_millis(400)))
@@ -87,10 +93,14 @@ impl UserSpaceWireGuardPath {
         let first = action(self.tunnel.encapsulate(inner_packet, &mut destination))?;
         self.apply(first)?;
         let deadline = Instant::now() + timeout;
+        let started = Instant::now();
         let mut network = [0_u8; 65_535];
         while Instant::now() < deadline {
             match self.socket.recv(&mut network) {
                 Ok(length) => {
+                    if self.handshake_latency_ms.is_none() {
+                        self.handshake_latency_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                    }
                     let next = decapsulation_action(self.tunnel.decapsulate(
                         None,
                         &network[..length],
@@ -126,6 +136,60 @@ impl UserSpaceWireGuardPath {
             }
         }
         Err("WireGuard path did not return a packet before timeout".into())
+    }
+
+    pub fn send_inner(&mut self, inner_packet: &[u8]) -> Result<(), String> {
+        let mut destination = vec![0_u8; 65_535];
+        let first = action(self.tunnel.encapsulate(inner_packet, &mut destination))?;
+        self.apply(first)?;
+        loop {
+            let drained =
+                decapsulation_action(self.tunnel.decapsulate(None, &[], &mut destination));
+            if matches!(drained, Action::Done) {
+                return Ok(());
+            }
+            self.apply(drained)?;
+        }
+    }
+
+    pub fn receive_inner(&mut self, timeout: Duration) -> Result<Vec<Vec<u8>>, String> {
+        self.socket
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| error.to_string())?;
+        let mut network = [0_u8; 65_535];
+        let mut destination = vec![0_u8; 65_535];
+        let mut packets = Vec::new();
+        match self.socket.recv(&mut network) {
+            Ok(length) => {
+                let mut next = decapsulation_action(self.tunnel.decapsulate(
+                    None,
+                    &network[..length],
+                    &mut destination,
+                ));
+                loop {
+                    match next {
+                        Action::Done => break,
+                        Action::Network(packet) => {
+                            self.socket
+                                .send(&packet)
+                                .map_err(|error| format!("WireGuard send failed: {error}"))?;
+                        }
+                        Action::Tunnel(packet) => packets.push(packet),
+                    }
+                    next =
+                        decapsulation_action(self.tunnel.decapsulate(None, &[], &mut destination));
+                }
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(format!("WireGuard receive failed: {error}")),
+        }
+        let timer = action(self.tunnel.update_timers(&mut destination))?;
+        if let Some(packet) = self.apply(timer)? {
+            packets.push(packet);
+        }
+        Ok(packets)
     }
 
     fn apply(&self, action: Action) -> Result<Option<Vec<u8>>, String> {

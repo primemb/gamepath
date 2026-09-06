@@ -24,7 +24,7 @@ class ServiceBridge {
     return this.status
   }
 
-  request(command, payload = {}) {
+  request(command, payload = {}, timeoutMs = 5000) {
     if (!fs.existsSync(this.tokenFile)) return Promise.reject(new Error('GamePath Network Service is not installed'))
     const token = fs.readFileSync(this.tokenFile, 'utf8').trim()
     const id = this.nextId++
@@ -40,7 +40,7 @@ class ServiceBridge {
         if (error) reject(error)
         else resolve(value)
       }
-      const timeout = setTimeout(() => finish(new Error('Network service request timed out')), 5000)
+      const timeout = setTimeout(() => finish(new Error('Network service request timed out')), timeoutMs)
       socket.setEncoding('utf8')
       socket.on('connect', () => socket.write(`${JSON.stringify({ id, token, command, payload })}\n`))
       socket.on('data', (chunk) => {
@@ -63,4 +63,3 @@ class ServiceBridge {
 }
 
 module.exports = { ServiceBridge }
-

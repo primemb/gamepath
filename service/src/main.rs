@@ -19,7 +19,10 @@ mod gamepath_service {
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{IpAddr, TcpListener, TcpStream};
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
@@ -32,6 +35,12 @@ mod gamepath_service {
         },
         service_control_handler::{self, ServiceControlHandlerResult},
         service_dispatcher,
+    };
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
     };
 
     const SERVICE_NAME: &str = "GamePathService";
@@ -64,6 +73,15 @@ mod gamepath_service {
         session_status: String,
         route_count: usize,
         traffic_mode: String,
+        engine: Option<EngineProcess>,
+    }
+
+    struct EngineProcess {
+        child: Child,
+        job: isize,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+        next_id: u64,
     }
 
     #[derive(Debug, Deserialize)]
@@ -96,6 +114,7 @@ mod gamepath_service {
     }
 
     fn run_service() -> ServiceResult<()> {
+        cleanup_stale_routes();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let handler_stop = Arc::clone(&stop);
@@ -136,6 +155,17 @@ mod gamepath_service {
             process_id: None,
         })?;
         Ok(())
+    }
+
+    fn cleanup_stale_routes() {
+        let script = "$i=@(Get-NetAdapter -Name 'GamePath*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ifIndex); if($i.Count){Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.InterfaceIndex -in $i -and $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1')} | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue}";
+        let _ = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
     }
 
     fn run_server(token_file: &Path, port: u16, stop: Arc<AtomicBool>) -> std::io::Result<()> {
@@ -207,8 +237,15 @@ mod gamepath_service {
                 }))
             }
             "validate-runtime" => validate_runtime(request.payload, state),
+            "start-session" => start_session(request.payload, state),
+            "session-status" => session_status(state),
             "stop-session" => {
                 let mut state = state.lock().unwrap();
+                if let Some(mut engine) = state.engine.take() {
+                    let _ = engine.request("stop-wireguard-session", json!({}));
+                    let _ = engine.child.kill();
+                    let _ = engine.child.wait();
+                }
                 state.session_status = "idle".into();
                 state.route_count = 0;
                 state.traffic_mode.clear();
@@ -225,6 +262,180 @@ mod gamepath_service {
             },
             Err(error) => failure(request.id, error),
         }
+    }
+
+    impl EngineProcess {
+        fn start() -> Result<Self, String> {
+            let executable = env::current_exe()
+                .map_err(|error| error.to_string())?
+                .parent()
+                .ok_or("service executable has no parent directory")?
+                .join("gamepath-engine.exe");
+            if !executable.is_file() {
+                return Err(format!(
+                    "native engine is missing: {}",
+                    executable.display()
+                ));
+            }
+            let mut child = Command::new(executable)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .map_err(|error| format!("could not start native engine: {error}"))?;
+            let job = match create_kill_on_close_job(&child) {
+                Ok(job) => job,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or("native engine stdin is unavailable")?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or("native engine stdout is unavailable")?;
+            let mut process = Self {
+                child,
+                job,
+                stdin,
+                stdout: BufReader::new(stdout),
+                next_id: 1,
+            };
+            process.request("hello", json!({}))?;
+            Ok(process)
+        }
+
+        fn request(&mut self, command: &str, payload: Value) -> Result<Value, String> {
+            let id = self.next_id;
+            self.next_id += 1;
+            serde_json::to_writer(
+                &mut self.stdin,
+                &json!({ "id": id, "command": command, "payload": payload }),
+            )
+            .map_err(|error| error.to_string())?;
+            self.stdin
+                .write_all(b"\n")
+                .and_then(|_| self.stdin.flush())
+                .map_err(|error| format!("native engine request failed: {error}"))?;
+            let mut line = String::new();
+            self.stdout
+                .read_line(&mut line)
+                .map_err(|error| format!("native engine response failed: {error}"))?;
+            if line.is_empty() {
+                return Err("native engine stopped unexpectedly".into());
+            }
+            let response: Value = serde_json::from_str(&line)
+                .map_err(|error| format!("invalid native engine response: {error}"))?;
+            if response["id"].as_u64() != Some(id) {
+                return Err("native engine returned a mismatched response".into());
+            }
+            if response["ok"].as_bool() != Some(true) {
+                return Err(response["error"]
+                    .as_str()
+                    .unwrap_or("native engine request failed")
+                    .to_owned());
+            }
+            Ok(response["result"].clone())
+        }
+    }
+
+    impl Drop for EngineProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            unsafe {
+                CloseHandle(self.job);
+            }
+        }
+    }
+
+    fn create_kill_on_close_job(child: &Child) -> Result<isize, String> {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job == 0 {
+                return Err(format!(
+                    "could not create engine job: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            let assigned = if configured != 0 {
+                AssignProcessToJobObject(job, child.as_raw_handle() as isize)
+            } else {
+                0
+            };
+            if configured == 0 || assigned == 0 {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(format!("could not contain engine process: {error}"));
+            }
+            Ok(job)
+        }
+    }
+
+    fn start_session(payload: Value, state: &Mutex<RuntimeState>) -> Result<Value, String> {
+        log_event("starting privileged engine session");
+        let mut runtime = state.lock().unwrap();
+        if let Some(mut current) = runtime.engine.take() {
+            let _ = current.child.kill();
+            let _ = current.child.wait();
+        }
+        let mut engine = EngineProcess::start().inspect_err(|error| log_event(error))?;
+        log_event("native engine child ready");
+        let traffic_mode = payload["trafficMode"].as_str().unwrap_or("all").to_owned();
+        let rules = payload["rules"].clone();
+        let paths = engine
+            .request("start-wireguard-session", payload)
+            .inspect_err(|error| log_event(error))?;
+        log_event("multipath workers connected");
+        let data_plane = engine
+            .request("probe-data-plane", json!({}))
+            .inspect_err(|error| log_event(error))?;
+        log_event("relay benchmark packet returned");
+        let capture = engine
+            .request(
+                "start-packet-capture",
+                json!({ "trafficMode": traffic_mode, "rules": rules }),
+            )
+            .inspect_err(|error| log_event(error))?;
+        log_event("Windows packet capture started");
+        runtime.session_status = "connected".into();
+        runtime.route_count = paths["paths"].as_array().map_or(0, Vec::len);
+        runtime.engine = Some(engine);
+        Ok(json!({ "paths": paths, "dataPlane": data_plane, "capture": capture }))
+    }
+
+    fn log_event(message: &str) {
+        use std::fs::OpenOptions;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let path = default_token_file().with_file_name("service.log");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{timestamp} {message}");
+        }
+    }
+
+    fn session_status(state: &Mutex<RuntimeState>) -> Result<Value, String> {
+        let mut runtime = state.lock().unwrap();
+        let engine = runtime.engine.as_mut().ok_or("no active network session")?;
+        engine.request("wireguard-session-status", json!({}))
     }
 
     fn validate_runtime(payload: Value, state: &Mutex<RuntimeState>) -> Result<Value, String> {

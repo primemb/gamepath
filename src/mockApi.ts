@@ -10,7 +10,7 @@ let state: AppState = {
     { id: 'rule-2', kind: 'hostname', value: '*.riotgames.com', label: 'Riot game services', enabled: true },
   ],
   trafficMode: 'split',
-  relays: [{ id: 'tr-istanbul-01', city: 'Istanbul', country: 'Turkey', code: 'TR', address: '', port: 51821, status: 'setup-required', hasEnrollmentToken: false, latency: 38 }],
+  relays: [{ id: 'tr-istanbul-01', city: 'Istanbul', country: 'Turkey', code: 'TR', address: 'tr-relay.example', port: 51821, status: 'ready', hasEnrollmentToken: true, latency: 38 }],
   activeRelayId: 'tr-istanbul-01',
   session: { status: 'idle' },
   engine: { status: 'ready', version: '0.1.0', message: 'Native engine ready', capabilities: { platform: 'windows', architecture: 'x86_64', wireGuardInstalled: true, activeWireGuardInterfaces: [], packetAdapterInstalled: false, packetAdapter: { libraryAvailable: true, libraryLoaded: true, message: 'Signed Wintun library is ready' }, interception: { backend: 'windivert-2.2.2', libraryAvailable: true, libraryLoaded: true, driverAvailable: true, administratorRequired: true, message: 'Signed WFP capture runtime is ready' } } },
@@ -68,7 +68,10 @@ export const mockApi: GamePathApi = {
   startSession: async () => {
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     state.session = relay?.status === 'ready'
-      ? { status: 'connected', message: 'Two encrypted paths are connected to the relay.', routeLatencies: [34, 39] }
+      ? { status: 'connected', message: 'Two encrypted paths are connected to the relay.', routeLatencies: [34, 39], pathMetrics: [
+        { route: 0, pathKind: 'direct', label: 'Direct ISP', endpoint: 'relay.local:51821', reachable: true, latencyMs: 34, nodeLatencyMs: null, packetsSent: 128, packetsReceived: 126, bytesSent: 148320, bytesReceived: 232410, lastError: null },
+        { route: 1, pathKind: 'wireguard', label: 'WireGuard route 1', endpoint: 'tr-01.example:51820', reachable: true, latencyMs: 39, nodeLatencyMs: 22, packetsSent: 128, packetsReceived: 127, bytesSent: 148320, bytesReceived: 232410, lastError: null },
+      ], metrics: { userToNodeMs: 22, nodeToRelayMs: 17, relayToServerMs: 9, endToEndMs: 48, benchmarkServer: '1.1.1.1', bytesSent: 296640, bytesReceived: 464820, packetsSent: 256, packetsReceived: 253, packetLossPercent: 1.17 } }
       : { status: 'error', message: 'The Istanbul relay needs its server component and address.' }
     return snapshot()
   },
@@ -76,4 +79,5 @@ export const mockApi: GamePathApi = {
     state.session = { status: 'idle' }
     return snapshot()
   },
+  refreshSession: async () => snapshot(),
 }

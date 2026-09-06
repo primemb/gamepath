@@ -11,7 +11,7 @@ The privileged Windows service installs filters based on Windows Filtering Platf
 3. Hostname rules are correlated through the client's DNS policy cache and compiled to current address sets. IP and CIDR rules match destinations directly.
 4. Selected UDP and TCP packets are passed to the GamePath transport. Unselected packets continue unchanged.
 
-The first implementation can use the signed WinDivert callout driver as the WFP capture layer. It exposes process identity at the flow layer and packet data at the network layer, so the service maintains a bounded five-tuple map between the two. A production-owned WFP callout can replace this backend later without changing the GUI or relay protocol.
+The current implementation uses the signed WinDivert callout driver as the WFP capture layer. It opens network filters only for selected destination ranges and ports discovered from process-aware socket events. DNS observation is copy-only. Unrelated traffic therefore stays in the kernel and cannot be held by the client. A production-owned WFP callout can replace this backend later without changing the GUI or relay protocol.
 
 ## All-traffic mode
 
@@ -33,7 +33,7 @@ Each purchased configuration is parsed only in memory for the active session. Th
 
 ## Privileged service
 
-The Electron UI and native engine remain unprivileged. `GamePathService` runs through Windows Service Control Manager and exposes a token-authenticated loopback API on `127.0.0.1`. The installer creates a random 256-bit control token under `%ProgramData%\GamePath`, protects it for Local System, administrators, and the installing user, and installs the signed Wintun and WinDivert runtime files beside the service. Adapter and WFP activation will live behind this boundary.
+The Electron UI remains unprivileged. `GamePathService` runs through Windows Service Control Manager and owns the native engine behind a token-authenticated loopback API on `127.0.0.1`. The installer creates a random 256-bit control token under `%ProgramData%\GamePath`, protects it for Local System, administrators, and the installing user, and installs the signed Wintun and WinDivert runtime files beside the service. A Windows Job Object with `KILL_ON_JOB_CLOSE` prevents the capture engine from surviving a service exit.
 
 ## WireSock option
 

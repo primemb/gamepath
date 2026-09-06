@@ -16,6 +16,8 @@
     "runtime:test": "electron scripts/test-runtime.cjs",
     "wireguard:probe": "electron scripts/probe-wireguard-routes.cjs",
     "wireguard:session-test": "electron scripts/test-wireguard-session.cjs",
+    "service:session-test": "electron scripts/test-service-session.cjs",
+    "service:split-test": "electron scripts/test-service-session.cjs --split-ip",
     "build": "tsc -b && vite build",
     "start": "electron .",
     "typecheck": "tsc -b --pretty false",

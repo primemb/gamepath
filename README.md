@@ -11,6 +11,8 @@ npm run dev
 
 Imported WireGuard configuration bodies are encrypted with Electron `safeStorage`, backed by Windows cryptography. Only non-secret metadata is sent to the renderer.
 
+To copy the privileged runtime without starting packet capture, use `deploy\install-windows-service.ps1 -LeaveStopped`. Running the installer from Settings installs and starts the service normally.
+
 ## Validate
 
 ```powershell
@@ -38,10 +40,10 @@ cargo test --manifest-path ..\relay\Cargo.toml
 - Keep a direct ISP path and distinct provider routes alive through persistent authenticated health checks.
 - Duplicate authenticated IP frames across the live paths and verify the complete Windows-to-relay-TUN return loop.
 - Detect configs that resolve to the same WireGuard endpoint and reuse the same client identity, then hold overlaps as standby instead of allowing their handshakes to replace each other.
-- Install an authenticated, auto-start Windows network service for the future Wintun and WFP data plane.
+- Install an authenticated Windows network service that owns the Wintun and WinDivert data planes and contains its engine in a kill-on-close Job Object.
 - Provision an idempotent Debian 13 relay with systemd, nftables NAT, TUN forwarding, per-client enrollment, authenticated probes, replay protection, and multipath reply fan-out.
 
-The Windows service and persistent user-space WireGuard path workers are active. Packet capture and reinjection through Wintun for all-traffic mode and WinDivert/WFP policy capture for split mode are the next implementation milestones.
+All-traffic mode captures and reinjects IPv4 through Wintun. Split mode uses narrow WinDivert/WFP filters for IP/CIDR targets and dynamically creates port filters from process-aware socket events for executable and folder targets. Exact hostnames resolve at activation; a copy-only DNS observer learns later addresses and wildcard subdomains without diverting unrelated traffic.
 
 The repository includes the official signed Wintun 0.14.1 AMD64 DLL and its redistribution license under `vendor/wintun`. The downloaded archive is verified against the SHA-256 published by the Wintun project before the binary is copied into the project.
 
