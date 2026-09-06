@@ -48,7 +48,18 @@ export const mockApi: GamePathApi = {
     return snapshot()
   },
   setRelay: async (id) => {
-    state.activeRelayId = id
+    state.activeRelayId = state.activeRelayId === id ? null : id
+    return snapshot()
+  },
+  addRelay: async (input) => {
+    const relay = { id: crypto.randomUUID(), city: input.city || 'Custom relay', country: input.country || 'Custom', code: 'VP', address: '', port: 51821, status: 'setup-required' as const, hasEnrollmentToken: false }
+    state.relays.push(relay)
+    state.activeRelayId = relay.id
+    return { state: snapshot(), relayId: relay.id }
+  },
+  removeRelayLocal: async (id) => {
+    state.relays = state.relays.filter((relay) => relay.id !== id)
+    if (state.activeRelayId === id) state.activeRelayId = null
     return snapshot()
   },
   configureRelay: async (id, input) => {
@@ -62,6 +73,16 @@ export const mockApi: GamePathApi = {
   testRelay: async (id) => {
     state.relays = state.relays.map((relay) => relay.id === id ? { ...relay, latency: 31, status: 'ready' } : relay)
     return { state: snapshot(), result: { reachable: true, latencyMs: 31, virtualIpv4: '10.203.0.2' } }
+  },
+  provisionRelayVps: async (id, input) => {
+    state.relays = state.relays.map((relay) => relay.id === id ? { ...relay, address: input.host, port: input.relayPort, hasEnrollmentToken: true, status: 'ready', sshFingerprint: 'preview-fingerprint' } : relay)
+    state.activeRelayId = id
+    return snapshot()
+  },
+  removeRelayVps: async (id) => {
+    state.relays = state.relays.map((relay) => relay.id === id ? { ...relay, hasEnrollmentToken: false, status: 'setup-required', latency: undefined } : relay)
+    if (state.activeRelayId === id) state.activeRelayId = null
+    return snapshot()
   },
   refreshService: async () => snapshot(),
   installService: async () => {

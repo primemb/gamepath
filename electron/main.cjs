@@ -6,6 +6,7 @@ const crypto = require('node:crypto')
 const { parseWireGuardConfig } = require('./wireguard.cjs')
 const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
+const { provisionRelay, removeRelay } = require('./vps.cjs')
 
 const defaultState = () => ({
   tunnels: [],
@@ -188,7 +189,25 @@ function registerIpc() {
   })
 
   ipcMain.handle('relay:set', (_event, id) => {
-    if (state.relays.some((relay) => relay.id === id)) state.activeRelayId = id
+    if (state.relays.some((relay) => relay.id === id)) state.activeRelayId = state.activeRelayId === id ? null : id
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('relay:add', (_event, input) => {
+    const city = String(input?.city ?? '').trim() || 'Custom relay'
+    const country = String(input?.country ?? '').trim() || 'Custom'
+    const relay = { id: crypto.randomUUID(), city, country, code: country.slice(0, 2).toUpperCase(), address: '', port: 51821, status: 'setup-required', hasEnrollmentToken: false }
+    state.relays.push(relay)
+    state.activeRelayId = relay.id
+    saveState()
+    return { state: publicState(), relayId: relay.id }
+  })
+
+  ipcMain.handle('relay:remove-local', (_event, id) => {
+    state.relays = state.relays.filter((relay) => relay.id !== id)
+    delete state.encryptedRelayTokens[id]
+    if (state.activeRelayId === id) state.activeRelayId = null
     saveState()
     return publicState()
   })
@@ -246,6 +265,43 @@ function registerIpc() {
     relay.status = 'ready'
     saveState()
     return { state: publicState(), result }
+  })
+
+  ipcMain.handle('relay:vps-provision', async (_event, id, input) => {
+    const relay = state.relays.find((item) => item.id === id)
+    if (!relay) throw new Error('Relay not found')
+    const host = String(input.host ?? '').trim()
+    const username = String(input.username ?? '').trim()
+    const password = String(input.password ?? '')
+    const sshPort = Number(input.sshPort ?? 22)
+    const relayPort = Number(input.relayPort ?? 51821)
+    if (!host || /\s|:\/\//.test(host)) throw new Error('Enter a valid VPS hostname or IP address')
+    if (!username || !password) throw new Error('Enter the SSH username and password')
+    if (![sshPort, relayPort].every((port) => Number.isInteger(port) && port >= 1 && port <= 65535)) throw new Error('Ports must be between 1 and 65535')
+    const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
+    const result = await provisionRelay(projectRoot, { host, username, password, sshPort, relayPort, expectedFingerprint: relay.sshFingerprint })
+    state.encryptedRelayTokens[id] = encryptConfig(result.token)
+    Object.assign(relay, { address: host, port: relayPort, status: 'ready', hasEnrollmentToken: true, sshFingerprint: result.fingerprint })
+    state.activeRelayId = id
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('relay:vps-remove', async (_event, id, input) => {
+    const relay = state.relays.find((item) => item.id === id)
+    if (!relay) throw new Error('Relay not found')
+    const host = String(input.host ?? relay.address ?? '').trim()
+    const username = String(input.username ?? '').trim()
+    const password = String(input.password ?? '')
+    const sshPort = Number(input.sshPort ?? 22)
+    if (!host || !username || !password) throw new Error('Enter the VPS hostname, SSH username, and password')
+    const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
+    await removeRelay(projectRoot, { host, username, password, sshPort, expectedFingerprint: relay.sshFingerprint })
+    delete state.encryptedRelayTokens[id]
+    Object.assign(relay, { status: 'setup-required', hasEnrollmentToken: false, latency: undefined })
+    if (state.activeRelayId === id) state.activeRelayId = null
+    saveState()
+    return publicState()
   })
 
   ipcMain.handle('service:refresh', async () => {

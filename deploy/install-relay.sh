@@ -145,7 +145,7 @@ MemoryDenyWriteExecute=true
 WantedBy=multi-user.target
 EOF
 
-if (( DO_ENROLL == 1 )) && ! compgen -G '/etc/gamepath/clients/*.json' >/dev/null; then
+if (( DO_ENROLL == 1 )) && [[ ! -f "$ENROLLMENT_OUTPUT" ]]; then
   umask 077
   /usr/local/bin/gamepath-relay enroll \
     --name "$CLIENT_NAME" \

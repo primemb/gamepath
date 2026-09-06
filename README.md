@@ -42,6 +42,8 @@ cargo test --manifest-path ..\relay\Cargo.toml
 - Choose all-system traffic or split-tunnel rules.
 - Add split rules for executables, folders, hostnames, and IP ranges.
 - Configure and test an authenticated Istanbul relay.
+- Add any number of relay locations and enable zero or one at a time.
+- Provision or remove a Debian VPS over password-authenticated SSH from the client; SSH passwords remain transient and host fingerprints are pinned after first use.
 - Start and monitor the Rust engine through private JSON-line IPC.
 - Detect the installed WireGuard client and active interfaces.
 - Validate complete session plans before any route mutation.

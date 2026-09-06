@@ -32,3 +32,9 @@ Each token contains a random 128-bit client ID, a random 256-bit pre-shared key,
 and an assigned address in `10.203.0.0/24`. Packet payloads use directional
 HKDF-SHA256 session keys and ChaCha20-Poly1305 authentication. Tokens and server
 records are never committed to Git.
+
+The Windows client's **Auto-configure VPS** action performs this deployment over
+SSH and imports the generated enrollment directly into Windows secure storage.
+Its **Remove VPS** action runs `deploy/uninstall-relay.sh`, which removes the
+GamePath service, nftables tables, configuration, enrolled clients, binary, and
+service account. The SSH password is required for each operation and is not saved.

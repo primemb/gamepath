@@ -208,11 +208,29 @@ function RelayModal({ relay, onClose, onSave, onImport }: { relay: Relay; onClos
   )
 }
 
+function AddRelayModal({ onClose, onAdd }: { onClose: () => void; onAdd: (input: { city: string; country: string }) => Promise<void> }) {
+  const [city, setCity] = useState('Istanbul')
+  const [country, setCountry] = useState('Turkey')
+  return <div className="modal-backdrop" onMouseDown={onClose}><section className="modal relay-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">New location</span><h2>Add relay server</h2></div><button className="icon-button" onClick={onClose}><X size={18} /></button></div><div className="relay-fields"><label className="field-label">City or label<input autoFocus value={city} onChange={(event) => setCity(event.target.value)} /></label><label className="field-label">Country<input value={country} onChange={(event) => setCountry(event.target.value)} /></label></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={!city.trim() || !country.trim()} onClick={() => onAdd({ city: city.trim(), country: country.trim() })}><Plus size={16} />Add relay</button></div></section></div>
+}
+
+function VpsModal({ relay, action, onClose, onSubmit }: { relay: Relay; action: 'provision' | 'remove'; onClose: () => void; onSubmit: (input: { host: string; sshPort: number; username: string; password: string; relayPort: number }) => Promise<void> }) {
+  const [host, setHost] = useState(relay.address)
+  const [sshPort, setSshPort] = useState('22')
+  const [username, setUsername] = useState('root')
+  const [password, setPassword] = useState('')
+  const [relayPort, setRelayPort] = useState(String(relay.port || 51821))
+  const [busy, setBusy] = useState(false)
+  return <div className="modal-backdrop" onMouseDown={busy ? undefined : onClose}><section className="modal relay-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">Secure SSH setup</span><h2>{action === 'provision' ? 'Configure Debian VPS' : 'Remove relay from VPS'}</h2></div><button className="icon-button" disabled={busy} onClick={onClose}><X size={18} /></button></div><p className="modal-intro">{action === 'provision' ? 'GamePath uploads its relay source, installs dependencies, configures the service and firewall, then imports this PC’s enrollment automatically.' : 'This removes the GamePath service, firewall tables, configuration, clients, and binary from this server.'} The SSH password is used only for this operation and is never saved.</p><div className="relay-fields"><label className="field-label">VPS hostname or IP<input autoFocus value={host} onChange={(event) => setHost(event.target.value)} placeholder="203.0.113.10" /></label><label className="field-label port-field">SSH port<input value={sshPort} onChange={(event) => setSshPort(event.target.value.replace(/\D/g, '').slice(0, 5))} /></label></div><div className="relay-fields"><label className="field-label">SSH username<input value={username} onChange={(event) => setUsername(event.target.value)} /></label><label className="field-label">SSH password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label></div>{action === 'provision' && <label className="field-label enrollment-field">Relay UDP port<input value={relayPort} onChange={(event) => setRelayPort(event.target.value.replace(/\D/g, '').slice(0, 5))} /></label>}<div className="modal-actions"><button className="button secondary" disabled={busy} onClick={onClose}>Cancel</button><button className={`button ${action === 'remove' ? 'danger' : 'primary'}`} disabled={busy || !host.trim() || !username.trim() || !password || !sshPort || !relayPort} onClick={async () => { setBusy(true); try { await onSubmit({ host: host.trim(), sshPort: Number(sshPort), username: username.trim(), password, relayPort: Number(relayPort) }) } finally { setBusy(false) } }}>{busy ? action === 'provision' ? 'Configuring VPS…' : 'Removing…' : action === 'provision' ? 'Configure VPS' : 'Remove from VPS'}</button></div></section></div>
+}
+
 function App() {
   const [state, setState] = useState<AppState | null>(null)
   const [view, setView] = useState<View>('dashboard')
   const [showRuleModal, setShowRuleModal] = useState(false)
   const [showRelayModal, setShowRelayModal] = useState(false)
+  const [showAddRelay, setShowAddRelay] = useState(false)
+  const [vpsTarget, setVpsTarget] = useState<{ id: string; action: 'provision' | 'remove' } | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [installingService, setInstallingService] = useState(false)
   const [latencyHistory, setLatencyHistory] = useState<number[]>([])
@@ -278,7 +296,7 @@ function App() {
         <div className="sidebar-bottom">
           <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}><Settings size={18} />Settings</button>
           <div className="client-card"><span><ShieldCheck size={16} /></span><div><strong>Local protection</strong><small>Keys secured by Windows</small></div></div>
-          <div className="version">Client 0.1.0 <i /> Alpha build</div>
+          <div className="version">Client 0.1.3 <i /> Alpha build</div>
         </div>
       </aside>
 
@@ -374,8 +392,8 @@ function App() {
 
           {view === 'relays' && (
             <section className="page-section">
-              <div className="relay-intro"><div><span className="eyebrow">Available region</span><h2>Turkey</h2><p>The relay combines your active paths and forwards clean traffic to the game server.</p></div><div className="flag-orb">TR</div></div>
-              <div className="relay-grid">{state.relays.map((item) => <article key={item.id} className={`relay-card ${state.activeRelayId === item.id ? 'selected' : ''}`}><button className="relay-choice" onClick={async () => setState(await api.setRelay(item.id))}><span className="relay-radio">{state.activeRelayId === item.id && <Check size={14} />}</span><div className="relay-location"><span><MapPin size={19} /></span><div><strong>{item.city}</strong><small>{item.address ? `${item.address}:${item.port}` : `${item.country} · Primary relay`}</small></div></div><div className="relay-stat"><small>Latency</small><strong>{item.latency ?? '—'}<em> ms</em></strong></div><div className={`relay-status ${item.status}`}><i />{item.status === 'ready' ? 'Configured' : 'Setup required'}</div></button><div className="relay-actions">{item.status === 'ready' && <button className="button secondary" onClick={async () => { try { const tested = await api.testRelay(item.id); setState(tested.state); setNotice(`Authenticated relay ready · ${Math.round(tested.result.latencyMs)} ms · ${tested.result.virtualIpv4}`) } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) } }}>Test</button>}<button className="button secondary relay-configure" onClick={() => { setState({ ...state, activeRelayId: item.id }); setShowRelayModal(true) }}>{item.status === 'ready' ? 'Edit' : 'Configure'}</button></div></article>)}</div>
+              <div className="relay-intro"><div><span className="eyebrow">Relay fleet</span><h2>{state.relays.length} server{state.relays.length === 1 ? '' : 's'}</h2><p>Add your VPS locations and enable one relay at a time.</p><button className="button primary" onClick={() => setShowAddRelay(true)}><Plus size={16} />Add VPS relay</button></div><div className="flag-orb">{relay?.code ?? 'GP'}</div></div>
+              <div className="relay-grid">{state.relays.map((item) => <article key={item.id} className={`relay-card ${state.activeRelayId === item.id ? 'selected' : ''}`}><button className="relay-choice" onClick={async () => setState(await api.setRelay(item.id))}><span className="relay-radio">{state.activeRelayId === item.id && <Check size={14} />}</span><div className="relay-location"><span><MapPin size={19} /></span><div><strong>{item.city}</strong><small>{item.address ? `${item.address}:${item.port}` : `${item.country} · VPS not configured`}</small></div></div><div className="relay-stat"><small>Latency</small><strong>{item.latency ?? '—'}<em> ms</em></strong></div><div className={`relay-status ${item.status}`}><i />{state.activeRelayId === item.id ? 'Enabled' : item.status === 'ready' ? 'Disabled' : 'Setup required'}</div></button><div className="relay-actions">{item.status === 'ready' && <button className="button secondary" onClick={async () => { try { const tested = await api.testRelay(item.id); setState(tested.state); setNotice(`Authenticated relay ready · ${Math.round(tested.result.latencyMs)} ms · ${tested.result.virtualIpv4}`) } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) } }}>Test</button>}<button className="button primary" onClick={() => setVpsTarget({ id: item.id, action: 'provision' })}>{item.status === 'ready' ? 'Update VPS' : 'Auto-configure VPS'}</button><button className="button secondary relay-configure" onClick={() => { setState({ ...state, activeRelayId: item.id }); setShowRelayModal(true) }}>Manual</button>{item.status === 'ready' && <button className="button secondary" onClick={() => setVpsTarget({ id: item.id, action: 'remove' })}>Remove VPS</button>}<button className="icon-button danger" aria-label={`Delete ${item.city}`} onClick={async () => setState(await api.removeRelayLocal(item.id))}><Trash2 size={16} /></button></div></article>)}</div>
               <div className="coming-regions"><span>More regions are planned</span><div><i>DE</i><i>NL</i><i>AE</i></div></div>
             </section>
           )}
@@ -395,6 +413,8 @@ function App() {
 
       {showRuleModal && <RuleModal onClose={() => setShowRuleModal(false)} onSave={async (input) => { setState(await api.addRule(input)); setShowRuleModal(false) }} />}
       {showRelayModal && relay && <RelayModal relay={relay} onClose={() => setShowRelayModal(false)} onImport={async () => { try { const result = await api.importRelayEnrollment(relay.id); if (result.state) setState(result.state) } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) } }} onSave={async (input) => { try { setState(await api.configureRelay(relay.id, input)); setShowRelayModal(false) } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) } }} />}
+      {showAddRelay && <AddRelayModal onClose={() => setShowAddRelay(false)} onAdd={async (input) => { const result = await api.addRelay(input); setState(result.state); setShowAddRelay(false); setVpsTarget({ id: result.relayId, action: 'provision' }) }} />}
+      {vpsTarget && (() => { const target = state.relays.find((item) => item.id === vpsTarget.id); return target ? <VpsModal relay={target} action={vpsTarget.action} onClose={() => setVpsTarget(null)} onSubmit={async (input) => { try { const next = vpsTarget.action === 'provision' ? await api.provisionRelayVps(target.id, input) : await api.removeRelayVps(target.id, input); setState(next); setNotice(vpsTarget.action === 'provision' ? 'VPS configured and enrollment protected by Windows.' : 'GamePath was removed from the VPS.'); setVpsTarget(null) } catch (error) { setNotice(error instanceof Error ? error.message : String(error)) } }} /> : null })()}
       {notice && <div className="toast"><Info size={17} /><span>{notice}</span><button onClick={() => setNotice(null)}><X size={15} /></button></div>}
     </div>
   )

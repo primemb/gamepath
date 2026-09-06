@@ -29,6 +29,7 @@ export type Relay = {
   status: 'ready' | 'setup-required' | 'offline'
   hasEnrollmentToken: boolean
   latency?: number
+  sshFingerprint?: string
 }
 
 export type AppState = {
@@ -36,7 +37,7 @@ export type AppState = {
   rules: SplitRule[]
   trafficMode: 'all' | 'split'
   relays: Relay[]
-  activeRelayId: string
+  activeRelayId: string | null
   session: {
     status: 'idle' | 'starting' | 'prepared' | 'connected' | 'error'
     message?: string
@@ -80,12 +81,18 @@ export type GamePathApi = {
   removeRule: (id: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
   setRelay: (id: string) => Promise<AppState>
+  addRelay: (input: { city: string; country: string }) => Promise<{ state: AppState; relayId: string }>
+  removeRelayLocal: (id: string) => Promise<AppState>
   configureRelay: (id: string, input: { address: string; port: number; enrollmentToken?: string }) => Promise<AppState>
   importRelayEnrollment: (id: string) => Promise<{ canceled: boolean; state?: AppState }>
   testRelay: (id: string) => Promise<{ state: AppState; result: { reachable: boolean; latencyMs: number; virtualIpv4: string } }>
+  provisionRelayVps: (id: string, input: VpsCredentials & { relayPort: number }) => Promise<AppState>
+  removeRelayVps: (id: string, input: VpsCredentials) => Promise<AppState>
   refreshService: () => Promise<AppState>
   installService: () => Promise<AppState>
   startSession: () => Promise<AppState>
   stopSession: () => Promise<AppState>
   refreshSession: () => Promise<AppState>
 }
+
+export type VpsCredentials = { host: string; sshPort: number; username: string; password: string }

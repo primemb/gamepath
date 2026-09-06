@@ -1,6 +1,6 @@
 {
   "name": "gamepath-client",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": "GamePath",
   "private": true,
   "type": "module",
@@ -31,7 +31,8 @@
     "@fontsource-variable/inter": "latest",
     "lucide-react": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "ssh2": "^1.17.0"
   },
   "devDependencies": {
     "@types/node": "latest",
@@ -63,8 +64,32 @@
         "to": "engine/target/release/gamepath-engine.exe"
       },
       {
+        "from": "engine/src",
+        "to": "engine/src"
+      },
+      {
+        "from": "engine/Cargo.toml",
+        "to": "engine/Cargo.toml"
+      },
+      {
+        "from": "engine/Cargo.lock",
+        "to": "engine/Cargo.lock"
+      },
+      {
         "from": "service/target/release/gamepath-service.exe",
         "to": "service/target/release/gamepath-service.exe"
+      },
+      {
+        "from": "relay/src",
+        "to": "relay/src"
+      },
+      {
+        "from": "relay/Cargo.toml",
+        "to": "relay/Cargo.toml"
+      },
+      {
+        "from": "relay/Cargo.lock",
+        "to": "relay/Cargo.lock"
       },
       {
         "from": "vendor/wintun",
