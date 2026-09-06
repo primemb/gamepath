@@ -1,6 +1,7 @@
 {
   "name": "gamepath-client",
   "version": "0.1.0",
+  "author": "GamePath",
   "private": true,
   "type": "module",
   "description": "A multipath gaming tunnel client for Windows",
@@ -18,6 +19,8 @@
     "wireguard:session-test": "electron scripts/test-wireguard-session.cjs",
     "service:session-test": "electron scripts/test-service-session.cjs",
     "service:split-test": "electron scripts/test-service-session.cjs --split-ip",
+    "native:release": "node scripts/build-release.cjs",
+    "package:windows": "npm run check && npm run native:release && node scripts/package-windows.cjs",
     "build": "tsc -b && vite build",
     "start": "electron .",
     "typecheck": "tsc -b --pretty false",
@@ -37,8 +40,43 @@
     "@vitejs/plugin-react": "latest",
     "concurrently": "latest",
     "electron": "latest",
+    "electron-builder": "latest",
     "typescript": "latest",
     "vite": "latest",
     "wait-on": "latest"
+  },
+  "build": {
+    "appId": "com.gamepath.client",
+    "productName": "GamePath",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "engine/target/release/gamepath-engine.exe", "to": "engine/target/release/gamepath-engine.exe" },
+      { "from": "service/target/release/gamepath-service.exe", "to": "service/target/release/gamepath-service.exe" },
+      { "from": "vendor/wintun", "to": "vendor/wintun" },
+      { "from": "vendor/windivert", "to": "vendor/windivert" },
+      { "from": "deploy", "to": "deploy" }
+    ],
+    "win": {
+      "target": "nsis",
+      "requestedExecutionLevel": "requireAdministrator",
+      "artifactName": "GamePath-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "GamePath",
+      "include": "build/installer.nsh"
+    }
   }
 }

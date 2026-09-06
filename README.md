@@ -9,6 +9,16 @@ npm install
 npm run dev
 ```
 
+Build the Windows installer with:
+
+```powershell
+npm run package:windows
+```
+
+The installer is written to `release\GamePath-Setup-0.1.0.exe`. The installed
+application requests administrator access at launch. Its uninstaller removes
+the Windows service, privileged runtime, control token, routes, and local app data.
+
 Imported WireGuard configuration bodies are encrypted with Electron `safeStorage`, backed by Windows cryptography. Only non-secret metadata is sent to the renderer.
 
 To copy the privileged runtime without starting packet capture, use `deploy\install-windows-service.ps1 -LeaveStopped`. Running the installer from Settings installs and starts the service normally.

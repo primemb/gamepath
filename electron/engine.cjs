@@ -4,8 +4,9 @@ const path = require('node:path')
 const readline = require('node:readline')
 
 class EngineBridge {
-  constructor(projectRoot) {
+  constructor(projectRoot, packaged = false) {
     this.projectRoot = projectRoot
+    this.packaged = packaged
     this.process = null
     this.nextId = 1
     this.pending = new Map()
@@ -15,8 +16,8 @@ class EngineBridge {
 
   async start() {
     if (this.process) return this.status
-    const binary = path.join(this.projectRoot, 'engine', 'target', 'debug', 'gamepath-engine.exe')
-    const runtimeDirectory = path.join(this.projectRoot, '.runtime')
+    const binary = path.join(this.projectRoot, 'engine', 'target', this.packaged ? 'release' : 'debug', 'gamepath-engine.exe')
+    const runtimeDirectory = path.join(require('node:os').tmpdir(), 'GamePath')
     fs.mkdirSync(runtimeDirectory, { recursive: true })
     this.runtimeBinary = path.join(runtimeDirectory, `gamepath-engine-${process.pid}-${Date.now()}.exe`)
     fs.copyFileSync(binary, this.runtimeBinary)

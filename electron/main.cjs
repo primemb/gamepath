@@ -254,8 +254,9 @@ function registerIpc() {
   })
 
   ipcMain.handle('service:install', () => {
-    const installer = path.join(__dirname, '..', 'deploy', 'install-windows-service.ps1')
-    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', installer, '-ProjectRoot', path.join(__dirname, '..')], {
+    const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
+    const installer = path.join(projectRoot, 'deploy', 'install-windows-service.ps1')
+    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', installer, '-ProjectRoot', projectRoot, '-SkipBuild'], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,
@@ -374,7 +375,8 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   loadState()
-  engineBridge = new EngineBridge(path.join(__dirname, '..'))
+  const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
+  engineBridge = new EngineBridge(projectRoot, app.isPackaged)
   serviceBridge = new ServiceBridge()
   await engineBridge.start()
   await serviceBridge.inspect()
