@@ -50,6 +50,7 @@ if [[ ! -f "$REPO_ROOT/relay/Cargo.toml" || ! -f "$REPO_ROOT/engine/Cargo.toml" 
 fi
 
 export DEBIAN_FRONTEND=noninteractive
+echo "GAMEPATH_PROGRESS:dependencies"
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates cargo rustc nftables iproute2 build-essential pkg-config
 
@@ -61,9 +62,11 @@ install -d -m 0755 -o gamepath -g gamepath /var/lib/gamepath
 
 install -d -m 0755 /var/cache/gamepath/cargo-target
 export CARGO_TARGET_DIR=/var/cache/gamepath/cargo-target
+echo "GAMEPATH_PROGRESS:compile"
 cargo build --release --manifest-path "$REPO_ROOT/relay/Cargo.toml"
 install -m 0755 "$CARGO_TARGET_DIR/release/gamepath-relay" /usr/local/bin/gamepath-relay
 
+echo "GAMEPATH_PROGRESS:network"
 cat >/etc/sysctl.d/90-gamepath-relay.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=0
@@ -106,6 +109,7 @@ nft list table ip gamepath_nat >/dev/null 2>&1 && nft delete table ip gamepath_n
 nft -f /etc/nftables.d/gamepath.nft
 systemctl enable nftables.service >/dev/null
 
+echo "GAMEPATH_PROGRESS:service"
 cat >/etc/gamepath/relay.env <<EOF
 GAMEPATH_BIND=${BIND_ADDRESS}:${PORT}
 GAMEPATH_CLIENTS=/etc/gamepath/clients
@@ -146,6 +150,7 @@ WantedBy=multi-user.target
 EOF
 
 if (( DO_ENROLL == 1 )) && [[ ! -f "$ENROLLMENT_OUTPUT" ]]; then
+  echo "GAMEPATH_PROGRESS:enrollment"
   umask 077
   /usr/local/bin/gamepath-relay enroll \
     --name "$CLIENT_NAME" \

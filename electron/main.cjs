@@ -279,7 +279,8 @@ function registerIpc() {
     if (!username || !password) throw new Error('Enter the SSH username and password')
     if (![sshPort, relayPort].every((port) => Number.isInteger(port) && port >= 1 && port <= 65535)) throw new Error('Ports must be between 1 and 65535')
     const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
-    const result = await provisionRelay(projectRoot, { host, username, password, sshPort, relayPort, expectedFingerprint: relay.sshFingerprint })
+    const progress = (update) => _event.sender.send('relay:vps-progress', { relayId: id, ...update })
+    const result = await provisionRelay(projectRoot, { host, username, password, sshPort, relayPort, expectedFingerprint: relay.sshFingerprint }, progress)
     state.encryptedRelayTokens[id] = encryptConfig(result.token)
     Object.assign(relay, { address: host, port: relayPort, status: 'ready', hasEnrollmentToken: true, sshFingerprint: result.fingerprint })
     state.activeRelayId = id
@@ -296,7 +297,8 @@ function registerIpc() {
     const sshPort = Number(input.sshPort ?? 22)
     if (!host || !username || !password) throw new Error('Enter the VPS hostname, SSH username, and password')
     const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
-    await removeRelay(projectRoot, { host, username, password, sshPort, expectedFingerprint: relay.sshFingerprint })
+    const progress = (update) => _event.sender.send('relay:vps-progress', { relayId: id, ...update })
+    await removeRelay(projectRoot, { host, username, password, sshPort, expectedFingerprint: relay.sshFingerprint }, progress)
     delete state.encryptedRelayTokens[id]
     Object.assign(relay, { status: 'setup-required', hasEnrollmentToken: false, latency: undefined })
     if (state.activeRelayId === id) state.activeRelayId = null

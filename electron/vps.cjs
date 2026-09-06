@@ -30,21 +30,21 @@ function connectSsh(input) {
   })
 }
 
-function execute(connection, command, stdin = '') {
+function execute(connection, command, stdin = '', onOutput) {
   return new Promise((resolve, reject) => {
     connection.exec(command, (error, stream) => {
       if (error) return reject(error)
       let stdout = ''
       let stderr = ''
-      stream.on('data', (chunk) => { stdout += chunk.toString(); if (stdout.length > 2_000_000) stdout = stdout.slice(-2_000_000) })
-      stream.stderr.on('data', (chunk) => { stderr += chunk.toString(); if (stderr.length > 2_000_000) stderr = stderr.slice(-2_000_000) })
+      stream.on('data', (chunk) => { const text = chunk.toString(); stdout += text; onOutput?.(text); if (stdout.length > 2_000_000) stdout = stdout.slice(-2_000_000) })
+      stream.stderr.on('data', (chunk) => { const text = chunk.toString(); stderr += text; onOutput?.(text); if (stderr.length > 2_000_000) stderr = stderr.slice(-2_000_000) })
       stream.on('close', (code) => code === 0 ? resolve(stdout) : reject(new Error((stderr || stdout || `Remote command exited with code ${code}`).trim())))
       stream.end(stdin)
     })
   })
 }
 
-async function uploadFiles(connection, root, remoteRoot, files) {
+async function uploadFiles(connection, root, remoteRoot, files, onProgress) {
   const sftp = await new Promise((resolve, reject) => connection.sftp((error, value) => error ? reject(error) : resolve(value)))
   const mkdir = (remote) => new Promise((resolve, reject) => sftp.mkdir(remote, { mode: 0o700 }, (error) => error && error.code !== 4 ? reject(error) : resolve()))
   const put = (local, remote) => new Promise((resolve, reject) => {
@@ -53,7 +53,7 @@ async function uploadFiles(connection, root, remoteRoot, files) {
   })
   await mkdir(remoteRoot)
   const made = new Set([remoteRoot])
-  for (const relative of files) {
+  for (const [index, relative] of files.entries()) {
     const remote = `${remoteRoot}/${relative.replaceAll('\\', '/')}`
     const parent = remote.slice(0, remote.lastIndexOf('/'))
     let current = ''
@@ -62,6 +62,7 @@ async function uploadFiles(connection, root, remoteRoot, files) {
       if (!made.has(current)) { await mkdir(current); made.add(current) }
     }
     await put(path.join(root, relative), remote)
+    onProgress?.({ stage: 'upload', percent: 10 + Math.round(((index + 1) / files.length) * 20), message: `Uploading relay files (${index + 1}/${files.length})` })
   }
   sftp.end()
 }
@@ -74,35 +75,53 @@ function deploymentFiles(root) {
   return result
 }
 
-async function rootCommand(connection, command, password, isRoot) {
-  if (isRoot) return execute(connection, `bash -lc ${quote(command)}`)
-  return execute(connection, `sudo -S -p '' bash -lc ${quote(command)}`, `${password}\n`)
+async function rootCommand(connection, command, password, isRoot, onOutput) {
+  if (isRoot) return execute(connection, `bash -lc ${quote(command)}`, '', onOutput)
+  return execute(connection, `sudo -S -p '' bash -lc ${quote(command)}`, `${password}\n`, onOutput)
 }
 
-async function provisionRelay(projectRoot, input) {
+async function provisionRelay(projectRoot, input, onProgress = () => {}) {
+  onProgress({ stage: 'connect', percent: 2, message: 'Connecting to the VPS over SSH' })
   const { connection, fingerprint } = await connectSsh(input)
   const remoteRoot = `/tmp/gamepath-deploy-${crypto.randomBytes(8).toString('hex')}`
   try {
     const isRoot = (await execute(connection, 'id -u')).trim() === '0'
-    await uploadFiles(connection, projectRoot, remoteRoot, deploymentFiles(projectRoot))
+    onProgress({ stage: 'verify', percent: 7, message: 'SSH identity verified' })
+    await uploadFiles(connection, projectRoot, remoteRoot, deploymentFiles(projectRoot), onProgress)
     const enrollment = `${remoteRoot}/windows-client.enroll`
-    await rootCommand(connection, `chmod +x ${quote(remoteRoot)}/deploy/install-relay.sh && bash ${quote(remoteRoot)}/deploy/install-relay.sh --port ${input.relayPort} --client-name windows-client --enrollment-output ${quote(enrollment)}`, input.password, isRoot)
+    let outputBuffer = ''
+    const progressOutput = (text) => {
+      outputBuffer += text
+      const stages = { dependencies: [38, 'Installing Debian dependencies'], compile: [55, 'Compiling the optimized relay'], network: [72, 'Configuring forwarding and firewall'], service: [84, 'Installing and starting the relay service'], enrollment: [92, 'Creating this PC’s enrollment'] }
+      for (const line of outputBuffer.split(/\r?\n/).slice(0, -1)) {
+        const match = line.match(/GAMEPATH_PROGRESS:([a-z]+)/)
+        if (match && stages[match[1]]) onProgress({ stage: match[1], percent: stages[match[1]][0], message: stages[match[1]][1] })
+      }
+      outputBuffer = outputBuffer.split(/\r?\n/).at(-1) ?? ''
+    }
+    onProgress({ stage: 'install', percent: 32, message: 'Starting Debian relay installation' })
+    await rootCommand(connection, `chmod +x ${quote(remoteRoot)}/deploy/install-relay.sh && bash ${quote(remoteRoot)}/deploy/install-relay.sh --port ${input.relayPort} --client-name windows-client --enrollment-output ${quote(enrollment)}`, input.password, isRoot, progressOutput)
+    onProgress({ stage: 'credential', percent: 96, message: 'Importing and protecting the enrollment credential' })
     const token = (await rootCommand(connection, `cat ${quote(enrollment)}`, input.password, isRoot)).trim()
     if (!token.startsWith('gpe1_') || token.length < 80) throw new Error('The server returned an invalid enrollment credential')
     await rootCommand(connection, `rm -rf ${quote(remoteRoot)}`, input.password, isRoot)
+    onProgress({ stage: 'complete', percent: 100, message: 'VPS relay is ready' })
     return { token, fingerprint }
   } finally {
     connection.end()
   }
 }
 
-async function removeRelay(projectRoot, input) {
+async function removeRelay(projectRoot, input, onProgress = () => {}) {
+  onProgress({ stage: 'connect', percent: 5, message: 'Connecting to the VPS over SSH' })
   const { connection, fingerprint } = await connectSsh(input)
   const remoteRoot = `/tmp/gamepath-remove-${crypto.randomBytes(8).toString('hex')}`
   try {
     const isRoot = (await execute(connection, 'id -u')).trim() === '0'
-    await uploadFiles(connection, projectRoot, remoteRoot, ['deploy/uninstall-relay.sh'])
+    await uploadFiles(connection, projectRoot, remoteRoot, ['deploy/uninstall-relay.sh'], onProgress)
+    onProgress({ stage: 'remove', percent: 45, message: 'Stopping and removing the relay deployment' })
     await rootCommand(connection, `chmod +x ${quote(remoteRoot)}/deploy/uninstall-relay.sh && bash ${quote(remoteRoot)}/deploy/uninstall-relay.sh; rm -rf ${quote(remoteRoot)}`, input.password, isRoot)
+    onProgress({ stage: 'complete', percent: 100, message: 'Relay deployment removed' })
     return { fingerprint }
   } finally {
     connection.end()

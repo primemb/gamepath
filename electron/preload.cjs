@@ -18,6 +18,11 @@ contextBridge.exposeInMainWorld('gamepath', {
   testRelay: (id) => ipcRenderer.invoke('relay:test', id),
   provisionRelayVps: (id, input) => ipcRenderer.invoke('relay:vps-provision', id, input),
   removeRelayVps: (id, input) => ipcRenderer.invoke('relay:vps-remove', id, input),
+  onRelayVpsProgress: (callback) => {
+    const handler = (_event, update) => callback(update)
+    ipcRenderer.on('relay:vps-progress', handler)
+    return () => ipcRenderer.removeListener('relay:vps-progress', handler)
+  },
   refreshService: () => ipcRenderer.invoke('service:refresh'),
   installService: () => ipcRenderer.invoke('service:install'),
   startSession: () => ipcRenderer.invoke('engine:start'),

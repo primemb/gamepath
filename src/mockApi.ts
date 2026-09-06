@@ -84,6 +84,7 @@ export const mockApi: GamePathApi = {
     if (state.activeRelayId === id) state.activeRelayId = null
     return snapshot()
   },
+  onRelayVpsProgress: () => () => undefined,
   refreshService: async () => snapshot(),
   installService: async () => {
     state.service = { status: 'ready', version: '0.1.0', message: 'Privileged network service ready', elevated: true }
