@@ -177,6 +177,32 @@ function sessionNodes(enabledTunnels) {
   })
 }
 
+/**
+ * Asks the relay to answer through the proxy.
+ *
+ * Accepting a UDP association proves nothing about whether the relay is
+ * reachable through it, so the check that matters is an authenticated frame
+ * making the round trip. That is what a session waits for, and what this
+ * reports.
+ */
+function probeSocks5Node(host, port, credentials) {
+  if (engineBridge?.status.status !== 'ready') throw new Error('The native routing engine is unavailable')
+  const { relay, enrollmentToken } = activeRelayWithToken()
+  return engineBridge.request(
+    'probe-socks5-node',
+    {
+      relayHost: relay.address,
+      relayPort: relay.port,
+      enrollmentToken,
+      host,
+      port,
+      username: credentials.username || null,
+      password: credentials.password || null,
+    },
+    20000,
+  )
+}
+
 function activeRelayWithToken() {
   const relay = state.relays.find((item) => item.id === state.activeRelayId)
   const encryptedToken = relay && state.encryptedRelayTokens[relay.id]
@@ -205,21 +231,23 @@ function registerIpc() {
   // Accepting UDP ASSOCIATE is not proof a proxy can carry GamePath traffic,
   // so this asks the relay for an authenticated reply through the proxy.
   ipcMain.handle('node:test-socks5', async (_event, input) => {
-    if (engineBridge?.status.status !== 'ready') throw new Error('The native routing engine is unavailable')
-    const { relay, enrollmentToken } = activeRelayWithToken()
     const { node, credentials } = parseSocks5Node(input ?? {}, 'probe')
-    return engineBridge.request(
-      'probe-socks5-node',
-      {
-        relayHost: relay.address,
-        relayPort: relay.port,
-        enrollmentToken,
-        host: node.host,
-        port: node.port,
-        username: credentials.username || null,
-        password: credentials.password || null,
-      },
-      20000,
+    return probeSocks5Node(node.host, node.port, credentials)
+  })
+
+  // Testing a node that is already saved reads its credentials back out of
+  // secure storage, so nobody has to retype a password to re-run a check.
+  ipcMain.handle('node:test-saved-socks5', async (_event, id) => {
+    const tunnel = state.tunnels.find((item) => item.id === id)
+    if (tunnel?.kind !== 'socks5') throw new Error('That node is not a SOCKS5 proxy')
+    const stored = state.encryptedConfigs[tunnel.id]
+    if (!stored) {
+      throw new Error(`${tunnel.name} is missing its stored secret. Remove the node and add it again.`)
+    }
+    return probeSocks5Node(
+      tunnel.host,
+      tunnel.port,
+      JSON.parse(safeStorage.decryptString(Buffer.from(stored, 'base64'))),
     )
   })
 

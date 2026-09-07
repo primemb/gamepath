@@ -174,6 +174,7 @@ export type GamePathApi = {
   importWireGuard: () => Promise<{ canceled: boolean; state?: AppState; errors?: string[] }>
   addSocks5Node: (input: Socks5NodeInput) => Promise<{ state: AppState; nodeId: string }>
   testSocks5Node: (input: Socks5NodeInput) => Promise<Socks5ProbeResult>
+  testSavedSocks5Node: (id: string) => Promise<Socks5ProbeResult>
   setTunnelEnabled: (id: string, enabled: boolean) => Promise<AppState>
   removeTunnel: (id: string) => Promise<AppState>
   browseRuleTarget: (kind: RuleKind) => Promise<{ canceled: boolean; value?: string; label?: string }>

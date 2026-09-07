@@ -172,12 +172,16 @@ function Endpoint({
   direct,
   onToggle,
   onRemove,
+  onTest,
 }: {
   tunnel: Tunnel
   direct: boolean
   onToggle: (enabled: boolean) => void
   onRemove: () => void
+  onTest: () => Promise<Socks5ProbeResult>
 }) {
+  const [testing, setTesting] = useState(false)
+  const [outcome, setOutcome] = useState<{ ok: boolean; message: string } | null>(null)
   const isProxy = tunnel.kind === 'socks5'
   // A proxy has no way to route on its own, so in direct mode it stays in the
   // list with the reason attached rather than quietly refusing to switch on.
@@ -228,6 +232,11 @@ function Endpoint({
             </>
           )}
         </div>
+        {outcome && (
+          <p className={`route-note ${outcome.ok ? 'is-good' : 'is-bad'}`}>
+            {outcome.ok ? <Check size={13} /> : <Info size={13} />} {outcome.message}
+          </p>
+        )}
         {unusable && (
           <p className="route-note">
             <Info size={13} /> A SOCKS5 proxy forwards connections, it does not route packets, so it needs a relay on
@@ -236,6 +245,31 @@ function Endpoint({
         )}
       </div>
       <div className="route-actions">
+        {/* A proxy is the one node whose reachability the app cannot infer, so
+            it gets a check of its own. Direct mode has no relay to answer it. */}
+        {isProxy && !direct && (
+          <button
+            className="button secondary"
+            disabled={testing}
+            onClick={async () => {
+              setTesting(true)
+              setOutcome(null)
+              try {
+                const probe = await onTest()
+                setOutcome({
+                  ok: true,
+                  message: `Relay answered through ${probe.proxy} in ${Math.round(probe.latencyMs)} ms (${Math.round(probe.setupLatencyMs)} ms to open the association).`,
+                })
+              } catch (error) {
+                setOutcome({ ok: false, message: (error as Error).message })
+              } finally {
+                setTesting(false)
+              }
+            }}
+          >
+            {testing ? 'Testing…' : 'Test'}
+          </button>
+        )}
         <Toggle
           checked={tunnel.enabled}
           disabled={unusable}
@@ -1698,6 +1732,7 @@ function App() {
                       key={tunnel.id}
                       tunnel={tunnel}
                       direct={direct}
+                      onTest={() => api.testSavedSocks5Node(tunnel.id)}
                       onToggle={async (enabled) => setState(await api.setTunnelEnabled(tunnel.id, enabled))}
                       onRemove={async () => setState(await api.removeTunnel(tunnel.id))}
                     />

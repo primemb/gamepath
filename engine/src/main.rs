@@ -6,7 +6,7 @@ use gamepath_engine::relay_path::{
     DirectWireGuardPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
 };
 use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
-use gamepath_engine::socks5::Socks5NodeConfig;
+use gamepath_engine::socks5::{Socks5NodeConfig, Socks5UdpPath};
 use gamepath_engine::timer::HighResolutionTimer;
 use gamepath_engine::wfp::inspect_backend;
 use serde::{Deserialize, Serialize};
@@ -1925,11 +1925,59 @@ fn probe_socks5_node(payload: Value) -> Result<Value, String> {
             }));
         }
     }
-    Err(
-        "the proxy accepted UDP ASSOCIATE but did not relay a datagram to the relay; \
-         it cannot be used as a GamePath node"
-            .into(),
-    )
+    // Before blaming the relay, find out whether this proxy forwards UDP at
+    // all. Many do not, and answer DNS themselves in a way that makes the
+    // association look functional.
+    if answers_dns_without_forwarding(&config) {
+        return Err(
+            "this proxy answers DNS from its own resolver and does not forward UDP anywhere \
+             else, so it cannot carry GamePath traffic. Testing such a proxy with a DNS \
+             query always succeeds and proves nothing. In sing-box and Xray based clients \
+             (Throne, NekoBox, v2rayN) this needs UDP enabled on the outbound and its \
+             server, and no routing rule blocking UDP other than port 53."
+                .into(),
+        );
+    }
+    Err(format!(
+        "the proxy opened a UDP association and forwards UDP, but the relay never answered \
+         through it. Check that UDP {} is open on the relay, and that the proxy has no \
+         routing rule sending {} somewhere else.",
+        input.relay_port, input.relay_host
+    ))
+}
+
+/// Whether the proxy resolves DNS itself rather than relaying the datagram.
+///
+/// The query is aimed at 192.0.2.1, which is reserved for documentation and
+/// routes nowhere. Nothing on the Internet can answer it, so a reply can only
+/// have been produced by the proxy intercepting the query. Clients built on
+/// sing-box and Xray commonly do exactly that, which is why a DNS round trip
+/// through them is not evidence that they relay UDP.
+fn answers_dns_without_forwarding(config: &Socks5NodeConfig) -> bool {
+    const UNROUTABLE_RESOLVER: SocketAddrV4 =
+        SocketAddrV4::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 53);
+    // An A query for a name reserved by RFC 2606 to never exist.
+    // Header, then the labels "gamepath" (8) and "invalid" (7), then A/IN.
+    let query = [
+        0x9e, 0x7a, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 8, b'g', b'a', b'm', b'e', b'p', b'a',
+        b't', b'h', 7, b'i', b'n', b'v', b'a', b'l', b'i', b'd', 0, 0, 1, 0, 1,
+    ];
+    let Ok(mut path) = Socks5UdpPath::open(config, UNROUTABLE_RESOLVER) else {
+        return false;
+    };
+    if path.send_frame(&query).is_err() {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        match path.receive_frames(Duration::from_millis(200)) {
+            // Any datagram at all settles it: the destination cannot reply.
+            Ok(frames) if !frames.is_empty() => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn inspect_system() -> Value {

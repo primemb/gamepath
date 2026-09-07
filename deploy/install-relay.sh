@@ -52,6 +52,10 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 echo "GAMEPATH_PROGRESS:dependencies"
 apt-get update
+# Debian's packaged toolchain, not rustup: the relay builds gamepath-engine from
+# source here, so anything in that crate must compile on the rustc Debian ships
+# (1.85 on trixie). Language features newer than that break provisioning even
+# though they build fine on a developer machine. `npm run relay:msrv` checks it.
 apt-get install -y --no-install-recommends ca-certificates cargo rustc nftables iproute2 build-essential pkg-config
 
 if ! id gamepath >/dev/null 2>&1; then

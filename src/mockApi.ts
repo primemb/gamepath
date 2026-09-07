@@ -113,6 +113,16 @@ export const mockApi: GamePathApi = {
     setupLatencyMs: 12,
     latencyMs: 41,
   }),
+  testSavedSocks5Node: async (id) => {
+    const tunnel = state.tunnels.find((item) => item.id === id)
+    return {
+      reachable: true,
+      udpAssociate: true,
+      proxy: tunnel?.endpoint ?? '',
+      setupLatencyMs: 12,
+      latencyMs: 41,
+    }
+  },
   setTunnelEnabled: async (id, enabled) => {
     // Direct mode picks one node rather than pooling several.
     const exclusive = state.connectionMode === 'direct' && enabled

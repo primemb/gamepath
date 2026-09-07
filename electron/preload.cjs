@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('gamepath', {
   importWireGuard: () => ipcRenderer.invoke('tunnel:import'),
   addSocks5Node: (input) => ipcRenderer.invoke('node:add-socks5', input),
   testSocks5Node: (input) => ipcRenderer.invoke('node:test-socks5', input),
+  testSavedSocks5Node: (id) => ipcRenderer.invoke('node:test-saved-socks5', id),
   setTunnelEnabled: (id, enabled) => ipcRenderer.invoke('tunnel:set-enabled', id, enabled),
   removeTunnel: (id) => ipcRenderer.invoke('tunnel:remove', id),
   browseRuleTarget: (kind) => ipcRenderer.invoke('rule:browse', kind),

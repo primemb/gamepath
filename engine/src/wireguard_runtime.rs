@@ -21,6 +21,19 @@ pub fn inspect(input: &str) -> Result<RuntimeWireGuardConfig, String> {
     parse(input, None)
 }
 
+/// The `AllowedIPs` line to write, or nothing when the configuration's own
+/// routes are being kept.
+///
+/// This returns an iterable rather than taking an `if let` at each of its three
+/// call sites: nesting those inside the surrounding condition draws a clippy
+/// warning, and collapsing them with a let-chain needs a newer compiler than
+/// the Debian `rustc` the relay host builds this crate with.
+fn allowed_ips_line(relay_route: &Option<String>) -> Option<String> {
+    relay_route
+        .as_ref()
+        .map(|route| format!("AllowedIPs = {route}"))
+}
+
 fn parse(input: &str, relay: Option<IpAddr>) -> Result<RuntimeWireGuardConfig, String> {
     let relay_route = relay.map(|relay| match relay {
         IpAddr::V4(address) => format!("{address}/32"),
@@ -38,11 +51,8 @@ fn parse(input: &str, relay: Option<IpAddr>) -> Result<RuntimeWireGuardConfig, S
     for original_line in input.lines() {
         let line = original_line.trim();
         if line.starts_with('[') && line.ends_with(']') {
-            if section == "peer"
-                && !peer_allowed_ips_written
-                && let Some(route) = &relay_route
-            {
-                output.push(format!("AllowedIPs = {route}"));
+            if section == "peer" && !peer_allowed_ips_written {
+                output.extend(allowed_ips_line(&relay_route));
             }
             section = match line.to_ascii_lowercase().as_str() {
                 "[interface]" => "interface",
@@ -103,11 +113,8 @@ fn parse(input: &str, relay: Option<IpAddr>) -> Result<RuntimeWireGuardConfig, S
         }
         output.push(original_line.to_owned());
     }
-    if section == "peer"
-        && !peer_allowed_ips_written
-        && let Some(route) = &relay_route
-    {
-        output.push(format!("AllowedIPs = {route}"));
+    if section == "peer" && !peer_allowed_ips_written {
+        output.extend(allowed_ips_line(&relay_route));
     }
     if !private_key {
         return Err("WireGuard configuration is missing Interface PrivateKey".into());

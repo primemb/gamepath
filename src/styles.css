@@ -2316,6 +2316,25 @@ main {
   margin-top: 2px;
   color: var(--violet);
 }
+/* A test result carries its own colour, because the outcome is the point. */
+.route-note.is-good {
+  color: #a7d8bf;
+}
+.route-note.is-good svg {
+  color: var(--green);
+}
+.route-note.is-bad {
+  color: #e7b4b4;
+}
+.route-note.is-bad svg {
+  color: #ef6f6f;
+}
+/* The card's own buttons stay quieter than the page's primary actions. */
+.route-actions .button {
+  min-height: 30px;
+  padding: 0 12px;
+  font-size: 11.5px;
+}
 
 @media (max-width: 1100px) {
   .mode-grid {

@@ -412,14 +412,23 @@ impl RelayPath for Socks5RelayPath {
     }
 
     fn health_note(&mut self) -> Option<String> {
-        // Stated without blame: proxies that tear the association down and
-        // proxies that keep relaying both close this stream, so the reader is
-        // told what happened rather than what it means.
-        self.path.control_closed().then(|| {
-            "the proxy closed its SOCKS5 control connection, which some proxies do while \
-             still relaying"
-                .to_owned()
-        })
+        // This is only asked for after a probe went unanswered, so the note has
+        // to point at the leg that failed: datagrams left through the
+        // association and nothing came back, which means the proxy is not
+        // getting them to the relay or not getting the reply home. The closed
+        // control stream is mentioned only to rule it out, since plenty of
+        // proxies close it and keep relaying perfectly.
+        let mut note = "the proxy accepted a UDP association but the relay never answered \
+                        through it; check that the proxy forwards UDP to the relay's port \
+                        rather than blocking it or sending it direct"
+            .to_owned();
+        if self.path.control_closed() {
+            note.push_str(
+                " (it also closed its SOCKS5 control connection, which is normal and not \
+                 the cause)",
+            );
+        }
+        Some(note)
     }
 }
 
