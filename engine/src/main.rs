@@ -278,68 +278,30 @@ impl WireGuardSessionManager {
         let relay_port = input.relay_port;
         let stop = Arc::new(AtomicBool::new(false));
         let sequences = Arc::new(AtomicU64::new(1));
-        let mut initial_statuses = vec![PathSessionStatus {
-            route: 0,
-            path_kind: "direct".into(),
-            label: "Direct ISP".into(),
-            endpoint: format!("{relay_ip}:{relay_port}"),
-            reachable: false,
-            latency_ms: None,
-            node_latency_ms: None,
-            packets_sent: 0,
-            packets_received: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            last_error: None,
-        }];
-        initial_statuses.extend(paths.iter().map(|(config_index, path)| PathSessionStatus {
-            route: *config_index,
-            path_kind: "wireguard".into(),
-            label: format!("WireGuard route {config_index}"),
-            endpoint: path.endpoint().to_string(),
-            reachable: false,
-            latency_ms: None,
-            node_latency_ms: None,
-            packets_sent: 0,
-            packets_received: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            last_error: None,
-        }));
+        let initial_statuses = paths
+            .iter()
+            .map(|(config_index, path)| PathSessionStatus {
+                route: *config_index,
+                path_kind: "wireguard".into(),
+                label: format!("WireGuard route {config_index}"),
+                endpoint: path.endpoint().to_string(),
+                reachable: false,
+                latency_ms: None,
+                node_latency_ms: None,
+                packets_sent: 0,
+                packets_received: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
+                last_error: None,
+            })
+            .collect::<Vec<_>>();
         let statuses = Arc::new(Mutex::new(initial_statuses));
-        let route_count = paths.len() + 1;
+        let route_count = paths.len();
         let mut workers = Vec::with_capacity(route_count);
         let mut commands = Vec::with_capacity(route_count);
         let (inbound_tx, inbound_rx) = mpsc::channel();
-        {
-            let (command_tx, command_rx) = mpsc::channel();
-            commands.push(command_tx);
-            let worker_stop = Arc::clone(&stop);
-            let worker_statuses = Arc::clone(&statuses);
-            let worker_sequences = Arc::clone(&sequences);
-            let worker_inbound = inbound_tx.clone();
-            workers.push(
-                thread::Builder::new()
-                    .name("gamepath-direct".into())
-                    .spawn(move || {
-                        run_direct_path(
-                            relay_ip,
-                            relay_port,
-                            client_id,
-                            key,
-                            session_id,
-                            worker_sequences,
-                            worker_stop,
-                            worker_statuses,
-                            command_rx,
-                            worker_inbound,
-                        )
-                    })
-                    .map_err(|error| format!("could not start direct path worker: {error}"))?,
-            );
-        }
         for (index, (_, path)) in paths.into_iter().enumerate() {
-            let status_index = index + 1;
+            let status_index = index;
             let (command_tx, command_rx) = mpsc::channel();
             commands.push(command_tx);
             let worker_stop = Arc::clone(&stop);
@@ -472,7 +434,13 @@ impl WireGuardSessionManager {
             .active
             .as_mut()
             .ok_or("start the WireGuard session before sending packets")?;
-        if !session.paths.lock().unwrap().iter().any(|path| path.reachable) {
+        if !session
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.reachable)
+        {
             return Err("no relay path is currently reachable".into());
         }
         let sequence = session.sequences.fetch_add(1, Ordering::Relaxed);
@@ -762,11 +730,13 @@ impl PacketCaptureManager {
         }
         #[cfg(windows)]
         if let Some(capture) = &self.active_split {
+            let diagnostics = capture.diagnostics();
             return json!({
                 "state": "capturing",
                 "backend": "windivert",
                 "trafficMode": "split",
                 "targetCount": capture.target_count(),
+                "diagnostics": diagnostics,
             });
         }
         json!({ "state": "idle" })
@@ -947,109 +917,6 @@ fn ipv4_source_address(packet: &[u8]) -> Option<std::net::Ipv4Addr> {
     Some(std::net::Ipv4Addr::new(
         packet[12], packet[13], packet[14], packet[15],
     ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_direct_path(
-    relay_ip: std::net::Ipv4Addr,
-    relay_port: u16,
-    client_id: [u8; 16],
-    key: [u8; 32],
-    session_id: u64,
-    sequences: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
-    commands: mpsc::Receiver<PathCommand>,
-    inbound: mpsc::Sender<Vec<u8>>,
-) {
-    use gamepath_engine::auth::SessionCrypto;
-    use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
-
-    let relay = SocketAddr::from((relay_ip, relay_port));
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
-        return;
-    };
-    if socket.connect(relay).is_err()
-        || socket
-            .set_read_timeout(Some(Duration::from_millis(20)))
-            .is_err()
-    {
-        return;
-    }
-    let Ok(crypto) = SessionCrypto::new(&key, session_id) else {
-        return;
-    };
-    let mut next_probe = Instant::now();
-    let mut pending_probe = None;
-    while !stop.load(Ordering::Acquire) {
-        while let Ok(command) = commands.try_recv() {
-            let result = socket
-                .send(&command.frame)
-                .map(|_| ())
-                .map_err(|error| format!("direct data send failed: {error}"));
-            record_path_send(&statuses, 0, command.frame.len(), result);
-        }
-        if Instant::now() >= next_probe && pending_probe.is_none() {
-            let sequence = sequences.fetch_add(1, Ordering::Relaxed);
-            let result = (|| {
-                let header = FrameHeader {
-                    flags: FLAG_CONTROL,
-                    client_id,
-                    session_id,
-                    sequence,
-                };
-                let frame = crypto.seal_client(header, b"ping")?;
-                {
-                    let mut current = statuses.lock().unwrap();
-                    current[0].packets_sent += 1;
-                }
-                socket
-                    .send(&frame)
-                    .map_err(|error| format!("direct path send failed: {error}"))?;
-                Ok::<(), String>(())
-            })();
-            match result {
-                Ok(()) => pending_probe = Some(Instant::now()),
-                Err(error) => {
-                    update_path_status(&statuses, 0, Err(error));
-                    next_probe = Instant::now() + Duration::from_secs(1);
-                }
-            }
-        }
-        let mut response = [0_u8; 65_535];
-        match socket.recv(&mut response) {
-            Ok(length) => {
-                if let Ok((header, plaintext)) = crypto.open_server(&response[..length]) {
-                    if header.flags & FLAG_CONTROL != 0 && plaintext == b"pong" {
-                        if let Some(started) = pending_probe.take() {
-                            update_path_status(
-                                &statuses,
-                                0,
-                                Ok(started.elapsed().as_secs_f64() * 1000.0),
-                            );
-                            next_probe = Instant::now() + Duration::from_secs(10);
-                        }
-                    } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
-                        record_path_receive(&statuses, 0, length);
-                        let _ = inbound.send(response[..length].to_vec());
-                    }
-                }
-            }
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::TimedOut => {}
-            Err(error) => update_path_status(&statuses, 0, Err(error.to_string())),
-        }
-        if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_secs(4)) {
-            pending_probe = None;
-            update_path_status(
-                &statuses,
-                0,
-                Err("direct path health check timed out".into()),
-            );
-            next_probe = Instant::now() + Duration::from_secs(1);
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

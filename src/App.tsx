@@ -109,13 +109,14 @@ function LatencyChart({ values }: { values: number[] }) {
 
 function TelemetryPanel({ state, history }: { state: AppState; history: number[] }) {
   const metrics = state.session.metrics
+  const capture = state.session.capture?.diagnostics
   const stages = [
     ['User → VPN node', metrics?.userToNodeMs, 'WireGuard handshake RTT'],
     ['Node → relay', metrics?.nodeToRelayMs, 'Tunnel segment estimate'],
     ['Relay → server', metrics?.relayToServerMs, metrics?.benchmarkServer ? `Benchmark ${metrics.benchmarkServer}` : 'Awaiting target'],
   ] as const
   return <section className="telemetry-panel">
-    <div className="telemetry-head"><div><span className="eyebrow">Live telemetry</span><h2>Network journey</h2></div><span className={`status-pill ${state.session.status === 'connected' ? 'online' : ''}`}><i />{state.session.status === 'connected' ? 'Live' : 'Waiting'}</span></div>
+    <div className="telemetry-head"><div><span className="eyebrow">Live telemetry</span><h2>Network journey</h2></div><span className={`status-pill ${state.session.status === 'connected' ? 'online' : ''}`}><i />{state.session.status === 'connected' ? capture ? `${capture.relayedPackets} game packets routed` : 'Live' : 'Waiting'}</span></div>
     <div className="journey-grid">{stages.map(([label, value, detail], index) => <div className="journey-stage" key={label}><span>{index + 1}</span><div><small>{label}</small><strong>{formatMetric(value)}</strong><em>{detail}</em></div></div>)}</div>
     <div className="telemetry-lower">
       <div className="chart-card"><div><span>End-to-end ping</span><strong>{formatMetric(metrics?.endToEndMs)}</strong></div><LatencyChart values={history} /></div>
@@ -334,7 +335,7 @@ function App() {
                 <div className="section-heading"><div><span className="eyebrow">Quick setup</span><h2>Get ready to play</h2></div><span className="progress-label">{readyCount}/3 complete</span></div>
                 <div className="progress-track"><span style={{ width: `${(readyCount / 3) * 100}%` }} /></div>
                 <div className="setup-list">
-                  <SetupStep done={readiness.routes} number={1} title="Add a WireGuard route" detail={`${state.tunnels.length} WireGuard configuration${state.tunnels.length === 1 ? '' : 's'} imported; direct ISP is automatic`} action="Configure" onClick={() => setView('routes')} />
+                  <SetupStep done={readiness.routes} number={1} title="Add a WireGuard route" detail={`${state.tunnels.length} WireGuard configuration${state.tunnels.length === 1 ? '' : 's'} imported; the relay is reached only through enabled VPN routes`} action="Configure" onClick={() => setView('routes')} />
                   <SetupStep done={readiness.rules} number={2} title="Choose traffic mode" detail={state.trafficMode === 'all' ? 'All system traffic' : `${enabledRules} active split-tunnel target${enabledRules === 1 ? '' : 's'}`} action="Configure" onClick={() => setView('split')} />
                   <SetupStep done={readiness.relay} number={3} title="Configure a relay" detail={relay ? `${relay.city}, ${relay.country}` : 'No relay selected'} action="Set up" onClick={() => setView('relays')} />
                 </div>
@@ -346,7 +347,7 @@ function App() {
                   <div className="map-node origin"><Gamepad2 size={19} /><span>Your game</span></div>
                   <div className="map-lines"><i /><i /></div>
                   <div className="path-stack">
-                    {[{ name: 'Direct ISP', enabled: true }, { name: enabledRoutes ? `${enabledRoutes} WireGuard route${enabledRoutes === 1 ? '' : 's'}` : 'WireGuard pool', enabled: enabledRoutes > 0 }].map((item, index) => <div key={item.name}><span className={item.enabled ? 'active' : ''}>{index + 1}</span><p>{item.name}</p><small>{item.enabled ? 'Available' : 'Not configured'}</small></div>)}
+                    {(state.tunnels.filter((tunnel) => tunnel.enabled).map((tunnel) => ({ name: tunnel.name, enabled: true })).length ? state.tunnels.filter((tunnel) => tunnel.enabled).map((tunnel) => ({ name: tunnel.name, enabled: true })) : [{ name: 'WireGuard pool', enabled: false }]).map((item, index) => <div key={item.name}><span className={item.enabled ? 'active' : ''}>{index + 1}</span><p>{item.name}</p><small>{item.enabled ? 'VPN path available' : 'Not configured'}</small></div>)}
                   </div>
                   <div className="map-lines inbound"><i /><i /></div>
                   <div className="map-node relay"><MapPin size={19} /><span>{relay?.city ?? 'Relay'}</span></div>
@@ -359,7 +360,7 @@ function App() {
 
           {view === 'routes' && (
             <section className="page-section">
-              <div className="toolbar"><div><span className="count-badge">{enabledRoutes} active</span><span className="muted">One provider route pairs with Direct ISP; distinct configs add more paths.</span></div><button className="button primary" onClick={importTunnels}><Import size={16} />Import .conf</button></div>
+              <div className="toolbar"><div><span className="count-badge">{enabledRoutes} active</span><span className="muted">Each active route carries relay traffic inside its WireGuard VPN. Direct ISP relay access is disabled.</span></div><button className="button primary" onClick={importTunnels}><Import size={16} />Import .conf</button></div>
               {state.tunnels.length ? <div className="route-list">{state.tunnels.map((tunnel) => <Endpoint key={tunnel.id} tunnel={tunnel} onToggle={async (enabled) => setState(await api.setTunnelEnabled(tunnel.id, enabled))} onRemove={async () => setState(await api.removeTunnel(tunnel.id))} />)}</div> : (
                 <div className="empty-state"><span><HardDrive size={28} /></span><h2>No WireGuard routes yet</h2><p>Import your purchased VPN configuration files. Private keys are encrypted using Windows secure storage.</p><button className="button primary" onClick={importTunnels}><Import size={16} />Import configurations</button></div>
               )}

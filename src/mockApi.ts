@@ -94,7 +94,6 @@ export const mockApi: GamePathApi = {
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     state.session = relay?.status === 'ready'
       ? { status: 'connected', message: 'Two encrypted paths are connected to the relay.', routeLatencies: [34, 39], pathMetrics: [
-        { route: 0, pathKind: 'direct', label: 'Direct ISP', endpoint: 'relay.local:51821', reachable: true, latencyMs: 34, nodeLatencyMs: null, packetsSent: 128, packetsReceived: 126, bytesSent: 148320, bytesReceived: 232410, lastError: null },
         { route: 1, pathKind: 'wireguard', label: 'WireGuard route 1', endpoint: 'tr-01.example:51820', reachable: true, latencyMs: 39, nodeLatencyMs: 22, packetsSent: 128, packetsReceived: 127, bytesSent: 148320, bytesReceived: 232410, lastError: null },
       ], metrics: { userToNodeMs: 22, nodeToRelayMs: 17, relayToServerMs: 9, endToEndMs: 48, benchmarkServer: '1.1.1.1', bytesSent: 296640, bytesReceived: 464820, packetsSent: 256, packetsReceived: 253, packetLossPercent: 1.17 } }
       : { status: 'error', message: 'The Istanbul relay needs its server component and address.' }

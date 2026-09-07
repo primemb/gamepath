@@ -33,7 +33,8 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw 'The GamePath service build failed.' }
 }
 
-$installDirectory = Join-Path $env:ProgramFiles 'GamePath'
+$nativeProgramFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+$installDirectory = Join-Path $nativeProgramFiles 'GamePath'
 $dataDirectory = Join-Path $env:ProgramData 'GamePath'
 $serviceBinary = Join-Path $installDirectory 'gamepath-service.exe'
 $tokenFile = Join-Path $dataDirectory 'service-token'
@@ -89,6 +90,9 @@ if (-not $existing) {
     & sc.exe create $serviceName binPath= ('"{0}"' -f $serviceBinary) start= auto DisplayName= 'GamePath Network Service' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to create the GamePath Windows service.' }
 }
+# Repoint services created by an older installer or a different install folder.
+& sc.exe config $serviceName binPath= ('"{0}"' -f $serviceBinary) | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Failed to update the GamePath service executable path.' }
 & sc.exe description $serviceName 'Privileged packet routing and tunnel lifecycle for GamePath.' | Out-Null
 & sc.exe failure $serviceName reset= 86400 actions= restart/2000/restart/5000/none/0 | Out-Null
 if ($LeaveStopped) {

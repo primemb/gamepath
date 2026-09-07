@@ -464,7 +464,11 @@ mod gamepath_service {
     fn session_status(state: &Mutex<RuntimeState>) -> Result<Value, String> {
         let mut runtime = state.lock().unwrap();
         let engine = runtime.engine.as_mut().ok_or("no active network session")?;
-        let result = engine.request("wireguard-session-status", json!({}))?;
+        let mut result = engine.request("wireguard-session-status", json!({}))?;
+        let capture = engine.request("packet-capture-status", json!({}))?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("capture".into(), capture);
+        }
         runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
         Ok(result)
     }

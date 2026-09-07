@@ -43,6 +43,7 @@ export type AppState = {
     message?: string
     routeLatencies?: number[]
     pathMetrics?: Array<{ route: number; pathKind: string; label: string; endpoint: string; reachable: boolean; latencyMs: number | null; nodeLatencyMs: number | null; packetsSent: number; packetsReceived: number; bytesSent: number; bytesReceived: number; lastError: string | null }>
+    capture?: { state: string; backend: string; trafficMode?: string; targetCount?: number; diagnostics?: { matchedSockets: number; captureFilterCount: number; capturedPackets: number; capturedBytes: number; relayedPackets: number; bypassedPackets: number } }
     metrics?: { userToNodeMs: number | null; nodeToRelayMs: number | null; relayToServerMs: number | null; endToEndMs: number | null; benchmarkServer: string; bytesSent: number; bytesReceived: number; packetsSent: number; packetsReceived: number; packetLossPercent: number }
   }
   engine: {

@@ -86,6 +86,7 @@ function updateSessionMetrics(runtime, dataPlane) {
   const userToNode = wireGuard?.nodeLatencyMs ?? null
   const nodeToRelay = userToNode != null && wireGuard?.latencyMs != null ? Math.max(0, wireGuard.latencyMs - userToNode) : null
   state.session.pathMetrics = paths
+  if (runtime.capture) state.session.capture = runtime.capture
   state.session.routeLatencies = paths.filter((path) => path.latencyMs != null).map((path) => Math.max(1, Math.round(path.latencyMs)))
   state.session.metrics = {
     userToNodeMs: userToNode,
@@ -380,6 +381,7 @@ function registerIpc() {
         const dataPlane = serviceSession.dataPlane
         const standbyNote = paths.skippedRoutes.length ? ` ${paths.skippedRoutes.length} overlapping config${paths.skippedRoutes.length === 1 ? ' is' : 's are'} held as standby.` : ''
         state.session = { status: 'connected', message: `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${standbyNote}` }
+        state.session.capture = serviceSession.capture
         updateSessionMetrics(paths, dataPlane)
       } catch (error) {
         try { await serviceBridge.request('stop-session') } catch {}

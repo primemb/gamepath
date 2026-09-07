@@ -7,7 +7,7 @@ use std::ffi::{CString, OsString, c_char, c_void};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -255,6 +255,45 @@ struct Registry {
     handles: Mutex<Vec<Arc<Handle>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     filters: Mutex<HashSet<String>>,
+    selectors: Mutex<HashSet<TrafficSelector>>,
+    matched_sockets: AtomicU64,
+    captured_packets: AtomicU64,
+    captured_bytes: AtomicU64,
+    relayed_packets: AtomicU64,
+    bypassed_packets: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TrafficSelector {
+    Destination {
+        first: u32,
+        last: u32,
+    },
+    Flow {
+        protocol: u8,
+        local_port: u16,
+        remote_port: Option<u16>,
+    },
+}
+
+impl TrafficSelector {
+    fn matches(self, fields: Ipv4Fields) -> bool {
+        match self {
+            Self::Destination { first, last } => {
+                let destination = u32::from(fields.destination);
+                destination >= first && destination <= last
+            }
+            Self::Flow {
+                protocol,
+                local_port,
+                remote_port,
+            } => {
+                fields.protocol == protocol
+                    && fields.source_port == local_port
+                    && remote_port.is_none_or(|port| fields.destination_port == port)
+            }
+        }
+    }
 }
 
 pub struct SplitPacketCapture {
@@ -277,48 +316,71 @@ impl SplitPacketCapture {
             handles: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
             filters: Mutex::new(HashSet::new()),
+            selectors: Mutex::new(HashSet::new()),
+            matched_sockets: AtomicU64::new(0),
+            captured_packets: AtomicU64::new(0),
+            captured_bytes: AtomicU64::new(0),
+            relayed_packets: AtomicU64::new(0),
+            bypassed_packets: AtomicU64::new(0),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let return_paths = Arc::new(Mutex::new(HashMap::new()));
         let send_handle = Arc::new(Handle::open(&registry.dll, "false", 0, 0x0008)?);
 
-        let mut initial = destination_terms(&plan)?;
-        initial.extend(
-            resolve_hostnames(&plan)
-                .into_iter()
-                .map(|ip| format!("ip.DstAddr == {ip}")),
-        );
-        if !initial.is_empty() {
-            spawn_capture(
-                initial.join(" or "),
-                Arc::clone(&registry),
-                Arc::clone(&stop),
-                Arc::clone(&sessions),
-                Arc::clone(&return_paths),
-                virtual_ipv4,
-            )?;
+        for selector in destination_selectors(&plan)? {
+            add_selector(&registry, selector);
+        }
+        for ip in resolve_hostnames(&plan) {
+            add_selector(
+                &registry,
+                TrafficSelector::Destination {
+                    first: u32::from(ip),
+                    last: u32::from(ip),
+                },
+            );
         }
 
         if !plan.application_paths.is_empty() || !plan.folder_prefixes.is_empty() {
-            spawn_process_tracker(
-                &plan,
-                Arc::clone(&registry),
-                Arc::clone(&stop),
-                Arc::clone(&sessions),
-                Arc::clone(&return_paths),
-                virtual_ipv4,
-            )?;
+            spawn_process_tracker(&plan, Arc::clone(&registry), Arc::clone(&stop))?;
         }
         if !plan.hostnames.is_empty() {
             spawn_dns_tracker(
                 plan.hostnames.clone(),
                 Arc::clone(&registry),
                 Arc::clone(&stop),
-                Arc::clone(&sessions),
-                Arc::clone(&return_paths),
-                virtual_ipv4,
             )?;
         }
+
+        // Keep one network handle open before applications create connections.
+        // Classification happens in memory, removing the race where a TCP SYN
+        // escaped while a new per-socket WinDivert handle was being created.
+        let network_filter = format!("outbound and ip and !loopback and {}", registry.bypass);
+        let network_handle = Arc::new(Handle::open(&registry.dll, &network_filter, 0, 0)?);
+        network_handle.set_param(0, 8192)?;
+        network_handle.set_param(2, 32 * 1024 * 1024)?;
+        registry
+            .handles
+            .lock()
+            .unwrap()
+            .push(Arc::clone(&network_handle));
+        let capture_registry = Arc::clone(&registry);
+        let capture_stop = Arc::clone(&stop);
+        let capture_sessions = Arc::clone(&sessions);
+        let capture_returns = Arc::clone(&return_paths);
+        let worker = thread::Builder::new()
+            .name("gamepath-windivert-selected".into())
+            .spawn(move || {
+                run_selected_capture(
+                    network_handle,
+                    capture_stop,
+                    capture_sessions,
+                    capture_returns,
+                    virtual_ipv4,
+                    capture_registry,
+                )
+            })
+            .map_err(|error| format!("could not start selected packet capture: {error}"))?;
+        registry.workers.lock().unwrap().push(worker);
 
         let inject_stop = Arc::clone(&stop);
         let inject_returns = Arc::clone(&return_paths);
@@ -346,6 +408,17 @@ impl SplitPacketCapture {
     pub fn target_count(&self) -> usize {
         self.target_count
     }
+
+    pub fn diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "matchedSockets": self.registry.matched_sockets.load(Ordering::Relaxed),
+            "captureFilterCount": self.registry.filters.lock().unwrap().len(),
+            "capturedPackets": self.registry.captured_packets.load(Ordering::Relaxed),
+            "capturedBytes": self.registry.captured_bytes.load(Ordering::Relaxed),
+            "relayedPackets": self.registry.relayed_packets.load(Ordering::Relaxed),
+            "bypassedPackets": self.registry.bypassed_packets.load(Ordering::Relaxed),
+        })
+    }
 }
 
 impl Drop for SplitPacketCapture {
@@ -361,31 +434,13 @@ impl Drop for SplitPacketCapture {
     }
 }
 
-fn spawn_capture(
-    target_filter: String,
-    registry: Arc<Registry>,
-    stop: Arc<AtomicBool>,
-    sessions: Arc<Mutex<WireGuardSessionManager>>,
-    return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
-    virtual_ipv4: Ipv4Addr,
-) -> Result<(), String> {
-    let filter = format!(
-        "outbound and ip and ({target_filter}) and {}",
-        registry.bypass
-    );
-    if !registry.filters.lock().unwrap().insert(filter.clone()) {
-        return Ok(());
-    }
-    let handle = Arc::new(Handle::open(&registry.dll, &filter, 0, 0)?);
-    handle.set_param(0, 8192)?;
-    handle.set_param(2, 32 * 1024 * 1024)?;
-    registry.handles.lock().unwrap().push(Arc::clone(&handle));
-    let worker = thread::Builder::new()
-        .name("gamepath-windivert-selected".into())
-        .spawn(move || run_selected_capture(handle, stop, sessions, return_paths, virtual_ipv4))
-        .map_err(|error| format!("could not start selected packet capture: {error}"))?;
-    registry.workers.lock().unwrap().push(worker);
-    Ok(())
+fn add_selector(registry: &Registry, selector: TrafficSelector) {
+    registry
+        .filters
+        .lock()
+        .unwrap()
+        .insert(format!("{selector:?}"));
+    registry.selectors.lock().unwrap().insert(selector);
 }
 
 fn run_selected_capture(
@@ -394,6 +449,7 @@ fn run_selected_capture(
     sessions: Arc<Mutex<WireGuardSessionManager>>,
     return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
     virtual_ipv4: Ipv4Addr,
+    registry: Arc<Registry>,
 ) {
     while !stop.load(Ordering::Acquire) {
         let Ok((packet, address)) = handle.recv(65_535) else {
@@ -403,6 +459,27 @@ fn run_selected_capture(
             let _ = handle.send(&packet, &address);
             continue;
         };
+        let mut selected = registry
+            .selectors
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|selector| selector.matches(fields));
+        // CONNECT and the first TCP SYN can run on different scheduler threads.
+        // Briefly hold only an unmatched SYN so the socket observer can classify it.
+        if !selected && is_tcp_syn(&packet) {
+            thread::sleep(Duration::from_millis(3));
+            selected = registry
+                .selectors
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|selector| selector.matches(fields));
+        }
+        if !selected {
+            let _ = handle.send(&packet, &address);
+            continue;
+        }
         return_paths.lock().unwrap().insert(
             ReturnKey::outbound(fields),
             ReturnPath {
@@ -411,6 +488,10 @@ fn run_selected_capture(
                 subinterface_index: address.network_data().subinterface_index,
             },
         );
+        registry.captured_packets.fetch_add(1, Ordering::Relaxed);
+        registry
+            .captured_bytes
+            .fetch_add(packet.len() as u64, Ordering::Relaxed);
         let mut tunneled = packet.clone();
         tunneled[12..16].copy_from_slice(&virtual_ipv4.octets());
         let mut checksum_address = address;
@@ -424,7 +505,10 @@ fn run_selected_capture(
                 .is_err()
         {
             // Fail open for the selected connection when the relay is unavailable.
+            registry.bypassed_packets.fetch_add(1, Ordering::Relaxed);
             let _ = handle.send(&packet, &address);
+        } else {
+            registry.relayed_packets.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -433,9 +517,6 @@ fn spawn_process_tracker(
     plan: &InterceptionPlan,
     registry: Arc<Registry>,
     stop: Arc<AtomicBool>,
-    sessions: Arc<Mutex<WireGuardSessionManager>>,
-    return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
-    virtual_ipv4: Ipv4Addr,
 ) -> Result<(), String> {
     // SOCKET events are observation-only. SNIFF|RECV_ONLY copies events while
     // allowing Windows to create every socket normally.
@@ -448,6 +529,19 @@ fn spawn_process_tracker(
     let worker = thread::Builder::new()
         .name("gamepath-windivert-processes".into())
         .spawn(move || {
+            // WinDivert reports only future socket events. Seed UDP filters for game
+            // sockets that already existed when the user pressed Start session.
+            // Existing TCP connections cannot move to a different public IP safely.
+            for socket in existing_ipv4_udp_sockets() {
+                if process_path(socket.process_id)
+                    .is_some_and(|path| path_matches(&path, &applications, &folders))
+                {
+                    worker_registry
+                        .matched_sockets
+                        .fetch_add(1, Ordering::Relaxed);
+                    add_selector(&worker_registry, socket.selector());
+                }
+            }
             while !worker_stop.load(Ordering::Acquire) {
                 let Ok((_, address)) = handle.recv(0) else {
                     break;
@@ -456,7 +550,8 @@ fn spawn_process_tracker(
                     continue;
                 }
                 let event = address.socket_data();
-                let port = u16::from_be(event.local_port);
+                // WinDivert SOCKET-layer ports are already in host byte order.
+                let port = event.local_port;
                 if port == 0
                     || !process_path(event.process_id)
                         .is_some_and(|path| path_matches(&path, &applications, &folders))
@@ -464,23 +559,20 @@ fn spawn_process_tracker(
                     continue;
                 }
                 let protocol = match event.protocol {
-                    6 => "tcp",
-                    17 => "udp",
+                    6 | 17 => event.protocol,
                     _ => continue,
                 };
-                let remote_port = u16::from_be(event.remote_port);
-                let remote_term = if remote_port == 0 {
-                    String::new()
-                } else {
-                    format!(" and {protocol}.DstPort == {remote_port}")
-                };
-                let _ = spawn_capture(
-                    format!("{protocol}.SrcPort == {port}{remote_term}"),
-                    Arc::clone(&worker_registry),
-                    Arc::clone(&worker_stop),
-                    Arc::clone(&sessions),
-                    Arc::clone(&return_paths),
-                    virtual_ipv4,
+                let remote_port = event.remote_port;
+                worker_registry
+                    .matched_sockets
+                    .fetch_add(1, Ordering::Relaxed);
+                add_selector(
+                    &worker_registry,
+                    TrafficSelector::Flow {
+                        protocol,
+                        local_port: port,
+                        remote_port: (remote_port != 0).then_some(remote_port),
+                    },
                 );
             }
         })
@@ -489,13 +581,95 @@ fn spawn_process_tracker(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ExistingSocket {
+    process_id: u32,
+    protocol: u8,
+    local_port: u16,
+    remote_port: u16,
+}
+
+impl ExistingSocket {
+    fn selector(self) -> TrafficSelector {
+        TrafficSelector::Flow {
+            protocol: self.protocol,
+            local_port: self.local_port,
+            remote_port: (self.remote_port != 0).then_some(self.remote_port),
+        }
+    }
+}
+
+#[link(name = "iphlpapi")]
+unsafe extern "system" {
+    fn GetExtendedUdpTable(
+        table: *mut c_void,
+        size: *mut u32,
+        order: i32,
+        family: u32,
+        table_class: u32,
+        reserved: u32,
+    ) -> u32;
+}
+
+fn existing_ipv4_udp_sockets() -> Vec<ExistingSocket> {
+    let mut sockets = Vec::new();
+    // MIB_UDPROW_OWNER_PID is three DWORDs; UDP has no fixed remote endpoint.
+    if let Some(buffer) =
+        ip_table(|table, size| unsafe { GetExtendedUdpTable(table, size, 0, 2, 1, 0) })
+    {
+        for row in dword_rows(&buffer, 3) {
+            let local_port = port_from_dword(row[1]);
+            if local_port != 0 {
+                sockets.push(ExistingSocket {
+                    process_id: row[2],
+                    protocol: 17,
+                    local_port,
+                    remote_port: 0,
+                });
+            }
+        }
+    }
+    sockets
+}
+
+fn ip_table(call: impl Fn(*mut c_void, *mut u32) -> u32) -> Option<Vec<u8>> {
+    let mut size = 0_u32;
+    let _ = call(std::ptr::null_mut(), &mut size);
+    if size < 4 {
+        return None;
+    }
+    let mut buffer = vec![0_u8; size as usize];
+    (call(buffer.as_mut_ptr().cast(), &mut size) == 0).then_some(buffer)
+}
+
+fn dword_rows(buffer: &[u8], width: usize) -> Vec<Vec<u32>> {
+    if buffer.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_ne_bytes(buffer[0..4].try_into().unwrap()) as usize;
+    let row_bytes = width * 4;
+    (0..count)
+        .filter_map(|index| {
+            let start = 4 + index * row_bytes;
+            let bytes = buffer.get(start..start + row_bytes)?;
+            Some(
+                bytes
+                    .chunks_exact(4)
+                    .map(|part| u32::from_ne_bytes(part.try_into().unwrap()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn port_from_dword(value: u32) -> u16 {
+    u16::from_be(value as u16)
+}
+
 fn spawn_dns_tracker(
     hostnames: Vec<String>,
     registry: Arc<Registry>,
     stop: Arc<AtomicBool>,
-    sessions: Arc<Mutex<WireGuardSessionManager>>,
-    return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
-    virtual_ipv4: Ipv4Addr,
 ) -> Result<(), String> {
     // SNIFF|RECV_ONLY copies DNS replies; it never diverts them from Windows.
     let handle = Arc::new(Handle::open(
@@ -515,13 +689,12 @@ fn spawn_dns_tracker(
                     break;
                 };
                 for address in dns_addresses(&packet, &hostnames) {
-                    let _ = spawn_capture(
-                        format!("ip.DstAddr == {address}"),
-                        Arc::clone(&worker_registry),
-                        Arc::clone(&worker_stop),
-                        Arc::clone(&sessions),
-                        Arc::clone(&return_paths),
-                        virtual_ipv4,
+                    add_selector(
+                        &worker_registry,
+                        TrafficSelector::Destination {
+                            first: u32::from(address),
+                            last: u32::from(address),
+                        },
                     );
                 }
             }
@@ -626,8 +799,8 @@ fn ipv4_fields(packet: &[u8]) -> Option<Ipv4Fields> {
     })
 }
 
-fn destination_terms(plan: &InterceptionPlan) -> Result<Vec<String>, String> {
-    let mut terms = Vec::new();
+fn destination_selectors(plan: &InterceptionPlan) -> Result<Vec<TrafficSelector>, String> {
+    let mut selectors = Vec::new();
     for network in &plan.ip_networks {
         let (address, prefix) = network.split_once('/').unwrap();
         let address: IpAddr = address
@@ -646,13 +819,22 @@ fn destination_terms(plan: &InterceptionPlan) -> Result<Vec<String>, String> {
         };
         let first = Ipv4Addr::from(u32::from(address) & mask);
         let last = Ipv4Addr::from(u32::from(first) | !mask);
-        terms.push(if first == last {
-            format!("ip.DstAddr == {first}")
-        } else {
-            format!("(ip.DstAddr >= {first} and ip.DstAddr <= {last})")
+        selectors.push(TrafficSelector::Destination {
+            first: u32::from(first),
+            last: u32::from(last),
         });
     }
-    Ok(terms)
+    Ok(selectors)
+}
+
+fn is_tcp_syn(packet: &[u8]) -> bool {
+    if packet.len() < 20 || packet[0] >> 4 != 4 || packet[9] != 6 {
+        return false;
+    }
+    let header = usize::from(packet[0] & 0x0f) * 4;
+    packet
+        .get(header + 13)
+        .is_some_and(|flags| flags & 0x02 != 0)
 }
 
 fn resolve_hostnames(plan: &InterceptionPlan) -> HashSet<Ipv4Addr> {
@@ -842,8 +1024,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            destination_terms(&plan).unwrap(),
-            ["(ip.DstAddr >= 203.0.113.0 and ip.DstAddr <= 203.0.113.255)"]
+            destination_selectors(&plan).unwrap(),
+            [TrafficSelector::Destination {
+                first: u32::from(Ipv4Addr::new(203, 0, 113, 0)),
+                last: u32::from(Ipv4Addr::new(203, 0, 113, 255)),
+            }]
         );
     }
 

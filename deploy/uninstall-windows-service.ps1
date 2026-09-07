@@ -21,17 +21,22 @@ if ($interfaceIndexes.Count) {
 }
 
 # Stop engines installed by GamePath or copied into its private temporary folder.
-$programRuntime = Join-Path $env:ProgramFiles 'GamePath'
+$nativeProgramFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+$programRuntime = Join-Path $nativeProgramFiles 'GamePath'
+$legacyProgramRuntime = if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'GamePath' } else { $null }
 $temporaryRuntime = Join-Path $env:TEMP 'GamePath'
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
         $_.Name -like 'gamepath-engine*.exe' -and
-        ($_.ExecutablePath -like "$programRuntime\*" -or $_.ExecutablePath -like "$temporaryRuntime\*")
+        ($_.ExecutablePath -like "$programRuntime\*" -or ($legacyProgramRuntime -and $_.ExecutablePath -like "$legacyProgramRuntime\*") -or $_.ExecutablePath -like "$temporaryRuntime\*")
     } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 & sc.exe delete $serviceName | Out-Null
 Remove-Item -LiteralPath $programRuntime -Recurse -Force -ErrorAction SilentlyContinue
+if ($legacyProgramRuntime -and $legacyProgramRuntime -ne $programRuntime) {
+    Remove-Item -LiteralPath $legacyProgramRuntime -Recurse -Force -ErrorAction SilentlyContinue
+}
 Remove-Item -LiteralPath (Join-Path $env:ProgramData 'GamePath') -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $temporaryRuntime -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $env:APPDATA 'GamePath') -Recurse -Force -ErrorAction SilentlyContinue
