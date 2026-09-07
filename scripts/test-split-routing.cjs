@@ -170,14 +170,18 @@ app
                   addedP99Ms: Number((summarize(routedLatency).p99Ms - summarize(directLatency).p99Ms).toFixed(2)),
                 }
               : undefined,
-            relayPaths: status.paths.map(({ label, pathKind, reachable, probesSent, probesReceived, probesLost }) => ({
-              label,
-              pathKind,
-              reachable,
-              probesSent,
-              probesReceived,
-              probesLost,
-            })),
+            relayPaths: status.paths.map(
+              ({ label, pathKind, reachable, packetsReceived, probesSent, probesReceived, probesLost }, index) => ({
+                label,
+                pathKind,
+                reachable,
+                packetsReceived,
+                workerIterations: status.pathWorkerIterations?.[index],
+                probesSent,
+                probesReceived,
+                probesLost,
+              }),
+            ),
             strategy: status.strategy,
             selectedRoutes: status.selectedRoutes,
             diagnostics,

@@ -104,6 +104,7 @@ struct ActiveWireGuardSession {
     sequences: Arc<AtomicU64>,
     decision_mask: Arc<AtomicU64>,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
+    path_worker_iterations: Arc<Vec<AtomicU64>>,
     bypass_ips: Vec<std::net::Ipv4Addr>,
 }
 
@@ -355,6 +356,11 @@ impl WireGuardSessionManager {
             (1_u64 << route_count) - 1
         };
         let decision_mask = Arc::new(AtomicU64::new(initial_mask));
+        let path_worker_iterations = Arc::new(
+            (0..route_count)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>(),
+        );
         let mut workers = Vec::with_capacity(route_count);
         let mut commands = Vec::with_capacity(route_count);
         let (inbound_tx, inbound_rx) = mpsc::channel();
@@ -368,6 +374,7 @@ impl WireGuardSessionManager {
             let worker_inbound = inbound_tx.clone();
             let worker_metrics = Arc::clone(&scheduler_metrics);
             let worker_decision = Arc::clone(&decision_mask);
+            let worker_iterations = Arc::clone(&path_worker_iterations);
             workers.push(
                 thread::Builder::new()
                     .name(format!("gamepath-wireguard-{}", index + 1))
@@ -387,6 +394,8 @@ impl WireGuardSessionManager {
                             worker_inbound,
                             worker_metrics,
                             worker_decision,
+                            initial_mask,
+                            worker_iterations,
                         )
                     })
                     .map_err(|error| format!("could not start WireGuard path worker: {error}"))?,
@@ -414,6 +423,7 @@ impl WireGuardSessionManager {
             sequences,
             decision_mask,
             scheduler_metrics,
+            path_worker_iterations,
             bypass_ips,
         });
 
@@ -503,15 +513,6 @@ impl WireGuardSessionManager {
             .active
             .as_mut()
             .ok_or("start the WireGuard session before sending packets")?;
-        if !session
-            .paths
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|path| path.reachable)
-        {
-            return Err("no relay path is currently reachable".into());
-        }
         let sequence = session.sequences.fetch_add(1, Ordering::Relaxed);
         let header = FrameHeader {
             flags: 0,
@@ -590,6 +591,11 @@ impl WireGuardSessionManager {
             .map(|(_, path)| path.route)
             .collect::<Vec<_>>();
         let scheduler_metrics = session.scheduler_metrics.lock().unwrap().clone();
+        let path_worker_iterations = session
+            .path_worker_iterations
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
         let state = if paths.iter().any(|path| path.reachable) {
             "connected"
         } else {
@@ -604,6 +610,7 @@ impl WireGuardSessionManager {
             "strategy": "adaptive",
             "selectedRoutes": selected_routes,
             "schedulerMetrics": scheduler_metrics,
+            "pathWorkerIterations": path_worker_iterations,
         })
     }
 
@@ -1019,6 +1026,8 @@ fn run_wireguard_path(
     inbound: mpsc::Sender<Vec<u8>>,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     decision_mask: Arc<AtomicU64>,
+    fallback_mask: u64,
+    worker_iterations: Arc<Vec<AtomicU64>>,
 ) {
     use gamepath_engine::auth::SessionCrypto;
     use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
@@ -1032,6 +1041,7 @@ fn run_wireguard_path(
     let mut next_probe = Instant::now();
     let mut pending_probe = None;
     while !stop.load(Ordering::Acquire) {
+        worker_iterations[index].fetch_add(1, Ordering::Relaxed);
         while let Ok(command) = commands.try_recv() {
             let result = ipv4_udp_packet(
                 path.address(),
@@ -1066,7 +1076,13 @@ fn run_wireguard_path(
                 Ok(()) => pending_probe = Some(Instant::now()),
                 Err(error) => {
                     statuses.lock().unwrap()[index].probes_lost += 1;
-                    update_scheduler_probe(&scheduler_metrics, &decision_mask, index, None);
+                    update_scheduler_probe(
+                        &scheduler_metrics,
+                        &decision_mask,
+                        fallback_mask,
+                        index,
+                        None,
+                    );
                     update_path_status(&statuses, index, Err(error));
                     next_probe = Instant::now() + Duration::from_millis(500);
                 }
@@ -1101,6 +1117,7 @@ fn run_wireguard_path(
                                 update_scheduler_probe(
                                     &scheduler_metrics,
                                     &decision_mask,
+                                    fallback_mask,
                                     index,
                                     Some(latency),
                                 );
@@ -1122,7 +1139,13 @@ fn run_wireguard_path(
         if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_millis(1500)) {
             pending_probe = None;
             statuses.lock().unwrap()[index].probes_lost += 1;
-            update_scheduler_probe(&scheduler_metrics, &decision_mask, index, None);
+            update_scheduler_probe(
+                &scheduler_metrics,
+                &decision_mask,
+                fallback_mask,
+                index,
+                None,
+            );
             update_path_status(
                 &statuses,
                 index,
@@ -1136,6 +1159,7 @@ fn run_wireguard_path(
 fn update_scheduler_probe(
     metrics: &Mutex<Vec<PathMetrics>>,
     decision_mask: &AtomicU64,
+    fallback_mask: u64,
     index: usize,
     latency_ms: Option<f64>,
 ) {
@@ -1145,15 +1169,16 @@ fn update_scheduler_probe(
     };
     match latency_ms {
         Some(latency) => path.record_probe(latency),
-        None => {
-            path.record_loss();
-            // A probe timeout is a hard reachability failure, so do not keep
-            // duplicating game traffic onto this path. record_probe restores
-            // the path automatically as soon as it answers again.
-            path.active = false;
-        }
+        None => path.record_loss(),
     }
     let decision = choose_paths(&metrics, Strategy::Adaptive);
+    decision_mask.store(
+        mask_for_decision(decision, fallback_mask),
+        Ordering::Release,
+    );
+}
+
+fn mask_for_decision(decision: Decision, fallback_mask: u64) -> u64 {
     let mask = match decision {
         Decision::Drop => 0,
         Decision::Single { path_id } => path_id
@@ -1169,7 +1194,7 @@ fn update_scheduler_probe(
                 .unwrap_or(0)
         }),
     };
-    decision_mask.store(mask, Ordering::Release);
+    if mask == 0 { fallback_mask } else { mask }
 }
 
 fn update_path_status(
@@ -1538,5 +1563,50 @@ mod tests {
         let packet = icmp_echo_packet(source, destination, 42, 1, true);
         assert_eq!(internet_checksum(&packet[..20]), 0);
         assert!(is_matching_icmp_reply(&packet, source, destination, 42));
+    }
+
+    #[test]
+    fn scheduler_mask_keeps_single_route_armed_after_loss() {
+        let mut route = PathMetrics::new("0");
+        route.record_probe(40.0);
+        route.record_loss();
+        assert_eq!(
+            mask_for_decision(choose_paths(&[route], Strategy::Adaptive), 0b1),
+            0b1
+        );
+    }
+
+    #[test]
+    fn scheduler_mask_selects_the_best_healthy_route() {
+        let mut slower = PathMetrics::new("0");
+        slower.record_probe(70.0);
+        let mut faster = PathMetrics::new("1");
+        faster.record_probe(35.0);
+        assert_eq!(
+            mask_for_decision(choose_paths(&[slower, faster], Strategy::Adaptive), 0b11),
+            0b10
+        );
+    }
+
+    #[test]
+    fn scheduler_mask_duplicates_degraded_routes() {
+        let mut degraded = PathMetrics::new("0");
+        degraded.record_probe(35.0);
+        degraded.record_loss();
+        let mut backup = PathMetrics::new("1");
+        backup.record_probe(50.0);
+        assert_eq!(
+            mask_for_decision(choose_paths(&[degraded, backup], Strategy::Adaptive), 0b11),
+            0b11
+        );
+    }
+
+    #[test]
+    fn scheduler_mask_falls_back_when_all_routes_are_unrated() {
+        let routes = [PathMetrics::new("0"), PathMetrics::new("1")];
+        assert_eq!(
+            mask_for_decision(choose_paths(&routes, Strategy::Adaptive), 0b11),
+            0b11
+        );
     }
 }

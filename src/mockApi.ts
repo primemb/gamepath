@@ -1,7 +1,7 @@
 import type { AppState, GamePathApi } from './types'
 
 let state: AppState = {
-  clientVersion: '0.1.13',
+  clientVersion: '0.1.14',
   tunnels: [
     {
       id: 'demo-1',

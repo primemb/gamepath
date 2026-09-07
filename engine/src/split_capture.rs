@@ -181,7 +181,7 @@ impl Handle {
         Ok((packet, address))
     }
 
-    fn recv_into(&self, packet: &mut [u8]) -> Result<(usize, Address), String> {
+    fn recv_into(&self, packet: &mut [u8]) -> Result<(usize, Address), std::io::Error> {
         let mut length = 0;
         let mut address = Address::default();
         if unsafe {
@@ -194,7 +194,7 @@ impl Handle {
             )
         } == 0
         {
-            return Err(std::io::Error::last_os_error().to_string());
+            return Err(std::io::Error::last_os_error());
         }
         Ok((length as usize, address))
     }
@@ -580,11 +580,15 @@ fn run_selected_capture(
     while !stop.load(Ordering::Acquire) {
         let (packet_length, address) = match handle.recv_into(&mut packet_buffer) {
             Ok(packet) => packet,
-            Err(_) => {
+            Err(error) => {
                 if !stop.load(Ordering::Acquire) {
                     registry
                         .capture_receive_errors
                         .fetch_add(1, Ordering::Relaxed);
+                }
+                if !stop.load(Ordering::Acquire) && matches!(error.raw_os_error(), Some(122 | 232))
+                {
+                    continue;
                 }
                 break;
             }
@@ -632,11 +636,12 @@ fn run_selected_capture(
                     deadline: Instant::now() + Duration::from_millis(3),
                 };
                 let depth = registry.pending_syn_depth.fetch_add(1, Ordering::Relaxed) + 1;
-                registry
-                    .pending_syn_peak
-                    .fetch_max(depth, Ordering::Relaxed);
                 match pending_syns.try_send(pending) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        registry
+                            .pending_syn_peak
+                            .fetch_max(depth, Ordering::Relaxed);
+                    }
                     Err(mpsc::TrySendError::Full(pending)) => {
                         registry.pending_syn_depth.fetch_sub(1, Ordering::Relaxed);
                         registry
@@ -736,13 +741,19 @@ fn run_pending_syns(
     pending: mpsc::Receiver<PendingSyn>,
 ) {
     let mut tunnel_buffer = Vec::with_capacity(65_535);
-    while !stop.load(Ordering::Acquire) {
+    loop {
         let item = match pending.recv_timeout(Duration::from_millis(10)) {
             Ok(item) => item,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         registry.pending_syn_depth.fetch_sub(1, Ordering::Relaxed);
+        if stop.load(Ordering::Acquire) {
+            // The capture handle is shutting down. Reinject every packet that
+            // was already removed from the network stack before exiting.
+            let _ = handle.send(&item.packet, &item.address);
+            continue;
+        }
         if let Some(wait) = item.deadline.checked_duration_since(Instant::now()) {
             thread::sleep(wait);
         }
