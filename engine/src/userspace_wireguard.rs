@@ -89,6 +89,10 @@ impl UserSpaceWireGuardPath {
         self.endpoint
     }
 
+    pub fn identity_fingerprint(&self) -> [u8; 32] {
+        self.identity_fingerprint
+    }
+
     pub fn conflicts_with(&self, other: &Self) -> bool {
         self.endpoint == other.endpoint && self.identity_fingerprint == other.identity_fingerprint
     }

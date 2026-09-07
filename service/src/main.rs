@@ -11,6 +11,7 @@ fn main() -> windows_service::Result<()> {
 
 #[cfg(windows)]
 mod gamepath_service {
+    use gamepath_engine::relay_path::NodeSpec;
     use gamepath_engine::wireguard_runtime::narrow_to_relay;
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
@@ -91,7 +92,27 @@ mod gamepath_service {
     struct ValidateRequest {
         relay_ip: IpAddr,
         traffic_mode: String,
+        #[serde(default)]
+        nodes: Vec<NodeSpec>,
+        #[serde(default)]
         wireguard_configs: Vec<String>,
+    }
+
+    impl ValidateRequest {
+        /// Callers may send the tagged node list or, for WireGuard-only
+        /// sessions, the original flat configuration list.
+        fn resolved_nodes(&self) -> Vec<NodeSpec> {
+            if !self.nodes.is_empty() {
+                return self.nodes.clone();
+            }
+            self.wireguard_configs
+                .iter()
+                .map(|config| NodeSpec::WireGuard {
+                    config: config.clone(),
+                    label: None,
+                })
+                .collect()
+        }
     }
 
     pub fn run() -> ServiceResult<()> {
@@ -479,23 +500,44 @@ mod gamepath_service {
         if input.traffic_mode != "all" && input.traffic_mode != "split" {
             return Err("traffic mode must be all or split".into());
         }
-        if input.wireguard_configs.is_empty() {
-            return Err("at least one WireGuard configuration is required".into());
+        let nodes = input.resolved_nodes();
+        if nodes.is_empty() {
+            return Err("at least one WireGuard or SOCKS5 node is required".into());
         }
-        let routes = input
-            .wireguard_configs
-            .iter()
-            .map(|source| narrow_to_relay(source, input.relay_ip))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut tunnel_addresses = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            let route = index + 1;
+            node.validate()
+                .map_err(|error| format!("route {route}: {error}"))?;
+            // A proxy on this machine reaches its own upstream over the default
+            // route. In all-traffic mode the tunnel owns that route, so the
+            // proxy's forwarded traffic would be captured and fed back into it.
+            if input.traffic_mode == "all" && node.is_loopback_proxy() {
+                return Err(format!(
+                    "route {route} ({}) runs on this PC and cannot be used in all-traffic mode, \
+                     because its own upstream traffic would be captured and looped back. \
+                     Use split-tunnel mode for a local proxy, or add a remote SOCKS5 proxy.",
+                    node.describe()
+                ));
+            }
+            if let NodeSpec::WireGuard { config, .. } = node {
+                tunnel_addresses.push(
+                    narrow_to_relay(config, input.relay_ip)
+                        .map_err(|error| format!("route {route}: {error}"))?
+                        .tunnel_address,
+                );
+            }
+        }
         let mut runtime = state.lock().unwrap();
         runtime.session_status = "validated".into();
-        runtime.route_count = routes.len();
+        runtime.route_count = nodes.len();
         runtime.traffic_mode = input.traffic_mode.clone();
         Ok(json!({
             "sessionStatus": "validated",
-            "routeCount": routes.len(),
+            "routeCount": nodes.len(),
             "trafficMode": input.traffic_mode,
-            "tunnelAddresses": routes.iter().map(|route| route.tunnel_address).collect::<Vec<_>>(),
+            "tunnelAddresses": tunnel_addresses,
+            "nodeKinds": nodes.iter().map(NodeSpec::kind).collect::<Vec<_>>(),
         }))
     }
 
@@ -541,6 +583,92 @@ mod gamepath_service {
             assert!(constant_time_equal(b"secret", b"secret"));
             assert!(!constant_time_equal(b"secret", b"secrex"));
             assert!(!constant_time_equal(b"secret", b"secret-long"));
+        }
+
+        const WIREGUARD_CONFIG: &str = "[Interface]\nPrivateKey = key\nAddress = 10.88.0.2/32\n\n[Peer]\nPublicKey = peer\nAllowedIPs = 0.0.0.0/0\nEndpoint = vpn.example:51820\n";
+
+        fn validate(traffic_mode: &str, nodes: Value) -> Result<Value, String> {
+            validate_runtime(
+                json!({
+                    "relayIp": "203.0.113.8",
+                    "trafficMode": traffic_mode,
+                    "nodes": nodes,
+                }),
+                &Mutex::new(RuntimeState::default()),
+            )
+        }
+
+        #[test]
+        fn a_wireguard_and_socks5_pair_validates_together() {
+            let result = validate(
+                "split",
+                json!([
+                    { "kind": "wireguard", "config": WIREGUARD_CONFIG },
+                    { "kind": "socks5", "host": "127.0.0.1", "port": 2080 },
+                ]),
+            )
+            .unwrap();
+            assert_eq!(result["routeCount"], 2);
+            assert_eq!(result["nodeKinds"][0], "wireguard");
+            assert_eq!(result["nodeKinds"][1], "socks5");
+            // Only WireGuard routes have a tunnel address to narrow.
+            assert_eq!(result["tunnelAddresses"].as_array().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn a_local_proxy_is_refused_in_all_traffic_mode() {
+            let error = validate(
+                "all",
+                json!([{ "kind": "socks5", "host": "127.0.0.1", "port": 2080 }]),
+            )
+            .err()
+            .unwrap();
+            assert!(error.contains("looped back"), "{error}");
+            // The same node is fine when only selected traffic is captured.
+            assert!(
+                validate(
+                    "split",
+                    json!([{ "kind": "socks5", "host": "127.0.0.1", "port": 2080 }]),
+                )
+                .is_ok()
+            );
+            // A remote proxy is fine in either mode.
+            assert!(
+                validate(
+                    "all",
+                    json!([{ "kind": "socks5", "host": "203.0.113.9", "port": 1080 }]),
+                )
+                .is_ok()
+            );
+        }
+
+        #[test]
+        fn a_malformed_node_names_its_route() {
+            let error = validate(
+                "split",
+                json!([
+                    { "kind": "socks5", "host": "proxy.example", "port": 1080 },
+                    { "kind": "socks5", "host": "proxy.example", "port": 0 },
+                ]),
+            )
+            .err()
+            .unwrap();
+            assert!(error.starts_with("route 2:"), "{error}");
+        }
+
+        #[test]
+        fn a_wireguard_only_request_still_validates_without_the_node_list() {
+            let result = validate_runtime(
+                json!({
+                    "relayIp": "203.0.113.8",
+                    "trafficMode": "all",
+                    "wireguardConfigs": [WIREGUARD_CONFIG],
+                }),
+                &Mutex::new(RuntimeState::default()),
+            )
+            .unwrap();
+            assert_eq!(result["routeCount"], 1);
+            assert_eq!(result["tunnelAddresses"][0], "10.88.0.2");
         }
     }
 }

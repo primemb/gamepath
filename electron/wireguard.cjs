@@ -17,6 +17,7 @@ function parseWireGuardConfig(source, filePath, id, importedAt = new Date().toIS
 
   return {
     id,
+    kind: 'wireguard',
     name: path.basename(filePath, path.extname(filePath)),
     endpoint,
     address: valueFromSection(source, 'Interface', 'Address') || 'Automatic',

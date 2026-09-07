@@ -1,5 +1,8 @@
+export type NodeKind = 'wireguard' | 'socks5'
+
 export type Tunnel = {
   id: string
+  kind: NodeKind
   name: string
   endpoint: string
   address: string
@@ -7,6 +10,25 @@ export type Tunnel = {
   enabled: boolean
   importedAt: string
   hasPrivateKey: boolean
+  /** SOCKS5 nodes only. */
+  host?: string
+  port?: number
+  hasCredentials?: boolean
+}
+
+export type Socks5NodeInput = {
+  address: string
+  label?: string
+  username?: string
+  password?: string
+}
+
+export type Socks5ProbeResult = {
+  reachable: boolean
+  udpAssociate: boolean
+  proxy: string
+  setupLatencyMs: number
+  latencyMs: number
 }
 
 export type RuleKind = 'application' | 'folder' | 'hostname' | 'ip'
@@ -141,6 +163,8 @@ export type AddRuleInput = Pick<SplitRule, 'kind' | 'value' | 'label'>
 export type GamePathApi = {
   bootstrap: () => Promise<AppState>
   importWireGuard: () => Promise<{ canceled: boolean; state?: AppState; errors?: string[] }>
+  addSocks5Node: (input: Socks5NodeInput) => Promise<{ state: AppState; nodeId: string }>
+  testSocks5Node: (input: Socks5NodeInput) => Promise<Socks5ProbeResult>
   setTunnelEnabled: (id: string, enabled: boolean) => Promise<AppState>
   removeTunnel: (id: string) => Promise<AppState>
   browseRuleTarget: (kind: RuleKind) => Promise<{ canceled: boolean; value?: string; label?: string }>

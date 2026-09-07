@@ -5,6 +5,7 @@ let state: AppState = {
   tunnels: [
     {
       id: 'demo-1',
+      kind: 'wireguard',
       name: 'Istanbul Falcon',
       endpoint: 'tr-01.example:51820',
       address: '10.44.0.2/32',
@@ -15,6 +16,7 @@ let state: AppState = {
     },
     {
       id: 'demo-2',
+      kind: 'wireguard',
       name: 'Istanbul Nova',
       endpoint: 'tr-02.example:51820',
       address: '10.71.0.8/32',
@@ -80,6 +82,36 @@ let mockTelemetryTick = 0
 export const mockApi: GamePathApi = {
   bootstrap: async () => snapshot(),
   importWireGuard: async () => ({ canceled: true }),
+  addSocks5Node: async (input) => {
+    const [host, port] = input.address
+      .replace(/^socks5h?:\/\//, '')
+      .split('@')
+      .pop()!
+      .split(':')
+    const node = {
+      id: crypto.randomUUID(),
+      kind: 'socks5' as const,
+      name: input.label?.trim() || `${host}:${port ?? 1080}`,
+      endpoint: `${host}:${port ?? 1080}`,
+      host,
+      port: Number(port ?? 1080),
+      address: 'SOCKS5 proxy',
+      dns: 'System default',
+      enabled: true,
+      importedAt: new Date().toISOString(),
+      hasPrivateKey: false,
+      hasCredentials: Boolean(input.username),
+    }
+    state.tunnels.push(node)
+    return { state: snapshot(), nodeId: node.id }
+  },
+  testSocks5Node: async (input) => ({
+    reachable: true,
+    udpAssociate: true,
+    proxy: input.address,
+    setupLatencyMs: 12,
+    latencyMs: 41,
+  }),
   setTunnelEnabled: async (id, enabled) => {
     state.tunnels = state.tunnels.map((item) => (item.id === id ? { ...item, enabled } : item))
     return snapshot()

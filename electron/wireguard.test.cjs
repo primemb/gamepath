@@ -16,6 +16,7 @@ PersistentKeepalive = 25
 
 test('parses safe WireGuard metadata without returning keys', () => {
   const parsed = parseWireGuardConfig(sample, 'C:\\vpn\\turkey-one.conf', 'route-1', '2026-09-06T00:00:00.000Z')
+  assert.equal(parsed.kind, 'wireguard')
   assert.equal(parsed.name, 'turkey-one')
   assert.equal(parsed.endpoint, '203.0.113.8:51820')
   assert.equal(parsed.address, '10.10.0.2/32')

@@ -2,12 +2,15 @@ use base64::Engine as _;
 use gamepath_engine::adapter::inspect_library;
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
+use gamepath_engine::relay_path::{NodeSpec, RelayPath, Socks5RelayPath};
 use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
+use gamepath_engine::socks5::Socks5NodeConfig;
+use gamepath_engine::timer::HighResolutionTimer;
 use gamepath_engine::wfp::inspect_backend;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -65,8 +68,52 @@ struct WireGuardProbeRequest {
     relay_port: u16,
     enrollment_token: String,
     wireguard_configs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionRequest {
+    relay_host: String,
+    relay_port: u16,
+    enrollment_token: String,
+    #[serde(default)]
+    nodes: Vec<NodeSpec>,
+    #[serde(default)]
+    wireguard_configs: Vec<String>,
     #[serde(default)]
     route_labels: Vec<String>,
+}
+
+impl SessionRequest {
+    /// Callers may send the tagged node list or, for WireGuard-only sessions,
+    /// the original flat configuration list.
+    fn resolved_nodes(&self) -> Vec<NodeSpec> {
+        if !self.nodes.is_empty() {
+            return self.nodes.clone();
+        }
+        self.wireguard_configs
+            .iter()
+            .enumerate()
+            .map(|(index, config)| NodeSpec::WireGuard {
+                config: config.clone(),
+                label: self.route_labels.get(index).cloned(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Socks5ProbeRequest {
+    relay_host: String,
+    relay_port: u16,
+    enrollment_token: String,
+    host: String,
+    port: u16,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +153,9 @@ struct ActiveWireGuardSession {
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     path_worker_iterations: Arc<Vec<AtomicU64>>,
     bypass_ips: Vec<std::net::Ipv4Addr>,
+    // Held for the session so the path workers wake on a millisecond timer
+    // instead of Windows' default ~15.6 ms one.
+    timer: HighResolutionTimer,
 }
 
 pub(crate) struct DataReceiver {
@@ -242,6 +292,7 @@ fn handle_request(
         "prepare-session" => prepare_session(request.payload),
         "probe-relay" => probe_relay(request.payload),
         "probe-wireguard-routes" => probe_wireguard_routes(request.payload),
+        "probe-socks5-node" => probe_socks5_node(request.payload),
         "start-wireguard-session" => sessions.lock().unwrap().start(request.payload),
         "wireguard-session-status" => Ok(sessions.lock().unwrap().status()),
         "probe-data-plane" => sessions.lock().unwrap().probe_data_plane(),
@@ -273,63 +324,61 @@ fn handle_request(
 
 impl WireGuardSessionManager {
     fn start(&mut self, payload: Value) -> Result<Value, String> {
-        use gamepath_engine::userspace_wireguard::UserSpaceWireGuardPath;
-
-        let input: WireGuardProbeRequest = serde_json::from_value(payload)
-            .map_err(|error| format!("invalid WireGuard session: {error}"))?;
-        if input.wireguard_configs.is_empty() {
-            return Err("at least one WireGuard configuration is required".into());
+        let input: SessionRequest = serde_json::from_value(payload)
+            .map_err(|error| format!("invalid session request: {error}"))?;
+        let nodes = input.resolved_nodes();
+        if nodes.is_empty() {
+            return Err("at least one WireGuard or SOCKS5 node is required".into());
         }
         let enrollment = EnrollmentToken::decode(&input.enrollment_token)?;
         let (client_id, key) = enrollment.material()?;
         let relay_ip = resolve_ipv4(&input.relay_host, input.relay_port)?;
-        let parsed_paths = input
-            .wireguard_configs
-            .iter()
-            .map(|source| UserSpaceWireGuardPath::from_config(source))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut paths = Vec::new();
+        let relay = SocketAddrV4::new(relay_ip, input.relay_port);
+        let mut paths: Vec<(usize, String, Box<dyn RelayPath>)> = Vec::new();
         let mut skipped_routes = Vec::new();
-        for (config_index, path) in parsed_paths.into_iter().enumerate() {
+        for (index, node) in nodes.iter().enumerate() {
+            let route = index + 1;
+            // A SOCKS5 node dials its proxy here, so name the failing node.
+            let path = node
+                .open(relay)
+                .map_err(|error| format!("route {route} ({}): {error}", node.describe()))?;
             if paths
                 .iter()
-                .any(|(_, current): &(usize, UserSpaceWireGuardPath)| path.conflicts_with(current))
+                .any(|(_, _, current)| current.identity() == path.identity())
             {
-                skipped_routes.push(config_index + 1);
-            } else {
-                paths.push((config_index + 1, path));
+                skipped_routes.push(route);
+                continue;
             }
+            let label = node
+                .label()
+                .or_else(|| {
+                    input
+                        .route_labels
+                        .get(index)
+                        .map(|label| label.trim().to_owned())
+                        .filter(|label| !label.is_empty())
+                })
+                .unwrap_or_else(|| node.default_label(route));
+            paths.push((route, label, path));
         }
         let mut bypass_ips = vec![relay_ip];
-        bypass_ips.extend(
-            paths
-                .iter()
-                .filter_map(|(_, path)| match path.endpoint().ip() {
-                    std::net::IpAddr::V4(ip) => Some(ip),
-                    std::net::IpAddr::V6(_) => None,
-                }),
-        );
+        bypass_ips.extend(paths.iter().filter_map(|(_, _, path)| path.bypass_ipv4()));
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
 
         self.stop();
+        let timer = HighResolutionTimer::raise();
         let session_id = rand::random::<u64>();
         let crypto = Arc::new(SessionCrypto::new(&key, session_id)?);
-        let relay_port = input.relay_port;
         let stop = Arc::new(AtomicBool::new(false));
         let sequences = Arc::new(AtomicU64::new(1));
         let initial_statuses = paths
             .iter()
-            .map(|(config_index, path)| PathSessionStatus {
-                route: *config_index,
-                path_kind: "wireguard".into(),
-                label: input
-                    .route_labels
-                    .get(config_index - 1)
-                    .cloned()
-                    .filter(|label| !label.trim().is_empty())
-                    .unwrap_or_else(|| format!("WireGuard route {config_index}")),
-                endpoint: path.endpoint().to_string(),
+            .map(|(route, label, path)| PathSessionStatus {
+                route: *route,
+                path_kind: path.kind().into(),
+                label: label.clone(),
+                endpoint: path.endpoint(),
                 reachable: false,
                 latency_ms: None,
                 node_latency_ms: None,
@@ -364,7 +413,7 @@ impl WireGuardSessionManager {
         let mut workers = Vec::with_capacity(route_count);
         let mut commands = Vec::with_capacity(route_count);
         let (inbound_tx, inbound_rx) = mpsc::channel();
-        for (index, (_, path)) in paths.into_iter().enumerate() {
+        for (index, (_, _, path)) in paths.into_iter().enumerate() {
             let status_index = index;
             let (command_tx, command_rx) = mpsc::channel();
             commands.push(command_tx);
@@ -375,16 +424,15 @@ impl WireGuardSessionManager {
             let worker_metrics = Arc::clone(&scheduler_metrics);
             let worker_decision = Arc::clone(&decision_mask);
             let worker_iterations = Arc::clone(&path_worker_iterations);
+            let worker_kind = path.kind();
             workers.push(
                 thread::Builder::new()
-                    .name(format!("gamepath-wireguard-{}", index + 1))
+                    .name(format!("gamepath-{worker_kind}-{}", index + 1))
                     .spawn(move || {
-                        run_wireguard_path(
+                        run_path(
                             path,
                             status_index,
                             worker_sequences,
-                            relay_ip,
-                            relay_port,
                             client_id,
                             key,
                             session_id,
@@ -398,7 +446,7 @@ impl WireGuardSessionManager {
                             worker_iterations,
                         )
                     })
-                    .map_err(|error| format!("could not start WireGuard path worker: {error}"))?,
+                    .map_err(|error| format!("could not start path worker: {error}"))?,
             );
         }
         let data_receiver = Arc::new(DataReceiver {
@@ -425,6 +473,7 @@ impl WireGuardSessionManager {
             scheduler_metrics,
             path_worker_iterations,
             bypass_ips,
+            timer,
         });
 
         let deadline = Instant::now() + Duration::from_secs(12);
@@ -450,9 +499,9 @@ impl WireGuardSessionManager {
             .unwrap_or_default();
         self.stop();
         if detail.is_empty() {
-            Err("WireGuard paths did not become ready before timeout".into())
+            Err("relay paths did not become ready before timeout".into())
         } else {
-            Err(format!("WireGuard paths did not become ready: {detail}"))
+            Err(format!("relay paths did not become ready: {detail}"))
         }
     }
 
@@ -611,6 +660,7 @@ impl WireGuardSessionManager {
             "selectedRoutes": selected_routes,
             "schedulerMetrics": scheduler_metrics,
             "pathWorkerIterations": path_worker_iterations,
+            "highResolutionTimer": session.timer.active(),
         })
     }
 
@@ -1011,12 +1061,10 @@ fn ipv4_source_address(packet: &[u8]) -> Option<std::net::Ipv4Addr> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_wireguard_path(
-    mut path: gamepath_engine::userspace_wireguard::UserSpaceWireGuardPath,
+fn run_path(
+    mut path: Box<dyn RelayPath>,
     index: usize,
     sequences: Arc<AtomicU64>,
-    relay_ip: std::net::Ipv4Addr,
-    relay_port: u16,
     client_id: [u8; 16],
     key: [u8; 32],
     session_id: u64,
@@ -1031,26 +1079,17 @@ fn run_wireguard_path(
 ) {
     use gamepath_engine::auth::SessionCrypto;
     use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
-    use gamepath_engine::userspace_wireguard::{ipv4_udp_packet, ipv4_udp_payload};
-    use rand::Rng;
 
     let Ok(crypto) = SessionCrypto::new(&key, session_id) else {
         return;
     };
-    let source_port = rand::rng().random_range(49_152..=65_535);
     let mut next_probe = Instant::now();
     let mut pending_probe = None;
+    let mut published_setup_latency = None;
     while !stop.load(Ordering::Acquire) {
         worker_iterations[index].fetch_add(1, Ordering::Relaxed);
         while let Ok(command) = commands.try_recv() {
-            let result = ipv4_udp_packet(
-                path.address(),
-                relay_ip,
-                source_port,
-                relay_port,
-                &command.frame,
-            )
-            .and_then(|inner| path.send_inner(&inner));
+            let result = path.send_frame(&command.frame);
             record_path_send(&statuses, index, command.frame.len(), result);
         }
         if Instant::now() >= next_probe && pending_probe.is_none() {
@@ -1063,14 +1102,12 @@ fn run_wireguard_path(
                     sequence,
                 };
                 let overlay = crypto.seal_client(header, b"ping")?;
-                let inner =
-                    ipv4_udp_packet(path.address(), relay_ip, source_port, relay_port, &overlay)?;
                 {
                     let mut current = statuses.lock().unwrap();
                     current[index].packets_sent += 1;
                     current[index].probes_sent += 1;
                 }
-                path.send_inner(&inner)
+                path.send_frame(&overlay)
             })();
             match result {
                 Ok(()) => pending_probe = Some(Instant::now()),
@@ -1088,27 +1125,10 @@ fn run_wireguard_path(
                 }
             }
         }
-        match path.receive_inner(Duration::from_millis(1)) {
-            Ok(packets) => {
-                for packet in packets {
-                    let Some((
-                        reply_source_ip,
-                        reply_destination_ip,
-                        reply_source_port,
-                        reply_destination_port,
-                        response_frame,
-                    )) = ipv4_udp_payload(&packet)
-                    else {
-                        continue;
-                    };
-                    if reply_source_ip != relay_ip
-                        || reply_destination_ip != path.address()
-                        || reply_source_port != relay_port
-                        || reply_destination_port != source_port
-                    {
-                        continue;
-                    }
-                    if let Ok((header, plaintext)) = crypto.open_server(response_frame) {
+        match path.receive_frames(Duration::from_millis(1)) {
+            Ok(frames) => {
+                for frame in frames {
+                    if let Ok((header, plaintext)) = crypto.open_server(&frame) {
                         if header.flags & FLAG_CONTROL != 0 && plaintext == b"pong" {
                             if let Some(started) = pending_probe.take() {
                                 let latency = started.elapsed().as_secs_f64() * 1000.0;
@@ -1124,17 +1144,20 @@ fn run_wireguard_path(
                                 next_probe = Instant::now() + Duration::from_millis(500);
                             }
                         } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
-                            record_path_receive(&statuses, index, response_frame.len());
-                            let _ = inbound.send(response_frame.to_vec());
+                            record_path_receive(&statuses, index, frame.len());
+                            let _ = inbound.send(frame);
                         }
                     }
                 }
             }
             Err(error) => update_path_status(&statuses, index, Err(error)),
         }
-        {
-            let mut current = statuses.lock().unwrap();
-            current[index].node_latency_ms = path.handshake_latency_ms();
+        // Setup latency is fixed once a path is up, and this lock is shared by
+        // every path worker, so it is taken only when the value actually moves.
+        let setup_latency = path.setup_latency_ms();
+        if setup_latency != published_setup_latency {
+            statuses.lock().unwrap()[index].node_latency_ms = setup_latency;
+            published_setup_latency = setup_latency;
         }
         if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_millis(1500)) {
             pending_probe = None;
@@ -1146,10 +1169,14 @@ fn run_wireguard_path(
                 index,
                 None,
             );
+            let note = path.health_note();
             update_path_status(
                 &statuses,
                 index,
-                Err("WireGuard path health check timed out".into()),
+                Err(match note {
+                    Some(note) => format!("path health check timed out: {note}"),
+                    None => "path health check timed out".to_owned(),
+                }),
             );
             next_probe = Instant::now() + Duration::from_millis(500);
         }
@@ -1456,6 +1483,69 @@ fn probe_relay(payload: Value) -> Result<Value, String> {
     }))
 }
 
+/// Proves a SOCKS5 proxy can carry GamePath traffic before it is saved as a
+/// node. Accepting UDP ASSOCIATE is not enough on its own: some proxies accept
+/// the association and then never forward a datagram, so this waits for an
+/// authenticated reply that only the relay can produce.
+fn probe_socks5_node(payload: Value) -> Result<Value, String> {
+    use gamepath_engine::auth::SessionCrypto;
+    use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
+
+    let input: Socks5ProbeRequest = serde_json::from_value(payload)
+        .map_err(|error| format!("invalid SOCKS5 probe: {error}"))?;
+    let enrollment = EnrollmentToken::decode(&input.enrollment_token)?;
+    let (client_id, key) = enrollment.material()?;
+    let relay_ip = resolve_ipv4(&input.relay_host, input.relay_port)?;
+    let relay = SocketAddrV4::new(relay_ip, input.relay_port);
+    let config = Socks5NodeConfig {
+        host: input.host,
+        port: input.port,
+        username: input.username,
+        password: input.password,
+    };
+    let mut path = Socks5RelayPath::open(&config, relay)?;
+    let session_id = rand::random::<u64>();
+    let crypto = SessionCrypto::new(&key, session_id)?;
+    let header = FrameHeader {
+        flags: FLAG_CONTROL,
+        client_id,
+        session_id,
+        sequence: 1,
+    };
+    let frame = crypto.seal_client(header, b"ping")?;
+    let started = Instant::now();
+    path.send_frame(&frame)?;
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        let frames = path.receive_frames(Duration::from_millis(200))?;
+        for response in frames {
+            let Ok((reply, plaintext)) = crypto.open_server(&response) else {
+                continue;
+            };
+            if reply.client_id != client_id
+                || reply.session_id != session_id
+                || reply.flags & (FLAG_CONTROL | FLAG_SERVER_TO_CLIENT)
+                    != (FLAG_CONTROL | FLAG_SERVER_TO_CLIENT)
+                || plaintext != b"pong"
+            {
+                continue;
+            }
+            return Ok(json!({
+                "reachable": true,
+                "udpAssociate": true,
+                "proxy": path.endpoint(),
+                "setupLatencyMs": path.setup_latency_ms(),
+                "latencyMs": started.elapsed().as_secs_f64() * 1000.0,
+            }));
+        }
+    }
+    Err(
+        "the proxy accepted UDP ASSOCIATE but did not relay a datagram to the relay; \
+         it cannot be used as a GamePath node"
+            .into(),
+    )
+}
+
 fn inspect_system() -> Value {
     let wireguard_exe = r"C:\Program Files\WireGuard\wireguard.exe";
     let wg_exe = r"C:\Program Files\WireGuard\wg.exe";
@@ -1533,6 +1623,55 @@ fn scheduler_demo() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session_request(payload: Value) -> SessionRequest {
+        serde_json::from_value(payload).unwrap()
+    }
+
+    #[test]
+    fn a_tagged_node_list_keeps_its_order_and_kinds() {
+        let request = session_request(json!({
+            "relayHost": "relay.example",
+            "relayPort": 51821,
+            "enrollmentToken": "gpe1_token",
+            "nodes": [
+                { "kind": "wireguard", "config": "[Interface]", "label": "Provider A" },
+                { "kind": "socks5", "host": "127.0.0.1", "port": 2080, "label": "Local proxy" },
+                { "kind": "socks5", "host": "proxy.example", "port": 1080,
+                  "username": "player", "password": "secret" },
+            ],
+        }));
+        let nodes = request.resolved_nodes();
+        assert_eq!(nodes.len(), 3);
+        assert!(matches!(nodes[0], NodeSpec::WireGuard { .. }));
+        assert_eq!(nodes[0].label().as_deref(), Some("Provider A"));
+        assert_eq!(nodes[1].label().as_deref(), Some("Local proxy"));
+        assert_eq!(nodes[1].describe(), "SOCKS5 proxy 127.0.0.1:2080");
+        assert_eq!(nodes[2].label(), None);
+        assert_eq!(nodes[2].default_label(3), "SOCKS5 route 3");
+        assert!(matches!(
+            &nodes[2],
+            NodeSpec::Socks5 { username, password, .. }
+                if username.as_deref() == Some("player") && password.as_deref() == Some("secret")
+        ));
+    }
+
+    #[test]
+    fn a_wireguard_only_request_still_works_without_the_node_list() {
+        let request = session_request(json!({
+            "relayHost": "relay.example",
+            "relayPort": 51821,
+            "enrollmentToken": "gpe1_token",
+            "wireguardConfigs": ["[Interface] one", "[Interface] two"],
+            "routeLabels": ["Falcon", "  "],
+        }));
+        let nodes = request.resolved_nodes();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].label().as_deref(), Some("Falcon"));
+        // A blank label falls back to the generated route name.
+        assert_eq!(nodes[1].label(), None);
+        assert_eq!(nodes[1].default_label(2), "WireGuard route 2");
+    }
 
     #[test]
     fn prepare_rejects_no_routes() {

@@ -4,6 +4,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { parseWireGuardConfig } = require('./wireguard.cjs')
+const { parseSocks5Node } = require('./socks5.cjs')
 const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
 const { provisionRelay, removeRelay } = require('./vps.cjs')
@@ -63,6 +64,8 @@ function loadState() {
     const loaded = JSON.parse(fs.readFileSync(statePath(), 'utf8'))
     state = { ...defaultState(), ...loaded, session: { status: 'idle' } }
     state.encryptedRelayTokens ??= {}
+    // Nodes imported before SOCKS5 support existed are all WireGuard routes.
+    state.tunnels = state.tunnels.map((tunnel) => ({ kind: 'wireguard', ...tunnel }))
     state.relays = state.relays.map((relay) => {
       const hasEnrollmentToken = Boolean(state.encryptedRelayTokens[relay.id])
       const normalized = { port: 51821, ...relay, hasEnrollmentToken }
@@ -91,17 +94,17 @@ function encryptConfig(source) {
 
 function updateSessionMetrics(runtime, dataPlane) {
   const paths = runtime.paths ?? []
-  const wireGuard = paths
-    .filter((path) => path.pathKind === 'wireguard' && path.reachable)
+  const fastest = paths
+    .filter((path) => path.reachable)
     .sort((left, right) => (left.latencyMs ?? Infinity) - (right.latencyMs ?? Infinity))[0]
   const sent = paths.reduce((total, path) => total + path.packetsSent, 0)
   const received = paths.reduce((total, path) => total + path.packetsReceived, 0)
   const probesReceived = paths.reduce((total, path) => total + (path.probesReceived ?? 0), 0)
   const probesLost = paths.reduce((total, path) => total + (path.probesLost ?? 0), 0)
   const completedProbes = probesReceived + probesLost
-  const userToNode = wireGuard?.nodeLatencyMs ?? null
+  const userToNode = fastest?.nodeLatencyMs ?? null
   const nodeToRelay =
-    userToNode != null && wireGuard?.latencyMs != null ? Math.max(0, wireGuard.latencyMs - userToNode) : null
+    userToNode != null && fastest?.latencyMs != null ? Math.max(0, fastest.latencyMs - userToNode) : null
   state.session.pathMetrics = paths
   state.session.selectedRoutes = runtime.selectedRoutes ?? []
   state.session.strategy = runtime.strategy ?? 'adaptive'
@@ -123,8 +126,77 @@ function updateSessionMetrics(runtime, dataPlane) {
   }
 }
 
+/**
+ * Decrypts each enabled node into the tagged list the engine expects. Secrets
+ * live in Windows secure storage until this moment and never reach the
+ * renderer: a WireGuard node yields its configuration body, a SOCKS5 node its
+ * stored credentials.
+ */
+function sessionNodes(enabledTunnels) {
+  return enabledTunnels.map((tunnel) => {
+    const stored = state.encryptedConfigs[tunnel.id]
+    if (!stored) {
+      throw new Error(`${tunnel.name} is missing its stored secret. Remove the node and add it again.`)
+    }
+    const secret = safeStorage.decryptString(Buffer.from(stored, 'base64'))
+    if (tunnel.kind === 'socks5') {
+      const { username, password } = JSON.parse(secret)
+      return {
+        kind: 'socks5',
+        host: tunnel.host,
+        port: tunnel.port,
+        username: username || null,
+        password: password || null,
+        label: tunnel.name,
+      }
+    }
+    return { kind: 'wireguard', config: secret, label: tunnel.name }
+  })
+}
+
+function activeRelayWithToken() {
+  const relay = state.relays.find((item) => item.id === state.activeRelayId)
+  const encryptedToken = relay && state.encryptedRelayTokens[relay.id]
+  if (!relay?.address || !encryptedToken) {
+    throw new Error('Configure the relay address and enrollment token first')
+  }
+  return { relay, enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedToken, 'base64')) }
+}
+
 function registerIpc() {
   ipcMain.handle('app:bootstrap', () => publicState())
+
+  ipcMain.handle('node:add-socks5', (_event, input) => {
+    const { node, credentials } = parseSocks5Node(input ?? {}, crypto.randomUUID())
+    if (state.tunnels.some((item) => item.kind === 'socks5' && item.endpoint === node.endpoint)) {
+      throw new Error(`${node.endpoint} is already added. Two associations on one proxy carry no extra path.`)
+    }
+    state.tunnels.push(node)
+    state.encryptedConfigs[node.id] = encryptConfig(JSON.stringify(credentials))
+    saveState()
+    return { state: publicState(), nodeId: node.id }
+  })
+
+  // Accepting UDP ASSOCIATE is not proof a proxy can carry GamePath traffic,
+  // so this asks the relay for an authenticated reply through the proxy.
+  ipcMain.handle('node:test-socks5', async (_event, input) => {
+    if (engineBridge?.status.status !== 'ready') throw new Error('The native routing engine is unavailable')
+    const { relay, enrollmentToken } = activeRelayWithToken()
+    const { node, credentials } = parseSocks5Node(input ?? {}, 'probe')
+    return engineBridge.request(
+      'probe-socks5-node',
+      {
+        relayHost: relay.address,
+        relayPort: relay.port,
+        enrollmentToken,
+        host: node.host,
+        port: node.port,
+        username: credentials.username || null,
+        password: credentials.password || null,
+      },
+      20000,
+    )
+  })
 
   ipcMain.handle('tunnel:import', async () => {
     const result = await dialog.showOpenDialog({
@@ -394,7 +466,7 @@ function registerIpc() {
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     const encryptedRelayToken = relay && state.encryptedRelayTokens[relay.id]
     if (enabledTunnels.length < 1) {
-      state.session = { status: 'error', message: 'Enable at least one WireGuard route.' }
+      state.session = { status: 'error', message: 'Enable at least one WireGuard or SOCKS5 node.' }
     } else if (state.trafficMode === 'split' && !enabledRules.length) {
       state.session = { status: 'error', message: 'Add at least one split-tunnel target.' }
     } else if (!relay || relay.status !== 'ready' || !encryptedRelayToken) {
@@ -406,9 +478,7 @@ function registerIpc() {
     } else {
       try {
         const enrollmentToken = safeStorage.decryptString(Buffer.from(encryptedRelayToken, 'base64'))
-        const wireguardConfigs = enabledTunnels.map((tunnel) =>
-          safeStorage.decryptString(Buffer.from(state.encryptedConfigs[tunnel.id], 'base64')),
-        )
+        const nodes = sessionNodes(enabledTunnels)
         const plan = await engineBridge.request('prepare-session', {
           routeIds: enabledTunnels.map((tunnel) => tunnel.id),
           trafficMode: state.trafficMode,
@@ -423,7 +493,7 @@ function registerIpc() {
         const runtime = await serviceBridge.request('validate-runtime', {
           relayIp,
           trafficMode: state.trafficMode,
-          wireguardConfigs,
+          nodes,
         })
         const serviceSession = await serviceBridge.request(
           'start-session',
@@ -431,8 +501,7 @@ function registerIpc() {
             relayHost: relay.address,
             relayPort: relay.port,
             enrollmentToken,
-            wireguardConfigs,
-            routeLabels: enabledTunnels.map((tunnel) => tunnel.name),
+            nodes,
             trafficMode: state.trafficMode,
             rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
           },
@@ -441,7 +510,7 @@ function registerIpc() {
         const paths = serviceSession.paths
         const dataPlane = serviceSession.dataPlane
         const standbyNote = paths.skippedRoutes.length
-          ? ` ${paths.skippedRoutes.length} overlapping config${paths.skippedRoutes.length === 1 ? ' is' : 's are'} held as standby.`
+          ? ` ${paths.skippedRoutes.length} overlapping node${paths.skippedRoutes.length === 1 ? ' is' : 's are'} held as standby.`
           : ''
         state.session = {
           status: 'connected',

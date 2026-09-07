@@ -1266,6 +1266,11 @@ main {
   align-items: center;
   gap: 10px;
 }
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
 .count-badge {
   padding: 5px 8px;
   border-radius: 7px;
@@ -1385,6 +1390,16 @@ main {
 }
 .status-pill.online i {
   background: var(--green);
+}
+.kind-pill {
+  padding: 3px 6px;
+  border-radius: 5px;
+  color: var(--cyan);
+  background: var(--cyan-soft);
+  font-size: 7px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 .route-meta {
   display: flex;
@@ -1544,6 +1559,11 @@ main {
   color: #6f7a8c;
   font-size: 10px;
   line-height: 1.55;
+}
+.empty-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
 }
 
 .rules-table {

@@ -25,6 +25,7 @@ import {
   Route,
   Server,
   Settings,
+  Share2,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -32,7 +33,17 @@ import {
   Zap,
 } from 'lucide-react'
 import { mockApi } from './mockApi'
-import type { AddRuleInput, AppState, GamePathApi, PathMetric, Relay, RuleKind, Tunnel } from './types'
+import type {
+  AddRuleInput,
+  AppState,
+  GamePathApi,
+  PathMetric,
+  Relay,
+  RuleKind,
+  Socks5NodeInput,
+  Socks5ProbeResult,
+  Tunnel,
+} from './types'
 
 type View = 'dashboard' | 'routes' | 'split' | 'relays' | 'settings'
 
@@ -40,7 +51,7 @@ const api: GamePathApi = window.gamepath ?? mockApi
 
 const navItems: { id: View; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'dashboard', label: 'Overview', icon: LayoutDashboard },
-  { id: 'routes', label: 'WireGuard routes', icon: Route },
+  { id: 'routes', label: 'Routes and nodes', icon: Route },
   { id: 'split', label: 'Split tunnel', icon: Network },
   { id: 'relays', label: 'Relay servers', icon: Server },
 ]
@@ -67,29 +78,45 @@ function Endpoint({
   onToggle: (enabled: boolean) => void
   onRemove: () => void
 }) {
+  const isProxy = tunnel.kind === 'socks5'
   return (
     <article className={`route-card ${tunnel.enabled ? 'is-enabled' : ''}`}>
-      <div className="route-state-icon">
-        <Radio size={18} />
-      </div>
+      <div className="route-state-icon">{isProxy ? <Share2 size={18} /> : <Radio size={18} />}</div>
       <div className="route-copy">
         <div className="route-title-row">
           <h3>{tunnel.name}</h3>
+          <span className="kind-pill">{isProxy ? 'SOCKS5' : 'WireGuard'}</span>
           <span className={`status-pill ${tunnel.enabled ? 'online' : ''}`}>
             <i /> {tunnel.enabled ? 'Enabled' : 'Disabled'}
           </span>
         </div>
         <p>{tunnel.endpoint}</p>
         <div className="route-meta">
-          <span>
-            Address <strong>{tunnel.address}</strong>
-          </span>
-          <span>
-            DNS <strong>{tunnel.dns}</strong>
-          </span>
-          <span>
-            <ShieldCheck size={13} /> Key protected
-          </span>
+          {isProxy ? (
+            <>
+              <span>
+                Transport <strong>UDP associate</strong>
+              </span>
+              <span>
+                Auth <strong>{tunnel.hasCredentials ? 'Username and password' : 'None'}</strong>
+              </span>
+              <span title="Frames are encrypted by GamePath, but the proxy hop itself is not">
+                <Info size={13} /> No outer encryption
+              </span>
+            </>
+          ) : (
+            <>
+              <span>
+                Address <strong>{tunnel.address}</strong>
+              </span>
+              <span>
+                DNS <strong>{tunnel.dns}</strong>
+              </span>
+              <span>
+                <ShieldCheck size={13} /> Key protected
+              </span>
+            </>
+          )}
         </div>
       </div>
       <div className="route-actions">
@@ -726,6 +753,144 @@ function RelayModal({
   )
 }
 
+function Socks5Modal({
+  onClose,
+  onAdd,
+  onTest,
+}: {
+  onClose: () => void
+  onAdd: (input: Socks5NodeInput) => Promise<void>
+  onTest: (input: Socks5NodeInput) => Promise<Socks5ProbeResult>
+}) {
+  const [address, setAddress] = useState('')
+  const [label, setLabel] = useState('')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState<'idle' | 'testing' | 'saving'>('idle')
+  const [result, setResult] = useState<string | null>(null)
+  const [failure, setFailure] = useState<string | null>(null)
+
+  const input = (): Socks5NodeInput => ({
+    address: address.trim(),
+    label: label.trim() || undefined,
+    username: username.trim() || undefined,
+    password: password || undefined,
+  })
+
+  const runTest = async () => {
+    setBusy('testing')
+    setResult(null)
+    setFailure(null)
+    try {
+      const probe = await onTest(input())
+      setResult(
+        `UDP works through ${probe.proxy}: relay answered in ${Math.round(probe.latencyMs)} ms ` +
+          `(${Math.round(probe.setupLatencyMs)} ms to open the association).`,
+      )
+    } catch (error) {
+      setFailure((error as Error).message)
+    } finally {
+      setBusy('idle')
+    }
+  }
+
+  const save = async () => {
+    setBusy('saving')
+    setFailure(null)
+    try {
+      await onAdd(input())
+    } catch (error) {
+      setFailure((error as Error).message)
+      setBusy('idle')
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section
+        className="modal relay-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Add a SOCKS5 node"
+      >
+        <div className="modal-head">
+          <div>
+            <span className="eyebrow">SOCKS5 proxy</span>
+            <h2>Add a proxy node</h2>
+          </div>
+          <button className="icon-button" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <p className="modal-intro">
+          GamePath carries game traffic as UDP, so the proxy has to support <strong>UDP ASSOCIATE</strong>. Test the
+          node before saving: some proxies accept the association and then never forward a datagram.
+        </p>
+        <label className="field-label">
+          Proxy address
+          <input
+            autoFocus
+            value={address}
+            onChange={(event) => setAddress(event.target.value)}
+            placeholder="127.0.0.1:2080 or socks5://user:password@proxy.example:1080"
+          />
+        </label>
+        <label className="field-label">
+          Name (optional)
+          <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Local proxy" />
+        </label>
+        <div className="relay-fields">
+          <label className="field-label">
+            Username (optional)
+            <input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="Leave blank" />
+          </label>
+          <label className="field-label">
+            Password (optional)
+            <input
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              placeholder="Leave blank"
+            />
+          </label>
+        </div>
+        {result && (
+          <div className="info-banner">
+            <Check size={18} />
+            <div>
+              <strong>This proxy can carry GamePath traffic</strong>
+              <p>{result}</p>
+            </div>
+          </div>
+        )}
+        {failure && (
+          <div className="info-banner">
+            <Info size={18} />
+            <div>
+              <strong>This proxy cannot be used yet</strong>
+              <p>{failure}</p>
+            </div>
+          </div>
+        )}
+        <div className="modal-actions">
+          <button className="button secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="button secondary" disabled={!address.trim() || busy !== 'idle'} onClick={runTest}>
+            <Zap size={16} />
+            {busy === 'testing' ? 'Testing…' : 'Test UDP'}
+          </button>
+          <button className="button primary" disabled={!address.trim() || busy !== 'idle'} onClick={save}>
+            <Check size={16} />
+            {busy === 'saving' ? 'Saving…' : 'Add node'}
+          </button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 function AddRelayModal({
   onClose,
   onAdd,
@@ -1014,6 +1179,7 @@ function App() {
   const [showRuleModal, setShowRuleModal] = useState(false)
   const [showRelayModal, setShowRelayModal] = useState(false)
   const [showAddRelay, setShowAddRelay] = useState(false)
+  const [showSocks5Modal, setShowSocks5Modal] = useState(false)
   const [vpsTarget, setVpsTarget] = useState<{ id: string; action: 'provision' | 'remove' } | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [installingService, setInstallingService] = useState(false)
@@ -1121,7 +1287,7 @@ function App() {
     {
       done: readiness.routes,
       title: 'Add a WireGuard route',
-      detail: `${state.tunnels.length} configuration${state.tunnels.length === 1 ? '' : 's'} imported; the relay is reached only through enabled VPN routes`,
+      detail: `${state.tunnels.length} node${state.tunnels.length === 1 ? '' : 's'} added; the relay is reached only through enabled nodes`,
       action: 'Configure',
       onClick: () => setView('routes'),
     },
@@ -1150,6 +1316,12 @@ function App() {
     if (result.errors?.length) setNotice(result.errors.join('\n'))
   }
 
+  const addSocks5Node = async (input: Socks5NodeInput) => {
+    const result = await api.addSocks5Node(input)
+    setState(result.state)
+    setShowSocks5Modal(false)
+  }
+
   const toggleSession = async () => {
     if (state.session.status !== 'connected') {
       setState({ ...state, session: { status: 'starting' } })
@@ -1161,7 +1333,7 @@ function App() {
 
   const title: Record<View, [string, string]> = {
     dashboard: ['Overview', 'Session control and live route telemetry.'],
-    routes: ['WireGuard routes', 'Import and choose the VPN paths GamePath can use.'],
+    routes: ['Routes and nodes', 'Import WireGuard configurations and add SOCKS5 proxies GamePath can use.'],
     split: ['Split tunnel', 'Choose exactly which traffic should enter the multipath tunnel.'],
     relays: ['Relay servers', 'Select the destination that combines your active routes.'],
     settings: ['Settings', 'Control startup, diagnostics, and client behavior.'],
@@ -1323,14 +1495,20 @@ function App() {
                 <div>
                   <span className="count-badge">{enabledRoutes} active</span>
                   <span className="muted">
-                    Each active route carries relay traffic inside its WireGuard VPN. Direct ISP relay access is
-                    disabled.
+                    Each active node carries relay traffic through its own hop, a WireGuard tunnel or a SOCKS5 proxy.
+                    Direct ISP relay access is disabled.
                   </span>
                 </div>
-                <button className="button primary" onClick={importTunnels}>
-                  <Import size={16} />
-                  Import .conf
-                </button>
+                <div className="toolbar-actions">
+                  <button className="button secondary" onClick={() => setShowSocks5Modal(true)}>
+                    <Share2 size={16} />
+                    Add SOCKS5
+                  </button>
+                  <button className="button primary" onClick={importTunnels}>
+                    <Import size={16} />
+                    Import .conf
+                  </button>
+                </div>
               </div>
               {state.tunnels.length ? (
                 <div className="route-list">
@@ -1348,15 +1526,21 @@ function App() {
                   <span>
                     <HardDrive size={28} />
                   </span>
-                  <h2>No WireGuard routes yet</h2>
+                  <h2>No nodes yet</h2>
                   <p>
-                    Import your purchased VPN configuration files. Private keys are encrypted using Windows secure
-                    storage.
+                    Import your purchased WireGuard configuration files, or add a SOCKS5 proxy that supports UDP.
+                    Private keys and proxy passwords are encrypted using Windows secure storage.
                   </p>
-                  <button className="button primary" onClick={importTunnels}>
-                    <Import size={16} />
-                    Import configurations
-                  </button>
+                  <div className="empty-actions">
+                    <button className="button primary" onClick={importTunnels}>
+                      <Import size={16} />
+                      Import configurations
+                    </button>
+                    <button className="button secondary" onClick={() => setShowSocks5Modal(true)}>
+                      <Share2 size={16} />
+                      Add a SOCKS5 proxy
+                    </button>
+                  </div>
                 </div>
               )}
               <div className="info-banner">
@@ -1736,6 +1920,13 @@ function App() {
             setState(await api.addRule(input))
             setShowRuleModal(false)
           }}
+        />
+      )}
+      {showSocks5Modal && (
+        <Socks5Modal
+          onClose={() => setShowSocks5Modal(false)}
+          onAdd={addSocks5Node}
+          onTest={(input) => api.testSocks5Node(input)}
         />
       )}
       {showRelayModal && relay && (
