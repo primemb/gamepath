@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use gamepath_engine::adapter::inspect_library;
-use gamepath_engine::auth::EnrollmentToken;
+use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
 use gamepath_engine::wfp::inspect_backend;
@@ -99,23 +99,24 @@ struct ActiveWireGuardSession {
     commands: Vec<mpsc::Sender<PathCommand>>,
     data_receiver: Arc<DataReceiver>,
     client_id: [u8; 16],
-    key: [u8; 32],
+    crypto: Arc<SessionCrypto>,
     virtual_ipv4: std::net::Ipv4Addr,
     sequences: Arc<AtomicU64>,
+    decision_mask: Arc<AtomicU64>,
+    scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     bypass_ips: Vec<std::net::Ipv4Addr>,
 }
 
 pub(crate) struct DataReceiver {
     inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
     client_id: [u8; 16],
-    key: [u8; 32],
     session_id: u64,
+    crypto: Arc<SessionCrypto>,
     server_replay: Mutex<SequenceWindow>,
 }
 
 impl DataReceiver {
     pub(crate) fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
-        use gamepath_engine::auth::SessionCrypto;
         use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT};
 
         let response = match self.inbound.lock().unwrap().recv_timeout(timeout) {
@@ -125,8 +126,7 @@ impl DataReceiver {
                 return Err("all path receivers stopped".into());
             }
         };
-        let crypto = SessionCrypto::new(&self.key, self.session_id)?;
-        let (header, plaintext) = crypto.open_server(&response)?;
+        let (header, plaintext) = self.crypto.open_server(&response)?;
         if header.client_id != self.client_id
             || header.session_id != self.session_id
             || header.flags & FLAG_SERVER_TO_CLIENT == 0
@@ -313,6 +313,7 @@ impl WireGuardSessionManager {
 
         self.stop();
         let session_id = rand::random::<u64>();
+        let crypto = Arc::new(SessionCrypto::new(&key, session_id)?);
         let relay_port = input.relay_port;
         let stop = Arc::new(AtomicBool::new(false));
         let sequences = Arc::new(AtomicU64::new(1));
@@ -343,6 +344,17 @@ impl WireGuardSessionManager {
             .collect::<Vec<_>>();
         let statuses = Arc::new(Mutex::new(initial_statuses));
         let route_count = paths.len();
+        let scheduler_metrics = Arc::new(Mutex::new(
+            (0..route_count)
+                .map(|index| PathMetrics::new(index.to_string()))
+                .collect::<Vec<_>>(),
+        ));
+        let initial_mask = if route_count >= 64 {
+            u64::MAX
+        } else {
+            (1_u64 << route_count) - 1
+        };
+        let decision_mask = Arc::new(AtomicU64::new(initial_mask));
         let mut workers = Vec::with_capacity(route_count);
         let mut commands = Vec::with_capacity(route_count);
         let (inbound_tx, inbound_rx) = mpsc::channel();
@@ -354,6 +366,8 @@ impl WireGuardSessionManager {
             let worker_statuses = Arc::clone(&statuses);
             let worker_sequences = Arc::clone(&sequences);
             let worker_inbound = inbound_tx.clone();
+            let worker_metrics = Arc::clone(&scheduler_metrics);
+            let worker_decision = Arc::clone(&decision_mask);
             workers.push(
                 thread::Builder::new()
                     .name(format!("gamepath-wireguard-{}", index + 1))
@@ -371,6 +385,8 @@ impl WireGuardSessionManager {
                             worker_statuses,
                             command_rx,
                             worker_inbound,
+                            worker_metrics,
+                            worker_decision,
                         )
                     })
                     .map_err(|error| format!("could not start WireGuard path worker: {error}"))?,
@@ -379,8 +395,8 @@ impl WireGuardSessionManager {
         let data_receiver = Arc::new(DataReceiver {
             inbound: Mutex::new(inbound_rx),
             client_id,
-            key,
             session_id,
+            crypto: Arc::clone(&crypto),
             server_replay: Mutex::new(SequenceWindow::default()),
         });
         self.active = Some(ActiveWireGuardSession {
@@ -393,9 +409,11 @@ impl WireGuardSessionManager {
             commands,
             data_receiver,
             client_id,
-            key,
+            crypto,
             virtual_ipv4: enrollment.virtual_ipv4,
             sequences,
+            decision_mask,
+            scheduler_metrics,
             bypass_ips,
         });
 
@@ -479,7 +497,6 @@ impl WireGuardSessionManager {
     }
 
     fn enqueue_data_packet(&mut self, packet: &[u8]) -> Result<(), String> {
-        use gamepath_engine::auth::SessionCrypto;
         use gamepath_engine::protocol::FrameHeader;
 
         let session = self
@@ -502,10 +519,14 @@ impl WireGuardSessionManager {
             session_id: session.session_id,
             sequence,
         };
-        let crypto = SessionCrypto::new(&session.key, session.session_id)?;
-        let frame = crypto.seal_client(header, packet)?;
+        let frame = session.crypto.seal_client(header, packet)?;
         let mut dispatched = 0;
-        for sender in &session.commands {
+        let decision = session.decision_mask.load(Ordering::Acquire);
+        for (index, sender) in session.commands.iter().enumerate() {
+            let bit = 1_u64.checked_shl(index as u32).unwrap_or(0);
+            if decision & bit == 0 {
+                continue;
+            }
             if sender
                 .send(PathCommand {
                     frame: frame.clone(),
@@ -561,6 +582,14 @@ impl WireGuardSessionManager {
             return json!({ "state": "idle", "paths": [] });
         };
         let paths = session.paths.lock().unwrap().clone();
+        let decision = session.decision_mask.load(Ordering::Acquire);
+        let selected_routes = paths
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| decision & 1_u64.checked_shl(*index as u32).unwrap_or(0) != 0)
+            .map(|(_, path)| path.route)
+            .collect::<Vec<_>>();
+        let scheduler_metrics = session.scheduler_metrics.lock().unwrap().clone();
         let state = if paths.iter().any(|path| path.reachable) {
             "connected"
         } else {
@@ -572,6 +601,9 @@ impl WireGuardSessionManager {
             "startedAt": session.started_at,
             "paths": paths,
             "skippedRoutes": session.skipped_routes,
+            "strategy": "adaptive",
+            "selectedRoutes": selected_routes,
+            "schedulerMetrics": scheduler_metrics,
         })
     }
 
@@ -598,7 +630,7 @@ impl Drop for WireGuardSessionManager {
 struct WindowsPacketCapture {
     stop: Arc<AtomicBool>,
     session: Arc<wintun::Session>,
-    worker: Option<JoinHandle<()>>,
+    workers: Vec<JoinHandle<()>>,
     routes: Vec<InstalledRoute>,
     adapter_index: u32,
 }
@@ -704,25 +736,23 @@ impl PacketCaptureManager {
                 .map_err(|error| format!("could not start Wintun packet ring: {error}"))?,
         );
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let worker_session = Arc::clone(&session);
-        let worker = thread::Builder::new()
-            .name("gamepath-wintun".into())
-            .spawn(move || {
-                run_wintun_pump(
-                    worker_session,
-                    sessions,
-                    data_receiver,
-                    virtual_ipv4,
-                    worker_stop,
-                )
-            })
-            .map_err(|error| format!("could not start Wintun packet pump: {error}"))?;
+        let uplink_stop = Arc::clone(&stop);
+        let uplink_session = Arc::clone(&session);
+        let uplink = thread::Builder::new()
+            .name("gamepath-wintun-uplink".into())
+            .spawn(move || run_wintun_uplink(uplink_session, sessions, virtual_ipv4, uplink_stop))
+            .map_err(|error| format!("could not start Wintun uplink: {error}"))?;
+        let downlink_stop = Arc::clone(&stop);
+        let downlink_session = Arc::clone(&session);
+        let downlink = thread::Builder::new()
+            .name("gamepath-wintun-downlink".into())
+            .spawn(move || run_wintun_downlink(downlink_session, data_receiver, downlink_stop))
+            .map_err(|error| format!("could not start Wintun downlink: {error}"))?;
 
         let mut capture = WindowsPacketCapture {
             stop,
             session,
-            worker: Some(worker),
+            workers: vec![uplink, downlink],
             routes: Vec::new(),
             adapter_index,
         };
@@ -813,7 +843,7 @@ impl Drop for WindowsPacketCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let _ = self.session.shutdown();
-        if let Some(worker) = self.worker.take() {
+        for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
         for route in self.routes.iter().rev() {
@@ -823,41 +853,44 @@ impl Drop for WindowsPacketCapture {
 }
 
 #[cfg(windows)]
-fn run_wintun_pump(
+fn run_wintun_uplink(
     session: Arc<wintun::Session>,
     sessions: Arc<Mutex<WireGuardSessionManager>>,
-    data_receiver: Arc<DataReceiver>,
     virtual_ipv4: std::net::Ipv4Addr,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Acquire) {
-        for _ in 0..128 {
-            let packet = match session.try_receive() {
-                Ok(Some(packet)) => packet,
-                Ok(None) => break,
-                Err(_) => return,
-            };
-            let bytes = packet.bytes().to_vec();
-            drop(packet);
-            if ipv4_source_address(&bytes) == Some(virtual_ipv4) {
-                let _ = sessions.lock().unwrap().enqueue_data_packet(&bytes);
-            }
+        let packet = match session.receive_blocking() {
+            Ok(packet) => packet,
+            Err(_) => return,
+        };
+        let bytes = packet.bytes().to_vec();
+        drop(packet);
+        if ipv4_source_address(&bytes) == Some(virtual_ipv4) {
+            let _ = sessions.lock().unwrap().enqueue_data_packet(&bytes);
         }
-        for _ in 0..128 {
-            let reply = match data_receiver.receive(Duration::ZERO) {
-                Ok(Some(packet)) => packet,
-                Ok(None) => break,
-                Err(_) => return,
-            };
-            if reply.len() > u16::MAX as usize {
-                continue;
-            }
-            if let Ok(mut packet) = session.allocate_send_packet(reply.len() as u16) {
-                packet.bytes_mut().copy_from_slice(&reply);
-                session.send_packet(packet);
-            }
+    }
+}
+
+#[cfg(windows)]
+fn run_wintun_downlink(
+    session: Arc<wintun::Session>,
+    data_receiver: Arc<DataReceiver>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::Acquire) {
+        let reply = match data_receiver.receive(Duration::from_millis(250)) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => continue,
+            Err(_) => return,
+        };
+        if reply.len() > u16::MAX as usize {
+            continue;
         }
-        thread::sleep(Duration::from_millis(1));
+        if let Ok(mut packet) = session.allocate_send_packet(reply.len() as u16) {
+            packet.bytes_mut().copy_from_slice(&reply);
+            session.send_packet(packet);
+        }
     }
 }
 
@@ -984,6 +1017,8 @@ fn run_wireguard_path(
     statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
     commands: mpsc::Receiver<PathCommand>,
     inbound: mpsc::Sender<Vec<u8>>,
+    scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
+    decision_mask: Arc<AtomicU64>,
 ) {
     use gamepath_engine::auth::SessionCrypto;
     use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
@@ -1031,8 +1066,9 @@ fn run_wireguard_path(
                 Ok(()) => pending_probe = Some(Instant::now()),
                 Err(error) => {
                     statuses.lock().unwrap()[index].probes_lost += 1;
+                    update_scheduler_probe(&scheduler_metrics, &decision_mask, index, None);
                     update_path_status(&statuses, index, Err(error));
-                    next_probe = Instant::now() + Duration::from_secs(1);
+                    next_probe = Instant::now() + Duration::from_millis(500);
                 }
             }
         }
@@ -1059,13 +1095,16 @@ fn run_wireguard_path(
                     if let Ok((header, plaintext)) = crypto.open_server(response_frame) {
                         if header.flags & FLAG_CONTROL != 0 && plaintext == b"pong" {
                             if let Some(started) = pending_probe.take() {
+                                let latency = started.elapsed().as_secs_f64() * 1000.0;
                                 statuses.lock().unwrap()[index].probes_received += 1;
-                                update_path_status(
-                                    &statuses,
+                                update_path_status(&statuses, index, Ok(latency));
+                                update_scheduler_probe(
+                                    &scheduler_metrics,
+                                    &decision_mask,
                                     index,
-                                    Ok(started.elapsed().as_secs_f64() * 1000.0),
+                                    Some(latency),
                                 );
-                                next_probe = Instant::now() + Duration::from_secs(10);
+                                next_probe = Instant::now() + Duration::from_millis(500);
                             }
                         } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
                             record_path_receive(&statuses, index, response_frame.len());
@@ -1080,17 +1119,57 @@ fn run_wireguard_path(
             let mut current = statuses.lock().unwrap();
             current[index].node_latency_ms = path.handshake_latency_ms();
         }
-        if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_secs(8)) {
+        if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_millis(1500)) {
             pending_probe = None;
             statuses.lock().unwrap()[index].probes_lost += 1;
+            update_scheduler_probe(&scheduler_metrics, &decision_mask, index, None);
             update_path_status(
                 &statuses,
                 index,
                 Err("WireGuard path health check timed out".into()),
             );
-            next_probe = Instant::now() + Duration::from_secs(1);
+            next_probe = Instant::now() + Duration::from_millis(500);
         }
     }
+}
+
+fn update_scheduler_probe(
+    metrics: &Mutex<Vec<PathMetrics>>,
+    decision_mask: &AtomicU64,
+    index: usize,
+    latency_ms: Option<f64>,
+) {
+    let mut metrics = metrics.lock().unwrap();
+    let Some(path) = metrics.get_mut(index) else {
+        return;
+    };
+    match latency_ms {
+        Some(latency) => path.record_probe(latency),
+        None => {
+            path.record_loss();
+            // A probe timeout is a hard reachability failure, so do not keep
+            // duplicating game traffic onto this path. record_probe restores
+            // the path automatically as soon as it answers again.
+            path.active = false;
+        }
+    }
+    let decision = choose_paths(&metrics, Strategy::Adaptive);
+    let mask = match decision {
+        Decision::Drop => 0,
+        Decision::Single { path_id } => path_id
+            .parse::<u32>()
+            .ok()
+            .and_then(|index| 1_u64.checked_shl(index))
+            .unwrap_or(0),
+        Decision::Duplicate { path_ids } => path_ids.into_iter().fold(0, |mask, path_id| {
+            mask | path_id
+                .parse::<u32>()
+                .ok()
+                .and_then(|index| 1_u64.checked_shl(index))
+                .unwrap_or(0)
+        }),
+    };
+    decision_mask.store(mask, Ordering::Release);
 }
 
 fn update_path_status(

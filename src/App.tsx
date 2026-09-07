@@ -156,6 +156,21 @@ const pathLoss = (path: PathMetric) => {
   return completed ? ((path.probesLost ?? 0) / completed) * 100 : 0
 }
 const formatRate = (bytesPerSecond: number | undefined) => `${formatBytes(bytesPerSecond)}/s`
+const histogramPercentile = (
+  buckets: Array<{ upperBoundUs: number | null; count: number }> | undefined,
+  percentile: number,
+) => {
+  if (!buckets?.length) return null
+  const total = buckets.reduce((sum, bucket) => sum + bucket.count, 0)
+  if (!total) return null
+  const target = total * percentile
+  let seen = 0
+  for (const bucket of buckets) {
+    seen += bucket.count
+    if (seen >= target) return bucket.upperBoundUs
+  }
+  return null
+}
 
 function LatencyChart({ histories, paths }: { histories: PathHistory; paths: PathMetric[] }) {
   const series = paths.map((path, index) => ({
@@ -234,6 +249,7 @@ function TelemetryPanel({
   const metrics = state.session.metrics
   const capture = state.session.capture?.diagnostics
   const connections = capture?.handledConnections ?? []
+  const captureP99 = histogramPercentile(capture?.captureLoopHistogram, 0.99)
   const paths = state.session.pathMetrics ?? []
   const bestPath = paths
     .filter((path) => path.reachable && path.latencyMs != null)
@@ -292,13 +308,17 @@ function TelemetryPanel({
       <div className="node-grid">
         {paths.map((path, index) => {
           const samples = histories[path.route] ?? []
+          const carryingTraffic = state.session.selectedRoutes?.includes(path.route) ?? path.reachable
           const nodeToRelay =
             path.nodeLatencyMs != null && path.latencyMs != null
               ? Math.max(0, path.latencyMs - path.nodeLatencyMs)
               : null
           const rate = rates[path.route]
           return (
-            <article className={`node-card ${path.reachable ? 'healthy' : 'unhealthy'}`} key={path.route}>
+            <article
+              className={`node-card ${path.reachable ? 'healthy' : 'unhealthy'} ${carryingTraffic ? 'carrying' : ''}`}
+              key={path.route}
+            >
               <div className="node-card-head">
                 <span className="node-color" style={{ background: pathColors[index % pathColors.length] }} />
                 <div>
@@ -307,7 +327,7 @@ function TelemetryPanel({
                 </div>
                 <span className={`route-health ${path.reachable ? 'online' : ''}`}>
                   <i />
-                  {path.reachable ? 'Healthy' : 'Offline'}
+                  {path.reachable ? (carryingTraffic ? 'Active' : 'Standby') : 'Offline'}
                 </span>
               </div>
               <div className="node-primary">
@@ -401,6 +421,22 @@ function TelemetryPanel({
           <p className="connections-empty">
             Start the game to see each executable and destination IP handled by GamePath.
           </p>
+        )}
+        {capture && (
+          <div className="capture-health">
+            <span>
+              Capture p99 <strong>{captureP99 == null ? '—' : `≤ ${captureP99} µs`}</strong>
+            </span>
+            <span>
+              Pending SYN <strong>{capture.pendingSynDepth ?? 0}</strong>
+            </span>
+            <span>
+              Queue peak <strong>{capture.pendingSynPeak ?? 0}</strong>
+            </span>
+            <span>
+              Overflow <strong>{capture.pendingSynOverflow ?? 0}</strong>
+            </span>
+          </div>
         )}
       </div>
       <div className="telemetry-lower">

@@ -1,6 +1,6 @@
 {
   "name": "gamepath-client",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "author": "GamePath",
   "private": true,
   "type": "module",
@@ -21,6 +21,7 @@
     "service:split-test": "electron scripts/test-service-session.cjs --split-ip",
     "service:stability-test": "electron scripts/test-split-stability.cjs",
     "service:routing-test": "electron scripts/test-split-routing.cjs",
+    "service:latency-benchmark": "electron scripts/test-split-routing.cjs --latency-benchmark",
     "native:release": "node scripts/build-release.cjs",
     "package:windows": "npm run check && npm run native:release && node scripts/package-windows.cjs",
     "build": "tsc -b && vite build",

@@ -8,9 +8,9 @@ use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -181,6 +181,24 @@ impl Handle {
         Ok((packet, address))
     }
 
+    fn recv_into(&self, packet: &mut [u8]) -> Result<(usize, Address), String> {
+        let mut length = 0;
+        let mut address = Address::default();
+        if unsafe {
+            (self.api.recv)(
+                self.raw,
+                packet.as_mut_ptr().cast(),
+                packet.len() as u32,
+                &mut length,
+                &mut address,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok((length as usize, address))
+    }
+
     fn send(&self, packet: &[u8], address: &Address) -> Result<(), String> {
         let mut sent = 0;
         if unsafe {
@@ -259,6 +277,13 @@ struct HandledConnection {
     started_at: u64,
 }
 
+struct PendingSyn {
+    packet: Vec<u8>,
+    address: Address,
+    fields: Ipv4Fields,
+    deadline: std::time::Instant,
+}
+
 struct Registry {
     dll: PathBuf,
     bypass: String,
@@ -266,6 +291,11 @@ struct Registry {
     workers: Mutex<Vec<JoinHandle<()>>>,
     selectors: Mutex<HashMap<TrafficSelector, Option<String>>>,
     handled_connections: Mutex<HashMap<ReturnKey, HandledConnection>>,
+    capture_loop_buckets: [AtomicU64; 8],
+    capture_receive_errors: AtomicU64,
+    pending_syn_depth: AtomicU64,
+    pending_syn_peak: AtomicU64,
+    pending_syn_overflow: AtomicU64,
     applications: Vec<String>,
     folders: Vec<String>,
     matched_sockets: AtomicU64,
@@ -330,6 +360,11 @@ impl SplitPacketCapture {
             workers: Mutex::new(Vec::new()),
             selectors: Mutex::new(HashMap::new()),
             handled_connections: Mutex::new(HashMap::new()),
+            capture_loop_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            capture_receive_errors: AtomicU64::new(0),
+            pending_syn_depth: AtomicU64::new(0),
+            pending_syn_peak: AtomicU64::new(0),
+            pending_syn_overflow: AtomicU64::new(0),
             applications: plan.application_paths.clone(),
             folders: plan.folder_prefixes.clone(),
             matched_sockets: AtomicU64::new(0),
@@ -376,13 +411,35 @@ impl SplitPacketCapture {
         // escaped while a new per-socket WinDivert handle was being created.
         let network_filter = format!("outbound and ip and !loopback and {}", registry.bypass);
         let network_handle = Arc::new(Handle::open(&registry.dll, &network_filter, 0, 0)?);
-        network_handle.set_param(0, 8192)?;
-        network_handle.set_param(2, 32 * 1024 * 1024)?;
+        network_handle.set_param(0, 1024)?;
+        network_handle.set_param(1, 100)?;
+        network_handle.set_param(2, 8 * 1024 * 1024)?;
         registry
             .handles
             .lock()
             .unwrap()
             .push(Arc::clone(&network_handle));
+        let (pending_tx, pending_rx) = mpsc::sync_channel(256);
+        let pending_handle = Arc::clone(&network_handle);
+        let pending_stop = Arc::clone(&stop);
+        let pending_sessions = Arc::clone(&sessions);
+        let pending_returns = Arc::clone(&return_paths);
+        let pending_registry = Arc::clone(&registry);
+        let worker = thread::Builder::new()
+            .name("gamepath-windivert-pending-syn".into())
+            .spawn(move || {
+                run_pending_syns(
+                    pending_handle,
+                    pending_stop,
+                    pending_sessions,
+                    pending_returns,
+                    virtual_ipv4,
+                    pending_registry,
+                    pending_rx,
+                )
+            })
+            .map_err(|error| format!("could not start pending SYN classifier: {error}"))?;
+        registry.workers.lock().unwrap().push(worker);
         let capture_registry = Arc::clone(&registry);
         let capture_stop = Arc::clone(&stop);
         let capture_sessions = Arc::clone(&sessions);
@@ -397,6 +454,7 @@ impl SplitPacketCapture {
                     capture_returns,
                     virtual_ipv4,
                     capture_registry,
+                    pending_tx,
                 )
             })
             .map_err(|error| format!("could not start selected packet capture: {error}"))?;
@@ -439,6 +497,16 @@ impl SplitPacketCapture {
             .cloned()
             .collect::<Vec<_>>();
         handled_connections.sort_by_key(|connection| std::cmp::Reverse(connection.started_at));
+        let capture_loop_histogram = [10_u64, 25, 50, 100, 250, 500, 1000, u64::MAX]
+            .into_iter()
+            .zip(self.registry.capture_loop_buckets.iter())
+            .map(|(upper_bound_us, count)| {
+                serde_json::json!({
+                    "upperBoundUs": (upper_bound_us != u64::MAX).then_some(upper_bound_us),
+                    "count": count.load(Ordering::Relaxed),
+                })
+            })
+            .collect::<Vec<_>>();
         serde_json::json!({
             "matchedSockets": self.registry.matched_sockets.load(Ordering::Relaxed),
             "captureFilterCount": self.registry.selectors.lock().unwrap().len(),
@@ -447,6 +515,12 @@ impl SplitPacketCapture {
             "relayedPackets": self.registry.relayed_packets.load(Ordering::Relaxed),
             "bypassedPackets": self.registry.bypassed_packets.load(Ordering::Relaxed),
             "handledConnections": handled_connections,
+            "captureLoopHistogram": capture_loop_histogram,
+            "captureReceiveErrors": self.registry.capture_receive_errors.load(Ordering::Relaxed),
+            "pendingSynDepth": self.registry.pending_syn_depth.load(Ordering::Relaxed),
+            "pendingSynPeak": self.registry.pending_syn_peak.load(Ordering::Relaxed),
+            "pendingSynOverflow": self.registry.pending_syn_overflow.load(Ordering::Relaxed),
+            "driverQueueTimeMs": 100,
         })
     }
 }
@@ -476,6 +550,22 @@ fn add_process_selector(registry: &Registry, selector: TrafficSelector, applicat
         .insert(selector, Some(application));
 }
 
+struct CaptureLoopTimer<'a> {
+    started: Instant,
+    registry: &'a Registry,
+}
+
+impl Drop for CaptureLoopTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_micros() as u64;
+        let bucket = [10_u64, 25, 50, 100, 250, 500, 1000]
+            .iter()
+            .position(|upper| elapsed <= *upper)
+            .unwrap_or(7);
+        self.registry.capture_loop_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn run_selected_capture(
     handle: Arc<Handle>,
     stop: Arc<AtomicBool>,
@@ -483,13 +573,29 @@ fn run_selected_capture(
     return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
     virtual_ipv4: Ipv4Addr,
     registry: Arc<Registry>,
+    pending_syns: mpsc::SyncSender<PendingSyn>,
 ) {
+    let mut packet_buffer = vec![0_u8; 65_535];
+    let mut tunnel_buffer = Vec::with_capacity(65_535);
     while !stop.load(Ordering::Acquire) {
-        let Ok((packet, address)) = handle.recv(65_535) else {
-            break;
+        let (packet_length, address) = match handle.recv_into(&mut packet_buffer) {
+            Ok(packet) => packet,
+            Err(_) => {
+                if !stop.load(Ordering::Acquire) {
+                    registry
+                        .capture_receive_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                break;
+            }
         };
-        let Some(fields) = ipv4_fields(&packet) else {
-            let _ = handle.send(&packet, &address);
+        let _loop_timer = CaptureLoopTimer {
+            started: Instant::now(),
+            registry: &registry,
+        };
+        let packet = &packet_buffer[..packet_length];
+        let Some(fields) = ipv4_fields(packet) else {
+            let _ = handle.send(packet, &address);
             continue;
         };
         let (mut selected, mut application) = registry
@@ -502,7 +608,7 @@ fn run_selected_capture(
             .unwrap_or((false, None));
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
-        if !selected && is_tcp_syn(&packet) {
+        if !selected && is_tcp_syn(packet) {
             if let Some(path) =
                 tcp_socket_process(fields, &registry.applications, &registry.folders)
             {
@@ -519,61 +625,149 @@ fn run_selected_capture(
                 registry.matched_sockets.fetch_add(1, Ordering::Relaxed);
                 selected = true;
             } else {
-                thread::sleep(Duration::from_millis(3));
-                let matched = registry
-                    .selectors
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|(selector, _)| selector.matches(fields))
-                    .map(|(_, application)| (true, application.clone()))
-                    .unwrap_or((false, None));
-                selected = matched.0;
-                application = matched.1;
+                let pending = PendingSyn {
+                    packet: packet.to_vec(),
+                    address,
+                    fields,
+                    deadline: Instant::now() + Duration::from_millis(3),
+                };
+                let depth = registry.pending_syn_depth.fetch_add(1, Ordering::Relaxed) + 1;
+                registry
+                    .pending_syn_peak
+                    .fetch_max(depth, Ordering::Relaxed);
+                match pending_syns.try_send(pending) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(pending)) => {
+                        registry.pending_syn_depth.fetch_sub(1, Ordering::Relaxed);
+                        registry
+                            .pending_syn_overflow
+                            .fetch_add(1, Ordering::Relaxed);
+                        let _ = handle.send(&pending.packet, &pending.address);
+                    }
+                    Err(mpsc::TrySendError::Disconnected(pending)) => {
+                        registry.pending_syn_depth.fetch_sub(1, Ordering::Relaxed);
+                        let _ = handle.send(&pending.packet, &pending.address);
+                    }
+                }
+                continue;
             }
         }
         if !selected {
-            let _ = handle.send(&packet, &address);
+            let _ = handle.send(packet, &address);
             continue;
         }
-        let connection_key = ReturnKey::outbound(fields);
-        let is_new_connection = return_paths
+        route_selected_packet(
+            &handle,
+            &sessions,
+            &return_paths,
+            virtual_ipv4,
+            &registry,
+            packet,
+            address,
+            fields,
+            application,
+            &mut tunnel_buffer,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_selected_packet(
+    handle: &Handle,
+    sessions: &Mutex<WireGuardSessionManager>,
+    return_paths: &Mutex<HashMap<ReturnKey, ReturnPath>>,
+    virtual_ipv4: Ipv4Addr,
+    registry: &Registry,
+    packet: &[u8],
+    address: Address,
+    fields: Ipv4Fields,
+    application: Option<String>,
+    tunnel_buffer: &mut Vec<u8>,
+) {
+    let connection_key = ReturnKey::outbound(fields);
+    let is_new_connection = return_paths
+        .lock()
+        .unwrap()
+        .insert(
+            connection_key,
+            ReturnPath {
+                local_ip: fields.source,
+                interface_index: address.network_data().interface_index,
+                subinterface_index: address.network_data().subinterface_index,
+            },
+        )
+        .is_none();
+    if is_new_connection {
+        record_handled_connection(registry, connection_key, fields, application);
+    }
+    registry.captured_packets.fetch_add(1, Ordering::Relaxed);
+    registry
+        .captured_bytes
+        .fetch_add(packet.len() as u64, Ordering::Relaxed);
+    tunnel_buffer.clear();
+    tunnel_buffer.extend_from_slice(packet);
+    let tunneled = &mut tunnel_buffer[..];
+    tunneled[12..16].copy_from_slice(&virtual_ipv4.octets());
+    clamp_tcp_mss(tunneled, 1000);
+    let mut checksum_address = address;
+    if handle.checksums(tunneled, &mut checksum_address).is_err()
+        || sessions
             .lock()
             .unwrap()
-            .insert(
-                connection_key,
-                ReturnPath {
-                    local_ip: fields.source,
-                    interface_index: address.network_data().interface_index,
-                    subinterface_index: address.network_data().subinterface_index,
-                },
-            )
-            .is_none();
-        if is_new_connection {
-            record_handled_connection(&registry, connection_key, fields, application);
-        }
-        registry.captured_packets.fetch_add(1, Ordering::Relaxed);
-        registry
-            .captured_bytes
-            .fetch_add(packet.len() as u64, Ordering::Relaxed);
-        let mut tunneled = packet.clone();
-        tunneled[12..16].copy_from_slice(&virtual_ipv4.octets());
-        clamp_tcp_mss(&mut tunneled, 1000);
-        let mut checksum_address = address;
-        if handle
-            .checksums(&mut tunneled, &mut checksum_address)
+            .enqueue_data_packet(tunneled)
             .is_err()
-            || sessions
-                .lock()
-                .unwrap()
-                .enqueue_data_packet(&tunneled)
-                .is_err()
-        {
-            // Fail open for the selected connection when the relay is unavailable.
-            registry.bypassed_packets.fetch_add(1, Ordering::Relaxed);
-            let _ = handle.send(&packet, &address);
+    {
+        // Fail open for the selected connection when the relay is unavailable.
+        registry.bypassed_packets.fetch_add(1, Ordering::Relaxed);
+        let _ = handle.send(packet, &address);
+    } else {
+        registry.relayed_packets.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pending_syns(
+    handle: Arc<Handle>,
+    stop: Arc<AtomicBool>,
+    sessions: Arc<Mutex<WireGuardSessionManager>>,
+    return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
+    virtual_ipv4: Ipv4Addr,
+    registry: Arc<Registry>,
+    pending: mpsc::Receiver<PendingSyn>,
+) {
+    let mut tunnel_buffer = Vec::with_capacity(65_535);
+    while !stop.load(Ordering::Acquire) {
+        let item = match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(item) => item,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        registry.pending_syn_depth.fetch_sub(1, Ordering::Relaxed);
+        if let Some(wait) = item.deadline.checked_duration_since(Instant::now()) {
+            thread::sleep(wait);
+        }
+        let application = registry
+            .selectors
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(selector, _)| selector.matches(item.fields))
+            .map(|(_, application)| application.clone());
+        if let Some(application) = application {
+            route_selected_packet(
+                &handle,
+                &sessions,
+                &return_paths,
+                virtual_ipv4,
+                &registry,
+                &item.packet,
+                item.address,
+                item.fields,
+                application,
+                &mut tunnel_buffer,
+            );
         } else {
-            registry.relayed_packets.fetch_add(1, Ordering::Relaxed);
+            let _ = handle.send(&item.packet, &item.address);
         }
     }
 }

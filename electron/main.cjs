@@ -103,6 +103,8 @@ function updateSessionMetrics(runtime, dataPlane) {
   const nodeToRelay =
     userToNode != null && wireGuard?.latencyMs != null ? Math.max(0, wireGuard.latencyMs - userToNode) : null
   state.session.pathMetrics = paths
+  state.session.selectedRoutes = runtime.selectedRoutes ?? []
+  state.session.strategy = runtime.strategy ?? 'adaptive'
   if (runtime.capture) state.session.capture = runtime.capture
   state.session.routeLatencies = paths
     .filter((path) => path.latencyMs != null)

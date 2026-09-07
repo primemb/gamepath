@@ -1,7 +1,7 @@
 import type { AppState, GamePathApi } from './types'
 
 let state: AppState = {
-  clientVersion: '0.1.12',
+  clientVersion: '0.1.13',
   tunnels: [
     {
       id: 'demo-1',
@@ -192,6 +192,8 @@ export const mockApi: GamePathApi = {
             status: 'connected',
             message: 'Two encrypted paths are connected to the relay.',
             routeLatencies: [34, 39],
+            strategy: 'adaptive',
+            selectedRoutes: [2],
             pathMetrics: [
               {
                 route: 1,

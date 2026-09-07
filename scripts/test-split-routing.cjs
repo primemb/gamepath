@@ -24,6 +24,37 @@ function readPublicAddress() {
   })
 }
 
+async function firstByteSample(curl) {
+  const result = await run(
+    curl,
+    [
+      '-4',
+      '--fail',
+      '--max-time',
+      '15',
+      '--output',
+      'NUL',
+      '--silent',
+      '--write-out',
+      '%{time_starttransfer}',
+      'http://speed.cloudflare.com/__down?bytes=1',
+    ],
+    { windowsHide: true },
+  )
+  return Number(result.stdout.trim()) * 1000
+}
+
+function summarize(samples) {
+  const sorted = [...samples].sort((left, right) => left - right)
+  const percentile = (value) => sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * value) - 1)]
+  return {
+    samples: sorted.length,
+    p50Ms: Number(percentile(0.5).toFixed(2)),
+    p95Ms: Number(percentile(0.95).toFixed(2)),
+    p99Ms: Number(percentile(0.99).toFixed(2)),
+  }
+}
+
 app
   .whenReady()
   .then(async () => {
@@ -37,8 +68,13 @@ app
     const enrollmentToken = safeStorage.decryptString(Buffer.from(state.encryptedRelayTokens[relay.id], 'base64'))
     const service = new ServiceBridge()
     const curl = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'curl.exe')
+    const benchmarkSamples = process.argv.includes('--latency-benchmark')
+      ? Number(process.env.GAMEPATH_LATENCY_SAMPLES || 20)
+      : 0
 
     try {
+      const directLatency = []
+      for (let index = 0; index < benchmarkSamples; index += 1) directLatency.push(await firstByteSample(curl))
       const started = await service.request(
         'start-session',
         {
@@ -58,6 +94,7 @@ app
       let throughputSeconds = null
       let throughputConnectSeconds = null
       let throughputStartTransferSeconds = null
+      const routedLatency = []
       const keepAlive = setInterval(() => service.request('session-status').catch(() => {}), 2_000)
       try {
         response = await run(curl, ['-4', '--fail', '--max-time', '15', 'http://api.ipify.org'], { windowsHide: true })
@@ -87,6 +124,7 @@ app
           throughputConnectSeconds = connectSeconds
           throughputStartTransferSeconds = startTransferSeconds
         }
+        for (let index = 0; index < benchmarkSamples; index += 1) routedLatency.push(await firstByteSample(curl))
       } catch (error) {
         requestError = error
         response ??= { stdout: '' }
@@ -124,6 +162,14 @@ app
             throughputSeconds,
             throughputConnectSeconds,
             throughputStartTransferSeconds,
+            latencyBenchmark: benchmarkSamples
+              ? {
+                  direct: summarize(directLatency),
+                  routed: summarize(routedLatency),
+                  addedP50Ms: Number((summarize(routedLatency).p50Ms - summarize(directLatency).p50Ms).toFixed(2)),
+                  addedP99Ms: Number((summarize(routedLatency).p99Ms - summarize(directLatency).p99Ms).toFixed(2)),
+                }
+              : undefined,
             relayPaths: status.paths.map(({ label, pathKind, reachable, probesSent, probesReceived, probesLost }) => ({
               label,
               pathKind,
@@ -132,6 +178,8 @@ app
               probesReceived,
               probesLost,
             })),
+            strategy: status.strategy,
+            selectedRoutes: status.selectedRoutes,
             diagnostics,
           },
           null,

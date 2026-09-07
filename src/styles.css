@@ -733,6 +733,10 @@ main {
 .node-card.healthy {
   border-color: rgba(38, 230, 205, 0.12);
 }
+.node-card.carrying {
+  border-color: rgba(38, 230, 205, 0.28);
+  box-shadow: inset 0 0 24px rgba(38, 230, 205, 0.025);
+}
 .node-card.unhealthy {
   border-color: rgba(255, 109, 122, 0.18);
 }
@@ -933,6 +937,21 @@ main {
   background: rgba(255, 255, 255, 0.015);
   font-size: 8px;
   text-align: center;
+}
+.capture-health {
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid rgba(255, 255, 255, 0.045);
+  display: flex;
+  gap: 18px;
+  color: #566173;
+  font-size: 7px;
+}
+.capture-health strong {
+  margin-left: 3px;
+  color: #96a2b3;
+  font-weight: 580;
+  font-variant-numeric: tabular-nums;
 }
 .telemetry-lower {
   margin-top: 10px;

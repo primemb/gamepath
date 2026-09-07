@@ -69,6 +69,8 @@ export type AppState = {
     status: 'idle' | 'starting' | 'prepared' | 'connected' | 'error'
     message?: string
     routeLatencies?: number[]
+    strategy?: 'adaptive' | 'fastest-path' | 'duplicate'
+    selectedRoutes?: number[]
     pathMetrics?: PathMetric[]
     capture?: {
       state: string
@@ -83,6 +85,12 @@ export type AppState = {
         relayedPackets: number
         bypassedPackets: number
         handledConnections?: HandledConnection[]
+        captureLoopHistogram?: Array<{ upperBoundUs: number | null; count: number }>
+        captureReceiveErrors?: number
+        pendingSynDepth?: number
+        pendingSynPeak?: number
+        pendingSynOverflow?: number
+        driverQueueTimeMs?: number
       }
     }
     metrics?: {
