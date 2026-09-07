@@ -50,6 +50,14 @@ export type PathMetric = {
   lastError: string | null
 }
 
+export type HandledConnection = {
+  application: string
+  destinationIp: string
+  destinationPort: number
+  protocol: string
+  startedAt: number
+}
+
 export type AppState = {
   clientVersion?: string
   tunnels: Tunnel[]
@@ -62,8 +70,33 @@ export type AppState = {
     message?: string
     routeLatencies?: number[]
     pathMetrics?: PathMetric[]
-    capture?: { state: string; backend: string; trafficMode?: string; targetCount?: number; diagnostics?: { matchedSockets: number; captureFilterCount: number; capturedPackets: number; capturedBytes: number; relayedPackets: number; bypassedPackets: number } }
-    metrics?: { userToNodeMs: number | null; nodeToRelayMs: number | null; relayToServerMs: number | null; endToEndMs: number | null; benchmarkServer: string; bytesSent: number; bytesReceived: number; packetsSent: number; packetsReceived: number; packetLossPercent: number }
+    capture?: {
+      state: string
+      backend: string
+      trafficMode?: string
+      targetCount?: number
+      diagnostics?: {
+        matchedSockets: number
+        captureFilterCount: number
+        capturedPackets: number
+        capturedBytes: number
+        relayedPackets: number
+        bypassedPackets: number
+        handledConnections?: HandledConnection[]
+      }
+    }
+    metrics?: {
+      userToNodeMs: number | null
+      nodeToRelayMs: number | null
+      relayToServerMs: number | null
+      endToEndMs: number | null
+      benchmarkServer: string
+      bytesSent: number
+      bytesReceived: number
+      packetsSent: number
+      packetsReceived: number
+      packetLossPercent: number
+    }
   }
   engine: {
     status: 'offline' | 'ready' | 'error'
@@ -76,7 +109,14 @@ export type AppState = {
       activeWireGuardInterfaces: string[]
       packetAdapterInstalled: boolean
       packetAdapter?: { libraryAvailable: boolean; libraryLoaded: boolean; driverVersion?: string; message: string }
-      interception?: { backend: string; libraryAvailable: boolean; libraryLoaded: boolean; driverAvailable: boolean; administratorRequired: boolean; message: string }
+      interception?: {
+        backend: string
+        libraryAvailable: boolean
+        libraryLoaded: boolean
+        driverAvailable: boolean
+        administratorRequired: boolean
+        message: string
+      }
     }
   }
   service: {
@@ -105,10 +145,14 @@ export type GamePathApi = {
   removeRelayLocal: (id: string) => Promise<AppState>
   configureRelay: (id: string, input: { address: string; port: number; enrollmentToken?: string }) => Promise<AppState>
   importRelayEnrollment: (id: string) => Promise<{ canceled: boolean; state?: AppState }>
-  testRelay: (id: string) => Promise<{ state: AppState; result: { reachable: boolean; latencyMs: number; virtualIpv4: string } }>
+  testRelay: (
+    id: string,
+  ) => Promise<{ state: AppState; result: { reachable: boolean; latencyMs: number; virtualIpv4: string } }>
   provisionRelayVps: (id: string, input: VpsCredentials & { relayPort: number }) => Promise<AppState>
   removeRelayVps: (id: string, input: VpsCredentials) => Promise<AppState>
-  onRelayVpsProgress: (callback: (update: { relayId: string; stage: string; percent: number; message: string }) => void) => () => void
+  onRelayVpsProgress: (
+    callback: (update: { relayId: string; stage: string; percent: number; message: string }) => void,
+  ) => () => void
   refreshService: () => Promise<AppState>
   installService: () => Promise<AppState>
   startSession: () => Promise<AppState>

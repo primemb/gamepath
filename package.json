@@ -1,6 +1,6 @@
 {
   "name": "gamepath-client",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "author": "GamePath",
   "private": true,
   "type": "module",
@@ -26,8 +26,10 @@
     "build": "tsc -b && vite build",
     "start": "electron .",
     "typecheck": "tsc -b --pretty false",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "test": "node --test electron/*.test.cjs",
-    "check": "npm test && npm run build && npm run engine:build && npm run service:build"
+    "check": "npm run format:check && npm test && npm run build && npm run engine:build && npm run service:build"
   },
   "dependencies": {
     "@fontsource-variable/inter": "latest",
@@ -44,6 +46,7 @@
     "concurrently": "latest",
     "electron": "latest",
     "electron-builder": "latest",
+    "prettier": "3.9.6",
     "typescript": "latest",
     "vite": "latest",
     "wait-on": "latest"

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -249,12 +249,23 @@ struct ReturnPath {
     subinterface_index: u32,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HandledConnection {
+    application: String,
+    destination_ip: Ipv4Addr,
+    destination_port: u16,
+    protocol: String,
+    started_at: u64,
+}
+
 struct Registry {
     dll: PathBuf,
     bypass: String,
     handles: Mutex<Vec<Arc<Handle>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
-    selectors: Mutex<HashSet<TrafficSelector>>,
+    selectors: Mutex<HashMap<TrafficSelector, Option<String>>>,
+    handled_connections: Mutex<HashMap<ReturnKey, HandledConnection>>,
     applications: Vec<String>,
     folders: Vec<String>,
     matched_sockets: AtomicU64,
@@ -317,7 +328,8 @@ impl SplitPacketCapture {
             bypass: bypass_clause(bypass_ips),
             handles: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
-            selectors: Mutex::new(HashSet::new()),
+            selectors: Mutex::new(HashMap::new()),
+            handled_connections: Mutex::new(HashMap::new()),
             applications: plan.application_paths.clone(),
             folders: plan.folder_prefixes.clone(),
             matched_sockets: AtomicU64::new(0),
@@ -344,7 +356,12 @@ impl SplitPacketCapture {
         }
 
         if !plan.application_paths.is_empty() || !plan.folder_prefixes.is_empty() {
-            spawn_process_tracker(&plan, Arc::clone(&registry), Arc::clone(&stop))?;
+            spawn_process_tracker(
+                &plan,
+                Arc::clone(&registry),
+                Arc::clone(&return_paths),
+                Arc::clone(&stop),
+            )?;
         }
         if !plan.hostnames.is_empty() {
             spawn_dns_tracker(
@@ -413,6 +430,15 @@ impl SplitPacketCapture {
     }
 
     pub fn diagnostics(&self) -> serde_json::Value {
+        let mut handled_connections = self
+            .registry
+            .handled_connections
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        handled_connections.sort_by_key(|connection| std::cmp::Reverse(connection.started_at));
         serde_json::json!({
             "matchedSockets": self.registry.matched_sockets.load(Ordering::Relaxed),
             "captureFilterCount": self.registry.selectors.lock().unwrap().len(),
@@ -420,6 +446,7 @@ impl SplitPacketCapture {
             "capturedBytes": self.registry.captured_bytes.load(Ordering::Relaxed),
             "relayedPackets": self.registry.relayed_packets.load(Ordering::Relaxed),
             "bypassedPackets": self.registry.bypassed_packets.load(Ordering::Relaxed),
+            "handledConnections": handled_connections,
         })
     }
 }
@@ -438,7 +465,15 @@ impl Drop for SplitPacketCapture {
 }
 
 fn add_selector(registry: &Registry, selector: TrafficSelector) {
-    registry.selectors.lock().unwrap().insert(selector);
+    registry.selectors.lock().unwrap().insert(selector, None);
+}
+
+fn add_process_selector(registry: &Registry, selector: TrafficSelector, application: String) {
+    registry
+        .selectors
+        .lock()
+        .unwrap()
+        .insert(selector, Some(application));
 }
 
 fn run_selected_capture(
@@ -457,48 +492,66 @@ fn run_selected_capture(
             let _ = handle.send(&packet, &address);
             continue;
         };
-        let mut selected = registry
+        let (mut selected, mut application) = registry
             .selectors
             .lock()
             .unwrap()
             .iter()
-            .any(|selector| selector.matches(fields));
+            .find(|(selector, _)| selector.matches(fields))
+            .map(|(_, application)| (true, application.clone()))
+            .unwrap_or((false, None));
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
         if !selected && is_tcp_syn(&packet) {
-            if tcp_socket_matches(fields, &registry.applications, &registry.folders) {
-                add_selector(
+            if let Some(path) =
+                tcp_socket_process(fields, &registry.applications, &registry.folders)
+            {
+                application = Some(process_name(&path));
+                add_process_selector(
                     &registry,
                     TrafficSelector::Flow {
                         protocol: 6,
                         local_port: fields.source_port,
                         remote_port: Some(fields.destination_port),
                     },
+                    application.clone().unwrap(),
                 );
                 registry.matched_sockets.fetch_add(1, Ordering::Relaxed);
                 selected = true;
             } else {
                 thread::sleep(Duration::from_millis(3));
-                selected = registry
+                let matched = registry
                     .selectors
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|selector| selector.matches(fields));
+                    .find(|(selector, _)| selector.matches(fields))
+                    .map(|(_, application)| (true, application.clone()))
+                    .unwrap_or((false, None));
+                selected = matched.0;
+                application = matched.1;
             }
         }
         if !selected {
             let _ = handle.send(&packet, &address);
             continue;
         }
-        return_paths.lock().unwrap().insert(
-            ReturnKey::outbound(fields),
-            ReturnPath {
-                local_ip: fields.source,
-                interface_index: address.network_data().interface_index,
-                subinterface_index: address.network_data().subinterface_index,
-            },
-        );
+        let connection_key = ReturnKey::outbound(fields);
+        let is_new_connection = return_paths
+            .lock()
+            .unwrap()
+            .insert(
+                connection_key,
+                ReturnPath {
+                    local_ip: fields.source,
+                    interface_index: address.network_data().interface_index,
+                    subinterface_index: address.network_data().subinterface_index,
+                },
+            )
+            .is_none();
+        if is_new_connection {
+            record_handled_connection(&registry, connection_key, fields, application);
+        }
         registry.captured_packets.fetch_add(1, Ordering::Relaxed);
         registry
             .captured_bytes
@@ -528,6 +581,7 @@ fn run_selected_capture(
 fn spawn_process_tracker(
     plan: &InterceptionPlan,
     registry: Arc<Registry>,
+    return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     // SOCKET events are observation-only. SNIFF|RECV_ONLY copies events while
@@ -545,13 +599,13 @@ fn spawn_process_tracker(
             // sockets that already existed when the user pressed Start session.
             // Existing TCP connections cannot move to a different public IP safely.
             for socket in existing_ipv4_udp_sockets() {
-                if process_path(socket.process_id)
-                    .is_some_and(|path| path_matches(&path, &applications, &folders))
+                if let Some(path) = process_path(socket.process_id)
+                    .filter(|path| path_matches(path, &applications, &folders))
                 {
                     worker_registry
                         .matched_sockets
                         .fetch_add(1, Ordering::Relaxed);
-                    add_selector(&worker_registry, socket.selector());
+                    add_process_selector(&worker_registry, socket.selector(), process_name(&path));
                 }
             }
             while !worker_stop.load(Ordering::Acquire) {
@@ -565,7 +619,7 @@ fn spawn_process_tracker(
                         .selectors
                         .lock()
                         .unwrap()
-                        .retain(|selector| {
+                        .retain(|selector, _| {
                             !matches!(
                                 selector,
                                 TrafficSelector::Flow { protocol, local_port, remote_port }
@@ -575,6 +629,20 @@ fn spawn_process_tracker(
                                             || *remote_port == Some(event.remote_port))
                             )
                         });
+                    return_paths.lock().unwrap().retain(|key, _| {
+                        key.protocol != event.protocol
+                            || key.local_port != event.local_port
+                            || (event.remote_port != 0 && key.remote_port != event.remote_port)
+                    });
+                    worker_registry
+                        .handled_connections
+                        .lock()
+                        .unwrap()
+                        .retain(|key, _| {
+                            key.protocol != event.protocol
+                                || key.local_port != event.local_port
+                                || (event.remote_port != 0 && key.remote_port != event.remote_port)
+                        });
                     continue;
                 }
                 if !matches!(event_kind, 3 | 4) {
@@ -582,10 +650,12 @@ fn spawn_process_tracker(
                 }
                 // WinDivert SOCKET-layer ports are already in host byte order.
                 let port = event.local_port;
-                if port == 0
-                    || !process_path(event.process_id)
-                        .is_some_and(|path| path_matches(&path, &applications, &folders))
-                {
+                let Some(path) = process_path(event.process_id)
+                    .filter(|path| path_matches(path, &applications, &folders))
+                else {
+                    continue;
+                };
+                if port == 0 {
                     continue;
                 }
                 let protocol = match event.protocol {
@@ -596,13 +666,14 @@ fn spawn_process_tracker(
                 worker_registry
                     .matched_sockets
                     .fetch_add(1, Ordering::Relaxed);
-                add_selector(
+                add_process_selector(
                     &worker_registry,
                     TrafficSelector::Flow {
                         protocol,
                         local_port: port,
                         remote_port: (remote_port != 0).then_some(remote_port),
                     },
+                    process_name(&path),
                 );
             }
         })
@@ -649,17 +720,24 @@ unsafe extern "system" {
     ) -> u32;
 }
 
-fn tcp_socket_matches(fields: Ipv4Fields, applications: &[String], folders: &[String]) -> bool {
+fn tcp_socket_process(
+    fields: Ipv4Fields,
+    applications: &[String],
+    folders: &[String],
+) -> Option<String> {
     let Some(buffer) =
         ip_table(|table, size| unsafe { GetExtendedTcpTable(table, size, 0, 2, 5, 0) })
     else {
-        return false;
+        return None;
     };
-    dword_rows(&buffer, 6).into_iter().any(|row| {
-        port_from_dword(row[2]) == fields.source_port
-            && port_from_dword(row[4]) == fields.destination_port
-            && Ipv4Addr::from(row[3].to_ne_bytes()) == fields.destination
-            && process_path(row[5]).is_some_and(|path| path_matches(&path, applications, folders))
+    dword_rows(&buffer, 6).into_iter().find_map(|row| {
+        if port_from_dword(row[2]) != fields.source_port
+            || port_from_dword(row[4]) != fields.destination_port
+            || Ipv4Addr::from(row[3].to_ne_bytes()) != fields.destination
+        {
+            return None;
+        }
+        process_path(row[5]).filter(|path| path_matches(path, applications, folders))
     })
 }
 
@@ -985,6 +1063,48 @@ fn path_matches(path: &str, applications: &[String], folders: &[String]) -> bool
                     .strip_prefix(folder)
                     .is_some_and(|suffix| suffix.starts_with('\\'))
         })
+}
+
+fn process_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_owned()
+}
+
+fn record_handled_connection(
+    registry: &Registry,
+    key: ReturnKey,
+    fields: Ipv4Fields,
+    application: Option<String>,
+) {
+    let mut connections = registry.handled_connections.lock().unwrap();
+    if connections.len() >= 64 && !connections.contains_key(&key) {
+        if let Some(oldest) = connections
+            .iter()
+            .min_by_key(|(_, connection)| connection.started_at)
+            .map(|(key, _)| *key)
+        {
+            connections.remove(&oldest);
+        }
+    }
+    connections.entry(key).or_insert_with(|| HandledConnection {
+        application: application.unwrap_or_else(|| "Matched destination".into()),
+        destination_ip: fields.destination,
+        destination_port: fields.destination_port,
+        protocol: match fields.protocol {
+            6 => "TCP",
+            17 => "UDP",
+            1 => "ICMP",
+            _ => "IP",
+        }
+        .into(),
+        started_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    });
 }
 
 fn process_path(process_id: u32) -> Option<String> {
