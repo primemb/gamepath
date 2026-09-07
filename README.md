@@ -101,6 +101,16 @@ forwarding, cannot be used. Accepting the association is not sufficient either,
 so **Test UDP** sends an authenticated frame and waits for the relay's reply
 through the proxy before the node is saved.
 
+Beware of testing a proxy with a DNS query. Clients built on sing-box and Xray
+— Throne, NekoBox, v2rayN and the rest — answer DNS from their own resolver
+instead of forwarding the datagram, so a DNS round trip succeeds even when the
+proxy relays no UDP at all. Aim a query at `192.0.2.1`, which is reserved and
+routes nowhere: a reply can only have come from the proxy intercepting it.
+**Test UDP** does exactly this before reporting a result, and says so when it
+finds a proxy in that state. Such a proxy usually needs UDP enabled on its
+outbound _and_ on the server it connects to, plus no routing rule blocking UDP
+other than port 53.
+
 A SOCKS5 hop adds no encryption of its own. Frames stay sealed and replay
 protected end to end, so the proxy operator cannot read or forge game traffic,
 but it does see the relay address and the traffic timing that WireGuard hides.

@@ -1931,10 +1931,12 @@ fn probe_socks5_node(payload: Value) -> Result<Value, String> {
     if answers_dns_without_forwarding(&config) {
         return Err(
             "this proxy answers DNS from its own resolver and does not forward UDP anywhere \
-             else, so it cannot carry GamePath traffic. Testing such a proxy with a DNS \
-             query always succeeds and proves nothing. In sing-box and Xray based clients \
-             (Throne, NekoBox, v2rayN) this needs UDP enabled on the outbound and its \
-             server, and no routing rule blocking UDP other than port 53."
+             else, so it cannot carry GamePath traffic. Testing it with a DNS query always \
+             succeeds and proves nothing. If it chains to another proxy, that one has to \
+             support UDP ASSOCIATE too: a TCP-only upstream refuses with code 7 while this \
+             proxy still grants the association here, so the failure is invisible from \
+             outside. Check the client's own log for that refusal. When the provider's \
+             proxy is TCP-only, use a WireGuard configuration from them instead."
                 .into(),
         );
     }
