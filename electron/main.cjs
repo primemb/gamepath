@@ -83,6 +83,9 @@ function updateSessionMetrics(runtime, dataPlane) {
   const wireGuard = paths.find((path) => path.pathKind === 'wireguard')
   const sent = paths.reduce((total, path) => total + path.packetsSent, 0)
   const received = paths.reduce((total, path) => total + path.packetsReceived, 0)
+  const probesReceived = paths.reduce((total, path) => total + (path.probesReceived ?? 0), 0)
+  const probesLost = paths.reduce((total, path) => total + (path.probesLost ?? 0), 0)
+  const completedProbes = probesReceived + probesLost
   const userToNode = wireGuard?.nodeLatencyMs ?? null
   const nodeToRelay = userToNode != null && wireGuard?.latencyMs != null ? Math.max(0, wireGuard.latencyMs - userToNode) : null
   state.session.pathMetrics = paths
@@ -98,7 +101,7 @@ function updateSessionMetrics(runtime, dataPlane) {
     bytesReceived: paths.reduce((total, path) => total + path.bytesReceived, 0),
     packetsSent: sent,
     packetsReceived: received,
-    packetLossPercent: sent ? Math.max(0, ((sent - received) / sent) * 100) : 0,
+    packetLossPercent: completedProbes ? (probesLost / completedProbes) * 100 : 0,
   }
 }
 

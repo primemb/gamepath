@@ -81,6 +81,9 @@ struct PathSessionStatus {
     packets_received: u64,
     bytes_sent: u64,
     bytes_received: u64,
+    probes_sent: u64,
+    probes_received: u64,
+    probes_lost: u64,
     last_error: Option<String>,
 }
 
@@ -292,6 +295,9 @@ impl WireGuardSessionManager {
                 packets_received: 0,
                 bytes_sent: 0,
                 bytes_received: 0,
+                probes_sent: 0,
+                probes_received: 0,
+                probes_lost: 0,
                 last_error: None,
             })
             .collect::<Vec<_>>();
@@ -972,12 +978,14 @@ fn run_wireguard_path(
                 {
                     let mut current = statuses.lock().unwrap();
                     current[index].packets_sent += 1;
+                    current[index].probes_sent += 1;
                 }
                 path.send_inner(&inner)
             })();
             match result {
                 Ok(()) => pending_probe = Some(Instant::now()),
                 Err(error) => {
+                    statuses.lock().unwrap()[index].probes_lost += 1;
                     update_path_status(&statuses, index, Err(error));
                     next_probe = Instant::now() + Duration::from_secs(1);
                 }
@@ -1006,6 +1014,7 @@ fn run_wireguard_path(
                     if let Ok((header, plaintext)) = crypto.open_server(response_frame) {
                         if header.flags & FLAG_CONTROL != 0 && plaintext == b"pong" {
                             if let Some(started) = pending_probe.take() {
+                                statuses.lock().unwrap()[index].probes_received += 1;
                                 update_path_status(
                                     &statuses,
                                     index,
@@ -1028,6 +1037,7 @@ fn run_wireguard_path(
         }
         if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_secs(8)) {
             pending_probe = None;
+            statuses.lock().unwrap()[index].probes_lost += 1;
             update_path_status(
                 &statuses,
                 index,

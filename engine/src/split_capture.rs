@@ -254,7 +254,6 @@ struct Registry {
     bypass: String,
     handles: Mutex<Vec<Arc<Handle>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
-    filters: Mutex<HashSet<String>>,
     selectors: Mutex<HashSet<TrafficSelector>>,
     matched_sockets: AtomicU64,
     captured_packets: AtomicU64,
@@ -315,7 +314,6 @@ impl SplitPacketCapture {
             bypass: bypass_clause(bypass_ips),
             handles: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
-            filters: Mutex::new(HashSet::new()),
             selectors: Mutex::new(HashSet::new()),
             matched_sockets: AtomicU64::new(0),
             captured_packets: AtomicU64::new(0),
@@ -412,7 +410,7 @@ impl SplitPacketCapture {
     pub fn diagnostics(&self) -> serde_json::Value {
         serde_json::json!({
             "matchedSockets": self.registry.matched_sockets.load(Ordering::Relaxed),
-            "captureFilterCount": self.registry.filters.lock().unwrap().len(),
+            "captureFilterCount": self.registry.selectors.lock().unwrap().len(),
             "capturedPackets": self.registry.captured_packets.load(Ordering::Relaxed),
             "capturedBytes": self.registry.captured_bytes.load(Ordering::Relaxed),
             "relayedPackets": self.registry.relayed_packets.load(Ordering::Relaxed),
@@ -435,11 +433,6 @@ impl Drop for SplitPacketCapture {
 }
 
 fn add_selector(registry: &Registry, selector: TrafficSelector) {
-    registry
-        .filters
-        .lock()
-        .unwrap()
-        .insert(format!("{selector:?}"));
     registry.selectors.lock().unwrap().insert(selector);
 }
 
@@ -546,10 +539,28 @@ fn spawn_process_tracker(
                 let Ok((_, address)) = handle.recv(0) else {
                     break;
                 };
-                if !matches!(address.event(), 3 | 4) {
+                let event_kind = address.event();
+                let event = address.socket_data();
+                if event_kind == 7 {
+                    worker_registry
+                        .selectors
+                        .lock()
+                        .unwrap()
+                        .retain(|selector| {
+                            !matches!(
+                                selector,
+                                TrafficSelector::Flow { protocol, local_port, remote_port }
+                                    if *protocol == event.protocol
+                                        && *local_port == event.local_port
+                                        && (remote_port.is_none()
+                                            || *remote_port == Some(event.remote_port))
+                            )
+                        });
                     continue;
                 }
-                let event = address.socket_data();
+                if !matches!(event_kind, 3 | 4) {
+                    continue;
+                }
                 // WinDivert SOCKET-layer ports are already in host byte order.
                 let port = event.local_port;
                 if port == 0

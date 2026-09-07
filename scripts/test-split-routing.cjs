@@ -73,7 +73,7 @@ app.whenReady().then(async () => {
       backend: started.capture.backend,
       publicAddress,
       normalPublicAddress,
-      relayPaths: status.paths.map(({ label, pathKind, reachable }) => ({ label, pathKind, reachable })),
+      relayPaths: status.paths.map(({ label, pathKind, reachable, probesSent, probesReceived, probesLost }) => ({ label, pathKind, reachable, probesSent, probesReceived, probesLost })),
       diagnostics,
     }, null, 2))
     if (requestError) throw new Error(`routed curl request failed: ${requestError.message}`)
