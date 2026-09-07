@@ -26,9 +26,8 @@ app.whenReady().then(async () => {
   const state = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'gamepath-state.json'), 'utf8'))
   const relay = state.relays.find((item) => item.id === state.activeRelayId)
   if (!relay) throw new Error('No active relay is configured')
-  const configs = state.tunnels
-    .filter((item) => item.enabled)
-    .map((item) => safeStorage.decryptString(Buffer.from(state.encryptedConfigs[item.id], 'base64')))
+  const enabledTunnels = state.tunnels.filter((item) => item.enabled)
+  const configs = enabledTunnels.map((item) => safeStorage.decryptString(Buffer.from(state.encryptedConfigs[item.id], 'base64')))
   const enrollmentToken = safeStorage.decryptString(Buffer.from(state.encryptedRelayTokens[relay.id], 'base64'))
   const service = new ServiceBridge()
   const curl = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'curl.exe')
@@ -39,6 +38,7 @@ app.whenReady().then(async () => {
       relayPort: relay.port,
       enrollmentToken,
       wireguardConfigs: configs,
+      routeLabels: enabledTunnels.map((item) => item.name),
       trafficMode: 'split',
       rules: [{ kind: 'application', value: curl }],
     }, 30_000)

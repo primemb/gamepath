@@ -1,6 +1,7 @@
 import type { AppState, GamePathApi } from './types'
 
 let state: AppState = {
+  clientVersion: '0.1.11',
   tunnels: [
     { id: 'demo-1', name: 'Istanbul Falcon', endpoint: 'tr-01.example:51820', address: '10.44.0.2/32', dns: '1.1.1.1', enabled: true, importedAt: new Date().toISOString(), hasPrivateKey: true },
     { id: 'demo-2', name: 'Istanbul Nova', endpoint: 'tr-02.example:51820', address: '10.71.0.8/32', dns: 'System default', enabled: true, importedAt: new Date().toISOString(), hasPrivateKey: true },
@@ -18,6 +19,7 @@ let state: AppState = {
 }
 
 const snapshot = () => structuredClone(state)
+let mockTelemetryTick = 0
 
 export const mockApi: GamePathApi = {
   bootstrap: async () => snapshot(),
@@ -94,7 +96,8 @@ export const mockApi: GamePathApi = {
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     state.session = relay?.status === 'ready'
       ? { status: 'connected', message: 'Two encrypted paths are connected to the relay.', routeLatencies: [34, 39], pathMetrics: [
-        { route: 1, pathKind: 'wireguard', label: 'WireGuard route 1', endpoint: 'tr-01.example:51820', reachable: true, latencyMs: 39, nodeLatencyMs: 22, packetsSent: 128, packetsReceived: 127, bytesSent: 148320, bytesReceived: 232410, lastError: null },
+        { route: 1, pathKind: 'wireguard', label: 'Istanbul Falcon', endpoint: 'tr-01.example:51820', reachable: true, latencyMs: 39, nodeLatencyMs: 22, packetsSent: 128, packetsReceived: 127, bytesSent: 148320, bytesReceived: 232410, probesSent: 12, probesReceived: 12, probesLost: 0, lastError: null },
+        { route: 2, pathKind: 'wireguard', label: 'Istanbul Nova', endpoint: 'tr-02.example:51820', reachable: true, latencyMs: 34, nodeLatencyMs: 19, packetsSent: 128, packetsReceived: 126, bytesSent: 148320, bytesReceived: 232410, probesSent: 12, probesReceived: 11, probesLost: 1, lastError: null },
       ], metrics: { userToNodeMs: 22, nodeToRelayMs: 17, relayToServerMs: 9, endToEndMs: 48, benchmarkServer: '1.1.1.1', bytesSent: 296640, bytesReceived: 464820, packetsSent: 256, packetsReceived: 253, packetLossPercent: 1.17 } }
       : { status: 'error', message: 'The Istanbul relay needs its server component and address.' }
     return snapshot()
@@ -103,5 +106,20 @@ export const mockApi: GamePathApi = {
     state.session = { status: 'idle' }
     return snapshot()
   },
-  refreshSession: async () => snapshot(),
+  refreshSession: async () => {
+    if (state.session.status === 'connected' && state.session.pathMetrics) {
+      mockTelemetryTick += 1
+      state.session.pathMetrics = state.session.pathMetrics.map((path, index) => ({
+        ...path,
+        latencyMs: 34 + index * 5 + ((mockTelemetryTick + index * 2) % 5),
+        packetsSent: path.packetsSent + 24 + index * 3,
+        packetsReceived: path.packetsReceived + 23 + index * 3,
+        bytesSent: path.bytesSent + 18400 + index * 2100,
+        bytesReceived: path.bytesReceived + 42600 + index * 3700,
+        probesSent: (path.probesSent ?? 0) + 1,
+        probesReceived: (path.probesReceived ?? 0) + 1,
+      }))
+    }
+    return snapshot()
+  },
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   AppWindow,
@@ -29,7 +29,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { mockApi } from './mockApi'
-import type { AddRuleInput, AppState, GamePathApi, Relay, RuleKind, Tunnel } from './types'
+import type { AddRuleInput, AppState, GamePathApi, PathMetric, Relay, RuleKind, Tunnel } from './types'
 
 type View = 'dashboard' | 'routes' | 'split' | 'relays' | 'settings'
 
@@ -94,32 +94,70 @@ const formatBytes = (bytes: number | undefined) => {
   return `${(value / 1024 ** 2).toFixed(2)} MB`
 }
 
-function LatencyChart({ values }: { values: number[] }) {
-  const samples = values.length > 1 ? values : [values[0] ?? 0, values[0] ?? 0]
-  const maximum = Math.max(...samples, 1)
-  const minimum = Math.min(...samples)
-  const spread = Math.max(maximum - minimum, 8)
-  const points = samples.map((value, index) => {
-    const x = (index / (samples.length - 1)) * 300
-    const y = 62 - ((value - minimum) / spread) * 48
-    return `${x},${y}`
-  }).join(' ')
-  return <svg className="latency-chart" viewBox="0 0 300 70" preserveAspectRatio="none" role="img" aria-label="End-to-end ping history"><defs><linearGradient id="latencyFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#26e6cd" stopOpacity=".25" /><stop offset="1" stopColor="#26e6cd" stopOpacity="0" /></linearGradient></defs><polygon points={`0,70 ${points} 300,70`} fill="url(#latencyFill)" /><polyline points={points} fill="none" stroke="#26e6cd" strokeWidth="2" vectorEffect="non-scaling-stroke" /></svg>
+type PathSample = { latency: number; probe: number }
+type PathHistory = Record<number, PathSample[]>
+type PathRate = { sent: number; received: number }
+
+const pathColors = ['#26e6cd', '#8a7cff', '#ffb35c', '#5ca8ff', '#ef6fae', '#8fdb62']
+const jitter = (samples: PathSample[]) => samples.length < 2 ? 0 : samples.slice(1).reduce((total, sample, index) => total + Math.abs(sample.latency - samples[index].latency), 0) / (samples.length - 1)
+const pathLoss = (path: PathMetric) => {
+  const completed = (path.probesReceived ?? 0) + (path.probesLost ?? 0)
+  return completed ? ((path.probesLost ?? 0) / completed) * 100 : 0
+}
+const formatRate = (bytesPerSecond: number | undefined) => `${formatBytes(bytesPerSecond)}/s`
+
+function LatencyChart({ histories, paths }: { histories: PathHistory; paths: PathMetric[] }) {
+  const series = paths.map((path, index) => ({ path, color: pathColors[index % pathColors.length], samples: histories[path.route] ?? [] }))
+  const allValues = series.flatMap((item) => item.samples.map((sample) => sample.latency))
+  const maximum = allValues.length ? Math.max(...allValues) : 10
+  const minimum = allValues.length ? Math.min(...allValues) : 0
+  const padding = Math.max((maximum - minimum) * .15, 4)
+  const low = Math.max(0, minimum - padding)
+  const high = maximum + padding
+  const range = Math.max(high - low, 1)
+  const points = (samples: PathSample[]) => {
+    const values = samples.length === 1 ? [samples[0], samples[0]] : samples
+    return values.map((sample, index) => `${(index / Math.max(values.length - 1, 1)) * 300},${62 - ((sample.latency - low) / range) * 52}`).join(' ')
+  }
+  return <>
+    <div className="chart-scale"><span>{Math.round(high)} ms</span><span>{Math.round(low)} ms</span></div>
+    <svg className="latency-chart" viewBox="0 0 300 70" preserveAspectRatio="none" role="img" aria-label="Latency history for every WireGuard route">
+      <g className="chart-grid"><line x1="0" y1="10" x2="300" y2="10" /><line x1="0" y1="36" x2="300" y2="36" /><line x1="0" y1="62" x2="300" y2="62" /></g>
+      {series.map((item) => item.samples.length ? <polyline key={item.path.route} points={points(item.samples)} fill="none" stroke={item.color} strokeWidth="2" vectorEffect="non-scaling-stroke" /> : null)}
+    </svg>
+    <div className="chart-legend">{series.map((item) => <span key={item.path.route}><i style={{ background: item.color }} />{item.path.label}</span>)}</div>
+  </>
 }
 
-function TelemetryPanel({ state, history }: { state: AppState; history: number[] }) {
+function TelemetryPanel({ state, histories, rates }: { state: AppState; histories: PathHistory; rates: Record<number, PathRate> }) {
   const metrics = state.session.metrics
   const capture = state.session.capture?.diagnostics
+  const paths = state.session.pathMetrics ?? []
+  const bestPath = paths.filter((path) => path.reachable && path.latencyMs != null).sort((a, b) => (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity))[0]
+  const bestNodeToRelay = bestPath?.nodeLatencyMs != null && bestPath.latencyMs != null ? Math.max(0, bestPath.latencyMs - bestPath.nodeLatencyMs) : null
   const stages = [
-    ['User → VPN node', metrics?.userToNodeMs, 'WireGuard handshake RTT'],
-    ['Node → relay', metrics?.nodeToRelayMs, 'Tunnel segment estimate'],
+    ['User → VPN node', bestPath?.nodeLatencyMs, bestPath ? `${bestPath.label} handshake` : 'Awaiting route'],
+    ['VPN node → relay', bestNodeToRelay, bestPath ? `${bestPath.label} estimate` : 'Awaiting route'],
     ['Relay → server', metrics?.relayToServerMs, metrics?.benchmarkServer ? `Benchmark ${metrics.benchmarkServer}` : 'Awaiting target'],
   ] as const
   return <section className="telemetry-panel">
-    <div className="telemetry-head"><div><span className="eyebrow">Live telemetry</span><h2>Network journey</h2></div><span className={`status-pill ${state.session.status === 'connected' ? 'online' : ''}`}><i />{state.session.status === 'connected' ? capture ? `${capture.relayedPackets} game packets routed` : 'Live' : 'Waiting'}</span></div>
+    <div className="telemetry-head"><div><span className="eyebrow">Live telemetry</span><h2>Network journey</h2><p>Passive counters and one tiny health probe per route every 10 seconds</p></div><span className={`status-pill ${state.session.status === 'connected' ? 'online' : ''}`}><i />{state.session.status === 'connected' ? capture ? `${capture.relayedPackets} game packets routed` : 'Live' : 'Waiting'}</span></div>
     <div className="journey-grid">{stages.map(([label, value, detail], index) => <div className="journey-stage" key={label}><span>{index + 1}</span><div><small>{label}</small><strong>{formatMetric(value)}</strong><em>{detail}</em></div></div>)}</div>
+    <div className="node-heading"><div><span className="eyebrow">All VPN nodes</span><h3>Route quality</h3></div><small>{paths.length} active route{paths.length === 1 ? '' : 's'}</small></div>
+    <div className="node-grid">{paths.map((path, index) => {
+      const samples = histories[path.route] ?? []
+      const nodeToRelay = path.nodeLatencyMs != null && path.latencyMs != null ? Math.max(0, path.latencyMs - path.nodeLatencyMs) : null
+      const rate = rates[path.route]
+      return <article className={`node-card ${path.reachable ? 'healthy' : 'unhealthy'}`} key={path.route}>
+        <div className="node-card-head"><span className="node-color" style={{ background: pathColors[index % pathColors.length] }} /><div><strong>{path.label}</strong><small>{path.endpoint}</small></div><span className={`route-health ${path.reachable ? 'online' : ''}`}><i />{path.reachable ? 'Healthy' : 'Offline'}</span></div>
+        <div className="node-primary"><span><small>Relay RTT</small><strong>{formatMetric(path.latencyMs)}</strong></span><span><small>Jitter</small><strong>{samples.length ? `${jitter(samples).toFixed(1)} ms` : '—'}</strong></span><span><small>Probe loss</small><strong>{`${pathLoss(path).toFixed(1)}%`}</strong></span></div>
+        <div className="node-secondary"><span>User → node <strong>{formatMetric(path.nodeLatencyMs)}</strong></span><span>Node → relay <strong>{formatMetric(nodeToRelay)}</strong></span><span>Probes <strong>{path.probesReceived ?? 0}/{path.probesSent ?? 0}</strong></span></div>
+        <div className="node-traffic"><span><ArrowUpRight size={13} />{formatRate(rate?.sent)}<small>{formatBytes(path.bytesSent)} total</small></span><span><ArrowDownRight size={13} />{formatRate(rate?.received)}<small>{formatBytes(path.bytesReceived)} total</small></span></div>
+        {path.lastError && <p className="node-error">{path.lastError}</p>}
+      </article>
+    })}</div>
     <div className="telemetry-lower">
-      <div className="chart-card"><div><span>End-to-end ping</span><strong>{formatMetric(metrics?.endToEndMs)}</strong></div><LatencyChart values={history} /></div>
+      <div className="chart-card"><div><span>Route latency history</span><strong>{bestPath ? `Best ${formatMetric(bestPath.latencyMs)}` : 'Waiting'}</strong></div><LatencyChart histories={histories} paths={paths} /></div>
       <div className="transfer-grid"><div><ArrowUpRight size={16} /><span>Data sent<strong>{formatBytes(metrics?.bytesSent)}</strong></span></div><div><ArrowDownRight size={16} /><span>Data received<strong>{formatBytes(metrics?.bytesReceived)}</strong></span></div><div><Activity size={16} /><span>Packet loss<strong>{metrics ? `${metrics.packetLossPercent.toFixed(1)}%` : '—'}</strong></span></div><div><Radio size={16} /><span>Packets<strong>{metrics ? `${metrics.packetsReceived} / ${metrics.packetsSent}` : '—'}</strong></span></div></div>
     </div>
   </section>
@@ -236,7 +274,9 @@ function App() {
   const [vpsTarget, setVpsTarget] = useState<{ id: string; action: 'provision' | 'remove' } | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [installingService, setInstallingService] = useState(false)
-  const [latencyHistory, setLatencyHistory] = useState<number[]>([])
+  const [pathHistories, setPathHistories] = useState<PathHistory>({})
+  const [pathRates, setPathRates] = useState<Record<number, PathRate>>({})
+  const previousPathCounters = useRef<{ at: number; paths: Record<number, { sent: number; received: number }> } | null>(null)
 
   useEffect(() => { api.bootstrap().then(setState) }, [])
   useEffect(() => {
@@ -245,10 +285,38 @@ function App() {
     return () => window.clearInterval(timer)
   }, [state?.session.status])
   useEffect(() => {
-    const latency = state?.session.metrics?.endToEndMs
-    if (latency != null) setLatencyHistory((values) => [...values.slice(-29), latency])
-    else if (state?.session.status === 'idle') setLatencyHistory([])
-  }, [state?.session.metrics?.endToEndMs])
+    if (state?.session.status === 'idle') {
+      setPathHistories({})
+      setPathRates({})
+      previousPathCounters.current = null
+      return
+    }
+    const paths = state?.session.pathMetrics
+    if (!paths?.length) return
+    setPathHistories((current) => {
+      const next = { ...current }
+      for (const path of paths) {
+        if (path.latencyMs == null) continue
+        const probe = path.probesReceived ?? 0
+        const samples = next[path.route] ?? []
+        if (samples.at(-1)?.probe !== probe) next[path.route] = [...samples.slice(-59), { latency: path.latencyMs, probe }]
+      }
+      return next
+    })
+    const now = performance.now()
+    const previous = previousPathCounters.current
+    if (previous) {
+      const elapsed = Math.max((now - previous.at) / 1000, .001)
+      setPathRates(Object.fromEntries(paths.map((path) => {
+        const old = previous.paths[path.route]
+        return [path.route, {
+          sent: old ? Math.max(0, path.bytesSent - old.sent) / elapsed : 0,
+          received: old ? Math.max(0, path.bytesReceived - old.received) / elapsed : 0,
+        }]
+      })))
+    }
+    previousPathCounters.current = { at: now, paths: Object.fromEntries(paths.map((path) => [path.route, { sent: path.bytesSent, received: path.bytesReceived }])) }
+  }, [state?.session.pathMetrics, state?.session.status])
 
   const enabledRoutes = state?.tunnels.filter((item) => item.enabled).length ?? 0
   const enabledRules = state?.rules.filter((item) => item.enabled).length ?? 0
@@ -299,7 +367,7 @@ function App() {
         <div className="sidebar-bottom">
           <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}><Settings size={18} />Settings</button>
           <div className="client-card"><span><ShieldCheck size={16} /></span><div><strong>Local protection</strong><small>Keys secured by Windows</small></div></div>
-          <div className="version">Client 0.1.7 <i /> Alpha build</div>
+          <div className="version">Client {state.clientVersion ?? 'development'} <i /> Alpha build</div>
         </div>
       </aside>
 
@@ -354,7 +422,7 @@ function App() {
                 </div>
               </section>
 
-              <TelemetryPanel state={state} history={latencyHistory} />
+              <TelemetryPanel state={state} histories={pathHistories} rates={pathRates} />
             </div>
           )}
 

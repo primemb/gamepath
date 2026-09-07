@@ -42,6 +42,7 @@ function publicState() {
   const { encryptedConfigs, encryptedRelayTokens, ...safeState } = state
   return structuredClone({
     ...safeState,
+    clientVersion: app.getVersion(),
     engine: engineBridge?.status ?? { status: 'offline', version: '', message: 'Native engine is starting', capabilities: null },
     service: serviceBridge?.status ?? { status: 'offline', version: '', message: 'Network service is starting', elevated: false },
   })
@@ -80,7 +81,9 @@ function encryptConfig(source) {
 
 function updateSessionMetrics(runtime, dataPlane) {
   const paths = runtime.paths ?? []
-  const wireGuard = paths.find((path) => path.pathKind === 'wireguard')
+  const wireGuard = paths
+    .filter((path) => path.pathKind === 'wireguard' && path.reachable)
+    .sort((left, right) => (left.latencyMs ?? Infinity) - (right.latencyMs ?? Infinity))[0]
   const sent = paths.reduce((total, path) => total + path.packetsSent, 0)
   const received = paths.reduce((total, path) => total + path.packetsReceived, 0)
   const probesReceived = paths.reduce((total, path) => total + (path.probesReceived ?? 0), 0)
@@ -377,6 +380,7 @@ function registerIpc() {
           relayPort: relay.port,
           enrollmentToken,
           wireguardConfigs,
+          routeLabels: enabledTunnels.map((tunnel) => tunnel.name),
           trafficMode: state.trafficMode,
           rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
         }, 30000)

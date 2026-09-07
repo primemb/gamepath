@@ -65,6 +65,8 @@ struct WireGuardProbeRequest {
     relay_port: u16,
     enrollment_token: String,
     wireguard_configs: Vec<String>,
+    #[serde(default)]
+    route_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,7 +321,12 @@ impl WireGuardSessionManager {
             .map(|(config_index, path)| PathSessionStatus {
                 route: *config_index,
                 path_kind: "wireguard".into(),
-                label: format!("WireGuard route {config_index}"),
+                label: input
+                    .route_labels
+                    .get(config_index - 1)
+                    .cloned()
+                    .filter(|label| !label.trim().is_empty())
+                    .unwrap_or_else(|| format!("WireGuard route {config_index}")),
                 endpoint: path.endpoint().to_string(),
                 reachable: false,
                 latency_ms: None,
