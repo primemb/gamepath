@@ -14,6 +14,7 @@ import {
   HardDrive,
   Import,
   Info,
+  Layers,
   LayoutDashboard,
   Link2,
   ListChecks,
@@ -29,6 +30,7 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
+  Waypoints,
   X,
   Zap,
 } from 'lucide-react'
@@ -36,6 +38,7 @@ import { mockApi } from './mockApi'
 import type {
   AddRuleInput,
   AppState,
+  ConnectionMode,
   GamePathApi,
   PathMetric,
   Relay,
@@ -53,16 +56,111 @@ const navItems: { id: View; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'dashboard', label: 'Overview', icon: LayoutDashboard },
   { id: 'routes', label: 'Routes and nodes', icon: Route },
   { id: 'split', label: 'Split tunnel', icon: Network },
-  { id: 'relays', label: 'Relay servers', icon: Server },
+  { id: 'relays', label: 'Connection', icon: Server },
 ]
 
-function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (next: boolean) => void; label: string }) {
+const connectionModes = [
+  {
+    id: 'relay' as const,
+    icon: Layers,
+    title: 'Relay mode',
+    tagline: 'Lowest loss',
+    body: 'Every node you enable carries the same packets to a relay you run. When one hop stumbles, the copy that took the other path still arrives on time.',
+    needs: 'Needs a VPS running the GamePath relay.',
+  },
+  {
+    id: 'direct' as const,
+    icon: Waypoints,
+    title: 'Direct mode',
+    tagline: 'No server needed',
+    body: 'Your selected traffic goes through one WireGuard node and out to the game from there. A plain split tunnel, with nothing else to run.',
+    needs: 'Needs one WireGuard node. SOCKS5 proxies can only be used with a relay.',
+  },
+]
+
+/**
+ * Picks how traffic leaves this PC.
+ *
+ * The two modes are not better and worse versions of each other — one is
+ * faster, the other needs nothing to be set up — so both are shown side by
+ * side with what each costs, and the one that suits what the user already has
+ * is marked. The trade-off of the chosen mode is stated under it rather than
+ * saved for the moment a session fails to start.
+ */
+function ConnectionModes({
+  mode,
+  recommended,
+  onSelect,
+  onSetUpRelay,
+}: {
+  mode: ConnectionMode
+  recommended: ConnectionMode | null
+  onSelect: (next: ConnectionMode) => void
+  onSetUpRelay: () => void
+}) {
+  return (
+    <div className="mode-picker">
+      <div className="mode-grid" role="radiogroup" aria-label="Connection mode">
+        {connectionModes.map((option) => {
+          const Icon = option.icon
+          const active = mode === option.id
+          return (
+            <button
+              type="button"
+              role="radio"
+              aria-checked={active}
+              key={option.id}
+              className={`mode-card ${active ? 'is-active' : ''}`}
+              onClick={() => onSelect(option.id)}
+            >
+              <span className="mode-icon">
+                <Icon size={19} />
+              </span>
+              <span className="mode-head">
+                <strong>{option.title}</strong>
+                <em>{option.tagline}</em>
+                {recommended === option.id && <span className="mode-tip">Suits your setup</span>}
+              </span>
+              <span className="mode-body">{option.body}</span>
+              <small>{option.needs}</small>
+            </button>
+          )
+        })}
+      </div>
+      {mode === 'direct' && (
+        <p className="mode-tradeoff">
+          <Info size={14} />
+          <span>
+            One path means a lost packet is simply lost. Combining nodes at a relay is what makes GamePath steadier than
+            a plain VPN.
+          </span>
+          <button className="text-button" onClick={onSetUpRelay}>
+            Switch to relay mode <ChevronRight size={14} />
+          </button>
+        </p>
+      )}
+    </div>
+  )
+}
+
+function Toggle({
+  checked,
+  onChange,
+  label,
+  disabled = false,
+}: {
+  checked: boolean
+  onChange: (next: boolean) => void
+  label: string
+  disabled?: boolean
+}) {
   return (
     <button
       className={`toggle ${checked ? 'is-on' : ''}`}
       onClick={() => onChange(!checked)}
       aria-label={label}
       aria-pressed={checked}
+      disabled={disabled}
     >
       <span />
     </button>
@@ -71,24 +169,36 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (nex
 
 function Endpoint({
   tunnel,
+  direct,
   onToggle,
   onRemove,
 }: {
   tunnel: Tunnel
+  direct: boolean
   onToggle: (enabled: boolean) => void
   onRemove: () => void
 }) {
   const isProxy = tunnel.kind === 'socks5'
+  // A proxy has no way to route on its own, so in direct mode it stays in the
+  // list with the reason attached rather than quietly refusing to switch on.
+  const unusable = direct && isProxy
+  const stateLabel = tunnel.enabled ? (direct ? 'Carrying traffic' : 'Enabled') : 'Disabled'
   return (
-    <article className={`route-card ${tunnel.enabled ? 'is-enabled' : ''}`}>
+    <article className={`route-card ${tunnel.enabled ? 'is-enabled' : ''} ${unusable ? 'is-unusable' : ''}`}>
       <div className="route-state-icon">{isProxy ? <Share2 size={18} /> : <Radio size={18} />}</div>
       <div className="route-copy">
         <div className="route-title-row">
           <h3>{tunnel.name}</h3>
           <span className="kind-pill">{isProxy ? 'SOCKS5' : 'WireGuard'}</span>
-          <span className={`status-pill ${tunnel.enabled ? 'online' : ''}`}>
-            <i /> {tunnel.enabled ? 'Enabled' : 'Disabled'}
-          </span>
+          {unusable ? (
+            <span className="status-pill">
+              <i /> Needs a relay
+            </span>
+          ) : (
+            <span className={`status-pill ${tunnel.enabled ? 'online' : ''}`}>
+              <i /> {stateLabel}
+            </span>
+          )}
         </div>
         <p>{tunnel.endpoint}</p>
         <div className="route-meta">
@@ -118,12 +228,25 @@ function Endpoint({
             </>
           )}
         </div>
+        {unusable && (
+          <p className="route-note">
+            <Info size={13} /> A SOCKS5 proxy forwards connections, it does not route packets, so it needs a relay on
+            the other side. Switch to relay mode to use this node.
+          </p>
+        )}
       </div>
       <div className="route-actions">
         <Toggle
           checked={tunnel.enabled}
+          disabled={unusable}
           onChange={onToggle}
-          label={`${tunnel.enabled ? 'Disable' : 'Enable'} ${tunnel.name}`}
+          label={
+            unusable
+              ? `${tunnel.name} cannot be used in direct mode`
+              : direct
+                ? `Carry traffic through ${tunnel.name}`
+                : `${tunnel.enabled ? 'Disable' : 'Enable'} ${tunnel.name}`
+          }
         />
         <button className="icon-button danger" onClick={onRemove} aria-label={`Remove ${tunnel.name}`}>
           <Trash2 size={16} />
@@ -311,19 +434,29 @@ function TelemetryPanel({
   const bestPath = paths
     .filter((path) => path.reachable && path.latencyMs != null)
     .sort((a, b) => (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity))[0]
+  // A direct session's node is the last hop, so its journey has one leg fewer
+  // and the middle stage would only ever read as an empty measurement. Before
+  // a session starts there is no session mode, so the chosen one stands in.
+  const direct = (state.session.mode ?? state.connectionMode) === 'direct'
   const bestNodeToRelay =
     bestPath?.nodeLatencyMs != null && bestPath.latencyMs != null
       ? Math.max(0, bestPath.latencyMs - bestPath.nodeLatencyMs)
       : null
-  const stages = [
-    ['User → VPN node', bestPath?.nodeLatencyMs, bestPath ? `${bestPath.label} handshake` : 'Awaiting route'],
-    ['VPN node → relay', bestNodeToRelay, bestPath ? `${bestPath.label} estimate` : 'Awaiting route'],
-    [
-      'Relay → server',
-      metrics?.relayToServerMs,
-      metrics?.benchmarkServer ? `Benchmark ${metrics.benchmarkServer}` : 'Awaiting target',
-    ],
+  const serverStage = [
+    direct ? 'VPN node → server' : 'Relay → server',
+    metrics?.relayToServerMs,
+    metrics?.benchmarkServer ? `Benchmark ${metrics.benchmarkServer}` : 'Awaiting target',
   ] as const
+  const stages = direct
+    ? ([
+        ['You → VPN node', bestPath?.nodeLatencyMs, bestPath ? `${bestPath.label} handshake` : 'Awaiting node'],
+        serverStage,
+      ] as const)
+    : ([
+        ['User → VPN node', bestPath?.nodeLatencyMs, bestPath ? `${bestPath.label} handshake` : 'Awaiting route'],
+        ['VPN node → relay', bestNodeToRelay, bestPath ? `${bestPath.label} estimate` : 'Awaiting route'],
+        serverStage,
+      ] as const)
   return (
     <section className="telemetry-panel">
       <div className="telemetry-head">
@@ -395,11 +528,11 @@ function TelemetryPanel({
 
       <div className="node-heading">
         <div>
-          <span className="eyebrow">All VPN nodes</span>
-          <h3>Route quality</h3>
+          <span className="eyebrow">{direct ? 'Your VPN node' : 'All VPN nodes'}</span>
+          <h3>{direct ? 'Node quality' : 'Route quality'}</h3>
         </div>
         <small>
-          {paths.length} active route{paths.length === 1 ? '' : 's'}
+          {direct ? 'One node, no duplication' : `${paths.length} active route${paths.length === 1 ? '' : 's'}`}
         </small>
       </div>
       {paths.length ? (
@@ -430,7 +563,7 @@ function TelemetryPanel({
                 </div>
                 <div className="node-primary">
                   <span>
-                    <small>Relay RTT</small>
+                    <small>{direct ? 'Node RTT' : 'Relay RTT'}</small>
                     <strong>{formatMetric(path.latencyMs)}</strong>
                   </span>
                   <span>
@@ -446,9 +579,11 @@ function TelemetryPanel({
                   <span>
                     User → node <strong>{formatMetric(path.nodeLatencyMs)}</strong>
                   </span>
-                  <span>
-                    Node → relay <strong>{formatMetric(nodeToRelay)}</strong>
-                  </span>
+                  {!direct && (
+                    <span>
+                      Node → relay <strong>{formatMetric(nodeToRelay)}</strong>
+                    </span>
+                  )}
                   <span>
                     Probes{' '}
                     <strong>
@@ -1082,28 +1217,34 @@ function SetupDrawer({
   onToggle,
   steps,
   routes,
-  relayCity,
+  destination,
+  direct,
   onManageRoutes,
 }: {
   open: boolean
   onToggle: () => void
   steps: SetupItem[]
   routes: string[]
-  relayCity: string
+  destination: string
+  direct: boolean
   onManageRoutes: () => void
 }) {
   const readyCount = steps.filter((step) => step.done).length
   const complete = readyCount === steps.length
   const stack = routes.length
     ? routes.map((name) => ({ name, enabled: true }))
-    : [{ name: 'WireGuard pool', enabled: false }]
+    : [{ name: direct ? 'WireGuard node' : 'WireGuard pool', enabled: false }]
   return (
     <section className={`setup-drawer ${open ? 'is-open' : ''} ${complete ? 'is-complete' : ''}`}>
       <button className="drawer-head" onClick={onToggle} aria-expanded={open}>
         <span className="drawer-icon">{complete ? <Check size={15} /> : <ListChecks size={15} />}</span>
         <span className="drawer-copy">
           <strong>{complete ? 'Setup complete' : `Setup — ${readyCount} of ${steps.length} ready`}</strong>
-          <small>Routes, traffic mode, relay and the current path chain</small>
+          <small>
+            {direct
+              ? 'Node, traffic mode and the current path'
+              : 'Routes, traffic mode, relay and the current path chain'}
+          </small>
         </span>
         <span className="drawer-pips" aria-hidden="true">
           {steps.map((step) => (
@@ -1134,7 +1275,7 @@ function SetupDrawer({
             <div className="section-heading">
               <div>
                 <span className="eyebrow">Path overview</span>
-                <h2>Current route chain</h2>
+                <h2>{direct ? 'Current path' : 'Current route chain'}</h2>
               </div>
               <button className="text-button" onClick={onManageRoutes}>
                 Manage <ChevronRight size={14} />
@@ -1154,7 +1295,9 @@ function SetupDrawer({
                   <div key={item.name}>
                     <span className={item.enabled ? 'active' : ''}>{index + 1}</span>
                     <p>{item.name}</p>
-                    <small>{item.enabled ? 'VPN path available' : 'Not configured'}</small>
+                    <small>
+                      {item.enabled ? (direct ? 'Carrying your traffic' : 'VPN path available') : 'Not configured'}
+                    </small>
                   </div>
                 ))}
               </div>
@@ -1163,8 +1306,8 @@ function SetupDrawer({
                 <i />
               </div>
               <div className="map-node relay">
-                <MapPin size={19} />
-                <span>{relayCity}</span>
+                {direct ? <Globe2 size={19} /> : <MapPin size={19} />}
+                <span>{destination}</span>
               </div>
             </div>
           </div>
@@ -1245,20 +1388,31 @@ function App() {
     }
   }, [state?.session.pathMetrics, state?.session.status])
 
-  const enabledRoutes = state?.tunnels.filter((item) => item.enabled).length ?? 0
+  const enabledNodes = state?.tunnels.filter((item) => item.enabled) ?? []
+  const enabledRoutes = enabledNodes.length
   const enabledRules = state?.rules.filter((item) => item.enabled).length ?? 0
   const relay = state?.relays.find((item) => item.id === state.activeRelayId)
   const trafficMode = state?.trafficMode ?? 'split'
+  const connectionMode = state?.connectionMode ?? 'relay'
+  const direct = connectionMode === 'direct'
+  const wireguardNodes = state?.tunnels.filter((item) => item.kind === 'wireguard').length ?? 0
+  // Direct mode is ready when exactly one node is chosen and that node can
+  // actually route, which is the same rule the engine enforces.
+  const directNode = enabledRoutes === 1 && enabledNodes[0].kind === 'wireguard' ? enabledNodes[0] : null
   const bestRouteLatency = state?.session.routeLatencies?.length ? Math.min(...state.session.routeLatencies) : null
   const readiness = useMemo(
     () => ({
-      routes: enabledRoutes >= 1,
+      routes: direct ? directNode != null : enabledRoutes >= 1,
       rules: trafficMode === 'all' || enabledRules >= 1,
-      relay: relay?.status === 'ready',
+      ...(direct ? {} : { relay: relay?.status === 'ready' }),
     }),
-    [enabledRoutes, enabledRules, relay, trafficMode],
+    [direct, directNode, enabledRoutes, enabledRules, relay, trafficMode],
   )
   const readyCount = Object.values(readiness).filter(Boolean).length
+  const stepCount = Object.keys(readiness).length
+  // Point at the mode the user's current setup can actually start in.
+  const recommendedMode: ConnectionMode | null =
+    relay?.status === 'ready' ? 'relay' : wireguardNodes > 0 ? 'direct' : null
 
   if (!state)
     return (
@@ -1282,12 +1436,16 @@ function App() {
     elevated: false,
   }
 
-  const activeRouteNames = state.tunnels.filter((tunnel) => tunnel.enabled).map((tunnel) => tunnel.name)
+  const activeRouteNames = enabledNodes.map((tunnel) => tunnel.name)
   const setupSteps: SetupItem[] = [
     {
       done: readiness.routes,
-      title: 'Add a WireGuard route',
-      detail: `${state.tunnels.length} node${state.tunnels.length === 1 ? '' : 's'} added; the relay is reached only through enabled nodes`,
+      title: direct ? 'Choose a WireGuard node' : 'Add a WireGuard route',
+      detail: direct
+        ? directNode
+          ? `${directNode.name} will carry your traffic`
+          : `${wireguardNodes} WireGuard node${wireguardNodes === 1 ? '' : 's'} added; pick exactly one`
+        : `${state.tunnels.length} node${state.tunnels.length === 1 ? '' : 's'} added; the relay is reached only through enabled nodes`,
       action: 'Configure',
       onClick: () => setView('routes'),
     },
@@ -1301,13 +1459,19 @@ function App() {
       action: 'Configure',
       onClick: () => setView('split'),
     },
-    {
-      done: readiness.relay,
-      title: 'Configure a relay',
-      detail: relay ? `${relay.city}, ${relay.country}` : 'No relay selected',
-      action: 'Set up',
-      onClick: () => setView('relays'),
-    },
+    // Direct mode has no relay to set up, so the step is not shown greyed out
+    // and unreachable — it simply is not part of this setup.
+    ...(direct
+      ? []
+      : [
+          {
+            done: readiness.relay === true,
+            title: 'Configure a relay',
+            detail: relay ? `${relay.city}, ${relay.country}` : 'No relay selected',
+            action: 'Set up',
+            onClick: () => setView('relays'),
+          },
+        ]),
   ]
 
   const importTunnels = async () => {
@@ -1335,7 +1499,7 @@ function App() {
     dashboard: ['Overview', 'Session control and live route telemetry.'],
     routes: ['Routes and nodes', 'Import WireGuard configurations and add SOCKS5 proxies GamePath can use.'],
     split: ['Split tunnel', 'Choose exactly which traffic should enter the multipath tunnel.'],
-    relays: ['Relay servers', 'Select the destination that combines your active routes.'],
+    relays: ['Connection', 'Choose how your traffic leaves this PC.'],
     settings: ['Settings', 'Control startup, diagnostics, and client behavior.'],
   }
 
@@ -1406,20 +1570,26 @@ function App() {
                     <Zap size={22} fill="currentColor" />
                   </span>
                   <div>
-                    <span className="eyebrow">Multipath session</span>
+                    <span className="eyebrow">{direct ? 'Direct session' : 'Multipath session'}</span>
                     <h2>
                       {state.session.status === 'connected'
-                        ? 'Paths connected'
-                        : readyCount === 3
+                        ? direct
+                          ? 'Traffic is routing'
+                          : 'Paths connected'
+                        : readyCount === stepCount
                           ? 'Ready to accelerate'
                           : 'Complete your setup'}
                     </h2>
                     <p>
                       {state.session.status === 'connected'
-                        ? `${enabledRoutes} encrypted paths active through ${relay?.city ?? 'the relay'}.`
-                        : readyCount === 3
-                          ? `${enabledRoutes} routes will carry game traffic through ${relay?.city ?? 'the relay'}.`
-                          : `${readyCount} of 3 requirements ready — open Setup below.`}
+                        ? direct
+                          ? `Selected traffic is going through ${directNode?.name ?? 'your node'}.`
+                          : `${enabledRoutes} encrypted paths active through ${relay?.city ?? 'the relay'}.`
+                        : readyCount === stepCount
+                          ? direct
+                            ? `${directNode?.name ?? 'Your node'} will carry your selected traffic.`
+                            : `${enabledRoutes} routes will carry game traffic through ${relay?.city ?? 'the relay'}.`
+                          : `${readyCount} of ${stepCount} requirements ready — open Setup below.`}
                     </p>
                   </div>
                 </div>
@@ -1428,7 +1598,7 @@ function App() {
                     <span className="stat-icon cyan">
                       <Route size={16} />
                     </span>
-                    <p>Active routes</p>
+                    <p>{direct ? 'Active node' : 'Active routes'}</p>
                     <strong>
                       {enabledRoutes}
                       <small> / {state.tunnels.length}</small>
@@ -1438,7 +1608,7 @@ function App() {
                     <span className="stat-icon violet">
                       <CircleGauge size={16} />
                     </span>
-                    <p>Best route</p>
+                    <p>{direct ? 'Node latency' : 'Best route'}</p>
                     <strong>
                       {bestRouteLatency ?? '—'}
                       <small> ms</small>
@@ -1470,18 +1640,22 @@ function App() {
                           : 'Start session'}
                     </span>
                   </button>
-                  <span className="session-mode">
-                    <Sparkles size={12} /> Adaptive duplication
-                  </span>
+                  {/* Which mode is live, and the way back to changing it. */}
+                  <button className="session-mode" onClick={() => setView('relays')}>
+                    {direct ? <Waypoints size={12} /> : <Sparkles size={12} />}
+                    {direct ? 'Direct · one node' : 'Relay · adaptive duplication'}
+                    <ChevronRight size={12} />
+                  </button>
                 </div>
               </section>
 
               <SetupDrawer
-                open={setupOpen ?? readyCount < 3}
-                onToggle={() => setSetupOpen(!(setupOpen ?? readyCount < 3))}
+                open={setupOpen ?? readyCount < stepCount}
+                onToggle={() => setSetupOpen(!(setupOpen ?? readyCount < stepCount))}
                 steps={setupSteps}
                 routes={activeRouteNames}
-                relayCity={relay?.city ?? 'Relay'}
+                destination={direct ? 'Game server' : (relay?.city ?? 'Relay')}
+                direct={direct}
                 onManageRoutes={() => setView('routes')}
               />
 
@@ -1493,17 +1667,24 @@ function App() {
             <section className="page-section">
               <div className="toolbar">
                 <div>
-                  <span className="count-badge">{enabledRoutes} active</span>
+                  <span className="count-badge">
+                    {direct ? (directNode ? '1 chosen' : 'None chosen') : `${enabledRoutes} active`}
+                  </span>
                   <span className="muted">
-                    Each active node carries relay traffic through its own hop, a WireGuard tunnel or a SOCKS5 proxy.
-                    Direct ISP relay access is disabled.
+                    {direct
+                      ? 'Direct mode sends your traffic through one WireGuard node, which routes it onward. SOCKS5 proxies need a relay on the other side.'
+                      : 'Each active node carries relay traffic through its own hop, a WireGuard tunnel or a SOCKS5 proxy. Direct ISP relay access is disabled.'}
                   </span>
                 </div>
                 <div className="toolbar-actions">
-                  <button className="button secondary" onClick={() => setShowSocks5Modal(true)}>
-                    <Share2 size={16} />
-                    Add SOCKS5
-                  </button>
+                  {/* Adding a proxy in direct mode would only produce a node
+                      that cannot be started, so it is offered in relay mode. */}
+                  {!direct && (
+                    <button className="button secondary" onClick={() => setShowSocks5Modal(true)}>
+                      <Share2 size={16} />
+                      Add SOCKS5
+                    </button>
+                  )}
                   <button className="button primary" onClick={importTunnels}>
                     <Import size={16} />
                     Import .conf
@@ -1516,6 +1697,7 @@ function App() {
                     <Endpoint
                       key={tunnel.id}
                       tunnel={tunnel}
+                      direct={direct}
                       onToggle={async (enabled) => setState(await api.setTunnelEnabled(tunnel.id, enabled))}
                       onRemove={async () => setState(await api.removeTunnel(tunnel.id))}
                     />
@@ -1528,18 +1710,23 @@ function App() {
                   </span>
                   <h2>No nodes yet</h2>
                   <p>
-                    Import your purchased WireGuard configuration files, or add a SOCKS5 proxy that supports UDP.
-                    Private keys and proxy passwords are encrypted using Windows secure storage.
+                    {direct
+                      ? 'Import the WireGuard configuration file from your VPN provider. Direct mode routes through it, so it is all you need. Private keys are encrypted using Windows secure storage.'
+                      : 'Import your purchased WireGuard configuration files, or add a SOCKS5 proxy that supports UDP. Private keys and proxy passwords are encrypted using Windows secure storage.'}
                   </p>
                   <div className="empty-actions">
                     <button className="button primary" onClick={importTunnels}>
                       <Import size={16} />
                       Import configurations
                     </button>
-                    <button className="button secondary" onClick={() => setShowSocks5Modal(true)}>
-                      <Share2 size={16} />
-                      Add a SOCKS5 proxy
-                    </button>
+                    {/* A proxy cannot carry a direct session, so offering one
+                        here would only lead to a node that will not start. */}
+                    {!direct && (
+                      <button className="button secondary" onClick={() => setShowSocks5Modal(true)}>
+                        <Share2 size={16} />
+                        Add a SOCKS5 proxy
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
@@ -1669,111 +1856,130 @@ function App() {
 
           {view === 'relays' && (
             <section className="page-section">
-              <div className="relay-intro">
-                <div>
-                  <span className="eyebrow">Relay fleet</span>
-                  <h2>
-                    {state.relays.length} server{state.relays.length === 1 ? '' : 's'}
-                  </h2>
-                  <p>Add your VPS locations and enable one relay at a time.</p>
-                  <button className="button primary" onClick={() => setShowAddRelay(true)}>
-                    <Plus size={16} />
-                    Add VPS relay
-                  </button>
-                </div>
-                <div className="flag-orb">{relay?.code ?? 'GP'}</div>
-              </div>
-              <div className="relay-grid">
-                {state.relays.map((item) => (
-                  <article key={item.id} className={`relay-card ${state.activeRelayId === item.id ? 'selected' : ''}`}>
-                    <button className="relay-choice" onClick={async () => setState(await api.setRelay(item.id))}>
-                      <span className="relay-radio">{state.activeRelayId === item.id && <Check size={14} />}</span>
-                      <div className="relay-location">
-                        <span>
-                          <MapPin size={19} />
-                        </span>
-                        <div>
-                          <strong>{item.city}</strong>
-                          <small>
-                            {item.address ? `${item.address}:${item.port}` : `${item.country} · VPS not configured`}
-                          </small>
-                        </div>
-                      </div>
-                      <div className="relay-stat">
-                        <small>Latency</small>
-                        <strong>
-                          {item.latency ?? '—'}
-                          <em> ms</em>
-                        </strong>
-                      </div>
-                      <div className={`relay-status ${item.status}`}>
-                        <i />
-                        {state.activeRelayId === item.id
-                          ? 'Enabled'
-                          : item.status === 'ready'
-                            ? 'Disabled'
-                            : 'Setup required'}
-                      </div>
+              <ConnectionModes
+                mode={connectionMode}
+                recommended={recommendedMode}
+                onSelect={async (next) => {
+                  if (next === connectionMode) return
+                  setState(await api.setConnectionMode(next))
+                }}
+                onSetUpRelay={async () => setState(await api.setConnectionMode('relay'))}
+              />
+              <div className={`relay-section ${direct ? 'is-inactive' : ''}`}>
+                {direct && (
+                  <p className="relay-section-note">
+                    <Info size={14} /> Relays are kept here for when you switch back. Direct mode does not use them.
+                  </p>
+                )}
+                <div className="relay-intro">
+                  <div>
+                    <span className="eyebrow">Relay fleet</span>
+                    <h2>
+                      {state.relays.length} server{state.relays.length === 1 ? '' : 's'}
+                    </h2>
+                    <p>Add your VPS locations and enable one relay at a time.</p>
+                    <button className="button primary" onClick={() => setShowAddRelay(true)}>
+                      <Plus size={16} />
+                      Add VPS relay
                     </button>
-                    <div className="relay-actions">
-                      {item.status === 'ready' && (
+                  </div>
+                  <div className="flag-orb">{relay?.code ?? 'GP'}</div>
+                </div>
+                <div className="relay-grid">
+                  {state.relays.map((item) => (
+                    <article
+                      key={item.id}
+                      className={`relay-card ${state.activeRelayId === item.id ? 'selected' : ''}`}
+                    >
+                      <button className="relay-choice" onClick={async () => setState(await api.setRelay(item.id))}>
+                        <span className="relay-radio">{state.activeRelayId === item.id && <Check size={14} />}</span>
+                        <div className="relay-location">
+                          <span>
+                            <MapPin size={19} />
+                          </span>
+                          <div>
+                            <strong>{item.city}</strong>
+                            <small>
+                              {item.address ? `${item.address}:${item.port}` : `${item.country} · VPS not configured`}
+                            </small>
+                          </div>
+                        </div>
+                        <div className="relay-stat">
+                          <small>Latency</small>
+                          <strong>
+                            {item.latency ?? '—'}
+                            <em> ms</em>
+                          </strong>
+                        </div>
+                        <div className={`relay-status ${item.status}`}>
+                          <i />
+                          {state.activeRelayId === item.id
+                            ? 'Enabled'
+                            : item.status === 'ready'
+                              ? 'Disabled'
+                              : 'Setup required'}
+                        </div>
+                      </button>
+                      <div className="relay-actions">
+                        {item.status === 'ready' && (
+                          <button
+                            className="button secondary"
+                            onClick={async () => {
+                              try {
+                                const tested = await api.testRelay(item.id)
+                                setState(tested.state)
+                                setNotice(
+                                  `Authenticated relay ready · ${Math.round(tested.result.latencyMs)} ms · ${tested.result.virtualIpv4}`,
+                                )
+                              } catch (error) {
+                                setNotice(error instanceof Error ? error.message : String(error))
+                              }
+                            }}
+                          >
+                            Test
+                          </button>
+                        )}
                         <button
-                          className="button secondary"
-                          onClick={async () => {
-                            try {
-                              const tested = await api.testRelay(item.id)
-                              setState(tested.state)
-                              setNotice(
-                                `Authenticated relay ready · ${Math.round(tested.result.latencyMs)} ms · ${tested.result.virtualIpv4}`,
-                              )
-                            } catch (error) {
-                              setNotice(error instanceof Error ? error.message : String(error))
-                            }
+                          className="button primary"
+                          onClick={() => setVpsTarget({ id: item.id, action: 'provision' })}
+                        >
+                          {item.status === 'ready' ? 'Update VPS' : 'Auto-configure VPS'}
+                        </button>
+                        <button
+                          className="button secondary relay-configure"
+                          onClick={() => {
+                            setState({ ...state, activeRelayId: item.id })
+                            setShowRelayModal(true)
                           }}
                         >
-                          Test
+                          Manual
                         </button>
-                      )}
-                      <button
-                        className="button primary"
-                        onClick={() => setVpsTarget({ id: item.id, action: 'provision' })}
-                      >
-                        {item.status === 'ready' ? 'Update VPS' : 'Auto-configure VPS'}
-                      </button>
-                      <button
-                        className="button secondary relay-configure"
-                        onClick={() => {
-                          setState({ ...state, activeRelayId: item.id })
-                          setShowRelayModal(true)
-                        }}
-                      >
-                        Manual
-                      </button>
-                      {item.status === 'ready' && (
+                        {item.status === 'ready' && (
+                          <button
+                            className="button secondary"
+                            onClick={() => setVpsTarget({ id: item.id, action: 'remove' })}
+                          >
+                            Remove VPS
+                          </button>
+                        )}
                         <button
-                          className="button secondary"
-                          onClick={() => setVpsTarget({ id: item.id, action: 'remove' })}
+                          className="icon-button danger"
+                          aria-label={`Delete ${item.city}`}
+                          onClick={async () => setState(await api.removeRelayLocal(item.id))}
                         >
-                          Remove VPS
+                          <Trash2 size={16} />
                         </button>
-                      )}
-                      <button
-                        className="icon-button danger"
-                        aria-label={`Delete ${item.city}`}
-                        onClick={async () => setState(await api.removeRelayLocal(item.id))}
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
-                  </article>
-                ))}
-              </div>
-              <div className="coming-regions">
-                <span>More regions are planned</span>
-                <div>
-                  <i>DE</i>
-                  <i>NL</i>
-                  <i>AE</i>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+                <div className="coming-regions">
+                  <span>More regions are planned</span>
+                  <div>
+                    <i>DE</i>
+                    <i>NL</i>
+                    <i>AE</i>
+                  </div>
                 </div>
               </div>
             </section>
@@ -1788,10 +1994,14 @@ function App() {
                   </span>
                   <div>
                     <strong>Adaptive duplication</strong>
-                    <p>Duplicate latency-sensitive packets when route quality becomes unstable.</p>
+                    <p>
+                      {direct
+                        ? 'Needs relay mode: duplicating a packet only helps when a second path can carry the copy.'
+                        : 'Duplicate latency-sensitive packets when route quality becomes unstable.'}
+                    </p>
                   </div>
                 </div>
-                <Toggle checked={true} onChange={() => undefined} label="Adaptive duplication" />
+                <Toggle checked={!direct} disabled={direct} onChange={() => undefined} label="Adaptive duplication" />
               </div>
               <div className="settings-card">
                 <div>

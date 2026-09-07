@@ -37,6 +37,7 @@ let state: AppState = {
     { id: 'rule-2', kind: 'hostname', value: '*.riotgames.com', label: 'Riot game services', enabled: true },
   ],
   trafficMode: 'split',
+  connectionMode: 'relay',
   relays: [
     {
       id: 'tr-istanbul-01',
@@ -113,7 +114,11 @@ export const mockApi: GamePathApi = {
     latencyMs: 41,
   }),
   setTunnelEnabled: async (id, enabled) => {
-    state.tunnels = state.tunnels.map((item) => (item.id === id ? { ...item, enabled } : item))
+    // Direct mode picks one node rather than pooling several.
+    const exclusive = state.connectionMode === 'direct' && enabled
+    state.tunnels = state.tunnels.map((item) =>
+      item.id === id ? { ...item, enabled } : exclusive ? { ...item, enabled: false } : item,
+    )
     return snapshot()
   },
   removeTunnel: async (id) => {
@@ -135,6 +140,16 @@ export const mockApi: GamePathApi = {
   },
   setTrafficMode: async (mode) => {
     state.trafficMode = mode
+    return snapshot()
+  },
+  setConnectionMode: async (mode) => {
+    state.connectionMode = mode
+    if (mode === 'direct') {
+      const chosen =
+        state.tunnels.find((item) => item.enabled && item.kind === 'wireguard') ??
+        state.tunnels.find((item) => item.kind === 'wireguard')
+      state.tunnels = state.tunnels.map((item) => ({ ...item, enabled: item.id === chosen?.id }))
+    }
     return snapshot()
   },
   setRelay: async (id) => {

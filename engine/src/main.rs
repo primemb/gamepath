@@ -2,7 +2,9 @@ use base64::Engine as _;
 use gamepath_engine::adapter::inspect_library;
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
-use gamepath_engine::relay_path::{NodeSpec, RelayPath, Socks5RelayPath};
+use gamepath_engine::relay_path::{
+    DirectWireGuardPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
+};
 use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
 use gamepath_engine::socks5::Socks5NodeConfig;
 use gamepath_engine::timer::HighResolutionTimer;
@@ -48,8 +50,15 @@ struct PrepareRequest {
     route_ids: Vec<String>,
     traffic_mode: String,
     rules: Vec<RuleSpec>,
+    /// Absent for callers written before direct sessions existed.
+    #[serde(default)]
+    mode: SessionMode,
+    /// A direct session has no relay, so these three carry nothing there.
+    #[serde(default)]
     relay_host: String,
+    #[serde(default)]
     relay_port: u16,
+    #[serde(default)]
     enrollment_token: String,
 }
 
@@ -73,8 +82,16 @@ struct WireGuardProbeRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionRequest {
+    /// Absent for callers written before direct sessions existed, all of which
+    /// meant a relay session.
+    #[serde(default)]
+    mode: SessionMode,
+    /// A direct session has no relay, so these three carry nothing there.
+    #[serde(default)]
     relay_host: String,
+    #[serde(default)]
     relay_port: u16,
+    #[serde(default)]
     enrollment_token: String,
     #[serde(default)]
     nodes: Vec<NodeSpec>,
@@ -136,7 +153,24 @@ struct PathSessionStatus {
     last_error: Option<String>,
 }
 
+/// What a session wraps captured packets in before a path carries them.
+enum SessionOverlay {
+    /// Relay sessions seal every packet under the enrollment key, so the relay
+    /// can authenticate it and so a duplicate arriving by another path can be
+    /// recognised as the same packet.
+    Relay {
+        client_id: [u8; 16],
+        crypto: Arc<SessionCrypto>,
+    },
+    /// A direct session's node is the last hop and speaks plain IPv4. There is
+    /// no relay to authenticate to and no duplicate to recognise, so packets
+    /// travel exactly as they were captured — inside WireGuard's own crypto.
+    Direct,
+}
+
 struct ActiveWireGuardSession {
+    mode: SessionMode,
+    overlay: SessionOverlay,
     session_id: u64,
     started_at: u128,
     stop: Arc<AtomicBool>,
@@ -145,8 +179,6 @@ struct ActiveWireGuardSession {
     skipped_routes: Vec<usize>,
     commands: Vec<mpsc::Sender<PathCommand>>,
     data_receiver: Arc<DataReceiver>,
-    client_id: [u8; 16],
-    crypto: Arc<SessionCrypto>,
     virtual_ipv4: std::net::Ipv4Addr,
     sequences: Arc<AtomicU64>,
     decision_mask: Arc<AtomicU64>,
@@ -158,12 +190,22 @@ struct ActiveWireGuardSession {
     timer: HighResolutionTimer,
 }
 
+/// How the inbound queue's contents have to be unwrapped.
+enum ReceiveMode {
+    Relay {
+        client_id: [u8; 16],
+        session_id: u64,
+        crypto: Arc<SessionCrypto>,
+        server_replay: Mutex<SequenceWindow>,
+    },
+    /// The worker already checked that these packets came out of the tunnel
+    /// addressed to us, and WireGuard already authenticated them.
+    Direct,
+}
+
 pub(crate) struct DataReceiver {
     inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
-    client_id: [u8; 16],
-    session_id: u64,
-    crypto: Arc<SessionCrypto>,
-    server_replay: Mutex<SequenceWindow>,
+    mode: ReceiveMode,
 }
 
 impl DataReceiver {
@@ -177,12 +219,21 @@ impl DataReceiver {
                 return Err("all path receivers stopped".into());
             }
         };
-        let (header, plaintext) = self.crypto.open_server(&response)?;
-        if header.client_id != self.client_id
-            || header.session_id != self.session_id
+        let ReceiveMode::Relay {
+            client_id,
+            session_id,
+            crypto,
+            server_replay,
+        } = &self.mode
+        else {
+            return Ok(Some(response));
+        };
+        let (header, plaintext) = crypto.open_server(&response)?;
+        if header.client_id != *client_id
+            || header.session_id != *session_id
             || header.flags & FLAG_SERVER_TO_CLIENT == 0
             || header.flags & FLAG_CONTROL != 0
-            || !self.server_replay.lock().unwrap().accept(header.sequence)
+            || !server_replay.lock().unwrap().accept(header.sequence)
         {
             return Ok(None);
         }
@@ -330,6 +381,16 @@ impl WireGuardSessionManager {
         if nodes.is_empty() {
             return Err("at least one WireGuard or SOCKS5 node is required".into());
         }
+        match input.mode {
+            SessionMode::Relay => self.start_relay(&input, &nodes)?,
+            SessionMode::Direct => self.start_direct(&nodes)?,
+        }
+        self.wait_until_ready()
+    }
+
+    /// Brings up a relay session: every node carries sealed frames to the
+    /// relay, and the scheduler decides how many of them each packet takes.
+    fn start_relay(&mut self, input: &SessionRequest, nodes: &[NodeSpec]) -> Result<(), String> {
         let enrollment = EnrollmentToken::decode(&input.enrollment_token)?;
         let (client_id, key) = enrollment.material()?;
         let relay_ip = resolve_ipv4(&input.relay_host, input.relay_port)?;
@@ -374,22 +435,8 @@ impl WireGuardSessionManager {
         let sequences = Arc::new(AtomicU64::new(1));
         let initial_statuses = paths
             .iter()
-            .map(|(route, label, path)| PathSessionStatus {
-                route: *route,
-                path_kind: path.kind().into(),
-                label: label.clone(),
-                endpoint: path.endpoint(),
-                reachable: false,
-                latency_ms: None,
-                node_latency_ms: None,
-                packets_sent: 0,
-                packets_received: 0,
-                bytes_sent: 0,
-                bytes_received: 0,
-                probes_sent: 0,
-                probes_received: 0,
-                probes_lost: 0,
-                last_error: None,
+            .map(|(route, label, path)| {
+                initial_status(*route, path.kind(), label.clone(), path.endpoint())
             })
             .collect::<Vec<_>>();
         let statuses = Arc::new(Mutex::new(initial_statuses));
@@ -451,12 +498,16 @@ impl WireGuardSessionManager {
         }
         let data_receiver = Arc::new(DataReceiver {
             inbound: Mutex::new(inbound_rx),
-            client_id,
-            session_id,
-            crypto: Arc::clone(&crypto),
-            server_replay: Mutex::new(SequenceWindow::default()),
+            mode: ReceiveMode::Relay {
+                client_id,
+                session_id,
+                crypto: Arc::clone(&crypto),
+                server_replay: Mutex::new(SequenceWindow::default()),
+            },
         });
         self.active = Some(ActiveWireGuardSession {
+            mode: SessionMode::Relay,
+            overlay: SessionOverlay::Relay { client_id, crypto },
             session_id,
             started_at: unix_time_millis(),
             stop,
@@ -465,8 +516,6 @@ impl WireGuardSessionManager {
             skipped_routes,
             commands,
             data_receiver,
-            client_id,
-            crypto,
             virtual_ipv4: enrollment.virtual_ipv4,
             sequences,
             decision_mask,
@@ -475,7 +524,91 @@ impl WireGuardSessionManager {
             bypass_ips,
             timer,
         });
+        Ok(())
+    }
 
+    /// Brings up a direct session: no relay, and one WireGuard node doing the
+    /// routing that a relay would otherwise do.
+    fn start_direct(&mut self, nodes: &[NodeSpec]) -> Result<(), String> {
+        // Duplication is the only reason to run several paths, and duplication
+        // needs a relay to recognise the copies. Say so rather than silently
+        // using the first node and leaving the rest looking active.
+        let [node] = nodes else {
+            return Err(format!(
+                "direct mode sends traffic through exactly one node, but {} are enabled. \
+                 Enable a single WireGuard node, or switch to relay mode to combine them.",
+                nodes.len()
+            ));
+        };
+        let path = node
+            .open_direct()
+            .map_err(|error| format!("{}: {error}", node.describe()))?;
+        let virtual_ipv4 = path.address();
+        let bypass_ips = path.bypass_ipv4().into_iter().collect::<Vec<_>>();
+        let label = node.label().unwrap_or_else(|| node.default_label(1));
+        let endpoint = path.endpoint().to_string();
+
+        self.stop();
+        let timer = HighResolutionTimer::raise();
+        let stop = Arc::new(AtomicBool::new(false));
+        let statuses = Arc::new(Mutex::new(vec![initial_status(
+            1,
+            KIND_WIREGUARD,
+            label,
+            endpoint,
+        )]));
+        let scheduler_metrics = Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())]));
+        let path_worker_iterations = Arc::new(vec![AtomicU64::new(0)]);
+        let (command_tx, command_rx) = mpsc::channel();
+        let (inbound_tx, inbound_rx) = mpsc::channel();
+        let worker_stop = Arc::clone(&stop);
+        let worker_statuses = Arc::clone(&statuses);
+        let worker_metrics = Arc::clone(&scheduler_metrics);
+        let worker_iterations = Arc::clone(&path_worker_iterations);
+        let worker = thread::Builder::new()
+            .name("gamepath-direct-1".into())
+            .spawn(move || {
+                run_direct_path(
+                    path,
+                    virtual_ipv4,
+                    worker_stop,
+                    worker_statuses,
+                    command_rx,
+                    inbound_tx,
+                    worker_metrics,
+                    worker_iterations,
+                )
+            })
+            .map_err(|error| format!("could not start path worker: {error}"))?;
+        self.active = Some(ActiveWireGuardSession {
+            mode: SessionMode::Direct,
+            overlay: SessionOverlay::Direct,
+            session_id: rand::random::<u64>(),
+            started_at: unix_time_millis(),
+            stop,
+            paths: statuses,
+            workers: vec![worker],
+            skipped_routes: Vec::new(),
+            commands: vec![command_tx],
+            data_receiver: Arc::new(DataReceiver {
+                inbound: Mutex::new(inbound_rx),
+                mode: ReceiveMode::Direct,
+            }),
+            virtual_ipv4,
+            sequences: Arc::new(AtomicU64::new(1)),
+            // One path, always selected: there is nothing to schedule between.
+            decision_mask: Arc::new(AtomicU64::new(1)),
+            scheduler_metrics,
+            path_worker_iterations,
+            bypass_ips,
+            timer,
+        });
+        Ok(())
+    }
+
+    /// Holds until every path reports itself usable, so traffic is never
+    /// captured into a session that cannot carry it yet.
+    fn wait_until_ready(&mut self) -> Result<Value, String> {
         let deadline = Instant::now() + Duration::from_secs(12);
         while Instant::now() < deadline {
             if self.all_paths_reachable() {
@@ -483,42 +616,75 @@ impl WireGuardSessionManager {
             }
             thread::sleep(Duration::from_millis(100));
         }
-        let detail = self
+        let (subject, detail) = self
             .active
             .as_ref()
             .map(|session| {
-                session
+                let subject = match session.mode {
+                    SessionMode::Relay => "relay paths",
+                    SessionMode::Direct => "the node",
+                };
+                let detail = session
                     .paths
                     .lock()
                     .unwrap()
                     .iter()
                     .filter_map(|path| path.last_error.as_deref())
                     .collect::<Vec<_>>()
-                    .join("; ")
+                    .join("; ");
+                (subject, detail)
             })
-            .unwrap_or_default();
+            .unwrap_or(("relay paths", String::new()));
         self.stop();
         if detail.is_empty() {
-            Err("relay paths did not become ready before timeout".into())
+            Err(format!("{subject} did not become ready before timeout"))
         } else {
-            Err(format!("relay paths did not become ready: {detail}"))
+            Err(format!("{subject} did not become ready: {detail}"))
         }
     }
 
     fn probe_data_plane(&mut self) -> Result<Value, String> {
-        let virtual_ipv4 = self
+        let session = self
             .active
             .as_ref()
-            .ok_or("start the WireGuard session before probing its data plane")?
-            .virtual_ipv4;
+            .ok_or("start the WireGuard session before probing its data plane")?;
+        let (virtual_ipv4, mode) = (session.virtual_ipv4, session.mode);
         let benchmark_server = std::net::Ipv4Addr::new(1, 1, 1, 1);
         let identifier = rand::random::<u16>();
         let request = icmp_echo_packet(virtual_ipv4, benchmark_server, identifier, 1, false);
         let started = Instant::now();
-        let reply = self.send_data_packet(&request)?;
-        if !is_matching_icmp_reply(&reply, benchmark_server, virtual_ipv4, identifier) {
-            return Err("relay data plane returned an unexpected packet".into());
-        }
+        // A relay session has to answer: the relay is the user's own, and this
+        // round trip is what proves the whole chain carries traffic. A direct
+        // session's node belongs to a provider who may simply filter ICMP,
+        // which says nothing about the game traffic it will carry — so there
+        // the probe is telemetry, and a silent node is not a failed session.
+        let timeout = match mode {
+            SessionMode::Relay => Duration::from_secs(8),
+            SessionMode::Direct => Duration::from_secs(2),
+        };
+        let reply = match self.send_data_packet(&request, timeout) {
+            Ok(reply)
+                if is_matching_icmp_reply(&reply, benchmark_server, virtual_ipv4, identifier) =>
+            {
+                reply
+            }
+            outcome => {
+                if mode == SessionMode::Relay {
+                    return Err(match outcome {
+                        Ok(_) => "relay data plane returned an unexpected packet".to_owned(),
+                        Err(error) => error,
+                    });
+                }
+                return Ok(json!({
+                    "reachable": false,
+                    "latencyMs": Value::Null,
+                    "userToRelayMs": Value::Null,
+                    "relayToServerMs": Value::Null,
+                    "benchmarkServer": benchmark_server.to_string(),
+                    "note": "the node did not answer a test ping, which many providers filter",
+                }));
+            }
+        };
         let end_to_end = started.elapsed().as_secs_f64() * 1000.0;
         let user_to_relay = self
             .active
@@ -543,9 +709,9 @@ impl WireGuardSessionManager {
         }))
     }
 
-    fn send_data_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>, String> {
+    fn send_data_packet(&mut self, packet: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
         self.enqueue_data_packet(packet)?;
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if let Some(packet) = self.receive_data_packet(remaining)? {
@@ -562,14 +728,21 @@ impl WireGuardSessionManager {
             .active
             .as_mut()
             .ok_or("start the WireGuard session before sending packets")?;
-        let sequence = session.sequences.fetch_add(1, Ordering::Relaxed);
-        let header = FrameHeader {
-            flags: 0,
-            client_id: session.client_id,
-            session_id: session.session_id,
-            sequence,
+        let frame = match &session.overlay {
+            SessionOverlay::Relay { client_id, crypto } => {
+                let sequence = session.sequences.fetch_add(1, Ordering::Relaxed);
+                let header = FrameHeader {
+                    flags: 0,
+                    client_id: *client_id,
+                    session_id: session.session_id,
+                    sequence,
+                };
+                crypto.seal_client(header, packet)?
+            }
+            // The node routes the packet as it stands, so there is nothing to
+            // wrap it in and no sequence for anyone to compare copies by.
+            SessionOverlay::Direct => packet.to_vec(),
         };
-        let frame = session.crypto.seal_client(header, packet)?;
         let mut dispatched = 0;
         let decision = session.decision_mask.load(Ordering::Acquire);
         for (index, sender) in session.commands.iter().enumerate() {
@@ -652,11 +825,16 @@ impl WireGuardSessionManager {
         };
         json!({
             "state": state,
+            "mode": session.mode.as_str(),
             "sessionId": session.session_id.to_string(),
             "startedAt": session.started_at,
             "paths": paths,
             "skippedRoutes": session.skipped_routes,
-            "strategy": "adaptive",
+            "strategy": match session.mode {
+                SessionMode::Relay => "adaptive",
+                // One path cannot be scheduled between, so nothing is chosen.
+                SessionMode::Direct => "single-path",
+            },
             "selectedRoutes": selected_routes,
             "schedulerMetrics": scheduler_metrics,
             "pathWorkerIterations": path_worker_iterations,
@@ -822,7 +1000,12 @@ impl PacketCaptureManager {
                 1,
             )?);
         }
-        let tunnel_gateway = std::net::Ipv4Addr::new(10, 203, 0, 1);
+        // The next hop has to sit inside the adapter's own /24 for Windows to
+        // accept the route. A relay hands out 10.203.0.x, so this is the same
+        // 10.203.0.1 as before; a direct session's address comes from the
+        // node's provider and gets the matching first host of its subnet.
+        let octets = virtual_ipv4.octets();
+        let tunnel_gateway = std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 1);
         capture.routes.push(add_ipv4_route(
             std::net::Ipv4Addr::UNSPECIFIED,
             std::net::Ipv4Addr::new(128, 0, 0, 0),
@@ -1061,6 +1244,209 @@ fn ipv4_source_address(packet: &[u8]) -> Option<std::net::Ipv4Addr> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn initial_status(
+    route: usize,
+    path_kind: &str,
+    label: String,
+    endpoint: String,
+) -> PathSessionStatus {
+    PathSessionStatus {
+        route,
+        path_kind: path_kind.into(),
+        label,
+        endpoint,
+        reachable: false,
+        latency_ms: None,
+        node_latency_ms: None,
+        packets_sent: 0,
+        packets_received: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        probes_sent: 0,
+        probes_received: 0,
+        probes_lost: 0,
+        last_error: None,
+    }
+}
+
+/// How many unanswered probes it takes to conclude the node filters ICMP.
+const DIRECT_PROBE_ATTEMPTS: u64 = 3;
+/// How many probes a node that *had* been answering may miss in a row before
+/// it is reported as down. There is no second path to fail over to here, so
+/// this only decides when the user is told, and a twitchier number would
+/// report a hiccup as an outage.
+const DIRECT_LOSS_LIMIT: u64 = 3;
+/// Where a direct session's latency probe is aimed. A public resolver that
+/// answers echo requests, reached through the node like any game server.
+const DIRECT_PROBE_TARGET: std::net::Ipv4Addr = std::net::Ipv4Addr::new(1, 1, 1, 1);
+
+/// Carries a direct session's traffic through its single node.
+///
+/// There is no relay here to exchange control frames with, so health and
+/// latency come from two different places. The WireGuard handshake decides
+/// whether the node is up: it either answered or it did not, and nothing about
+/// the user's traffic can make that ambiguous. An ICMP echo through the tunnel
+/// then measures the whole trip out to the Internet — but only as telemetry.
+/// Plenty of providers filter ICMP while routing everything else perfectly, so
+/// after a few unanswered probes this stops asking and stops counting them as
+/// loss, rather than reporting a healthy node as totally lossy.
+#[allow(clippy::too_many_arguments)]
+fn run_direct_path(
+    mut path: DirectWireGuardPath,
+    address: std::net::Ipv4Addr,
+    stop: Arc<AtomicBool>,
+    statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
+    commands: mpsc::Receiver<PathCommand>,
+    inbound: mpsc::Sender<Vec<u8>>,
+    scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
+    worker_iterations: Arc<Vec<AtomicU64>>,
+) {
+    let identifier = rand::random::<u16>();
+    let mut probe_sequence = 0_u16;
+    let mut next_probe = Instant::now();
+    let mut pending_probe: Option<Instant> = None;
+    let mut probes_attempted = 0_u64;
+    let mut consecutive_losses = 0_u64;
+    let mut icmp_answered = false;
+    let mut probing = true;
+    let mut published_health = (None, false);
+    let mut published_error = false;
+    // Set once this worker has a specific answer for why the node is not
+    // usable. Transport errors are noisier and less useful than that answer,
+    // so they stop overwriting it.
+    let mut verdict = false;
+    let started = Instant::now();
+    let mut reported_silence = false;
+    let endpoint = path.endpoint();
+
+    while !stop.load(Ordering::Acquire) {
+        worker_iterations[0].fetch_add(1, Ordering::Relaxed);
+        // Health is decided first so the rest of the iteration can see it, and
+        // published only when it moves: this lock is on the hot path.
+        let handshake = path.handshake_latency_ms();
+        let losing = icmp_answered && consecutive_losses >= DIRECT_LOSS_LIMIT;
+        let reachable = handshake.is_some() && !losing;
+        if (handshake, reachable) != published_health {
+            let mut current = statuses.lock().unwrap();
+            current[0].reachable = reachable;
+            current[0].node_latency_ms = handshake;
+            if let Some(latency) = handshake {
+                // Stand in for the end-to-end number until a probe answers, so
+                // a node that filters ICMP still reports a real measurement.
+                current[0].latency_ms.get_or_insert(latency);
+            }
+            current[0].last_error = losing
+                .then(|| format!("{endpoint} stopped answering probes sent through the tunnel"));
+            published_error = losing;
+            verdict = losing;
+            published_health = (handshake, reachable);
+        }
+        while let Ok(command) = commands.try_recv() {
+            let length = command.frame.len();
+            let result = path.send_packet(&command.frame);
+            record_path_send(&statuses, 0, length, result);
+        }
+        if probing && pending_probe.is_none() && Instant::now() >= next_probe {
+            probe_sequence = probe_sequence.wrapping_add(1);
+            let probe = icmp_echo_packet(
+                address,
+                DIRECT_PROBE_TARGET,
+                identifier,
+                probe_sequence,
+                false,
+            );
+            match path.send_packet(&probe) {
+                Ok(()) => {
+                    probes_attempted += 1;
+                    // Until one probe is answered nothing is published, so a
+                    // node that filters ICMP never reports probes it did send
+                    // and never looks totally lossy because of it.
+                    if icmp_answered {
+                        statuses.lock().unwrap()[0].probes_sent += 1;
+                    }
+                    pending_probe = Some(Instant::now());
+                }
+                // The handshake, not this probe, decides whether the node is
+                // up, so a failed send is recorded and the loop carries on.
+                Err(error) => {
+                    if !verdict {
+                        statuses.lock().unwrap()[0].last_error = Some(error);
+                        published_error = true;
+                    }
+                }
+            }
+            next_probe = Instant::now() + Duration::from_millis(500);
+        }
+        match path.receive_packets(Duration::from_millis(1)) {
+            Ok(packets) => {
+                for packet in packets {
+                    if is_matching_icmp_reply(&packet, DIRECT_PROBE_TARGET, address, identifier) {
+                        let Some(started) = pending_probe.take() else {
+                            continue;
+                        };
+                        let latency = started.elapsed().as_secs_f64() * 1000.0;
+                        let first = !icmp_answered;
+                        icmp_answered = true;
+                        consecutive_losses = 0;
+                        {
+                            let mut current = statuses.lock().unwrap();
+                            // The probe this answers was sent before ICMP was
+                            // known to work, so it was not counted then.
+                            current[0].probes_sent += u64::from(first);
+                            current[0].probes_received += 1;
+                            current[0].latency_ms = Some(latency);
+                        }
+                        scheduler_metrics.lock().unwrap()[0].record_probe(latency);
+                        continue;
+                    }
+                    record_path_receive(&statuses, 0, packet.len());
+                    let _ = inbound.send(packet);
+                }
+                // Windows reports an unreachable endpoint on the next read of a
+                // connected UDP socket, so a restarting node leaves an error
+                // behind that its next reply disproves. Clearing it costs a
+                // lock, so it is taken only when the state actually changes.
+                if published_error && reachable {
+                    statuses.lock().unwrap()[0].last_error = None;
+                    published_error = false;
+                }
+            }
+            Err(error) => {
+                if !verdict {
+                    statuses.lock().unwrap()[0].last_error = Some(error);
+                    published_error = true;
+                }
+            }
+        }
+        // A silent peer is the usual way a direct session fails to start, and
+        // the timeout alone would not say which part of the file to look at.
+        if !reported_silence
+            && path.handshake_latency_ms().is_none()
+            && started.elapsed() > Duration::from_secs(3)
+        {
+            reported_silence = true;
+            published_error = true;
+            verdict = true;
+            statuses.lock().unwrap()[0].last_error = Some(format!(
+                "no WireGuard handshake reply from {endpoint}; check the configuration's Endpoint, \
+                 PrivateKey and Peer PublicKey"
+            ));
+        }
+        if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_millis(1500)) {
+            pending_probe = None;
+            if icmp_answered {
+                consecutive_losses += 1;
+                statuses.lock().unwrap()[0].probes_lost += 1;
+                scheduler_metrics.lock().unwrap()[0].record_loss();
+            } else if probes_attempted >= DIRECT_PROBE_ATTEMPTS {
+                // Never answered once: this node does not carry ICMP, which
+                // says nothing about the traffic it does carry.
+                probing = false;
+            }
+        }
+    }
+}
+
 fn run_path(
     mut path: Box<dyn RelayPath>,
     index: usize,
@@ -1589,11 +1975,22 @@ fn prepare_session(payload: Value) -> Result<Value, String> {
         return Err("at least one active WireGuard route is required".into());
     }
     let interception = compile_policy(&input.traffic_mode, &input.rules)?;
-    if input.relay_host.trim().is_empty() || input.relay_port == 0 {
-        return Err("a relay host and port are required".into());
-    }
-    let enrollment = EnrollmentToken::decode(&input.enrollment_token)?;
-    let (client_id, _) = enrollment.material()?;
+    // A direct session has no relay to address and no enrollment to prove, so
+    // only the capture policy above is planned for it.
+    let enrollment = match input.mode {
+        SessionMode::Relay => {
+            if input.relay_host.trim().is_empty() || input.relay_port == 0 {
+                return Err("a relay host and port are required".into());
+            }
+            Some(EnrollmentToken::decode(&input.enrollment_token)?)
+        }
+        SessionMode::Direct => None,
+    };
+    let client_id = enrollment
+        .as_ref()
+        .map(EnrollmentToken::material)
+        .transpose()?
+        .map(|(client_id, _)| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(client_id));
     let plan_id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1601,12 +1998,16 @@ fn prepare_session(payload: Value) -> Result<Value, String> {
         .to_string();
     Ok(json!({
         "planId": plan_id,
+        "mode": input.mode.as_str(),
         "routeCount": input.route_ids.len(),
         "trafficMode": input.traffic_mode,
         "interception": interception,
-        "relay": { "host": input.relay_host, "port": input.relay_port },
-        "clientId": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(client_id),
-        "virtualIpv4": enrollment.virtual_ipv4,
+        "relay": enrollment.as_ref().map(|_| json!({
+            "host": input.relay_host,
+            "port": input.relay_port,
+        })),
+        "clientId": client_id,
+        "virtualIpv4": enrollment.map(|enrollment| enrollment.virtual_ipv4),
         "state": "prepared",
     }))
 }
@@ -1671,6 +2072,242 @@ mod tests {
         // A blank label falls back to the generated route name.
         assert_eq!(nodes[1].label(), None);
         assert_eq!(nodes[1].default_label(2), "WireGuard route 2");
+    }
+
+    #[test]
+    fn a_request_without_a_mode_still_means_a_relay_session() {
+        let request = session_request(json!({
+            "relayHost": "relay.example",
+            "relayPort": 51821,
+            "enrollmentToken": "gpe1_token",
+            "wireguardConfigs": ["[Interface] one"],
+        }));
+        assert_eq!(request.mode, SessionMode::Relay);
+    }
+
+    #[test]
+    fn a_direct_request_carries_no_relay_details() {
+        let request = session_request(json!({
+            "mode": "direct",
+            "nodes": [{ "kind": "wireguard", "config": "[Interface]", "label": "Provider A" }],
+        }));
+        assert_eq!(request.mode, SessionMode::Direct);
+        assert_eq!(request.mode.as_str(), "direct");
+        assert!(request.relay_host.is_empty());
+        assert_eq!(request.relay_port, 0);
+        assert!(request.enrollment_token.is_empty());
+        assert_eq!(request.resolved_nodes().len(), 1);
+    }
+
+    /// A WireGuard peer that answers ICMP echoes through the tunnel, and stops
+    /// answering anything once `alive` is cleared — a node going down.
+    fn spawn_echoing_peer(
+        server_secret: [u8; 32],
+        client_public: [u8; 32],
+        alive: Arc<AtomicBool>,
+    ) -> u16 {
+        use boringtun::noise::{Tunn, TunnResult};
+        use boringtun::x25519::{PublicKey, StaticSecret};
+
+        let socket = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        thread::spawn(move || {
+            let mut tunnel = Tunn::new(
+                StaticSecret::from(server_secret),
+                PublicKey::from(client_public),
+                None,
+                None,
+                1,
+                None,
+            );
+            let mut network = [0_u8; 65_535];
+            let mut scratch = vec![0_u8; 65_535];
+            while alive.load(Ordering::Acquire) {
+                let Ok((length, from)) = socket.recv_from(&mut network) else {
+                    continue;
+                };
+                let mut input: &[u8] = &network[..length];
+                loop {
+                    match tunnel.decapsulate(None, input, &mut scratch) {
+                        TunnResult::WriteToNetwork(packet) => {
+                            let _ = socket.send_to(packet, from);
+                        }
+                        TunnResult::WriteToTunnelV4(packet, _) => {
+                            let request = packet.to_vec();
+                            let (source, destination) =
+                                (request[12..16].to_vec(), request[16..20].to_vec());
+                            let identifier = u16::from_be_bytes([request[24], request[25]]);
+                            let sequence = u16::from_be_bytes([request[26], request[27]]);
+                            let echo = icmp_echo_packet(
+                                std::net::Ipv4Addr::new(
+                                    destination[0],
+                                    destination[1],
+                                    destination[2],
+                                    destination[3],
+                                ),
+                                std::net::Ipv4Addr::new(source[0], source[1], source[2], source[3]),
+                                identifier,
+                                sequence,
+                                true,
+                            );
+                            let mut out = vec![0_u8; echo.len() + 128];
+                            if let TunnResult::WriteToNetwork(sealed) =
+                                tunnel.encapsulate(&echo, &mut out)
+                            {
+                                let _ = socket.send_to(sealed, from);
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                    input = &[];
+                }
+            }
+        });
+        port
+    }
+
+    fn wait_for(
+        statuses: &Arc<Mutex<Vec<PathSessionStatus>>>,
+        limit: Duration,
+        ready: impl Fn(&PathSessionStatus) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if ready(&statuses.lock().unwrap()[0]) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_direct_node_that_stops_answering_stops_reporting_itself_healthy() {
+        use base64::engine::general_purpose::STANDARD;
+        use boringtun::x25519::{PublicKey, StaticSecret};
+
+        let (client_secret, server_secret) = ([11_u8; 32], [13_u8; 32]);
+        let client_public = *PublicKey::from(&StaticSecret::from(client_secret)).as_bytes();
+        let server_public = *PublicKey::from(&StaticSecret::from(server_secret)).as_bytes();
+        let alive = Arc::new(AtomicBool::new(true));
+        let port = spawn_echoing_peer(server_secret, client_public, Arc::clone(&alive));
+        let address = std::net::Ipv4Addr::new(10, 66, 66, 2);
+        let config = format!(
+            "[Interface]\nPrivateKey = {}\nAddress = {address}/32\n[Peer]\nPublicKey = {}\nEndpoint = 127.0.0.1:{port}\nAllowedIPs = 0.0.0.0/0",
+            STANDARD.encode(client_secret),
+            STANDARD.encode(server_public),
+        );
+        let path = NodeSpec::WireGuard {
+            config,
+            label: None,
+        }
+        .open_direct()
+        .unwrap();
+
+        let statuses = Arc::new(Mutex::new(vec![initial_status(
+            1,
+            KIND_WIREGUARD,
+            "Provider A".into(),
+            format!("127.0.0.1:{port}"),
+        )]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_commands, command_rx) = mpsc::channel();
+        let (inbound_tx, _inbound) = mpsc::channel();
+        let worker = thread::spawn({
+            let (stop, statuses) = (Arc::clone(&stop), Arc::clone(&statuses));
+            move || {
+                run_direct_path(
+                    path,
+                    address,
+                    stop,
+                    statuses,
+                    command_rx,
+                    inbound_tx,
+                    Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())])),
+                    Arc::new(vec![AtomicU64::new(0)]),
+                )
+            }
+        });
+
+        assert!(
+            wait_for(&statuses, Duration::from_secs(10), |status| {
+                status.reachable && status.probes_received > 0
+            }),
+            "the node never came up: {:?}",
+            statuses.lock().unwrap()[0].last_error
+        );
+        {
+            let current = statuses.lock().unwrap();
+            // Every answered probe is counted against one that was sent.
+            assert!(current[0].probes_sent >= current[0].probes_received);
+            assert!(current[0].node_latency_ms.is_some());
+            assert!(current[0].latency_ms.is_some());
+            assert!(current[0].last_error.is_none());
+        }
+
+        // The node goes away. A completed handshake is not evidence that it is
+        // still there, so the path has to notice and say so.
+        alive.store(false, Ordering::Release);
+        assert!(
+            wait_for(&statuses, Duration::from_secs(20), |status| !status
+                .reachable),
+            "a node that stopped answering still reported itself healthy"
+        );
+        assert!(
+            statuses.lock().unwrap()[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("stopped answering")),
+            "{:?}",
+            statuses.lock().unwrap()[0].last_error
+        );
+
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_direct_session_refuses_to_pick_one_node_out_of_several() {
+        let mut manager = WireGuardSessionManager::default();
+        let node = || NodeSpec::WireGuard {
+            config: "[Interface]".into(),
+            label: None,
+        };
+        let error = manager.start_direct(&[node(), node()]).err().unwrap();
+        assert!(error.contains("exactly one node"), "{error}");
+        // The message has to name both ways out, since either is reasonable.
+        assert!(error.contains("single WireGuard node"), "{error}");
+        assert!(error.contains("relay mode"), "{error}");
+        assert!(manager.active.is_none());
+    }
+
+    #[test]
+    fn prepare_plans_a_direct_session_without_relay_details() {
+        let plan = prepare_session(json!({
+            "mode": "direct",
+            "routeIds": ["node-1"],
+            "trafficMode": "split",
+            "rules": [{ "kind": "application", "value": "C:\\Games\\game.exe" }],
+        }))
+        .unwrap();
+        assert_eq!(plan["mode"], "direct");
+        assert_eq!(plan["state"], "prepared");
+        // Nothing relay-shaped is invented for a session that has no relay.
+        assert!(plan["relay"].is_null());
+        assert!(plan["clientId"].is_null());
+        assert!(plan["virtualIpv4"].is_null());
+        // The capture policy is still planned, and still has to compile.
+        assert!(!plan["interception"].is_null());
+        assert!(
+            prepare_session(json!({
+                "mode": "direct", "routeIds": ["node-1"], "trafficMode": "split", "rules": [],
+            }))
+            .is_err()
+        );
     }
 
     #[test]

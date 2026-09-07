@@ -5,6 +5,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const { parseWireGuardConfig } = require('./wireguard.cjs')
 const { parseSocks5Node } = require('./socks5.cjs')
+const { directNodeSelection, directSelectionAfterSwitch } = require('./connection.cjs')
 const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
 const { provisionRelay, removeRelay } = require('./vps.cjs')
@@ -15,6 +16,7 @@ const defaultState = () => ({
   encryptedRelayTokens: {},
   rules: [],
   trafficMode: 'split',
+  connectionMode: 'relay',
   relays: [
     {
       id: 'tr-istanbul-01',
@@ -64,6 +66,8 @@ function loadState() {
     const loaded = JSON.parse(fs.readFileSync(statePath(), 'utf8'))
     state = { ...defaultState(), ...loaded, session: { status: 'idle' } }
     state.encryptedRelayTokens ??= {}
+    // Sessions saved before direct mode existed all went through a relay.
+    if (state.connectionMode !== 'direct') state.connectionMode = 'relay'
     // Nodes imported before SOCKS5 support existed are all WireGuard routes.
     state.tunnels = state.tunnels.map((tunnel) => ({ kind: 'wireguard', ...tunnel }))
     state.relays = state.relays.map((relay) => {
@@ -92,6 +96,21 @@ function encryptConfig(source) {
   return safeStorage.encryptString(source).toString('base64')
 }
 
+function relaySessionMessage(plan, paths, dataPlane) {
+  const standby = paths.skippedRoutes.length
+  const standbyNote = standby ? ` ${standby} overlapping node${standby === 1 ? ' is' : 's are'} held as standby.` : ''
+  return `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${standbyNote}`
+}
+
+function directSessionMessage(plan, node, dataPlane) {
+  // A node that filters the test ping is still a working node, so say what was
+  // and was not measured instead of implying something went wrong.
+  const measured = dataPlane.reachable
+    ? `benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms`
+    : 'the node does not answer test pings, so only its own traffic is measured'
+  return `Session ${plan.planId} is routing selected traffic through ${node.name}; ${measured}.`
+}
+
 function updateSessionMetrics(runtime, dataPlane) {
   const paths = runtime.paths ?? []
   const fastest = paths
@@ -102,9 +121,13 @@ function updateSessionMetrics(runtime, dataPlane) {
   const probesReceived = paths.reduce((total, path) => total + (path.probesReceived ?? 0), 0)
   const probesLost = paths.reduce((total, path) => total + (path.probesLost ?? 0), 0)
   const completedProbes = probesReceived + probesLost
+  const direct = (runtime.mode ?? state.session.mode) === 'direct'
   const userToNode = fastest?.nodeLatencyMs ?? null
+  // A direct session's node is the last hop, so there is no second leg to
+  // report — reporting one would invent a hop the traffic never takes.
   const nodeToRelay =
-    userToNode != null && fastest?.latencyMs != null ? Math.max(0, fastest.latencyMs - userToNode) : null
+    !direct && userToNode != null && fastest?.latencyMs != null ? Math.max(0, fastest.latencyMs - userToNode) : null
+  state.session.mode = runtime.mode ?? state.session.mode ?? 'relay'
   state.session.pathMetrics = paths
   state.session.selectedRoutes = runtime.selectedRoutes ?? []
   state.session.strategy = runtime.strategy ?? 'adaptive'
@@ -158,7 +181,9 @@ function activeRelayWithToken() {
   const relay = state.relays.find((item) => item.id === state.activeRelayId)
   const encryptedToken = relay && state.encryptedRelayTokens[relay.id]
   if (!relay?.address || !encryptedToken) {
-    throw new Error('Configure the relay address and enrollment token first')
+    // Only a relay can answer a proxy's authenticated probe, so this is also
+    // what a direct-mode user sees when testing a SOCKS5 node.
+    throw new Error('Testing a SOCKS5 node needs a relay. Configure its address and enrollment token first.')
   }
   return { relay, enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedToken, 'base64')) }
 }
@@ -224,7 +249,26 @@ function registerIpc() {
 
   ipcMain.handle('tunnel:set-enabled', (_event, id, enabled) => {
     const tunnel = state.tunnels.find((item) => item.id === id)
-    if (tunnel) tunnel.enabled = Boolean(enabled)
+    if (!tunnel) return publicState()
+    tunnel.enabled = Boolean(enabled)
+    // Direct mode carries traffic through one node, so selecting a node here
+    // means choosing it rather than adding it to a pool.
+    if (state.connectionMode === 'direct' && tunnel.enabled) {
+      for (const other of state.tunnels) if (other.id !== id) other.enabled = false
+    }
+    saveState()
+    return publicState()
+  })
+
+  // Switching modes changes what a selected node means, so the selection is
+  // carried across rather than left in a shape the new mode cannot start with.
+  ipcMain.handle('connection:set-mode', (_event, mode) => {
+    if (mode !== 'relay' && mode !== 'direct') throw new Error('Unknown connection mode')
+    state.connectionMode = mode
+    if (mode === 'direct') {
+      const chosen = directSelectionAfterSwitch(state.tunnels)
+      for (const tunnel of state.tunnels) tunnel.enabled = tunnel.id === chosen
+    }
     saveState()
     return publicState()
   })
@@ -461,60 +505,73 @@ function registerIpc() {
   })
 
   ipcMain.handle('engine:start', async () => {
+    const mode = state.connectionMode === 'direct' ? 'direct' : 'relay'
     const enabledTunnels = state.tunnels.filter((tunnel) => tunnel.enabled)
     const enabledRules = state.rules.filter((rule) => rule.enabled)
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     const encryptedRelayToken = relay && state.encryptedRelayTokens[relay.id]
-    if (enabledTunnels.length < 1) {
-      state.session = { status: 'error', message: 'Enable at least one WireGuard or SOCKS5 node.' }
+    const direct = mode === 'direct'
+    const selection = direct ? directNodeSelection(enabledTunnels) : { node: null, error: null }
+    const blocker = direct
+      ? selection.error
+      : enabledTunnels.length < 1
+        ? 'Enable at least one WireGuard or SOCKS5 node.'
+        : !relay || relay.status !== 'ready' || !encryptedRelayToken
+          ? 'The Istanbul relay needs its address and enrollment token.'
+          : null
+    if (blocker) {
+      state.session = { status: 'error', message: blocker }
     } else if (state.trafficMode === 'split' && !enabledRules.length) {
       state.session = { status: 'error', message: 'Add at least one split-tunnel target.' }
-    } else if (!relay || relay.status !== 'ready' || !encryptedRelayToken) {
-      state.session = { status: 'error', message: 'The Istanbul relay needs its address and enrollment token.' }
     } else if (engineBridge?.status.status !== 'ready') {
       state.session = { status: 'error', message: 'The native routing engine is unavailable.' }
     } else if (serviceBridge?.status.status !== 'ready') {
       state.session = { status: 'error', message: 'Install and start the GamePath Network Service in Settings.' }
     } else {
       try {
-        const enrollmentToken = safeStorage.decryptString(Buffer.from(encryptedRelayToken, 'base64'))
+        const rules = enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value }))
         const nodes = sessionNodes(enabledTunnels)
+        // A relay session addresses and authenticates itself to the relay; a
+        // direct session has neither, so it sends neither.
+        const relayCredentials = direct
+          ? {}
+          : {
+              relayHost: relay.address,
+              relayPort: relay.port,
+              enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedRelayToken, 'base64')),
+            }
         const plan = await engineBridge.request('prepare-session', {
+          mode,
           routeIds: enabledTunnels.map((tunnel) => tunnel.id),
           trafficMode: state.trafficMode,
-          rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
-          relayHost: relay.address,
-          relayPort: relay.port,
-          enrollmentToken,
+          rules,
+          ...relayCredentials,
         })
-        const relayAddresses = await require('node:dns').promises.lookup(relay.address, { all: true })
-        const relayIp = relayAddresses.find((entry) => entry.family === 4)?.address ?? relayAddresses[0]?.address
-        if (!relayIp) throw new Error('The relay hostname did not resolve')
-        const runtime = await serviceBridge.request('validate-runtime', {
+        let relayIp
+        if (!direct) {
+          const relayAddresses = await require('node:dns').promises.lookup(relay.address, { all: true })
+          relayIp = relayAddresses.find((entry) => entry.family === 4)?.address ?? relayAddresses[0]?.address
+          if (!relayIp) throw new Error('The relay hostname did not resolve')
+        }
+        await serviceBridge.request('validate-runtime', {
+          mode,
           relayIp,
           trafficMode: state.trafficMode,
           nodes,
         })
         const serviceSession = await serviceBridge.request(
           'start-session',
-          {
-            relayHost: relay.address,
-            relayPort: relay.port,
-            enrollmentToken,
-            nodes,
-            trafficMode: state.trafficMode,
-            rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
-          },
+          { mode, ...relayCredentials, nodes, trafficMode: state.trafficMode, rules },
           30000,
         )
         const paths = serviceSession.paths
         const dataPlane = serviceSession.dataPlane
-        const standbyNote = paths.skippedRoutes.length
-          ? ` ${paths.skippedRoutes.length} overlapping node${paths.skippedRoutes.length === 1 ? ' is' : 's are'} held as standby.`
-          : ''
         state.session = {
           status: 'connected',
-          message: `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${standbyNote}`,
+          mode,
+          message: direct
+            ? directSessionMessage(plan, selection.node, dataPlane)
+            : relaySessionMessage(plan, paths, dataPlane),
         }
         state.session.capture = serviceSession.capture
         updateSessionMetrics(paths, dataPlane)
@@ -546,9 +603,14 @@ function registerIpc() {
       try {
         const runtime = await serviceBridge.request('session-status')
         updateSessionMetrics(runtime)
+        // Selected traffic keeps going into the tunnel while the workers are
+        // alive, so it is not quietly falling back to the normal connection:
+        // it is not getting through, and stopping the session is what fixes it.
         if (runtime.state !== 'connected') {
           state.session.message =
-            'Relay paths are temporarily unavailable; selected traffic is using the normal Internet connection.'
+            runtime.mode === 'direct'
+              ? 'The node has stopped answering. Selected traffic is not getting through — stop the session to use your normal connection.'
+              : 'Relay paths are unavailable. Selected traffic is not getting through — stop the session to use your normal connection.'
         }
       } catch (error) {
         try {

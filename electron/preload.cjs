@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('gamepath', {
   setRuleEnabled: (id, enabled) => ipcRenderer.invoke('rule:set-enabled', id, enabled),
   removeRule: (id) => ipcRenderer.invoke('rule:remove', id),
   setTrafficMode: (mode) => ipcRenderer.invoke('traffic:set-mode', mode),
+  setConnectionMode: (mode) => ipcRenderer.invoke('connection:set-mode', mode),
   setRelay: (id) => ipcRenderer.invoke('relay:set', id),
   addRelay: (input) => ipcRenderer.invoke('relay:add', input),
   removeRelayLocal: (id) => ipcRenderer.invoke('relay:remove-local', id),

@@ -17,6 +17,63 @@ The current implementation uses the signed WinDivert callout driver as the WFP c
 
 All traffic is routed into the signed Wintun adapter. This avoids process correlation overhead when every connection has the same policy. Relay endpoint routes and local-network bypass routes are installed before the default route changes.
 
+## Relay and direct sessions
+
+A session runs in one of two modes, chosen by the client and carried through
+`prepare-session`, `validate-runtime` and `start-wireguard-session` as `mode`.
+A request without a `mode` is a relay session, which is what every caller
+written before direct mode meant.
+
+A **relay session** seals each captured packet under the enrollment key, gives
+it a session ID and sequence number, and hands it to the scheduler, which sends
+it over one or more node transports to the relay. The relay authenticates the
+frame, writes the inner packet to its TUN, and the kernel there does the
+routing and NAT.
+
+A **direct session** has no relay, so a node has to do that work itself. Only a
+WireGuard node can: its server already routes and NATs whatever comes out of
+the tunnel. The captured packet is rewritten to the tunnel's own address and
+sent as it stands, with no GamePath framing, no sequence number and no
+duplication — WireGuard's own crypto is the only wrapping, and replies come
+back as plain inner packets addressed to the tunnel. A SOCKS5 node is refused
+before anything is opened, since a proxy has nothing to route with.
+
+The two modes meet at `enqueue_data_packet` and `DataReceiver::receive`, so the
+capture layer above them is identical: split-tunnel filters, the Wintun
+all-traffic path, the reply injector and the privileged service are unchanged
+by the choice.
+
+Health is judged differently because the evidence differs. A relay session
+exchanges authenticated control frames with a relay it owns, so a silent path
+is a broken path. A direct session's node belongs to a provider and answers
+nothing at the application layer, so the engine sends an ICMP echo through the
+tunnel to `1.1.1.1` every 500 ms and works from two signals:
+
+- The **WireGuard handshake** says the node is there at all. It is what the
+  session waits for at startup, and a peer that has not answered within three
+  seconds is reported with the part of the configuration to check, rather than
+  as a bare timeout.
+- The **echo** measures the whole trip to the Internet and, once one has been
+  answered, becomes the liveness signal: three consecutive misses mark the path
+  down, the same conclusion a relay path reaches from its own probes.
+
+A completed handshake is deliberately not treated as lasting proof. It never
+expires on its own, so a node that dies mid-session would otherwise keep
+reporting itself healthy for as long as the process ran.
+
+Some providers filter ICMP while routing everything else perfectly. If no echo
+is ever answered, the engine stops asking after three attempts and stops
+counting them as loss — reporting such a node as totally lossy would be wrong —
+and the handshake round trip stands in for the route latency. **The cost is
+that a node in this state has no liveness signal at all** and stays reported as
+up while the tunnel is established. Probe counters stay unpublished until one
+echo is answered, so the client never shows probes it could not measure.
+
+Routes into the Wintun adapter derive their next hop from the session address
+rather than a fixed one. A relay hands out `10.203.0.x` and gets `10.203.0.1`
+as before; a direct session's address comes from the provider and gets the
+first host of its own `/24`.
+
 ## Multipath transport
 
 Every node becomes one path behind a common `RelayPath` transport interface, so the scheduler, the sequence allocator, and the session's authenticated framing work the same whichever transport a route uses. Two transports exist today: a user-space WireGuard tunnel and a SOCKS5 UDP association. A session may mix them freely.

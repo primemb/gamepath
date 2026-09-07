@@ -42,6 +42,7 @@ cargo test --manifest-path ..\relay\Cargo.toml
 - Enable, disable, and remove individual routes.
 - Choose all-system traffic or split-tunnel rules.
 - Add split rules for executables, folders, hostnames, and IP ranges.
+- Choose relay mode, which combines every enabled node at a relay you own, or direct mode, which needs no server and routes through a single WireGuard node.
 - Configure and test an authenticated Istanbul relay.
 - Add any number of relay locations and enable zero or one at a time.
 - Provision or remove a Debian VPS over password-authenticated SSH from the client; SSH passwords remain transient and host fingerprints are pinned after first use.
@@ -67,6 +68,28 @@ The WFP prototype backend uses the upstream WinDivert 2.2.2-A x64 runtime under 
 
 See `docs/architecture.md` for the WFP, Winsock, Wintun, and optional WireSock backend design.
 See `docs/relay-security.md` and `deploy/README.md` for the encrypted overlay and one-command relay installation.
+
+## Connection modes
+
+**Relay mode** is what GamePath is for. Every enabled node carries the same
+sealed frames to a relay you run, and the scheduler sends latency-sensitive
+packets down more than one path at once, so a packet lost on one hop still
+arrives by another. It needs a VPS.
+
+**Direct mode** is for people who have no server to run a relay on. Selected
+traffic goes through one WireGuard node, which routes it onward exactly as a
+normal VPN would — GamePath still decides which applications, folders,
+hostnames and addresses enter the tunnel, but nothing is duplicated and there
+is no second path to fall back on.
+
+Direct mode takes a WireGuard node and only a WireGuard node. A SOCKS5 proxy
+forwards connections and datagrams; it cannot route the raw packets GamePath
+captures, so it needs a relay on the other side to do that. Exactly one node is
+used, because combining nodes is the relay's job.
+
+Nothing else changes between the modes. Split-tunnel rules, all-traffic mode,
+the capture layer and the privileged service work the same either way, and
+switching modes needs no reconfiguration beyond choosing the node.
 
 ## SOCKS5 nodes
 

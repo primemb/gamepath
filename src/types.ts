@@ -1,5 +1,12 @@
 export type NodeKind = 'wireguard' | 'socks5'
 
+/**
+ * How traffic reaches the Internet. `relay` combines every enabled node at a
+ * relay the user runs; `direct` sends it through one WireGuard node instead,
+ * for people with no server of their own.
+ */
+export type ConnectionMode = 'relay' | 'direct'
+
 export type Tunnel = {
   id: string
   kind: NodeKind
@@ -85,13 +92,15 @@ export type AppState = {
   tunnels: Tunnel[]
   rules: SplitRule[]
   trafficMode: 'all' | 'split'
+  connectionMode: ConnectionMode
   relays: Relay[]
   activeRelayId: string | null
   session: {
     status: 'idle' | 'starting' | 'prepared' | 'connected' | 'error'
+    mode?: ConnectionMode
     message?: string
     routeLatencies?: number[]
-    strategy?: 'adaptive' | 'fastest-path' | 'duplicate'
+    strategy?: 'adaptive' | 'fastest-path' | 'duplicate' | 'single-path'
     selectedRoutes?: number[]
     pathMetrics?: PathMetric[]
     capture?: {
@@ -172,6 +181,7 @@ export type GamePathApi = {
   setRuleEnabled: (id: string, enabled: boolean) => Promise<AppState>
   removeRule: (id: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
+  setConnectionMode: (mode: ConnectionMode) => Promise<AppState>
   setRelay: (id: string) => Promise<AppState>
   addRelay: (input: { city: string; country: string }) => Promise<{ state: AppState; relayId: string }>
   removeRelayLocal: (id: string) => Promise<AppState>

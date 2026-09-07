@@ -7,11 +7,25 @@ pub struct RuntimeWireGuardConfig {
     pub endpoint: String,
 }
 
+/// Rewrites a configuration so the tunnel carries nothing but relay traffic.
 pub fn narrow_to_relay(input: &str, relay: IpAddr) -> Result<RuntimeWireGuardConfig, String> {
-    let relay_route = match relay {
+    parse(input, Some(relay))
+}
+
+/// Checks a configuration without changing where it routes.
+///
+/// A direct session has no relay to narrow towards: the node is the last hop,
+/// so it keeps whatever the provider's own AllowedIPs say. Only the shape is
+/// verified, using exactly the same rules as the relay path.
+pub fn inspect(input: &str) -> Result<RuntimeWireGuardConfig, String> {
+    parse(input, None)
+}
+
+fn parse(input: &str, relay: Option<IpAddr>) -> Result<RuntimeWireGuardConfig, String> {
+    let relay_route = relay.map(|relay| match relay {
         IpAddr::V4(address) => format!("{address}/32"),
         IpAddr::V6(address) => format!("{address}/128"),
-    };
+    });
     let mut section = "";
     let mut output = Vec::new();
     let mut tunnel_address = None;
@@ -24,8 +38,11 @@ pub fn narrow_to_relay(input: &str, relay: IpAddr) -> Result<RuntimeWireGuardCon
     for original_line in input.lines() {
         let line = original_line.trim();
         if line.starts_with('[') && line.ends_with(']') {
-            if section == "peer" && !peer_allowed_ips_written {
-                output.push(format!("AllowedIPs = {relay_route}"));
+            if section == "peer"
+                && !peer_allowed_ips_written
+                && let Some(route) = &relay_route
+            {
+                output.push(format!("AllowedIPs = {route}"));
             }
             section = match line.to_ascii_lowercase().as_str() {
                 "[interface]" => "interface",
@@ -69,8 +86,14 @@ pub fn narrow_to_relay(input: &str, relay: IpAddr) -> Result<RuntimeWireGuardCon
                 "publickey" => public_key = !value.is_empty(),
                 "endpoint" => endpoint = Some(value.to_owned()),
                 "allowedips" => {
+                    // A direct session keeps the provider's own routes, so the
+                    // line is only replaced when there is a relay to narrow to.
+                    let Some(route) = &relay_route else {
+                        output.push(original_line.to_owned());
+                        continue;
+                    };
                     if !peer_allowed_ips_written {
-                        output.push(format!("AllowedIPs = {relay_route}"));
+                        output.push(format!("AllowedIPs = {route}"));
                         peer_allowed_ips_written = true;
                     }
                     continue;
@@ -80,8 +103,11 @@ pub fn narrow_to_relay(input: &str, relay: IpAddr) -> Result<RuntimeWireGuardCon
         }
         output.push(original_line.to_owned());
     }
-    if section == "peer" && !peer_allowed_ips_written {
-        output.push(format!("AllowedIPs = {relay_route}"));
+    if section == "peer"
+        && !peer_allowed_ips_written
+        && let Some(route) = &relay_route
+    {
+        output.push(format!("AllowedIPs = {route}"));
     }
     if !private_key {
         return Err("WireGuard configuration is missing Interface PrivateKey".into());
@@ -133,6 +159,32 @@ PersistentKeepalive = 25
         assert!(!result.source.contains("0.0.0.0/0"));
         assert!(!result.source.contains("DNS ="));
         assert!(!result.source.contains("MTU ="));
+    }
+
+    #[test]
+    fn a_direct_session_keeps_the_providers_own_routes() {
+        let result = inspect(CONFIG).unwrap();
+        assert_eq!(
+            result.tunnel_address,
+            "10.88.0.2".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(result.endpoint, "vpn.example:51820");
+        // The node is the last hop, so its full-tunnel routes have to survive.
+        assert!(result.source.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
+        // Side effects the client applies itself are still dropped.
+        assert!(!result.source.contains("DNS ="));
+        assert!(!result.source.contains("MTU ="));
+    }
+
+    #[test]
+    fn a_direct_session_rejects_the_same_broken_configurations() {
+        assert!(inspect("[Interface]\nAddress = 10.0.0.2/32\n").is_err());
+        assert!(
+            inspect(&format!(
+                "{CONFIG}\n[Peer]\nPublicKey = another\nEndpoint = other.example:51820\n"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

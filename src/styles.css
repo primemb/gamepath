@@ -462,8 +462,24 @@ main {
   align-items: center;
   justify-content: center;
   gap: 6px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
   color: #78839a;
   font-size: 10px;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background 0.15s ease;
+}
+.session-mode:hover {
+  color: #cfd6e4;
+  background: rgba(255, 255, 255, 0.04);
+}
+.session-mode:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
 }
 .session-mode svg:first-child {
   color: var(--violet);
@@ -1449,6 +1465,10 @@ main {
   background: var(--cyan);
   box-shadow: 0 0 8px rgba(38, 230, 205, 0.4);
 }
+.toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
 .icon-button {
   width: 30px;
   height: 30px;
@@ -2135,5 +2155,170 @@ main {
   }
   .route-map {
     grid-template-columns: 70px 1fr 135px 1fr 70px;
+  }
+}
+
+/* Connection mode chooser --------------------------------------------- */
+
+.mode-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.mode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.mode-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 6px 14px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.018);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border 0.15s ease,
+    background 0.15s ease;
+}
+.mode-card:hover {
+  border-color: rgba(255, 255, 255, 0.16);
+}
+.mode-card:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+.mode-card.is-active {
+  border-color: rgba(38, 230, 205, 0.34);
+  background: linear-gradient(120deg, rgba(38, 230, 205, 0.05), rgba(255, 255, 255, 0.014) 45%);
+}
+.mode-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: #616b7c;
+  background: rgba(255, 255, 255, 0.04);
+}
+.mode-card.is-active .mode-icon {
+  color: var(--cyan);
+  background: var(--cyan-soft);
+}
+.mode-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  min-height: 36px;
+  align-content: center;
+}
+.mode-head strong {
+  font-size: 14px;
+}
+.mode-head em {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+}
+.mode-tip {
+  padding: 2px 7px;
+  border-radius: 20px;
+  background: var(--cyan-soft);
+  color: var(--cyan);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+}
+.mode-body {
+  grid-column: 2;
+  display: block;
+  max-inline-size: 52ch;
+  color: #b3bccb;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.mode-card small {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.mode-tradeoff {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.014);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.mode-tradeoff svg {
+  flex: 0 0 auto;
+  color: var(--violet);
+}
+.mode-tradeoff span {
+  flex: 1 1 320px;
+  min-inline-size: 0;
+}
+
+/* The relay list stays visible in direct mode, quietly, so switching back
+   does not feel like finding a page that had gone missing. */
+/* A plain block so the relay cards keep the spacing they already had. */
+.relay-section {
+  margin-top: 22px;
+}
+.relay-section.is-inactive {
+  opacity: 0.62;
+}
+.relay-section-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.relay-section-note svg {
+  flex: 0 0 auto;
+  color: var(--violet);
+}
+
+/* A node the current mode cannot use keeps its place and says why. */
+.route-card.is-unusable {
+  background: rgba(255, 255, 255, 0.008);
+}
+.route-card.is-unusable .route-state-icon,
+.route-card.is-unusable .route-copy > p,
+.route-card.is-unusable .route-meta {
+  opacity: 0.5;
+}
+.route-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 8px 0 0;
+  max-inline-size: 74ch;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+.route-note svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--violet);
+}
+
+@media (max-width: 1100px) {
+  .mode-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

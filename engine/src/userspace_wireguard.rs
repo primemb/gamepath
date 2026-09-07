@@ -13,6 +13,7 @@ pub struct UserSpaceWireGuardPath {
     address: Ipv4Addr,
     endpoint: SocketAddr,
     identity_fingerprint: [u8; 32],
+    handshake_started: Option<Instant>,
     handshake_latency_ms: Option<f64>,
     read_timeout: Option<Duration>,
     network_buffer: Vec<u8>,
@@ -74,6 +75,7 @@ impl UserSpaceWireGuardPath {
             address,
             endpoint,
             identity_fingerprint: Sha256::digest(private_key).into(),
+            handshake_started: None,
             handshake_latency_ms: None,
             read_timeout: None,
             network_buffer: vec![0_u8; 65_535],
@@ -154,6 +156,9 @@ impl UserSpaceWireGuardPath {
     }
 
     pub fn send_inner(&mut self, inner_packet: &[u8]) -> Result<(), String> {
+        // The first packet out is what makes BoringTun emit its handshake
+        // initiation, so this is the moment the round trip to the peer starts.
+        self.handshake_started.get_or_insert_with(Instant::now);
         let first = action(
             self.tunnel
                 .encapsulate(inner_packet, &mut self.tunnel_buffer),
@@ -174,6 +179,11 @@ impl UserSpaceWireGuardPath {
         let mut packets = Vec::new();
         match self.socket.recv(&mut self.network_buffer) {
             Ok(length) => {
+                // Anything at all coming back from the peer is the handshake
+                // response, so this doubles as proof the tunnel is alive.
+                if let (None, Some(started)) = (self.handshake_latency_ms, self.handshake_started) {
+                    self.handshake_latency_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                }
                 let mut next = decapsulation_action(self.tunnel.decapsulate(
                     None,
                     &self.network_buffer[..length],

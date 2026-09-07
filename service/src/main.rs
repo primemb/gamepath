@@ -11,8 +11,8 @@ fn main() -> windows_service::Result<()> {
 
 #[cfg(windows)]
 mod gamepath_service {
-    use gamepath_engine::relay_path::NodeSpec;
-    use gamepath_engine::wireguard_runtime::narrow_to_relay;
+    use gamepath_engine::relay_path::{NodeSpec, SessionMode};
+    use gamepath_engine::wireguard_runtime::{inspect, narrow_to_relay};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use std::env;
@@ -90,7 +90,13 @@ mod gamepath_service {
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct ValidateRequest {
-        relay_ip: IpAddr,
+        /// Absent for callers written before direct sessions existed, all of
+        /// which meant a relay session.
+        #[serde(default)]
+        mode: SessionMode,
+        /// A direct session has no relay to narrow the tunnels towards.
+        #[serde(default)]
+        relay_ip: Option<IpAddr>,
         traffic_mode: String,
         #[serde(default)]
         nodes: Vec<NodeSpec>,
@@ -504,6 +510,24 @@ mod gamepath_service {
         if nodes.is_empty() {
             return Err("at least one WireGuard or SOCKS5 node is required".into());
         }
+        // A direct session has no relay behind the node, so the node itself has
+        // to be able to route. Catch that here, before anything is opened.
+        if input.mode == SessionMode::Direct {
+            if nodes.len() != 1 {
+                return Err(format!(
+                    "direct mode sends traffic through exactly one node, but {} are enabled. \
+                     Enable a single WireGuard node, or switch to relay mode to combine them.",
+                    nodes.len()
+                ));
+            }
+            if !nodes[0].supports_direct() {
+                return Err(format!(
+                    "{} cannot carry a direct session on its own. Use a WireGuard node for \
+                     direct mode, or set up a relay to reach this proxy through.",
+                    nodes[0].describe()
+                ));
+            }
+        }
         let mut tunnel_addresses = Vec::new();
         for (index, node) in nodes.iter().enumerate() {
             let route = index + 1;
@@ -521,8 +545,17 @@ mod gamepath_service {
                 ));
             }
             if let NodeSpec::WireGuard { config, .. } = node {
+                // A relay session narrows the tunnel to the relay alone; a
+                // direct session keeps the routes the provider shipped.
+                let runtime = match input.relay_ip.filter(|_| input.mode == SessionMode::Relay) {
+                    Some(relay_ip) => narrow_to_relay(config, relay_ip),
+                    None if input.mode == SessionMode::Relay => {
+                        Err("a relay session needs the relay address".to_owned())
+                    }
+                    None => inspect(config),
+                };
                 tunnel_addresses.push(
-                    narrow_to_relay(config, input.relay_ip)
+                    runtime
                         .map_err(|error| format!("route {route}: {error}"))?
                         .tunnel_address,
                 );
@@ -534,6 +567,7 @@ mod gamepath_service {
         runtime.traffic_mode = input.traffic_mode.clone();
         Ok(json!({
             "sessionStatus": "validated",
+            "mode": input.mode.as_str(),
             "routeCount": nodes.len(),
             "trafficMode": input.traffic_mode,
             "tunnelAddresses": tunnel_addresses,
@@ -640,6 +674,71 @@ mod gamepath_service {
                 )
                 .is_ok()
             );
+        }
+
+        fn validate_direct(nodes: Value) -> Result<Value, String> {
+            // A direct session sends no relay address at all.
+            validate_runtime(
+                json!({ "mode": "direct", "trafficMode": "split", "nodes": nodes }),
+                &Mutex::new(RuntimeState::default()),
+            )
+        }
+
+        #[test]
+        fn a_direct_session_keeps_the_nodes_own_routes() {
+            let result =
+                validate_direct(json!([{ "kind": "wireguard", "config": WIREGUARD_CONFIG }]))
+                    .unwrap();
+            assert_eq!(result["mode"], "direct");
+            assert_eq!(result["routeCount"], 1);
+            assert_eq!(result["tunnelAddresses"][0], "10.88.0.2");
+            // The default is still a relay session, for callers that send no mode.
+            assert_eq!(
+                validate(
+                    "split",
+                    json!([{ "kind": "wireguard", "config": WIREGUARD_CONFIG }])
+                )
+                .unwrap()["mode"],
+                "relay"
+            );
+        }
+
+        #[test]
+        fn a_direct_session_turns_away_nodes_it_cannot_route_through() {
+            let error = validate_direct(
+                json!([{ "kind": "socks5", "host": "proxy.example", "port": 1080 }]),
+            )
+            .err()
+            .unwrap();
+            assert!(error.contains("WireGuard node for direct mode"), "{error}");
+            assert!(error.contains("relay"), "{error}");
+
+            let error = validate_direct(json!([
+                { "kind": "wireguard", "config": WIREGUARD_CONFIG },
+                { "kind": "wireguard", "config": WIREGUARD_CONFIG },
+            ]))
+            .err()
+            .unwrap();
+            assert!(error.contains("exactly one node"), "{error}");
+
+            // A broken configuration is still caught the same way.
+            assert!(
+                validate_direct(json!([{ "kind": "wireguard", "config": "[Interface]" }])).is_err()
+            );
+        }
+
+        #[test]
+        fn a_relay_session_still_needs_its_relay_address() {
+            let error = validate_runtime(
+                json!({
+                    "trafficMode": "split",
+                    "nodes": [{ "kind": "wireguard", "config": WIREGUARD_CONFIG }],
+                }),
+                &Mutex::new(RuntimeState::default()),
+            )
+            .err()
+            .unwrap();
+            assert!(error.contains("relay address"), "{error}");
         }
 
         #[test]
