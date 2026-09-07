@@ -5,6 +5,7 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   Check,
+  ChevronDown,
   ChevronRight,
   CircleGauge,
   FolderOpen,
@@ -15,9 +16,11 @@ import {
   Info,
   LayoutDashboard,
   Link2,
+  ListChecks,
   MapPin,
   Network,
   Plus,
+  Power,
   Radio,
   Route,
   Server,
@@ -172,6 +175,11 @@ const histogramPercentile = (
   return null
 }
 
+const CHART_WIDTH = 600
+const CHART_HEIGHT = 160
+const CHART_TOP = 4
+const CHART_BOTTOM = 156
+
 function LatencyChart({ histories, paths }: { histories: PathHistory; paths: PathMetric[] }) {
   const series = paths.map((path, index) => ({
     path,
@@ -185,51 +193,71 @@ function LatencyChart({ histories, paths }: { histories: PathHistory; paths: Pat
   const low = Math.max(0, minimum - padding)
   const high = maximum + padding
   const range = Math.max(high - low, 1)
-  const points = (samples: PathSample[]) => {
+  const project = (latency: number) => CHART_BOTTOM - ((latency - low) / range) * (CHART_BOTTOM - CHART_TOP)
+  const line = (samples: PathSample[]) => {
     const values = samples.length === 1 ? [samples[0], samples[0]] : samples
     return values
-      .map(
-        (sample, index) =>
-          `${(index / Math.max(values.length - 1, 1)) * 300},${62 - ((sample.latency - low) / range) * 52}`,
-      )
+      .map((sample, index) => `${(index / Math.max(values.length - 1, 1)) * CHART_WIDTH},${project(sample.latency)}`)
       .join(' ')
   }
+  if (!series.length) return <p className="chart-empty">Route latency appears here as soon as a session is running.</p>
   return (
     <>
-      <div className="chart-scale">
-        <span>{Math.round(high)} ms</span>
-        <span>{Math.round(low)} ms</span>
+      <div className="chart-body">
+        <div className="chart-axis">
+          <span>{Math.round(high)} ms</span>
+          <span>{Math.round((high + low) / 2)} ms</span>
+          <span>{Math.round(low)} ms</span>
+        </div>
+        <svg
+          className="latency-chart"
+          viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+          preserveAspectRatio="none"
+          role="img"
+          aria-label="Latency history for every WireGuard route"
+        >
+          <defs>
+            {series.map((item) => (
+              <linearGradient key={item.path.route} id={`route-fill-${item.path.route}`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={item.color} stopOpacity="0.26" />
+                <stop offset="100%" stopColor={item.color} stopOpacity="0" />
+              </linearGradient>
+            ))}
+          </defs>
+          <g className="chart-grid">
+            <line x1="0" y1={CHART_TOP} x2={CHART_WIDTH} y2={CHART_TOP} />
+            <line x1="0" y1={(CHART_TOP + CHART_BOTTOM) / 2} x2={CHART_WIDTH} y2={(CHART_TOP + CHART_BOTTOM) / 2} />
+            <line x1="0" y1={CHART_BOTTOM} x2={CHART_WIDTH} y2={CHART_BOTTOM} />
+          </g>
+          {series.map((item) => {
+            if (!item.samples.length) return null
+            const points = line(item.samples)
+            return (
+              <g key={item.path.route}>
+                <polygon
+                  points={`0,${CHART_HEIGHT} ${points} ${CHART_WIDTH},${CHART_HEIGHT}`}
+                  fill={`url(#route-fill-${item.path.route})`}
+                />
+                <polyline
+                  points={points}
+                  fill="none"
+                  stroke={item.color}
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  vectorEffect="non-scaling-stroke"
+                />
+              </g>
+            )
+          })}
+        </svg>
       </div>
-      <svg
-        className="latency-chart"
-        viewBox="0 0 300 70"
-        preserveAspectRatio="none"
-        role="img"
-        aria-label="Latency history for every WireGuard route"
-      >
-        <g className="chart-grid">
-          <line x1="0" y1="10" x2="300" y2="10" />
-          <line x1="0" y1="36" x2="300" y2="36" />
-          <line x1="0" y1="62" x2="300" y2="62" />
-        </g>
-        {series.map((item) =>
-          item.samples.length ? (
-            <polyline
-              key={item.path.route}
-              points={points(item.samples)}
-              fill="none"
-              stroke={item.color}
-              strokeWidth="2"
-              vectorEffect="non-scaling-stroke"
-            />
-          ) : null,
-        )}
-      </svg>
       <div className="chart-legend">
         {series.map((item) => (
           <span key={item.path.route}>
             <i style={{ background: item.color }} />
             {item.path.label}
+            <strong>{formatMetric(item.path.latencyMs)}</strong>
           </span>
         ))}
       </div>
@@ -246,11 +274,13 @@ function TelemetryPanel({
   histories: PathHistory
   rates: Record<number, PathRate>
 }) {
+  const [showConnections, setShowConnections] = useState(true)
   const metrics = state.session.metrics
   const capture = state.session.capture?.diagnostics
   const connections = capture?.handledConnections ?? []
   const captureP99 = histogramPercentile(capture?.captureLoopHistogram, 0.99)
   const paths = state.session.pathMetrics ?? []
+  const live = state.session.status === 'connected'
   const bestPath = paths
     .filter((path) => path.reachable && path.latencyMs != null)
     .sort((a, b) => (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity))[0]
@@ -273,29 +303,69 @@ function TelemetryPanel({
         <div>
           <span className="eyebrow">Live telemetry</span>
           <h2>Network journey</h2>
-          <p>Passive counters and one tiny health probe per route every 10 seconds</p>
         </div>
-        <span className={`status-pill ${state.session.status === 'connected' ? 'online' : ''}`}>
+        <span className={`status-pill ${live ? 'online' : ''}`}>
           <i />
-          {state.session.status === 'connected'
-            ? capture
-              ? `${capture.relayedPackets} game packets routed`
-              : 'Live'
-            : 'Waiting'}
+          {live ? (capture ? `${capture.relayedPackets} game packets routed` : 'Live') : 'Waiting'}
         </span>
       </div>
-      <div className="journey-grid">
-        {stages.map(([label, value, detail], index) => (
-          <div className="journey-stage" key={label}>
-            <span>{index + 1}</span>
+
+      <div className="telemetry-charts">
+        <div className="chart-card">
+          <div className="card-head">
             <div>
-              <small>{label}</small>
-              <strong>{formatMetric(value)}</strong>
-              <em>{detail}</em>
+              <span className="eyebrow">Route latency history</span>
+              <h3>{bestPath ? `Best ${formatMetric(bestPath.latencyMs)}` : 'Waiting for probes'}</h3>
+            </div>
+            <small>Last 60 probes · one probe per route every 10s</small>
+          </div>
+          <LatencyChart histories={histories} paths={paths} />
+        </div>
+        <div className="telemetry-side">
+          <div className="journey-card">
+            <span className="eyebrow">Journey breakdown</span>
+            <div className="journey-grid">
+              {stages.map(([label, value, detail], index) => (
+                <div className="journey-stage" key={label}>
+                  <span>{index + 1}</span>
+                  <div>
+                    <small>{label}</small>
+                    <strong>{formatMetric(value)}</strong>
+                    <em>{detail}</em>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
-        ))}
+          <div className="transfer-grid">
+            <div>
+              <ArrowUpRight size={15} />
+              <span>
+                Data sent<strong>{formatBytes(metrics?.bytesSent)}</strong>
+              </span>
+            </div>
+            <div>
+              <ArrowDownRight size={15} />
+              <span>
+                Data received<strong>{formatBytes(metrics?.bytesReceived)}</strong>
+              </span>
+            </div>
+            <div>
+              <Activity size={15} />
+              <span>
+                Packet loss<strong>{metrics ? `${metrics.packetLossPercent.toFixed(1)}%` : '—'}</strong>
+              </span>
+            </div>
+            <div>
+              <Radio size={15} />
+              <span>
+                Packets<strong>{metrics ? `${metrics.packetsReceived} / ${metrics.packetsSent}` : '—'}</strong>
+              </span>
+            </div>
+          </div>
+        </div>
       </div>
+
       <div className="node-heading">
         <div>
           <span className="eyebrow">All VPN nodes</span>
@@ -305,78 +375,87 @@ function TelemetryPanel({
           {paths.length} active route{paths.length === 1 ? '' : 's'}
         </small>
       </div>
-      <div className="node-grid">
-        {paths.map((path, index) => {
-          const samples = histories[path.route] ?? []
-          const carryingTraffic = state.session.selectedRoutes?.includes(path.route) ?? path.reachable
-          const nodeToRelay =
-            path.nodeLatencyMs != null && path.latencyMs != null
-              ? Math.max(0, path.latencyMs - path.nodeLatencyMs)
-              : null
-          const rate = rates[path.route]
-          return (
-            <article
-              className={`node-card ${path.reachable ? 'healthy' : 'unhealthy'} ${carryingTraffic ? 'carrying' : ''}`}
-              key={path.route}
-            >
-              <div className="node-card-head">
-                <span className="node-color" style={{ background: pathColors[index % pathColors.length] }} />
-                <div>
-                  <strong>{path.label}</strong>
-                  <small>{path.endpoint}</small>
+      {paths.length ? (
+        <div className="node-grid">
+          {paths.map((path, index) => {
+            const samples = histories[path.route] ?? []
+            const carryingTraffic = state.session.selectedRoutes?.includes(path.route) ?? path.reachable
+            const nodeToRelay =
+              path.nodeLatencyMs != null && path.latencyMs != null
+                ? Math.max(0, path.latencyMs - path.nodeLatencyMs)
+                : null
+            const rate = rates[path.route]
+            return (
+              <article
+                className={`node-card ${path.reachable ? 'healthy' : 'unhealthy'} ${carryingTraffic ? 'carrying' : ''}`}
+                key={path.route}
+              >
+                <div className="node-card-head">
+                  <span className="node-color" style={{ background: pathColors[index % pathColors.length] }} />
+                  <div>
+                    <strong>{path.label}</strong>
+                    <small>{path.endpoint}</small>
+                  </div>
+                  <span className={`route-health ${path.reachable ? 'online' : ''}`}>
+                    <i />
+                    {path.reachable ? (carryingTraffic ? 'Active' : 'Standby') : 'Offline'}
+                  </span>
                 </div>
-                <span className={`route-health ${path.reachable ? 'online' : ''}`}>
-                  <i />
-                  {path.reachable ? (carryingTraffic ? 'Active' : 'Standby') : 'Offline'}
-                </span>
-              </div>
-              <div className="node-primary">
-                <span>
-                  <small>Relay RTT</small>
-                  <strong>{formatMetric(path.latencyMs)}</strong>
-                </span>
-                <span>
-                  <small>Jitter</small>
-                  <strong>{samples.length ? `${jitter(samples).toFixed(1)} ms` : '—'}</strong>
-                </span>
-                <span>
-                  <small>Probe loss</small>
-                  <strong>{`${pathLoss(path).toFixed(1)}%`}</strong>
-                </span>
-              </div>
-              <div className="node-secondary">
-                <span>
-                  User → node <strong>{formatMetric(path.nodeLatencyMs)}</strong>
-                </span>
-                <span>
-                  Node → relay <strong>{formatMetric(nodeToRelay)}</strong>
-                </span>
-                <span>
-                  Probes{' '}
-                  <strong>
-                    {path.probesReceived ?? 0}/{path.probesSent ?? 0}
-                  </strong>
-                </span>
-              </div>
-              <div className="node-traffic">
-                <span>
-                  <ArrowUpRight size={13} />
-                  {formatRate(rate?.sent)}
-                  <small>{formatBytes(path.bytesSent)} total</small>
-                </span>
-                <span>
-                  <ArrowDownRight size={13} />
-                  {formatRate(rate?.received)}
-                  <small>{formatBytes(path.bytesReceived)} total</small>
-                </span>
-              </div>
-              {path.lastError && <p className="node-error">{path.lastError}</p>}
-            </article>
-          )
-        })}
-      </div>
-      <div className="connections-card">
-        <div className="connections-head">
+                <div className="node-primary">
+                  <span>
+                    <small>Relay RTT</small>
+                    <strong>{formatMetric(path.latencyMs)}</strong>
+                  </span>
+                  <span>
+                    <small>Jitter</small>
+                    <strong>{samples.length ? `${jitter(samples).toFixed(1)} ms` : '—'}</strong>
+                  </span>
+                  <span>
+                    <small>Probe loss</small>
+                    <strong>{`${pathLoss(path).toFixed(1)}%`}</strong>
+                  </span>
+                </div>
+                <div className="node-secondary">
+                  <span>
+                    User → node <strong>{formatMetric(path.nodeLatencyMs)}</strong>
+                  </span>
+                  <span>
+                    Node → relay <strong>{formatMetric(nodeToRelay)}</strong>
+                  </span>
+                  <span>
+                    Probes{' '}
+                    <strong>
+                      {path.probesReceived ?? 0}/{path.probesSent ?? 0}
+                    </strong>
+                  </span>
+                </div>
+                <div className="node-traffic">
+                  <span>
+                    <ArrowUpRight size={13} />
+                    {formatRate(rate?.sent)}
+                    <small>{formatBytes(path.bytesSent)} total</small>
+                  </span>
+                  <span>
+                    <ArrowDownRight size={13} />
+                    {formatRate(rate?.received)}
+                    <small>{formatBytes(path.bytesReceived)} total</small>
+                  </span>
+                </div>
+                {path.lastError && <p className="node-error">{path.lastError}</p>}
+              </article>
+            )
+          })}
+        </div>
+      ) : (
+        <p className="node-empty">Start a session to measure every enabled WireGuard route.</p>
+      )}
+
+      <div className={`connections-card ${showConnections ? 'is-open' : ''}`}>
+        <button
+          className="connections-head"
+          onClick={() => setShowConnections((current) => !current)}
+          aria-expanded={showConnections}
+        >
           <div>
             <span className="eyebrow">Handled connections</span>
             <h3>Traffic currently routed</h3>
@@ -384,95 +463,65 @@ function TelemetryPanel({
           <small>
             {connections.length} active connection{connections.length === 1 ? '' : 's'}
           </small>
-        </div>
-        {connections.length ? (
-          <div className="connections-table">
-            <div className="connection-header">
-              <span>Application</span>
-              <span>Destination</span>
-              <span>Protocol</span>
-              <span>Connected</span>
-            </div>
-            {connections.map((connection, index) => (
-              <div
-                className="connection-row"
-                key={`${connection.application}-${connection.destinationIp}-${connection.destinationPort}-${index}`}
-              >
-                <span>
-                  <AppWindow size={14} />
-                  <strong>{connection.application}</strong>
-                </span>
-                <code>
-                  {connection.destinationIp}
-                  {connection.destinationPort ? `:${connection.destinationPort}` : ''}
-                </code>
-                <em>{connection.protocol}</em>
-                <time>
-                  {new Date(connection.startedAt * 1000).toLocaleTimeString([], {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                    second: '2-digit',
-                  })}
-                </time>
+          <ChevronDown size={15} />
+        </button>
+        {showConnections && (
+          <>
+            {connections.length ? (
+              <div className="connections-table">
+                <div className="connection-header">
+                  <span>Application</span>
+                  <span>Destination</span>
+                  <span>Protocol</span>
+                  <span>Connected</span>
+                </div>
+                {connections.map((connection, index) => (
+                  <div
+                    className="connection-row"
+                    key={`${connection.application}-${connection.destinationIp}-${connection.destinationPort}-${index}`}
+                  >
+                    <span>
+                      <AppWindow size={14} />
+                      <strong>{connection.application}</strong>
+                    </span>
+                    <code>
+                      {connection.destinationIp}
+                      {connection.destinationPort ? `:${connection.destinationPort}` : ''}
+                    </code>
+                    <em>{connection.protocol}</em>
+                    <time>
+                      {new Date(connection.startedAt * 1000).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                      })}
+                    </time>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        ) : (
-          <p className="connections-empty">
-            Start the game to see each executable and destination IP handled by GamePath.
-          </p>
+            ) : (
+              <p className="connections-empty">
+                Start the game to see each executable and destination IP handled by GamePath.
+              </p>
+            )}
+            {capture && (
+              <div className="capture-health">
+                <span>
+                  Capture p99 <strong>{captureP99 == null ? '—' : `≤ ${captureP99} µs`}</strong>
+                </span>
+                <span>
+                  Pending SYN <strong>{capture.pendingSynDepth ?? 0}</strong>
+                </span>
+                <span>
+                  Queue peak <strong>{capture.pendingSynPeak ?? 0}</strong>
+                </span>
+                <span>
+                  Overflow <strong>{capture.pendingSynOverflow ?? 0}</strong>
+                </span>
+              </div>
+            )}
+          </>
         )}
-        {capture && (
-          <div className="capture-health">
-            <span>
-              Capture p99 <strong>{captureP99 == null ? '—' : `≤ ${captureP99} µs`}</strong>
-            </span>
-            <span>
-              Pending SYN <strong>{capture.pendingSynDepth ?? 0}</strong>
-            </span>
-            <span>
-              Queue peak <strong>{capture.pendingSynPeak ?? 0}</strong>
-            </span>
-            <span>
-              Overflow <strong>{capture.pendingSynOverflow ?? 0}</strong>
-            </span>
-          </div>
-        )}
-      </div>
-      <div className="telemetry-lower">
-        <div className="chart-card">
-          <div>
-            <span>Route latency history</span>
-            <strong>{bestPath ? `Best ${formatMetric(bestPath.latencyMs)}` : 'Waiting'}</strong>
-          </div>
-          <LatencyChart histories={histories} paths={paths} />
-        </div>
-        <div className="transfer-grid">
-          <div>
-            <ArrowUpRight size={16} />
-            <span>
-              Data sent<strong>{formatBytes(metrics?.bytesSent)}</strong>
-            </span>
-          </div>
-          <div>
-            <ArrowDownRight size={16} />
-            <span>
-              Data received<strong>{formatBytes(metrics?.bytesReceived)}</strong>
-            </span>
-          </div>
-          <div>
-            <Activity size={16} />
-            <span>
-              Packet loss<strong>{metrics ? `${metrics.packetLossPercent.toFixed(1)}%` : '—'}</strong>
-            </span>
-          </div>
-          <div>
-            <Radio size={16} />
-            <span>
-              Packets<strong>{metrics ? `${metrics.packetsReceived} / ${metrics.packetsSent}` : '—'}</strong>
-            </span>
-          </div>
-        </div>
       </div>
     </section>
   )
@@ -861,6 +910,104 @@ function VpsModal({
   )
 }
 
+type SetupItem = { done: boolean; title: string; detail: string; action: string; onClick: () => void }
+
+function SetupDrawer({
+  open,
+  onToggle,
+  steps,
+  routes,
+  relayCity,
+  onManageRoutes,
+}: {
+  open: boolean
+  onToggle: () => void
+  steps: SetupItem[]
+  routes: string[]
+  relayCity: string
+  onManageRoutes: () => void
+}) {
+  const readyCount = steps.filter((step) => step.done).length
+  const complete = readyCount === steps.length
+  const stack = routes.length
+    ? routes.map((name) => ({ name, enabled: true }))
+    : [{ name: 'WireGuard pool', enabled: false }]
+  return (
+    <section className={`setup-drawer ${open ? 'is-open' : ''} ${complete ? 'is-complete' : ''}`}>
+      <button className="drawer-head" onClick={onToggle} aria-expanded={open}>
+        <span className="drawer-icon">{complete ? <Check size={15} /> : <ListChecks size={15} />}</span>
+        <span className="drawer-copy">
+          <strong>{complete ? 'Setup complete' : `Setup — ${readyCount} of ${steps.length} ready`}</strong>
+          <small>Routes, traffic mode, relay and the current path chain</small>
+        </span>
+        <span className="drawer-pips" aria-hidden="true">
+          {steps.map((step) => (
+            <i key={step.title} className={step.done ? 'done' : ''} />
+          ))}
+        </span>
+        <span className="drawer-toggle">
+          {open ? 'Hide' : 'Show'}
+          <ChevronDown size={15} />
+        </span>
+      </button>
+      {open && (
+        <div className="drawer-body">
+          <div className="setup-list">
+            {steps.map((step, index) => (
+              <SetupStep
+                key={step.title}
+                done={step.done}
+                number={index + 1}
+                title={step.title}
+                detail={step.detail}
+                action={step.action}
+                onClick={step.onClick}
+              />
+            ))}
+          </div>
+          <div className="route-preview">
+            <div className="section-heading">
+              <div>
+                <span className="eyebrow">Path overview</span>
+                <h2>Current route chain</h2>
+              </div>
+              <button className="text-button" onClick={onManageRoutes}>
+                Manage <ChevronRight size={14} />
+              </button>
+            </div>
+            <div className="route-map">
+              <div className="map-node origin">
+                <Gamepad2 size={19} />
+                <span>Your game</span>
+              </div>
+              <div className="map-lines">
+                <i />
+                <i />
+              </div>
+              <div className="path-stack">
+                {stack.map((item, index) => (
+                  <div key={item.name}>
+                    <span className={item.enabled ? 'active' : ''}>{index + 1}</span>
+                    <p>{item.name}</p>
+                    <small>{item.enabled ? 'VPN path available' : 'Not configured'}</small>
+                  </div>
+                ))}
+              </div>
+              <div className="map-lines inbound">
+                <i />
+                <i />
+              </div>
+              <div className="map-node relay">
+                <MapPin size={19} />
+                <span>{relayCity}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
 function App() {
   const [state, setState] = useState<AppState | null>(null)
   const [view, setView] = useState<View>('dashboard')
@@ -870,6 +1017,7 @@ function App() {
   const [vpsTarget, setVpsTarget] = useState<{ id: string; action: 'provision' | 'remove' } | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [installingService, setInstallingService] = useState(false)
+  const [setupOpen, setSetupOpen] = useState<boolean | null>(null)
   const [pathHistories, setPathHistories] = useState<PathHistory>({})
   const [pathRates, setPathRates] = useState<Record<number, PathRate>>({})
   const previousPathCounters = useRef<{ at: number; paths: Record<number, { sent: number; received: number }> } | null>(
@@ -968,6 +1116,34 @@ function App() {
     elevated: false,
   }
 
+  const activeRouteNames = state.tunnels.filter((tunnel) => tunnel.enabled).map((tunnel) => tunnel.name)
+  const setupSteps: SetupItem[] = [
+    {
+      done: readiness.routes,
+      title: 'Add a WireGuard route',
+      detail: `${state.tunnels.length} configuration${state.tunnels.length === 1 ? '' : 's'} imported; the relay is reached only through enabled VPN routes`,
+      action: 'Configure',
+      onClick: () => setView('routes'),
+    },
+    {
+      done: readiness.rules,
+      title: 'Choose traffic mode',
+      detail:
+        state.trafficMode === 'all'
+          ? 'All system traffic'
+          : `${enabledRules} active split-tunnel target${enabledRules === 1 ? '' : 's'}`,
+      action: 'Configure',
+      onClick: () => setView('split'),
+    },
+    {
+      done: readiness.relay,
+      title: 'Configure a relay',
+      detail: relay ? `${relay.city}, ${relay.country}` : 'No relay selected',
+      action: 'Set up',
+      onClick: () => setView('relays'),
+    },
+  ]
+
   const importTunnels = async () => {
     const result = await api.importWireGuard()
     if (result.state) setState(result.state)
@@ -984,7 +1160,7 @@ function App() {
   }
 
   const title: Record<View, [string, string]> = {
-    dashboard: ['Command center', 'Configure your routes, targets, and relay before starting a session.'],
+    dashboard: ['Overview', 'Session control and live route telemetry.'],
     routes: ['WireGuard routes', 'Import and choose the VPN paths GamePath can use.'],
     split: ['Split tunnel', 'Choose exactly which traffic should enter the multipath tunnel.'],
     relays: ['Relay servers', 'Select the destination that combines your active routes.'],
@@ -1052,170 +1228,90 @@ function App() {
         <div className="content">
           {view === 'dashboard' && (
             <div className="dashboard-grid">
-              <section className="connect-panel">
-                <div className="panel-glow" />
-                <div className="connection-orbit">
-                  <span className="orbit orbit-one" />
-                  <span className="orbit orbit-two" />
-                  <div className="connection-core">
-                    <Zap size={28} fill="currentColor" />
-                  </div>
-                </div>
-                <span className="eyebrow">Multipath session</span>
-                <h2>
-                  {state.session.status === 'connected'
-                    ? 'Paths connected'
-                    : readyCount === 3
-                      ? 'Ready to accelerate'
-                      : 'Complete your setup'}
-                </h2>
-                <p>
-                  {state.session.status === 'connected'
-                    ? `${enabledRoutes} encrypted paths are connected through ${relay?.city}.`
-                    : readyCount === 3
-                      ? `${enabledRoutes} routes will carry matching game traffic through ${relay?.city}.`
-                      : `${readyCount} of 3 requirements ready. Configure the remaining items below.`}
-                </p>
-                <button
-                  className={`connect-button ${state.session.status === 'connected' ? 'connected' : ''}`}
-                  disabled={state.session.status === 'starting'}
-                  onClick={toggleSession}
-                >
-                  <span>
-                    {state.session.status === 'starting'
-                      ? 'Starting…'
-                      : state.session.status === 'connected'
-                        ? 'Stop session'
-                        : 'Start session'}
+              <section className={`command-bar ${state.session.status === 'connected' ? 'is-live' : ''}`}>
+                <div className="command-identity">
+                  <span className="command-core">
+                    <Zap size={22} fill="currentColor" />
                   </span>
-                  {state.session.status === 'connected' ? <Check size={18} /> : <ArrowUpRight size={18} />}
-                </button>
-                <div className="session-mode">
-                  <Sparkles size={14} /> Adaptive duplication <Info size={13} />
-                </div>
-              </section>
-
-              <section className="stats-strip">
-                <div>
-                  <span className="stat-icon cyan">
-                    <Route size={18} />
-                  </span>
-                  <p>Active routes</p>
-                  <strong>
-                    {enabledRoutes}
-                    <small> / {state.tunnels.length}</small>
-                  </strong>
-                </div>
-                <div>
-                  <span className="stat-icon violet">
-                    <CircleGauge size={18} />
-                  </span>
-                  <p>Best route</p>
-                  <strong>
-                    {bestRouteLatency ?? '—'}
-                    <small> ms</small>
-                  </strong>
-                </div>
-                <div>
-                  <span className="stat-icon green">
-                    <Activity size={18} />
-                  </span>
-                  <p>Packet loss</p>
-                  <strong>
-                    {state.session.metrics ? state.session.metrics.packetLossPercent.toFixed(1) : '—'}
-                    <small> %</small>
-                  </strong>
-                </div>
-              </section>
-
-              <section className="setup-panel">
-                <div className="section-heading">
                   <div>
-                    <span className="eyebrow">Quick setup</span>
-                    <h2>Get ready to play</h2>
+                    <span className="eyebrow">Multipath session</span>
+                    <h2>
+                      {state.session.status === 'connected'
+                        ? 'Paths connected'
+                        : readyCount === 3
+                          ? 'Ready to accelerate'
+                          : 'Complete your setup'}
+                    </h2>
+                    <p>
+                      {state.session.status === 'connected'
+                        ? `${enabledRoutes} encrypted paths active through ${relay?.city ?? 'the relay'}.`
+                        : readyCount === 3
+                          ? `${enabledRoutes} routes will carry game traffic through ${relay?.city ?? 'the relay'}.`
+                          : `${readyCount} of 3 requirements ready — open Setup below.`}
+                    </p>
                   </div>
-                  <span className="progress-label">{readyCount}/3 complete</span>
                 </div>
-                <div className="progress-track">
-                  <span style={{ width: `${(readyCount / 3) * 100}%` }} />
-                </div>
-                <div className="setup-list">
-                  <SetupStep
-                    done={readiness.routes}
-                    number={1}
-                    title="Add a WireGuard route"
-                    detail={`${state.tunnels.length} WireGuard configuration${state.tunnels.length === 1 ? '' : 's'} imported; the relay is reached only through enabled VPN routes`}
-                    action="Configure"
-                    onClick={() => setView('routes')}
-                  />
-                  <SetupStep
-                    done={readiness.rules}
-                    number={2}
-                    title="Choose traffic mode"
-                    detail={
-                      state.trafficMode === 'all'
-                        ? 'All system traffic'
-                        : `${enabledRules} active split-tunnel target${enabledRules === 1 ? '' : 's'}`
-                    }
-                    action="Configure"
-                    onClick={() => setView('split')}
-                  />
-                  <SetupStep
-                    done={readiness.relay}
-                    number={3}
-                    title="Configure a relay"
-                    detail={relay ? `${relay.city}, ${relay.country}` : 'No relay selected'}
-                    action="Set up"
-                    onClick={() => setView('relays')}
-                  />
-                </div>
-              </section>
-
-              <section className="route-preview">
-                <div className="section-heading">
+                <div className="command-stats">
                   <div>
-                    <span className="eyebrow">Path overview</span>
-                    <h2>Current route chain</h2>
+                    <span className="stat-icon cyan">
+                      <Route size={16} />
+                    </span>
+                    <p>Active routes</p>
+                    <strong>
+                      {enabledRoutes}
+                      <small> / {state.tunnels.length}</small>
+                    </strong>
                   </div>
-                  <button className="text-button" onClick={() => setView('routes')}>
-                    Manage <ChevronRight size={14} />
+                  <div>
+                    <span className="stat-icon violet">
+                      <CircleGauge size={16} />
+                    </span>
+                    <p>Best route</p>
+                    <strong>
+                      {bestRouteLatency ?? '—'}
+                      <small> ms</small>
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="stat-icon green">
+                      <Activity size={16} />
+                    </span>
+                    <p>Packet loss</p>
+                    <strong>
+                      {state.session.metrics ? state.session.metrics.packetLossPercent.toFixed(1) : '—'}
+                      <small> %</small>
+                    </strong>
+                  </div>
+                </div>
+                <div className="command-action">
+                  <button
+                    className={`connect-button ${state.session.status === 'connected' ? 'connected' : ''}`}
+                    disabled={state.session.status === 'starting'}
+                    onClick={toggleSession}
+                  >
+                    <Power size={17} />
+                    <span>
+                      {state.session.status === 'starting'
+                        ? 'Starting…'
+                        : state.session.status === 'connected'
+                          ? 'Stop session'
+                          : 'Start session'}
+                    </span>
                   </button>
-                </div>
-                <div className="route-map">
-                  <div className="map-node origin">
-                    <Gamepad2 size={19} />
-                    <span>Your game</span>
-                  </div>
-                  <div className="map-lines">
-                    <i />
-                    <i />
-                  </div>
-                  <div className="path-stack">
-                    {(state.tunnels
-                      .filter((tunnel) => tunnel.enabled)
-                      .map((tunnel) => ({ name: tunnel.name, enabled: true })).length
-                      ? state.tunnels
-                          .filter((tunnel) => tunnel.enabled)
-                          .map((tunnel) => ({ name: tunnel.name, enabled: true }))
-                      : [{ name: 'WireGuard pool', enabled: false }]
-                    ).map((item, index) => (
-                      <div key={item.name}>
-                        <span className={item.enabled ? 'active' : ''}>{index + 1}</span>
-                        <p>{item.name}</p>
-                        <small>{item.enabled ? 'VPN path available' : 'Not configured'}</small>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="map-lines inbound">
-                    <i />
-                    <i />
-                  </div>
-                  <div className="map-node relay">
-                    <MapPin size={19} />
-                    <span>{relay?.city ?? 'Relay'}</span>
-                  </div>
+                  <span className="session-mode">
+                    <Sparkles size={12} /> Adaptive duplication
+                  </span>
                 </div>
               </section>
+
+              <SetupDrawer
+                open={setupOpen ?? readyCount < 3}
+                onToggle={() => setSetupOpen(!(setupOpen ?? readyCount < 3))}
+                steps={setupSteps}
+                routes={activeRouteNames}
+                relayCity={relay?.city ?? 'Relay'}
+                onManageRoutes={() => setView('routes')}
+              />
 
               <TelemetryPanel state={state} histories={pathHistories} rates={pathRates} />
             </div>
