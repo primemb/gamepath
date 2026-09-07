@@ -16,12 +16,22 @@ class EngineBridge {
 
   async start() {
     if (this.process) return this.status
-    const binary = path.join(this.projectRoot, 'engine', 'target', this.packaged ? 'release' : 'debug', 'gamepath-engine.exe')
+    const binary = path.join(
+      this.projectRoot,
+      'engine',
+      'target',
+      this.packaged ? 'release' : 'debug',
+      'gamepath-engine.exe',
+    )
     const runtimeDirectory = path.join(require('node:os').tmpdir(), 'GamePath')
     fs.mkdirSync(runtimeDirectory, { recursive: true })
     this.runtimeBinary = path.join(runtimeDirectory, `gamepath-engine-${process.pid}-${Date.now()}.exe`)
     fs.copyFileSync(binary, this.runtimeBinary)
-    this.process = spawn(this.runtimeBinary, [], { cwd: this.projectRoot, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    this.process = spawn(this.runtimeBinary, [], {
+      cwd: this.projectRoot,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
     this.process.once('error', (error) => {
       this.status = { status: 'error', version: '', message: error.message, capabilities: null }
       this.rejectPending(error)
@@ -62,7 +72,11 @@ class EngineBridge {
 
   handleLine(line) {
     let response
-    try { response = JSON.parse(line) } catch { return }
+    try {
+      response = JSON.parse(line)
+    } catch {
+      return
+    }
     const pending = this.pending.get(response.id)
     if (!pending) return
     clearTimeout(pending.timeout)
@@ -86,7 +100,9 @@ class EngineBridge {
 
   cleanupRuntime() {
     if (!this.runtimeBinary) return
-    try { fs.unlinkSync(this.runtimeBinary) } catch {}
+    try {
+      fs.unlinkSync(this.runtimeBinary)
+    } catch {}
     this.runtimeBinary = null
   }
 }

@@ -5,19 +5,31 @@ const path = require('node:path')
 class ServiceBridge {
   constructor(options = {}) {
     this.port = options.port ?? 47983
-    this.tokenFile = options.tokenFile ?? path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'GamePath', 'service-token')
+    this.tokenFile =
+      options.tokenFile ?? path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'GamePath', 'service-token')
     this.nextId = 1
     this.status = { status: 'not-installed', version: '', message: 'Network service is not installed', elevated: false }
   }
 
   async inspect() {
     if (!fs.existsSync(this.tokenFile)) {
-      this.status = { status: 'not-installed', version: '', message: 'Network service is not installed', elevated: false }
+      this.status = {
+        status: 'not-installed',
+        version: '',
+        message: 'Network service is not installed',
+        elevated: false,
+      }
       return this.status
     }
     try {
       const result = await this.request('status')
-      this.status = { status: 'ready', version: result.version, message: 'Privileged network service ready', elevated: Boolean(result.elevated), sessionStatus: result.sessionStatus }
+      this.status = {
+        status: 'ready',
+        version: result.version,
+        message: 'Privileged network service ready',
+        elevated: Boolean(result.elevated),
+        sessionStatus: result.sessionStatus,
+      }
     } catch (error) {
       this.status = { status: 'offline', version: '', message: error.message, elevated: false }
     }
@@ -57,7 +69,9 @@ class ServiceBridge {
         }
       })
       socket.on('error', (error) => finish(new Error(`Network service unavailable: ${error.message}`)))
-      socket.on('end', () => { if (!settled) finish(new Error('Network service closed the connection')) })
+      socket.on('end', () => {
+        if (!settled) finish(new Error('Network service closed the connection'))
+      })
     })
   }
 }

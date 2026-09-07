@@ -43,8 +43,18 @@ function publicState() {
   return structuredClone({
     ...safeState,
     clientVersion: app.getVersion(),
-    engine: engineBridge?.status ?? { status: 'offline', version: '', message: 'Native engine is starting', capabilities: null },
-    service: serviceBridge?.status ?? { status: 'offline', version: '', message: 'Network service is starting', elevated: false },
+    engine: engineBridge?.status ?? {
+      status: 'offline',
+      version: '',
+      message: 'Native engine is starting',
+      capabilities: null,
+    },
+    service: serviceBridge?.status ?? {
+      status: 'offline',
+      version: '',
+      message: 'Network service is starting',
+      elevated: false,
+    },
   })
 }
 
@@ -90,10 +100,13 @@ function updateSessionMetrics(runtime, dataPlane) {
   const probesLost = paths.reduce((total, path) => total + (path.probesLost ?? 0), 0)
   const completedProbes = probesReceived + probesLost
   const userToNode = wireGuard?.nodeLatencyMs ?? null
-  const nodeToRelay = userToNode != null && wireGuard?.latencyMs != null ? Math.max(0, wireGuard.latencyMs - userToNode) : null
+  const nodeToRelay =
+    userToNode != null && wireGuard?.latencyMs != null ? Math.max(0, wireGuard.latencyMs - userToNode) : null
   state.session.pathMetrics = paths
   if (runtime.capture) state.session.capture = runtime.capture
-  state.session.routeLatencies = paths.filter((path) => path.latencyMs != null).map((path) => Math.max(1, Math.round(path.latencyMs)))
+  state.session.routeLatencies = paths
+    .filter((path) => path.latencyMs != null)
+    .map((path) => Math.max(1, Math.round(path.latencyMs)))
   state.session.metrics = {
     userToNodeMs: userToNode,
     nodeToRelayMs: nodeToRelay,
@@ -204,7 +217,16 @@ function registerIpc() {
   ipcMain.handle('relay:add', (_event, input) => {
     const city = String(input?.city ?? '').trim() || 'Custom relay'
     const country = String(input?.country ?? '').trim() || 'Custom'
-    const relay = { id: crypto.randomUUID(), city, country, code: country.slice(0, 2).toUpperCase(), address: '', port: 51821, status: 'setup-required', hasEnrollmentToken: false }
+    const relay = {
+      id: crypto.randomUUID(),
+      city,
+      country,
+      code: country.slice(0, 2).toUpperCase(),
+      address: '',
+      port: 51821,
+      status: 'setup-required',
+      hasEnrollmentToken: false,
+    }
     state.relays.push(relay)
     state.activeRelayId = relay.id
     saveState()
@@ -251,7 +273,8 @@ function registerIpc() {
     })
     if (result.canceled) return { canceled: true }
     const token = fs.readFileSync(result.filePaths[0], 'utf8').trim()
-    if (!token.startsWith('gpe1_') || token.length < 80) throw new Error('The selected file is not a valid GamePath enrollment token')
+    if (!token.startsWith('gpe1_') || token.length < 80)
+      throw new Error('The selected file is not a valid GamePath enrollment token')
     state.encryptedRelayTokens[id] = encryptConfig(token)
     relay.hasEnrollmentToken = true
     relay.status = relay.address ? 'ready' : 'setup-required'
@@ -284,12 +307,23 @@ function registerIpc() {
     const relayPort = Number(input.relayPort ?? 51821)
     if (!host || /\s|:\/\//.test(host)) throw new Error('Enter a valid VPS hostname or IP address')
     if (!username || !password) throw new Error('Enter the SSH username and password')
-    if (![sshPort, relayPort].every((port) => Number.isInteger(port) && port >= 1 && port <= 65535)) throw new Error('Ports must be between 1 and 65535')
+    if (![sshPort, relayPort].every((port) => Number.isInteger(port) && port >= 1 && port <= 65535))
+      throw new Error('Ports must be between 1 and 65535')
     const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
     const progress = (update) => _event.sender.send('relay:vps-progress', { relayId: id, ...update })
-    const result = await provisionRelay(projectRoot, { host, username, password, sshPort, relayPort, expectedFingerprint: relay.sshFingerprint }, progress)
+    const result = await provisionRelay(
+      projectRoot,
+      { host, username, password, sshPort, relayPort, expectedFingerprint: relay.sshFingerprint },
+      progress,
+    )
     state.encryptedRelayTokens[id] = encryptConfig(result.token)
-    Object.assign(relay, { address: host, port: relayPort, status: 'ready', hasEnrollmentToken: true, sshFingerprint: result.fingerprint })
+    Object.assign(relay, {
+      address: host,
+      port: relayPort,
+      status: 'ready',
+      hasEnrollmentToken: true,
+      sshFingerprint: result.fingerprint,
+    })
     state.activeRelayId = id
     saveState()
     return publicState()
@@ -305,7 +339,11 @@ function registerIpc() {
     if (!host || !username || !password) throw new Error('Enter the VPS hostname, SSH username, and password')
     const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
     const progress = (update) => _event.sender.send('relay:vps-progress', { relayId: id, ...update })
-    await removeRelay(projectRoot, { host, username, password, sshPort, expectedFingerprint: relay.sshFingerprint }, progress)
+    await removeRelay(
+      projectRoot,
+      { host, username, password, sshPort, expectedFingerprint: relay.sshFingerprint },
+      progress,
+    )
     delete state.encryptedRelayTokens[id]
     Object.assign(relay, { status: 'setup-required', hasEnrollmentToken: false, latency: undefined })
     if (state.activeRelayId === id) state.activeRelayId = null
@@ -322,13 +360,21 @@ function registerIpc() {
     const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
     const installer = path.join(projectRoot, 'deploy', 'install-windows-service.ps1')
     await new Promise((resolve, reject) => {
-      const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', installer, '-ProjectRoot', projectRoot, '-SkipBuild'], {
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
+      const child = spawn(
+        'powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', installer, '-ProjectRoot', projectRoot, '-SkipBuild'],
+        {
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      )
       let output = ''
-      child.stdout.on('data', (chunk) => { output += chunk.toString() })
-      child.stderr.on('data', (chunk) => { output += chunk.toString() })
+      child.stdout.on('data', (chunk) => {
+        output += chunk.toString()
+      })
+      child.stderr.on('data', (chunk) => {
+        output += chunk.toString()
+      })
       child.once('error', reject)
       child.once('exit', (code) => {
         if (code === 0) resolve()
@@ -358,7 +404,9 @@ function registerIpc() {
     } else {
       try {
         const enrollmentToken = safeStorage.decryptString(Buffer.from(encryptedRelayToken, 'base64'))
-        const wireguardConfigs = enabledTunnels.map((tunnel) => safeStorage.decryptString(Buffer.from(state.encryptedConfigs[tunnel.id], 'base64')))
+        const wireguardConfigs = enabledTunnels.map((tunnel) =>
+          safeStorage.decryptString(Buffer.from(state.encryptedConfigs[tunnel.id], 'base64')),
+        )
         const plan = await engineBridge.request('prepare-session', {
           routeIds: enabledTunnels.map((tunnel) => tunnel.id),
           trafficMode: state.trafficMode,
@@ -375,23 +423,34 @@ function registerIpc() {
           trafficMode: state.trafficMode,
           wireguardConfigs,
         })
-        const serviceSession = await serviceBridge.request('start-session', {
-          relayHost: relay.address,
-          relayPort: relay.port,
-          enrollmentToken,
-          wireguardConfigs,
-          routeLabels: enabledTunnels.map((tunnel) => tunnel.name),
-          trafficMode: state.trafficMode,
-          rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
-        }, 30000)
+        const serviceSession = await serviceBridge.request(
+          'start-session',
+          {
+            relayHost: relay.address,
+            relayPort: relay.port,
+            enrollmentToken,
+            wireguardConfigs,
+            routeLabels: enabledTunnels.map((tunnel) => tunnel.name),
+            trafficMode: state.trafficMode,
+            rules: enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value })),
+          },
+          30000,
+        )
         const paths = serviceSession.paths
         const dataPlane = serviceSession.dataPlane
-        const standbyNote = paths.skippedRoutes.length ? ` ${paths.skippedRoutes.length} overlapping config${paths.skippedRoutes.length === 1 ? ' is' : 's are'} held as standby.` : ''
-        state.session = { status: 'connected', message: `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${standbyNote}` }
+        const standbyNote = paths.skippedRoutes.length
+          ? ` ${paths.skippedRoutes.length} overlapping config${paths.skippedRoutes.length === 1 ? ' is' : 's are'} held as standby.`
+          : ''
+        state.session = {
+          status: 'connected',
+          message: `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${standbyNote}`,
+        }
         state.session.capture = serviceSession.capture
         updateSessionMetrics(paths, dataPlane)
       } catch (error) {
-        try { await serviceBridge.request('stop-session') } catch {}
+        try {
+          await serviceBridge.request('stop-session')
+        } catch {}
         state.session = { status: 'error', message: error.message }
       }
     }
@@ -417,10 +476,13 @@ function registerIpc() {
         const runtime = await serviceBridge.request('session-status')
         updateSessionMetrics(runtime)
         if (runtime.state !== 'connected') {
-          state.session.message = 'Relay paths are temporarily unavailable; selected traffic is using the normal Internet connection.'
+          state.session.message =
+            'Relay paths are temporarily unavailable; selected traffic is using the normal Internet connection.'
         }
       } catch (error) {
-        try { await serviceBridge.request('stop-session') } catch {}
+        try {
+          await serviceBridge.request('stop-session')
+        } catch {}
         state.session = { status: 'error', message: error.message }
       }
     }

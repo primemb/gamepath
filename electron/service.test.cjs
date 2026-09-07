@@ -19,7 +19,9 @@ test('authenticates and parses a network service response', async (context) => {
       if (!source.includes('\n')) return
       const request = JSON.parse(source)
       assert.equal(request.token, fs.readFileSync(tokenFile, 'utf8'))
-      socket.end(`${JSON.stringify({ id: request.id, ok: true, result: { version: 'test', elevated: true, sessionStatus: 'idle' } })}\n`)
+      socket.end(
+        `${JSON.stringify({ id: request.id, ok: true, result: { version: 'test', elevated: true, sessionStatus: 'idle' } })}\n`,
+      )
     })
   })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -29,4 +31,3 @@ test('authenticates and parses a network service response', async (context) => {
   assert.equal(status.status, 'ready')
   assert.equal(status.elevated, true)
 })
-
