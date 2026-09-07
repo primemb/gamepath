@@ -14,6 +14,9 @@ pub struct UserSpaceWireGuardPath {
     endpoint: SocketAddr,
     identity_fingerprint: [u8; 32],
     handshake_latency_ms: Option<f64>,
+    read_timeout: Option<Duration>,
+    network_buffer: Vec<u8>,
+    tunnel_buffer: Vec<u8>,
 }
 
 impl UserSpaceWireGuardPath {
@@ -48,6 +51,12 @@ impl UserSpaceWireGuardPath {
             .transpose()?;
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .map_err(|error| format!("could not create WireGuard UDP socket: {error}"))?;
+        socket2::SockRef::from(&socket)
+            .set_recv_buffer_size(4 * 1024 * 1024)
+            .map_err(|error| format!("could not enlarge WireGuard receive buffer: {error}"))?;
+        socket2::SockRef::from(&socket)
+            .set_send_buffer_size(4 * 1024 * 1024)
+            .map_err(|error| format!("could not enlarge WireGuard send buffer: {error}"))?;
         socket
             .connect(endpoint)
             .map_err(|error| format!("could not connect WireGuard endpoint: {error}"))?;
@@ -66,6 +75,9 @@ impl UserSpaceWireGuardPath {
             endpoint,
             identity_fingerprint: Sha256::digest(private_key).into(),
             handshake_latency_ms: None,
+            read_timeout: None,
+            network_buffer: vec![0_u8; 65_535],
+            tunnel_buffer: vec![0_u8; 65_535],
         })
     }
 
@@ -86,25 +98,24 @@ impl UserSpaceWireGuardPath {
     }
 
     pub fn transact(&mut self, inner_packet: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
-        self.socket
-            .set_read_timeout(Some(Duration::from_millis(400)))
-            .map_err(|error| error.to_string())?;
-        let mut destination = vec![0_u8; 65_535];
-        let first = action(self.tunnel.encapsulate(inner_packet, &mut destination))?;
+        self.set_read_timeout(Duration::from_millis(400))?;
+        let first = action(
+            self.tunnel
+                .encapsulate(inner_packet, &mut self.tunnel_buffer),
+        )?;
         self.apply(first)?;
         let deadline = Instant::now() + timeout;
         let started = Instant::now();
-        let mut network = [0_u8; 65_535];
         while Instant::now() < deadline {
-            match self.socket.recv(&mut network) {
+            match self.socket.recv(&mut self.network_buffer) {
                 Ok(length) => {
                     if self.handshake_latency_ms.is_none() {
                         self.handshake_latency_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
                     }
                     let next = decapsulation_action(self.tunnel.decapsulate(
                         None,
-                        &network[..length],
-                        &mut destination,
+                        &self.network_buffer[..length],
+                        &mut self.tunnel_buffer,
                     ));
                     if let Some(packet) = self.apply(next)? {
                         return Ok(packet);
@@ -113,7 +124,7 @@ impl UserSpaceWireGuardPath {
                         let drained = decapsulation_action(self.tunnel.decapsulate(
                             None,
                             &[],
-                            &mut destination,
+                            &mut self.tunnel_buffer,
                         ));
                         if matches!(drained, Action::Done) {
                             break;
@@ -127,7 +138,7 @@ impl UserSpaceWireGuardPath {
                     if error.kind() == io::ErrorKind::WouldBlock
                         || error.kind() == io::ErrorKind::TimedOut =>
                 {
-                    let timer = action(self.tunnel.update_timers(&mut destination))?;
+                    let timer = action(self.tunnel.update_timers(&mut self.tunnel_buffer))?;
                     if let Some(packet) = self.apply(timer)? {
                         return Ok(packet);
                     }
@@ -139,12 +150,14 @@ impl UserSpaceWireGuardPath {
     }
 
     pub fn send_inner(&mut self, inner_packet: &[u8]) -> Result<(), String> {
-        let mut destination = vec![0_u8; 65_535];
-        let first = action(self.tunnel.encapsulate(inner_packet, &mut destination))?;
+        let first = action(
+            self.tunnel
+                .encapsulate(inner_packet, &mut self.tunnel_buffer),
+        )?;
         self.apply(first)?;
         loop {
             let drained =
-                decapsulation_action(self.tunnel.decapsulate(None, &[], &mut destination));
+                decapsulation_action(self.tunnel.decapsulate(None, &[], &mut self.tunnel_buffer));
             if matches!(drained, Action::Done) {
                 return Ok(());
             }
@@ -153,18 +166,14 @@ impl UserSpaceWireGuardPath {
     }
 
     pub fn receive_inner(&mut self, timeout: Duration) -> Result<Vec<Vec<u8>>, String> {
-        self.socket
-            .set_read_timeout(Some(timeout))
-            .map_err(|error| error.to_string())?;
-        let mut network = [0_u8; 65_535];
-        let mut destination = vec![0_u8; 65_535];
+        self.set_read_timeout(timeout)?;
         let mut packets = Vec::new();
-        match self.socket.recv(&mut network) {
+        match self.socket.recv(&mut self.network_buffer) {
             Ok(length) => {
                 let mut next = decapsulation_action(self.tunnel.decapsulate(
                     None,
-                    &network[..length],
-                    &mut destination,
+                    &self.network_buffer[..length],
+                    &mut self.tunnel_buffer,
                 ));
                 loop {
                     match next {
@@ -176,8 +185,11 @@ impl UserSpaceWireGuardPath {
                         }
                         Action::Tunnel(packet) => packets.push(packet),
                     }
-                    next =
-                        decapsulation_action(self.tunnel.decapsulate(None, &[], &mut destination));
+                    next = decapsulation_action(self.tunnel.decapsulate(
+                        None,
+                        &[],
+                        &mut self.tunnel_buffer,
+                    ));
                 }
             }
             Err(error)
@@ -185,11 +197,21 @@ impl UserSpaceWireGuardPath {
                     || error.kind() == io::ErrorKind::TimedOut => {}
             Err(error) => return Err(format!("WireGuard receive failed: {error}")),
         }
-        let timer = action(self.tunnel.update_timers(&mut destination))?;
+        let timer = action(self.tunnel.update_timers(&mut self.tunnel_buffer))?;
         if let Some(packet) = self.apply(timer)? {
             packets.push(packet);
         }
         Ok(packets)
+    }
+
+    fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), String> {
+        if self.read_timeout != Some(timeout) {
+            self.socket
+                .set_read_timeout(Some(timeout))
+                .map_err(|error| error.to_string())?;
+            self.read_timeout = Some(timeout);
+        }
+        Ok(())
     }
 
     fn apply(&self, action: Action) -> Result<Option<Vec<u8>>, String> {

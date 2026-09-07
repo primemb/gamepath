@@ -44,12 +44,29 @@ app.whenReady().then(async () => {
     }, 30_000)
     let response
     let requestError
+    let throughputBytesPerSecond = null
+    let throughputSeconds = null
+    let throughputConnectSeconds = null
+    let throughputStartTransferSeconds = null
     const keepAlive = setInterval(() => service.request('session-status').catch(() => {}), 2_000)
     try {
       response = await run(curl, ['-4', '--fail', '--max-time', '15', 'http://api.ipify.org'], { windowsHide: true })
+      if (process.argv.includes('--throughput')) {
+        const throughputBytes = Number(process.env.GAMEPATH_TEST_BYTES || 1_000_000)
+        const download = await run(curl, [
+          '-4', '--location', '--fail', '--max-time', '120', '--output', 'NUL',
+          '--silent', '--show-error', '--write-out', '%{speed_download} %{time_total} %{time_connect} %{time_starttransfer}',
+          `http://speed.cloudflare.com/__down?bytes=${throughputBytes}`,
+        ], { windowsHide: true })
+        const [speed, seconds, connectSeconds, startTransferSeconds] = download.stdout.trim().split(/\s+/).map(Number)
+        throughputBytesPerSecond = speed
+        throughputSeconds = seconds
+        throughputConnectSeconds = connectSeconds
+        throughputStartTransferSeconds = startTransferSeconds
+      }
     } catch (error) {
       requestError = error
-      response = { stdout: error.stdout || '' }
+      response ??= { stdout: '' }
     } finally {
       clearInterval(keepAlive)
     }
@@ -73,6 +90,10 @@ app.whenReady().then(async () => {
       backend: started.capture.backend,
       publicAddress,
       normalPublicAddress,
+      throughputMbps: throughputBytesPerSecond == null ? undefined : Number((throughputBytesPerSecond * 8 / 1_000_000).toFixed(2)),
+      throughputSeconds,
+      throughputConnectSeconds,
+      throughputStartTransferSeconds,
       relayPaths: status.paths.map(({ label, pathKind, reachable, probesSent, probesReceived, probesLost }) => ({ label, pathKind, reachable, probesSent, probesReceived, probesLost })),
       diagnostics,
     }, null, 2))

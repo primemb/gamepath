@@ -95,13 +95,46 @@ struct ActiveWireGuardSession {
     workers: Vec<JoinHandle<()>>,
     skipped_routes: Vec<usize>,
     commands: Vec<mpsc::Sender<PathCommand>>,
-    inbound: mpsc::Receiver<Vec<u8>>,
+    data_receiver: Arc<DataReceiver>,
     client_id: [u8; 16],
     key: [u8; 32],
     virtual_ipv4: std::net::Ipv4Addr,
     sequences: Arc<AtomicU64>,
     bypass_ips: Vec<std::net::Ipv4Addr>,
-    server_replay: SequenceWindow,
+}
+
+pub(crate) struct DataReceiver {
+    inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
+    client_id: [u8; 16],
+    key: [u8; 32],
+    session_id: u64,
+    server_replay: Mutex<SequenceWindow>,
+}
+
+impl DataReceiver {
+    pub(crate) fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
+        use gamepath_engine::auth::SessionCrypto;
+        use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT};
+
+        let response = match self.inbound.lock().unwrap().recv_timeout(timeout) {
+            Ok(response) => response,
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("all path receivers stopped".into());
+            }
+        };
+        let crypto = SessionCrypto::new(&self.key, self.session_id)?;
+        let (header, plaintext) = crypto.open_server(&response)?;
+        if header.client_id != self.client_id
+            || header.session_id != self.session_id
+            || header.flags & FLAG_SERVER_TO_CLIENT == 0
+            || header.flags & FLAG_CONTROL != 0
+            || !self.server_replay.lock().unwrap().accept(header.sequence)
+        {
+            return Ok(None);
+        }
+        Ok(Some(plaintext))
+    }
 }
 
 #[derive(Default)]
@@ -336,6 +369,13 @@ impl WireGuardSessionManager {
                     .map_err(|error| format!("could not start WireGuard path worker: {error}"))?,
             );
         }
+        let data_receiver = Arc::new(DataReceiver {
+            inbound: Mutex::new(inbound_rx),
+            client_id,
+            key,
+            session_id,
+            server_replay: Mutex::new(SequenceWindow::default()),
+        });
         self.active = Some(ActiveWireGuardSession {
             session_id,
             started_at: unix_time_millis(),
@@ -344,13 +384,12 @@ impl WireGuardSessionManager {
             workers,
             skipped_routes,
             commands,
-            inbound: inbound_rx,
+            data_receiver,
             client_id,
             key,
             virtual_ipv4: enrollment.virtual_ipv4,
             sequences,
             bypass_ips,
-            server_replay: SequenceWindow::default(),
         });
 
         let deadline = Instant::now() + Duration::from_secs(12);
@@ -476,31 +515,17 @@ impl WireGuardSessionManager {
     }
 
     fn receive_data_packet(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
-        use gamepath_engine::auth::SessionCrypto;
-        use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT};
-
         let session = self
             .active
             .as_mut()
             .ok_or("start the WireGuard session before receiving packets")?;
-        let response = match session.inbound.recv_timeout(timeout) {
-            Ok(response) => response,
-            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("all path receivers stopped".into());
-            }
-        };
-        let crypto = SessionCrypto::new(&session.key, session.session_id)?;
-        let (header, plaintext) = crypto.open_server(&response)?;
-        if header.client_id != session.client_id
-            || header.session_id != session.session_id
-            || header.flags & FLAG_SERVER_TO_CLIENT == 0
-            || header.flags & FLAG_CONTROL != 0
-            || !session.server_replay.accept(header.sequence)
-        {
-            return Ok(None);
-        }
-        Ok(Some(plaintext))
+        session.data_receiver.receive(timeout)
+    }
+
+    fn data_receiver(&self) -> Option<Arc<DataReceiver>> {
+        self.active
+            .as_ref()
+            .map(|session| Arc::clone(&session.data_receiver))
     }
 
     fn virtual_ipv4(&self) -> Option<std::net::Ipv4Addr> {
@@ -589,13 +614,16 @@ impl PacketCaptureManager {
         let input: PacketCaptureRequest = serde_json::from_value(payload)
             .map_err(|error| format!("invalid packet capture request: {error}"))?;
         self.stop();
-        let (virtual_ipv4, bypass_ips) = {
+        let (virtual_ipv4, bypass_ips, data_receiver) = {
             let manager = sessions.lock().unwrap();
             (
                 manager
                     .virtual_ipv4()
                     .ok_or("start the multipath session before packet capture")?,
                 manager.bypass_ips(),
+                manager
+                    .data_receiver()
+                    .ok_or("start the multipath session before packet capture")?,
             )
         };
         if input.traffic_mode == "split" {
@@ -604,6 +632,7 @@ impl PacketCaptureManager {
                 virtual_ipv4,
                 &bypass_ips,
                 sessions,
+                data_receiver,
             )?;
             let target_count = split.target_count();
             self.active_split = Some(split);
@@ -672,7 +701,15 @@ impl PacketCaptureManager {
         let worker_session = Arc::clone(&session);
         let worker = thread::Builder::new()
             .name("gamepath-wintun".into())
-            .spawn(move || run_wintun_pump(worker_session, sessions, virtual_ipv4, worker_stop))
+            .spawn(move || {
+                run_wintun_pump(
+                    worker_session,
+                    sessions,
+                    data_receiver,
+                    virtual_ipv4,
+                    worker_stop,
+                )
+            })
             .map_err(|error| format!("could not start Wintun packet pump: {error}"))?;
 
         let mut capture = WindowsPacketCapture {
@@ -782,6 +819,7 @@ impl Drop for WindowsPacketCapture {
 fn run_wintun_pump(
     session: Arc<wintun::Session>,
     sessions: Arc<Mutex<WireGuardSessionManager>>,
+    data_receiver: Arc<DataReceiver>,
     virtual_ipv4: std::net::Ipv4Addr,
     stop: Arc<AtomicBool>,
 ) {
@@ -799,7 +837,7 @@ fn run_wintun_pump(
             }
         }
         for _ in 0..128 {
-            let reply = match sessions.lock().unwrap().receive_data_packet(Duration::ZERO) {
+            let reply = match data_receiver.receive(Duration::ZERO) {
                 Ok(Some(packet)) => packet,
                 Ok(None) => break,
                 Err(_) => return,
@@ -991,7 +1029,7 @@ fn run_wireguard_path(
                 }
             }
         }
-        match path.receive_inner(Duration::from_millis(20)) {
+        match path.receive_inner(Duration::from_millis(1)) {
             Ok(packets) => {
                 for packet in packets {
                     let Some((

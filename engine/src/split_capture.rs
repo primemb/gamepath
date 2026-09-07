@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use crate::WireGuardSessionManager;
+use crate::{DataReceiver, WireGuardSessionManager};
 use gamepath_engine::policy::{InterceptionPlan, RuleSpec, compile};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString, c_char, c_void};
@@ -255,6 +255,8 @@ struct Registry {
     handles: Mutex<Vec<Arc<Handle>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     selectors: Mutex<HashSet<TrafficSelector>>,
+    applications: Vec<String>,
+    folders: Vec<String>,
     matched_sockets: AtomicU64,
     captured_packets: AtomicU64,
     captured_bytes: AtomicU64,
@@ -307,6 +309,7 @@ impl SplitPacketCapture {
         virtual_ipv4: Ipv4Addr,
         bypass_ips: &[Ipv4Addr],
         sessions: Arc<Mutex<WireGuardSessionManager>>,
+        data_receiver: Arc<DataReceiver>,
     ) -> Result<Self, String> {
         let plan = compile("split", rules)?;
         let registry = Arc::new(Registry {
@@ -315,6 +318,8 @@ impl SplitPacketCapture {
             handles: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
             selectors: Mutex::new(HashSet::new()),
+            applications: plan.application_paths.clone(),
+            folders: plan.folder_prefixes.clone(),
             matched_sockets: AtomicU64::new(0),
             captured_packets: AtomicU64::new(0),
             captured_bytes: AtomicU64::new(0),
@@ -388,7 +393,7 @@ impl SplitPacketCapture {
                 run_reply_injector(
                     send_handle,
                     inject_stop,
-                    sessions,
+                    data_receiver,
                     inject_returns,
                     virtual_ipv4,
                 )
@@ -461,13 +466,26 @@ fn run_selected_capture(
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
         if !selected && is_tcp_syn(&packet) {
-            thread::sleep(Duration::from_millis(3));
-            selected = registry
-                .selectors
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|selector| selector.matches(fields));
+            if tcp_socket_matches(fields, &registry.applications, &registry.folders) {
+                add_selector(
+                    &registry,
+                    TrafficSelector::Flow {
+                        protocol: 6,
+                        local_port: fields.source_port,
+                        remote_port: Some(fields.destination_port),
+                    },
+                );
+                registry.matched_sockets.fetch_add(1, Ordering::Relaxed);
+                selected = true;
+            } else {
+                thread::sleep(Duration::from_millis(3));
+                selected = registry
+                    .selectors
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|selector| selector.matches(fields));
+            }
         }
         if !selected {
             let _ = handle.send(&packet, &address);
@@ -487,6 +505,7 @@ fn run_selected_capture(
             .fetch_add(packet.len() as u64, Ordering::Relaxed);
         let mut tunneled = packet.clone();
         tunneled[12..16].copy_from_slice(&virtual_ipv4.octets());
+        clamp_tcp_mss(&mut tunneled, 1000);
         let mut checksum_address = address;
         if handle
             .checksums(&mut tunneled, &mut checksum_address)
@@ -612,6 +631,14 @@ impl ExistingSocket {
 
 #[link(name = "iphlpapi")]
 unsafe extern "system" {
+    fn GetExtendedTcpTable(
+        table: *mut c_void,
+        size: *mut u32,
+        order: i32,
+        family: u32,
+        table_class: u32,
+        reserved: u32,
+    ) -> u32;
     fn GetExtendedUdpTable(
         table: *mut c_void,
         size: *mut u32,
@@ -620,6 +647,20 @@ unsafe extern "system" {
         table_class: u32,
         reserved: u32,
     ) -> u32;
+}
+
+fn tcp_socket_matches(fields: Ipv4Fields, applications: &[String], folders: &[String]) -> bool {
+    let Some(buffer) =
+        ip_table(|table, size| unsafe { GetExtendedTcpTable(table, size, 0, 2, 5, 0) })
+    else {
+        return false;
+    };
+    dword_rows(&buffer, 6).into_iter().any(|row| {
+        port_from_dword(row[2]) == fields.source_port
+            && port_from_dword(row[4]) == fields.destination_port
+            && Ipv4Addr::from(row[3].to_ne_bytes()) == fields.destination
+            && process_path(row[5]).is_some_and(|path| path_matches(&path, applications, folders))
+    })
 }
 
 fn existing_ipv4_udp_sockets() -> Vec<ExistingSocket> {
@@ -718,17 +759,19 @@ fn spawn_dns_tracker(
 fn run_reply_injector(
     handle: Arc<Handle>,
     stop: Arc<AtomicBool>,
-    sessions: Arc<Mutex<WireGuardSessionManager>>,
+    data_receiver: Arc<DataReceiver>,
     return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
     virtual_ipv4: Ipv4Addr,
 ) {
     while !stop.load(Ordering::Acquire) {
-        let Ok(Some(mut packet)) = sessions
-            .lock()
-            .unwrap()
-            .receive_data_packet(Duration::from_millis(20))
-        else {
-            continue;
+        let received = data_receiver.receive(Duration::from_millis(20));
+        let mut packet = match received {
+            Ok(Some(packet)) => packet,
+            Ok(None) => continue,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
         };
         let Some(fields) = ipv4_fields(&packet) else {
             continue;
@@ -745,9 +788,49 @@ fn run_reply_injector(
             continue;
         };
         packet[16..20].copy_from_slice(&path.local_ip.octets());
+        clamp_tcp_mss(&mut packet, 1000);
         let mut address = Address::inbound(path.interface_index, path.subinterface_index);
         if handle.checksums(&mut packet, &mut address).is_ok() {
             let _ = handle.send(&packet, &address);
+        }
+    }
+}
+
+fn clamp_tcp_mss(packet: &mut [u8], maximum: u16) {
+    if packet.len() < 20 || packet[0] >> 4 != 4 || packet[9] != 6 {
+        return;
+    }
+    let ip_header = usize::from(packet[0] & 0x0f) * 4;
+    if packet.len() < ip_header + 20 || packet[ip_header + 13] & 0x02 == 0 {
+        return;
+    }
+    let tcp_header = usize::from(packet[ip_header + 12] >> 4) * 4;
+    if tcp_header < 20 || packet.len() < ip_header + tcp_header {
+        return;
+    }
+    let mut offset = ip_header + 20;
+    let end = ip_header + tcp_header;
+    while offset < end {
+        match packet[offset] {
+            0 => break,
+            1 => offset += 1,
+            kind => {
+                let Some(&length) = packet.get(offset + 1) else {
+                    break;
+                };
+                let length = usize::from(length);
+                if length < 2 || offset + length > end {
+                    break;
+                }
+                if kind == 2 && length == 4 {
+                    let current = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+                    if current > maximum {
+                        packet[offset + 2..offset + 4].copy_from_slice(&maximum.to_be_bytes());
+                    }
+                    break;
+                }
+                offset += length;
+            }
         }
     }
 }
@@ -1048,5 +1131,17 @@ mod tests {
         assert!(hostname_matches("eu.game.example", "*.game.example"));
         assert!(hostname_matches("game.example", "*.game.example"));
         assert!(!hostname_matches("other.example", "*.game.example"));
+    }
+
+    #[test]
+    fn nested_tunnel_clamps_tcp_mss() {
+        let mut packet = vec![0_u8; 44];
+        packet[0] = 0x45;
+        packet[9] = 6;
+        packet[20 + 12] = 0x60;
+        packet[20 + 13] = 0x02;
+        packet[40..44].copy_from_slice(&[2, 4, 0x05, 0xb4]);
+        clamp_tcp_mss(&mut packet, 1000);
+        assert_eq!(&packet[42..44], &1000_u16.to_be_bytes());
     }
 }
