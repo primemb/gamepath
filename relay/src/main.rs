@@ -16,6 +16,16 @@ const MAX_PACKET: usize = 65_535;
 const MAX_ENDPOINTS_PER_SESSION: usize = 8;
 const ENDPOINT_TTL: Duration = Duration::from_secs(45);
 
+/// How long a session survives without authenticated traffic. A client that
+/// reconnects gets a new session id, so without this every reconnect would
+/// leave its predecessor's replay window behind for the life of the process.
+const SESSION_TTL: Duration = Duration::from_secs(180);
+
+/// Sessions one enrolled client may hold at once. Roaming and a handful of
+/// paths need a few; an enrolled client cycling session ids to grow the map
+/// does not get to keep them.
+const MAX_SESSIONS_PER_CLIENT: usize = 8;
+
 #[derive(Parser)]
 #[command(name = "gamepath-relay", version, about)]
 struct Cli {
@@ -82,6 +92,32 @@ struct SessionState {
     endpoints: Vec<(SocketAddr, Instant)>,
     outbound_sequence: u64,
     last_seen: Instant,
+}
+
+impl RelayClient {
+    /// Drops sessions that have gone quiet, then enforces the per-client cap by
+    /// evicting the least recently used. Called before a session is created,
+    /// which is the only moment the map can grow.
+    fn admit_session(&mut self, session_id: u64, now: Instant) -> &mut SessionState {
+        self.sessions
+            .retain(|_, session| now.duration_since(session.last_seen) <= SESSION_TTL);
+        if !self.sessions.contains_key(&session_id) {
+            while self.sessions.len() >= MAX_SESSIONS_PER_CLIENT {
+                let Some(oldest) = self
+                    .sessions
+                    .iter()
+                    .min_by_key(|(_, session)| session.last_seen)
+                    .map(|(id, _)| *id)
+                else {
+                    break;
+                };
+                self.sessions.remove(&oldest);
+            }
+        }
+        self.sessions
+            .entry(session_id)
+            .or_insert_with(SessionState::new)
+    }
 }
 
 impl SessionState {
@@ -314,10 +350,12 @@ fn serve(
         let Ok((verified_header, plaintext)) = crypto.open_client(&frame[..length]) else {
             continue;
         };
-        let session = client
-            .sessions
-            .entry(header.session_id)
-            .or_insert_with(SessionState::new);
+        // Read before the session borrow, which holds `client` mutably.
+        let client_id = client.client_id;
+        let virtual_ipv4 = client.record.virtual_ipv4;
+        // Only an authenticated frame reaches here, so an unenrolled sender
+        // cannot make the session map grow at all.
+        let session = client.admit_session(header.session_id, Instant::now());
         session.observe_endpoint(endpoint);
         if !session.replay.accept(verified_header.sequence) {
             continue;
@@ -326,7 +364,7 @@ fn serve(
             session.outbound_sequence = session.outbound_sequence.wrapping_add(1);
             let response_header = FrameHeader {
                 flags: FLAG_CONTROL | FLAG_SERVER_TO_CLIENT,
-                client_id: client.client_id,
+                client_id,
                 session_id: header.session_id,
                 sequence: session.outbound_sequence,
             };
@@ -335,7 +373,7 @@ fn serve(
             }
             continue;
         }
-        if ipv4_source(&plaintext) != Some(client.record.virtual_ipv4) {
+        if ipv4_source(&plaintext) != Some(virtual_ipv4) {
             continue;
         }
         if let Err(error) = tun_writer.send(&plaintext) {
@@ -465,6 +503,71 @@ fn write_secret(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_client() -> RelayClient {
+        RelayClient {
+            record: ClientRecord {
+                name: "test".into(),
+                version: 1,
+                client_id: "id".into(),
+                pre_shared_key: "key".into(),
+                virtual_ipv4: Ipv4Addr::new(10, 203, 0, 2),
+            },
+            client_id: [0; 16],
+            key: [0; 32],
+            sessions: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_quiet_session_is_expired_rather_than_kept_for_the_life_of_the_process() {
+        let mut client = relay_client();
+        let start = Instant::now();
+        client.admit_session(1, start);
+        assert_eq!(client.sessions.len(), 1);
+        // A reconnect long after the first session went quiet.
+        client.admit_session(2, start + SESSION_TTL + Duration::from_secs(1));
+        assert_eq!(client.sessions.len(), 1);
+        assert!(client.sessions.contains_key(&2));
+    }
+
+    #[test]
+    fn an_active_session_survives_a_new_one_being_admitted() {
+        let mut client = relay_client();
+        let start = Instant::now();
+        client.admit_session(1, start).last_seen = start + Duration::from_secs(10);
+        client.admit_session(2, start + Duration::from_secs(10));
+        assert_eq!(client.sessions.len(), 2);
+    }
+
+    #[test]
+    fn a_client_cycling_session_ids_cannot_grow_the_map_without_bound() {
+        let mut client = relay_client();
+        let start = Instant::now();
+        for id in 0..MAX_SESSIONS_PER_CLIENT as u64 * 4 {
+            // Every session stays fresh, so only the cap can hold this down.
+            let session = client.admit_session(id, start);
+            session.last_seen = start + Duration::from_millis(id);
+        }
+        assert_eq!(client.sessions.len(), MAX_SESSIONS_PER_CLIENT);
+        // The survivors are the most recent ones.
+        assert!(client.sessions.contains_key(
+            &(MAX_SESSIONS_PER_CLIENT as u64 * 4 - 1)
+        ));
+        assert!(!client.sessions.contains_key(&0));
+    }
+
+    #[test]
+    fn admitting_an_existing_session_does_not_evict_anything() {
+        let mut client = relay_client();
+        let start = Instant::now();
+        for id in 0..MAX_SESSIONS_PER_CLIENT as u64 {
+            client.admit_session(id, start).last_seen = start + Duration::from_millis(id);
+        }
+        client.admit_session(0, start);
+        assert_eq!(client.sessions.len(), MAX_SESSIONS_PER_CLIENT);
+        assert!(client.sessions.contains_key(&0));
+    }
 
     #[test]
     fn replay_window_accepts_reordering_once() {

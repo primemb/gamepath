@@ -4,6 +4,21 @@ use crate::scheduler::Decision;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::time::Duration;
+
+/// Shortest socket read timeout the platform accepts.
+///
+/// `SO_RCVTIMEO` reads zero as "block forever", so the standard library rejects
+/// a zero duration outright. A path worker asking for the shortest possible
+/// wait must not get an error back for it: the worker cannot tell that apart
+/// from the node having gone away, and would take a perfectly healthy path out
+/// of service. Sub-millisecond values round up to this anyway.
+pub const MIN_READ_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// Clamps a requested read timeout to something a socket will accept.
+pub fn socket_read_timeout(requested: Duration) -> Duration {
+    requested.max(MIN_READ_TIMEOUT)
+}
 
 pub struct UdpPath {
     id: String,
@@ -164,6 +179,28 @@ fn bind_to_interface(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_zero_read_timeout_is_clamped_rather_than_rejected() {
+        use super::{MIN_READ_TIMEOUT, socket_read_timeout};
+        use std::net::UdpSocket;
+        use std::time::Duration;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // The reason the clamp exists: the platform refuses the raw value.
+        assert!(socket.set_read_timeout(Some(Duration::ZERO)).is_err());
+        assert!(
+            socket
+                .set_read_timeout(Some(socket_read_timeout(Duration::ZERO)))
+                .is_ok()
+        );
+        assert_eq!(socket_read_timeout(Duration::ZERO), MIN_READ_TIMEOUT);
+        // Anything longer is passed through untouched.
+        assert_eq!(
+            socket_read_timeout(Duration::from_millis(250)),
+            Duration::from_millis(250)
+        );
+    }
+
     use super::*;
     use std::net::{Ipv4Addr, UdpSocket};
     use std::time::Duration;

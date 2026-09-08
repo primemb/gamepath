@@ -61,7 +61,9 @@ cargo test --manifest-path ..\relay\Cargo.toml
 - Install an authenticated Windows network service that owns the Wintun and WinDivert data planes and contains its engine in a kill-on-close Job Object.
 - Provision an idempotent Debian 13+ or Ubuntu 22.04+ relay with systemd, nftables NAT, TUN forwarding, per-client enrollment, authenticated probes, replay protection, and multipath reply fan-out.
 
-All-traffic mode captures and reinjects IPv4 through Wintun. Split mode uses narrow WinDivert/WFP filters for IP/CIDR targets and dynamically creates port filters from process-aware socket events for executable and folder targets. Exact hostnames resolve at activation; a copy-only DNS observer learns later addresses and wildcard subdomains without diverting unrelated traffic.
+All-traffic mode captures and reinjects IPv4 through Wintun. IPv6 is not carried: on a dual-stack connection, IPv6 keeps using your normal route while a session runs, and the client warns when it detects one.
+
+Split mode compiles IP and CIDR targets straight into the WinDivert kernel filter, so unrelated traffic never leaves the kernel. Executable, folder and hostname targets cannot be expressed in a filter that is fixed when the handle opens, so those plans admit all outbound IPv4 and classify in user space, reinjecting what was not selected — a compatibility backend with a measurable cost, reported as `captureScope` in capture diagnostics. Exact hostnames resolve at activation; a copy-only DNS observer learns later addresses and wildcard subdomains.
 
 The repository includes the official signed Wintun 0.14.1 AMD64 DLL and its redistribution license under `vendor/wintun`. The downloaded archive is verified against the SHA-256 published by the Wintun project before the binary is copied into the project.
 

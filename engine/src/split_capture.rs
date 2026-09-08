@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 use crate::{DataReceiver, WireGuardSessionManager};
+use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::policy::{InterceptionPlan, RuleSpec, compile};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString, c_char, c_void};
@@ -8,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -284,12 +285,96 @@ struct PendingSyn {
     deadline: std::time::Instant,
 }
 
+/// Read-optimised view of the selector set.
+///
+/// Every captured packet is classified against this, so classification has to
+/// be a couple of hash lookups and a binary search rather than a linear scan of
+/// a map held under a mutex. Selectors change when a connection opens or
+/// closes, which is rare enough that rebuilding the whole table then is far
+/// cheaper than paying for the scan on every packet.
+#[derive(Default)]
+struct SelectorTable {
+    /// Destination ranges, sorted by their first address and merged so at most
+    /// one range can contain any given address.
+    destinations: Vec<(u32, u32)>,
+    /// Keyed by the exact tuple a packet presents, so both the port-specific
+    /// and the any-port form of a flow selector are direct lookups.
+    flows: HashMap<(u8, u16, Option<u16>), Option<String>>,
+    len: usize,
+}
+
+impl SelectorTable {
+    fn build(selectors: &HashMap<TrafficSelector, Option<String>>) -> Self {
+        let mut destinations = Vec::new();
+        let mut flows = HashMap::new();
+        for (selector, application) in selectors {
+            match *selector {
+                TrafficSelector::Destination { first, last } => destinations.push((first, last)),
+                TrafficSelector::Flow {
+                    protocol,
+                    local_port,
+                    remote_port,
+                } => {
+                    flows.insert((protocol, local_port, remote_port), application.clone());
+                }
+            }
+        }
+        destinations.sort_unstable();
+        // Overlapping rules are ordinary - a /24 and a host inside it - and
+        // merging them is what lets the search stop at the first candidate.
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(destinations.len());
+        for (first, last) in destinations {
+            match merged.last_mut() {
+                Some(previous) if first <= previous.1.saturating_add(1) => {
+                    previous.1 = previous.1.max(last);
+                }
+                _ => merged.push((first, last)),
+            }
+        }
+        Self {
+            destinations: merged,
+            flows,
+            len: selectors.len(),
+        }
+    }
+
+    /// The application a packet is selected for, or `None` when nothing
+    /// matches. A destination match has no application attached to it.
+    fn lookup(&self, fields: Ipv4Fields) -> Option<Option<String>> {
+        // Flows are checked first: they name the process that owns the
+        // connection, which is the more specific of the two answers.
+        if let Some(application) = self
+            .flows
+            .get(&(
+                fields.protocol,
+                fields.source_port,
+                Some(fields.destination_port),
+            ))
+            .or_else(|| self.flows.get(&(fields.protocol, fields.source_port, None)))
+        {
+            return Some(application.clone());
+        }
+        let destination = u32::from(fields.destination);
+        let index = self
+            .destinations
+            .partition_point(|(first, _)| *first <= destination);
+        let (_, last) = self.destinations.get(index.checked_sub(1)?)?;
+        (destination <= *last).then_some(None)
+    }
+}
+
 struct Registry {
     dll: PathBuf,
     bypass: String,
     handles: Mutex<Vec<Arc<Handle>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     selectors: Mutex<HashMap<TrafficSelector, Option<String>>>,
+    /// Rebuilt from `selectors` on every change. Behind an `RwLock` so
+    /// classifying a packet never contends with another classifier.
+    table: RwLock<Arc<SelectorTable>>,
+    /// Bumped with every `table` swap, so the capture loop can hold its own
+    /// copy and take the lock only when the set has actually changed.
+    table_version: AtomicU64,
     handled_connections: Mutex<HashMap<ReturnKey, HandledConnection>>,
     capture_loop_buckets: [AtomicU64; 8],
     capture_receive_errors: AtomicU64,
@@ -299,6 +384,9 @@ struct Registry {
     applications: Vec<String>,
     folders: Vec<String>,
     matched_sockets: AtomicU64,
+    /// MSS advertised on captured TCP handshakes, derived from what the chosen
+    /// transports add to a packet rather than fixed at a guess.
+    tcp_mss: u16,
     captured_packets: AtomicU64,
     captured_bytes: AtomicU64,
     relayed_packets: AtomicU64,
@@ -319,6 +407,10 @@ enum TrafficSelector {
 }
 
 impl TrafficSelector {
+    /// The plain definition of a match. [`SelectorTable`] is the indexed form
+    /// used on the hot path; a test asserts the two agree, which is what this
+    /// is kept for.
+    #[cfg(test)]
     fn matches(self, fields: Ipv4Fields) -> bool {
         match self {
             Self::Destination { first, last } => {
@@ -342,6 +434,66 @@ pub struct SplitPacketCapture {
     stop: Arc<AtomicBool>,
     registry: Arc<Registry>,
     target_count: usize,
+    scope: CaptureScope,
+}
+
+/// How much of the outbound stream the kernel filter admits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureScope {
+    /// WinDivert filter clause narrowing the capture.
+    clause: String,
+    /// True when the clause admits every outbound IPv4 packet, so unselected
+    /// traffic is classified in user space and reinjected.
+    broad: bool,
+    /// Why the broad filter was needed, for diagnostics.
+    reason: &'static str,
+}
+
+/// Ranges beyond which a destination filter stops being worth building. Each
+/// range costs two comparisons in the kernel's filter program, and past this
+/// the scan is no cheaper than classifying in user space.
+const MAX_FILTER_RANGES: usize = 48;
+
+/// Builds the narrowest kernel filter the plan allows.
+fn capture_scope(plan: &InterceptionPlan, destinations: &[(u32, u32)]) -> CaptureScope {
+    let broad = |reason| CaptureScope {
+        clause: "true".to_owned(),
+        broad: true,
+        reason,
+    };
+    if !plan.application_paths.is_empty() || !plan.folder_prefixes.is_empty() {
+        // The ports these rules match are only known once the process opens a
+        // socket, which is after this filter is fixed.
+        return broad("application and folder rules are classified in user space");
+    }
+    if !plan.hostnames.is_empty() {
+        // A hostname's addresses can change mid-session as DNS answers arrive.
+        return broad("hostname rules resolve to addresses while the session runs");
+    }
+    if destinations.is_empty() {
+        return broad("no destination rules to narrow the filter with");
+    }
+    if destinations.len() > MAX_FILTER_RANGES {
+        return broad("too many destination ranges for a kernel filter");
+    }
+    let clause = destinations
+        .iter()
+        .map(|(first, last)| {
+            let first = Ipv4Addr::from(*first);
+            let last = Ipv4Addr::from(*last);
+            if first == last {
+                format!("ip.DstAddr == {first}")
+            } else {
+                format!("(ip.DstAddr >= {first} and ip.DstAddr <= {last})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" or ");
+    CaptureScope {
+        clause: format!("({clause})"),
+        broad: false,
+        reason: "destination rules are matched in the kernel",
+    }
 }
 
 impl SplitPacketCapture {
@@ -351,6 +503,7 @@ impl SplitPacketCapture {
         bypass_ips: &[Ipv4Addr],
         sessions: Arc<Mutex<WireGuardSessionManager>>,
         data_receiver: Arc<DataReceiver>,
+        effective_mtu: EffectiveMtu,
     ) -> Result<Self, String> {
         let plan = compile("split", rules)?;
         let registry = Arc::new(Registry {
@@ -359,6 +512,8 @@ impl SplitPacketCapture {
             handles: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
             selectors: Mutex::new(HashMap::new()),
+            table: RwLock::new(Arc::new(SelectorTable::default())),
+            table_version: AtomicU64::new(0),
             handled_connections: Mutex::new(HashMap::new()),
             capture_loop_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             capture_receive_errors: AtomicU64::new(0),
@@ -372,6 +527,7 @@ impl SplitPacketCapture {
             captured_bytes: AtomicU64::new(0),
             relayed_packets: AtomicU64::new(0),
             bypassed_packets: AtomicU64::new(0),
+            tcp_mss: effective_mtu.tcp_mss(),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let return_paths = Arc::new(Mutex::new(HashMap::new()));
@@ -409,7 +565,18 @@ impl SplitPacketCapture {
         // Keep one network handle open before applications create connections.
         // Classification happens in memory, removing the race where a TCP SYN
         // escaped while a new per-socket WinDivert handle was being created.
-        let network_filter = format!("outbound and ip and !loopback and {}", registry.bypass);
+        //
+        // When every rule names a destination, that whole set is expressible in
+        // the kernel filter and unrelated traffic never leaves the kernel at
+        // all. Process and hostname rules cannot be: a WinDivert filter is
+        // fixed when the handle opens, while those two learn new addresses and
+        // ports while the session runs, so they need the broad filter and the
+        // in-memory classifier behind it.
+        let scope = capture_scope(&plan, &selector_table(&registry).destinations);
+        let network_filter = format!(
+            "outbound and ip and !loopback and {} and {}",
+            scope.clause, registry.bypass
+        );
         let network_handle = Arc::new(Handle::open(&registry.dll, &network_filter, 0, 0)?);
         network_handle.set_param(0, 1024)?;
         network_handle.set_param(1, 100)?;
@@ -480,6 +647,7 @@ impl SplitPacketCapture {
             stop,
             registry,
             target_count: rules.len(),
+            scope,
         })
     }
 
@@ -509,7 +677,11 @@ impl SplitPacketCapture {
             .collect::<Vec<_>>();
         serde_json::json!({
             "matchedSockets": self.registry.matched_sockets.load(Ordering::Relaxed),
-            "captureFilterCount": self.registry.selectors.lock().unwrap().len(),
+            "captureFilterCount": selector_table(&self.registry).len,
+            "captureScope": if self.scope.broad { "all-outbound" } else { "destinations" },
+            "captureScopeReason": self.scope.reason,
+            "captureFilter": self.scope.clause,
+            "tcpMss": self.registry.tcp_mss,
             "capturedPackets": self.registry.captured_packets.load(Ordering::Relaxed),
             "capturedBytes": self.registry.captured_bytes.load(Ordering::Relaxed),
             "relayedPackets": self.registry.relayed_packets.load(Ordering::Relaxed),
@@ -539,15 +711,31 @@ impl Drop for SplitPacketCapture {
 }
 
 fn add_selector(registry: &Registry, selector: TrafficSelector) {
-    registry.selectors.lock().unwrap().insert(selector, None);
+    let mut selectors = registry.selectors.lock().unwrap();
+    if selectors.insert(selector, None).is_none() {
+        publish_selectors(registry, &selectors);
+    }
 }
 
 fn add_process_selector(registry: &Registry, selector: TrafficSelector, application: String) {
-    registry
-        .selectors
-        .lock()
-        .unwrap()
-        .insert(selector, Some(application));
+    let mut selectors = registry.selectors.lock().unwrap();
+    let previous = selectors.insert(selector, Some(application.clone()));
+    if previous != Some(Some(application)) {
+        publish_selectors(registry, &selectors);
+    }
+}
+
+/// Swaps in a fresh classification table. Called with the selector lock held so
+/// the table is never built from a half-applied change.
+fn publish_selectors(registry: &Registry, selectors: &HashMap<TrafficSelector, Option<String>>) {
+    *registry.table.write().unwrap() = Arc::new(SelectorTable::build(selectors));
+    registry.table_version.fetch_add(1, Ordering::Release);
+}
+
+/// The current classification table. The read lock is released before any
+/// packet work, so a selector change is never blocked behind one.
+fn selector_table(registry: &Registry) -> Arc<SelectorTable> {
+    Arc::clone(&registry.table.read().unwrap())
 }
 
 struct CaptureLoopTimer<'a> {
@@ -577,6 +765,10 @@ fn run_selected_capture(
 ) {
     let mut packet_buffer = vec![0_u8; 65_535];
     let mut tunnel_buffer = Vec::with_capacity(65_535);
+    // The table is swapped only when a connection opens or closes, so the loop
+    // keeps its own copy and touches the lock on the versions that change.
+    let mut table_version = registry.table_version.load(Ordering::Acquire);
+    let mut table = selector_table(&registry);
     while !stop.load(Ordering::Acquire) {
         let (packet_length, address) = match handle.recv_into(&mut packet_buffer) {
             Ok(packet) => packet,
@@ -597,19 +789,20 @@ fn run_selected_capture(
             started: Instant::now(),
             registry: &registry,
         };
+        let current_version = registry.table_version.load(Ordering::Acquire);
+        if current_version != table_version {
+            table = selector_table(&registry);
+            table_version = current_version;
+        }
         let packet = &packet_buffer[..packet_length];
         let Some(fields) = ipv4_fields(packet) else {
             let _ = handle.send(packet, &address);
             continue;
         };
-        let (mut selected, mut application) = registry
-            .selectors
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(selector, _)| selector.matches(fields))
-            .map(|(_, application)| (true, application.clone()))
-            .unwrap_or((false, None));
+        let (mut selected, mut application) = match table.lookup(fields) {
+            Some(application) => (true, application),
+            None => (false, None),
+        };
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
         if !selected && is_tcp_syn(packet) {
@@ -713,7 +906,7 @@ fn route_selected_packet(
     tunnel_buffer.extend_from_slice(packet);
     let tunneled = &mut tunnel_buffer[..];
     tunneled[12..16].copy_from_slice(&virtual_ipv4.octets());
-    clamp_tcp_mss(tunneled, 1000);
+    clamp_tcp_mss(tunneled, registry.tcp_mss);
     let mut checksum_address = address;
     if handle.checksums(tunneled, &mut checksum_address).is_err()
         || sessions
@@ -757,13 +950,7 @@ fn run_pending_syns(
         if let Some(wait) = item.deadline.checked_duration_since(Instant::now()) {
             thread::sleep(wait);
         }
-        let application = registry
-            .selectors
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(selector, _)| selector.matches(item.fields))
-            .map(|(_, application)| application.clone());
+        let application = selector_table(&registry).lookup(item.fields);
         if let Some(application) = application {
             route_selected_packet(
                 &handle,
@@ -820,11 +1007,10 @@ fn spawn_process_tracker(
                 let event_kind = address.event();
                 let event = address.socket_data();
                 if event_kind == 7 {
-                    worker_registry
-                        .selectors
-                        .lock()
-                        .unwrap()
-                        .retain(|selector, _| {
+                    {
+                        let mut selectors = worker_registry.selectors.lock().unwrap();
+                        let before = selectors.len();
+                        selectors.retain(|selector, _| {
                             !matches!(
                                 selector,
                                 TrafficSelector::Flow { protocol, local_port, remote_port }
@@ -834,6 +1020,10 @@ fn spawn_process_tracker(
                                             || *remote_port == Some(event.remote_port))
                             )
                         });
+                        if selectors.len() != before {
+                            publish_selectors(&worker_registry, &selectors);
+                        }
+                    }
                     return_paths.lock().unwrap().retain(|key, _| {
                         key.protocol != event.protocol
                             || key.local_port != event.local_port
@@ -930,11 +1120,7 @@ fn tcp_socket_process(
     applications: &[String],
     folders: &[String],
 ) -> Option<String> {
-    let Some(buffer) =
-        ip_table(|table, size| unsafe { GetExtendedTcpTable(table, size, 0, 2, 5, 0) })
-    else {
-        return None;
-    };
+    let buffer = ip_table(|table, size| unsafe { GetExtendedTcpTable(table, size, 0, 2, 5, 0) })?;
     dword_rows(&buffer, 6).into_iter().find_map(|row| {
         if port_from_dword(row[2]) != fields.source_port
             || port_from_dword(row[4]) != fields.destination_port
@@ -989,8 +1175,10 @@ fn dword_rows(buffer: &[u8], width: usize) -> Vec<Vec<u32>> {
             let bytes = buffer.get(start..start + row_bytes)?;
             Some(
                 bytes
-                    .chunks_exact(4)
-                    .map(|part| u32::from_ne_bytes(part.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|part| u32::from_ne_bytes(*part))
                     .collect(),
             )
         })
@@ -1118,7 +1306,7 @@ fn clamp_tcp_mss(packet: &mut [u8], maximum: u16) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Ipv4Fields {
     source: Ipv4Addr,
     destination: Ipv4Addr,
@@ -1285,14 +1473,14 @@ fn record_handled_connection(
     application: Option<String>,
 ) {
     let mut connections = registry.handled_connections.lock().unwrap();
-    if connections.len() >= 64 && !connections.contains_key(&key) {
-        if let Some(oldest) = connections
+    if connections.len() >= 64
+        && !connections.contains_key(&key)
+        && let Some(oldest) = connections
             .iter()
             .min_by_key(|(_, connection)| connection.started_at)
             .map(|(key, _)| *key)
-        {
-            connections.remove(&oldest);
-        }
+    {
+        connections.remove(&oldest);
     }
     connections.entry(key).or_insert_with(|| HandledConnection {
         application: application.unwrap_or_else(|| "Matched destination".into()),
@@ -1432,6 +1620,179 @@ fn hostname_matches(name: &str, target: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn fields(destination: Ipv4Addr, protocol: u8, source_port: u16, destination_port: u16) -> Ipv4Fields {
+        Ipv4Fields {
+            source: Ipv4Addr::new(192, 168, 1, 20),
+            destination,
+            protocol,
+            source_port,
+            destination_port,
+        }
+    }
+
+    fn table_of(entries: &[(TrafficSelector, Option<String>)]) -> SelectorTable {
+        SelectorTable::build(&entries.iter().cloned().collect())
+    }
+
+    fn plan_for(rules: &[(&str, &str)]) -> InterceptionPlan {
+        let rules = rules
+            .iter()
+            .map(|(kind, value)| RuleSpec {
+                kind: (*kind).into(),
+                value: (*value).into(),
+            })
+            .collect::<Vec<_>>();
+        compile("split", &rules).unwrap()
+    }
+
+    #[test]
+    fn the_lookup_table_agrees_with_the_selector_definition() {
+        let entries = [
+            (
+                TrafficSelector::Destination {
+                    first: u32::from(Ipv4Addr::new(203, 0, 113, 0)),
+                    last: u32::from(Ipv4Addr::new(203, 0, 113, 255)),
+                },
+                None,
+            ),
+            (
+                TrafficSelector::Destination {
+                    first: u32::from(Ipv4Addr::new(198, 51, 100, 7)),
+                    last: u32::from(Ipv4Addr::new(198, 51, 100, 7)),
+                },
+                None,
+            ),
+            (
+                TrafficSelector::Flow {
+                    protocol: 6,
+                    local_port: 51_000,
+                    remote_port: Some(443),
+                },
+                Some("game.exe".to_owned()),
+            ),
+            (
+                TrafficSelector::Flow {
+                    protocol: 17,
+                    local_port: 51_001,
+                    remote_port: None,
+                },
+                Some("voice.exe".to_owned()),
+            ),
+        ];
+        let table = table_of(&entries);
+        let probes = [
+            fields(Ipv4Addr::new(203, 0, 113, 9), 17, 40_000, 7777),
+            fields(Ipv4Addr::new(203, 0, 114, 9), 17, 40_000, 7777),
+            fields(Ipv4Addr::new(198, 51, 100, 7), 6, 40_000, 80),
+            fields(Ipv4Addr::new(198, 51, 100, 8), 6, 40_000, 80),
+            fields(Ipv4Addr::new(8, 8, 8, 8), 6, 51_000, 443),
+            fields(Ipv4Addr::new(8, 8, 8, 8), 6, 51_000, 444),
+            fields(Ipv4Addr::new(8, 8, 8, 8), 17, 51_001, 1234),
+            fields(Ipv4Addr::new(8, 8, 8, 8), 17, 51_002, 1234),
+            fields(Ipv4Addr::new(0, 0, 0, 0), 6, 1, 1),
+            fields(Ipv4Addr::new(255, 255, 255, 255), 6, 1, 1),
+        ];
+        for probe in probes {
+            let expected = entries
+                .iter()
+                .any(|(selector, _)| selector.matches(probe));
+            assert_eq!(
+                table.lookup(probe).is_some(),
+                expected,
+                "disagreement on {probe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flow_match_carries_the_application_and_a_destination_match_does_not() {
+        let table = table_of(&[
+            (
+                TrafficSelector::Flow {
+                    protocol: 6,
+                    local_port: 51_000,
+                    remote_port: Some(443),
+                },
+                Some("game.exe".to_owned()),
+            ),
+            (
+                TrafficSelector::Destination {
+                    first: u32::from(Ipv4Addr::new(203, 0, 113, 0)),
+                    last: u32::from(Ipv4Addr::new(203, 0, 113, 255)),
+                },
+                None,
+            ),
+        ]);
+        assert_eq!(
+            table.lookup(fields(Ipv4Addr::new(8, 8, 8, 8), 6, 51_000, 443)),
+            Some(Some("game.exe".to_owned()))
+        );
+        assert_eq!(
+            table.lookup(fields(Ipv4Addr::new(203, 0, 113, 5), 17, 1, 1)),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn overlapping_destination_rules_merge_into_one_range() {
+        let table = table_of(&[
+            (
+                TrafficSelector::Destination {
+                    first: u32::from(Ipv4Addr::new(203, 0, 113, 0)),
+                    last: u32::from(Ipv4Addr::new(203, 0, 113, 255)),
+                },
+                None,
+            ),
+            (
+                TrafficSelector::Destination {
+                    first: u32::from(Ipv4Addr::new(203, 0, 113, 40)),
+                    last: u32::from(Ipv4Addr::new(203, 0, 113, 40)),
+                },
+                None,
+            ),
+        ]);
+        assert_eq!(table.destinations.len(), 1);
+        assert!(table.lookup(fields(Ipv4Addr::new(203, 0, 113, 40), 6, 1, 1)).is_some());
+        assert!(table.lookup(fields(Ipv4Addr::new(203, 0, 114, 0), 6, 1, 1)).is_none());
+    }
+
+    #[test]
+    fn destination_only_rules_are_matched_in_the_kernel() {
+        let plan = plan_for(&[("ip", "203.0.113.0/24"), ("ip", "198.51.100.7/32")]);
+        let table = SelectorTable::build(
+            &destination_selectors(&plan)
+                .unwrap()
+                .into_iter()
+                .map(|selector| (selector, None))
+                .collect(),
+        );
+        let scope = capture_scope(&plan, &table.destinations);
+        assert!(!scope.broad);
+        assert!(scope.clause.contains("ip.DstAddr >= 203.0.113.0"));
+        assert!(scope.clause.contains("ip.DstAddr <= 203.0.113.255"));
+        assert!(scope.clause.contains("ip.DstAddr == 198.51.100.7"));
+    }
+
+    #[test]
+    fn application_rules_still_need_the_broad_filter() {
+        let plan = plan_for(&[
+            ("ip", "203.0.113.0/24"),
+            ("application", "C:\\Games\\game.exe"),
+        ]);
+        let scope = capture_scope(&plan, &[(0, u32::MAX)]);
+        assert!(scope.broad);
+        assert_eq!(scope.clause, "true");
+    }
+
+    #[test]
+    fn too_many_ranges_fall_back_to_the_broad_filter() {
+        let plan = plan_for(&[("ip", "203.0.113.0/24")]);
+        let ranges = (0..=MAX_FILTER_RANGES as u32)
+            .map(|index| (index * 4, index * 4 + 1))
+            .collect::<Vec<_>>();
+        assert!(capture_scope(&plan, &ranges).broad);
+    }
+
     #[test]
     fn destination_range_is_compiled() {
         let plan = compile(
@@ -1458,15 +1819,56 @@ mod tests {
         assert!(!hostname_matches("other.example", "*.game.example"));
     }
 
-    #[test]
-    fn nested_tunnel_clamps_tcp_mss() {
+    /// A TCP SYN advertising `mss`.
+    fn syn_with_mss(mss: u16) -> Vec<u8> {
         let mut packet = vec![0_u8; 44];
         packet[0] = 0x45;
         packet[9] = 6;
         packet[20 + 12] = 0x60;
         packet[20 + 13] = 0x02;
-        packet[40..44].copy_from_slice(&[2, 4, 0x05, 0xb4]);
+        packet[40..42].copy_from_slice(&[2, 4]);
+        packet[42..44].copy_from_slice(&mss.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn nested_tunnel_clamps_tcp_mss() {
+        let mut packet = syn_with_mss(1460);
         clamp_tcp_mss(&mut packet, 1000);
         assert_eq!(&packet[42..44], &1000_u16.to_be_bytes());
+    }
+
+    #[test]
+    fn the_clamp_only_ever_lowers_the_advertised_mss() {
+        // The derived clamp is far above the old fixed 1000, so it matters that
+        // a peer offering less is left alone rather than talked upwards.
+        let mut packet = syn_with_mss(536);
+        clamp_tcp_mss(&mut packet, 1316);
+        assert_eq!(&packet[42..44], &536_u16.to_be_bytes());
+    }
+
+    #[test]
+    fn the_derived_mss_and_its_headers_fit_inside_the_derived_mtu() {
+        for kinds in [
+            vec!["wireguard"],
+            vec!["socks5"],
+            vec!["wireguard", "socks5"],
+        ] {
+            for mode in [
+                gamepath_engine::relay_path::SessionMode::Relay,
+                gamepath_engine::relay_path::SessionMode::Direct,
+            ] {
+                let mtu = EffectiveMtu::for_session(mode, kinds.clone(), 1500);
+                let segment = u32::from(mtu.tcp_mss()) + 20 + 20;
+                assert!(
+                    segment <= u32::from(mtu.mtu),
+                    "{kinds:?} {mode:?}: a full segment overruns the tunnel MTU"
+                );
+                assert!(
+                    segment + u32::from(mtu.overhead) <= 1500,
+                    "{kinds:?} {mode:?}: a full segment overruns the physical link"
+                );
+            }
+        }
     }
 }

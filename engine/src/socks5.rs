@@ -234,7 +234,7 @@ impl Socks5UdpPath {
     }
 
     fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), String> {
-        let timeout = timeout.max(Duration::from_millis(1));
+        let timeout = crate::transport::socket_read_timeout(timeout);
         if self.read_timeout != Some(timeout) {
             self.udp
                 .set_read_timeout(Some(timeout))

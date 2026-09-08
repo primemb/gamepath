@@ -11,11 +11,37 @@ The privileged Windows service installs filters based on Windows Filtering Platf
 3. Hostname rules are correlated through the client's DNS policy cache and compiled to current address sets. IP and CIDR rules match destinations directly.
 4. Selected UDP and TCP packets are passed to the GamePath transport. Unselected packets continue unchanged.
 
-The current implementation uses the signed WinDivert callout driver as the WFP capture layer. It opens network filters only for selected destination ranges and ports discovered from process-aware socket events. DNS observation is copy-only. Unrelated traffic therefore stays in the kernel and cannot be held by the client. A production-owned WFP callout can replace this backend later without changing the GUI or relay protocol.
+The current implementation uses the signed WinDivert callout driver as the WFP capture layer, in one of two scopes reported as `captureScope` in capture diagnostics:
+
+- **`destinations`** — every rule in the plan names an address or CIDR, so the whole set is compiled into the kernel filter. Unrelated traffic stays in the kernel and is never handed to the client.
+- **`all-outbound`** — the plan contains application, folder or hostname rules. A WinDivert filter is fixed when the handle opens, while those rules learn new ports and addresses while the session runs, so the filter admits all outbound IPv4 and the client classifies in user space. Unselected packets are reinjected. This costs a user-space round trip on traffic that was never selected, which is measurable as latency and CPU under load; it is a compatibility backend, not the intended steady state.
+
+Classification itself is a hash lookup and a binary search against an immutable snapshot, rebuilt only when a connection opens or closes, so it does not hold a lock on the packet path. DNS observation is copy-only.
+
+Replacing the `all-outbound` scope properly means a signed WFP callout using ALE process classification and network-layer redirection, which can drop in behind the same policy compiler without changing the GUI or the relay protocol.
 
 ## All-traffic mode
 
-All traffic is routed into the signed Wintun adapter. This avoids process correlation overhead when every connection has the same policy. Relay endpoint routes and local-network bypass routes are installed before the default route changes.
+All IPv4 traffic is routed into the signed Wintun adapter. This avoids process correlation overhead when every connection has the same policy. Relay endpoint routes and local-network bypass routes are installed before the default route changes.
+
+**IPv6 is not carried.** Capture, address rewriting and relay framing are IPv4 throughout, and the mode installs only the IPv4 `0.0.0.0/1` and `128.0.0.0/1` routes. On a dual-stack connection, IPv6 keeps using the normal route while a session runs. The engine probes for a globally routable IPv6 source address when capture starts and reports it as `ipv6.systemHasRoute`; the client shows a warning when it is true. Carrying IPv6 end to end is a separate milestone.
+
+## Session lease
+
+The privileged service holds a lease on every session and tears down capture and
+routes when it expires, so a client that crashes cannot leave the machine's
+routing table rewritten. Only `session-status` renews it.
+
+That renewal runs on a **main-process** timer. It cannot be driven from the
+renderer: Chromium throttles timers in a window that is hidden, occluded or
+minimized, which is exactly what a fullscreen game does to this one, and a
+throttled poll lets the lease expire a few minutes into play. The client renews
+every `SESSION_POLL_MS`, the service allows `SESSION_LEASE`, and a test asserts
+the first leaves several retries of headroom inside the second.
+
+## Packet size
+
+A captured packet is not what leaves the machine, so the tunnel MTU is derived from what the selected transports actually add rather than fixed at a constant. `EffectiveMtu::for_session` costs the outer IPv4/UDP header, the transport's own framing, and — for a relay session — the inner IPv4/UDP datagram, the 40-byte GamePath header and its 16-byte AEAD tag. Relay over WireGuard therefore costs 144 bytes and yields a 1356-byte MTU on a 1500-byte link; direct WireGuard costs 60 and yields 1440. A mixed route set takes the smallest, because the scheduler may move a packet onto any of them. The Wintun adapter is sized from this, and split mode clamps the TCP MSS to `mtu - 40` rather than to a fixed conservative value.
 
 ## Relay and direct sessions
 
@@ -85,6 +111,51 @@ The direct ISP path is always available alongside provider routes. If two files 
 Authenticated GamePath frames are wrapped in an inner IPv4/UDP packet addressed to the relay, then encrypted independently by each WireGuard instance. Packets receive a session ID and monotonically increasing sequence number before adaptive scheduling sends them on one or two routes. The relay sees two authenticated endpoints and fans replies back across both.
 
 Direct and WireGuard workers share one atomic sequence allocator, so control traffic and data traffic never reuse an authenticated nonce or fall behind the relay replay window. The client sends one encrypted data frame to every selected path and accepts the first authenticated reply; later copies are discarded by sequence number.
+
+## Queueing
+
+Each path has a bounded outbound queue. The dispatcher offers a packet with a
+non-blocking send and, when the queue is full, drops it and counts it rather
+than letting the backlog grow: a saturated path is already behind, and a game
+packet that waits for the backlog to drain is stale by the time it arrives.
+Workers also send at most `PATH_SEND_BATCH` packets per iteration, so a burst
+cannot delay the inbound frames, probes and timers that decide whether a path is
+still alive, and they shed any packet that has waited past `PATH_QUEUE_MAX_AGE`.
+Queue depth and drop counts per path are reported in session status.
+
+## Route retry
+
+A route is dialled once when the session starts and its transport is then owned
+by that route's worker. Three things can go wrong with it, and they are handled
+separately:
+
+- **It fails to dial.** The route is recorded in `skippedRoutes` with the reason
+  and the session starts on the rest. Only every route failing is a start
+  failure, and that error names each one.
+- **It dials but never answers.** See _Degraded startup_ below: it stays out of
+  the dispatcher's selection and keeps probing.
+- **It dies mid-session.** WireGuard recovers by itself, because BoringTun
+  re-initiates a handshake from its own timers. A SOCKS5 association and an
+  OpenVPN link have no equivalent, so after `RECONNECT_AFTER_FAILURES`
+  consecutive failed health checks the worker redials its node, backing off from
+  `RECONNECT_BACKOFF_MIN` to `RECONNECT_BACKOFF_MAX` between attempts and
+  resetting both the moment a probe is answered.
+
+The dial runs on its own thread and the worker collects the result without
+blocking, so a route that is down never delays the probes of its own path or a
+session stop. A redialled path reaches the relay from a new source endpoint; the
+relay learns endpoints from authenticated frames and expires them after
+`ENDPOINT_TTL`, so the old one ages out with nothing to reconcile.
+
+## Degraded startup
+
+A relay session becomes ready when at least one path is usable, not when all of
+them are. Paths that have not answered stay out of the dispatcher's selection —
+tracked as a health mask separate from the scheduler's latency-based pick — and
+keep probing, joining in when they answer. Status reports them as
+`degradedRoutes`. A direct session has exactly one path, so it still requires
+that path. Every path is given a short settling window first, so a healthy route
+set does not start with routes missing.
 
 ## Worker timing
 

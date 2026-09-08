@@ -148,15 +148,40 @@ export type AppState = {
     routeLatencies?: number[]
     strategy?: 'adaptive' | 'fastest-path' | 'duplicate' | 'single-path'
     selectedRoutes?: number[]
+    /** Routes that are enabled but not currently carrying traffic. */
+    degradedRoutes?: number[]
+    /** Routes that are enabled but were left out of the session entirely. */
+    skippedRoutes?: Array<{ route: number; label: string; reason: string }>
+    /** What the chosen transports leave for payload, and how the queues fare. */
+    transport?: {
+      effectiveMtu: number
+      overheadBytes: number | null
+      queueCapacity: number | null
+      queueDepth: number[]
+      droppedPackets: number[]
+    }
     pathMetrics?: PathMetric[]
     capture?: {
       state: string
       backend: string
       trafficMode?: string
       targetCount?: number
+      effectiveMtu?: number
+      tcpMss?: number
+      transportOverhead?: number
+      /**
+       * GamePath carries IPv4. `systemHasRoute` says whether this machine also
+       * has a working IPv6 route, which keeps using the normal connection.
+       */
+      ipv6?: { carried: boolean; systemHasRoute: boolean }
       diagnostics?: {
         matchedSockets: number
         captureFilterCount: number
+        /** `destinations` when the kernel filter admits only selected targets. */
+        captureScope?: 'all-outbound' | 'destinations'
+        captureScopeReason?: string
+        captureFilter?: string
+        tcpMss?: number
         capturedPackets: number
         capturedBytes: number
         relayedPackets: number

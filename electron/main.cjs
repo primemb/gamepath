@@ -117,9 +117,16 @@ function encryptConfig(source) {
 }
 
 function relaySessionMessage(plan, paths, dataPlane) {
-  const standby = paths.skippedRoutes.length
-  const standbyNote = standby ? ` ${standby} overlapping node${standby === 1 ? ' is' : 's are'} held as standby.` : ''
-  return `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${standbyNote}`
+  // A skipped route is one that is enabled but not in the session: it either
+  // duplicates another node's endpoint, or it could not be dialled. Saying so
+  // matters — the session runs without it, and nothing else would mention it.
+  const skipped = paths.skippedRoutes ?? []
+  const note = skipped.length
+    ? ` ${skipped.length} node${skipped.length === 1 ? '' : 's'} did not join: ${skipped
+        .map((route) => `${route.label} (${route.reason})`)
+        .join('; ')}.`
+    : ''
+  return `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${note}`
 }
 
 function directSessionMessage(plan, node, dataPlane) {
@@ -130,6 +137,15 @@ function directSessionMessage(plan, node, dataPlane) {
     : 'the node does not answer test pings, so only its own traffic is measured'
   return `Session ${plan.planId} is routing selected traffic through ${node.name}; ${measured}.`
 }
+
+/**
+ * How often the main process renews the service's session lease. Well inside
+ * the service's SESSION_LEASE so a slow request or two cannot expire it.
+ */
+const SESSION_POLL_MS = 3000
+
+let sessionKeepAlive = null
+let sessionPollInFlight = false
 
 function updateSessionMetrics(runtime, dataPlane) {
   const paths = runtime.paths ?? []
@@ -150,7 +166,21 @@ function updateSessionMetrics(runtime, dataPlane) {
   state.session.mode = runtime.mode ?? state.session.mode ?? 'relay'
   state.session.pathMetrics = paths
   state.session.selectedRoutes = runtime.selectedRoutes ?? []
+  // Routes the session is running without. A multipath session starts on the
+  // routes that answered, so these have to be named rather than implied by a
+  // route missing from the selection.
+  state.session.degradedRoutes = runtime.degradedRoutes ?? []
+  state.session.skippedRoutes = runtime.skippedRoutes ?? []
   state.session.strategy = runtime.strategy ?? 'adaptive'
+  if (runtime.effectiveMtu) {
+    state.session.transport = {
+      effectiveMtu: runtime.effectiveMtu,
+      overheadBytes: runtime.transportOverhead ?? null,
+      queueCapacity: runtime.queueCapacity ?? null,
+      queueDepth: runtime.queueDepth ?? [],
+      droppedPackets: runtime.droppedPackets ?? [],
+    }
+  }
   if (runtime.capture) state.session.capture = runtime.capture
   state.session.routeLatencies = paths
     .filter((path) => path.latencyMs != null)
@@ -754,11 +784,13 @@ function registerIpc() {
         }
         state.session.capture = serviceSession.capture
         updateSessionMetrics(paths, dataPlane)
+        startSessionKeepAlive()
       } catch (error) {
         try {
           await serviceBridge.request('stop-session')
         } catch {}
         state.session = { status: 'error', message: error.message }
+        stopSessionKeepAlive()
       }
     }
     saveState()
@@ -766,6 +798,7 @@ function registerIpc() {
   })
 
   ipcMain.handle('engine:stop', async () => {
+    stopSessionKeepAlive()
     try {
       if (engineBridge?.status.status === 'ready') await engineBridge.request('stop-wireguard-session')
       if (serviceBridge?.status.status === 'ready') await serviceBridge.request('stop-session')
@@ -778,28 +811,69 @@ function registerIpc() {
   })
 
   ipcMain.handle('engine:session-status', async () => {
-    if (state.session.status === 'connected' && serviceBridge?.status.status === 'ready') {
-      try {
-        const runtime = await serviceBridge.request('session-status')
-        updateSessionMetrics(runtime)
-        // Selected traffic keeps going into the tunnel while the workers are
-        // alive, so it is not quietly falling back to the normal connection:
-        // it is not getting through, and stopping the session is what fixes it.
-        if (runtime.state !== 'connected') {
-          state.session.message =
-            runtime.mode === 'direct'
-              ? 'The node has stopped answering. Selected traffic is not getting through — stop the session to use your normal connection.'
-              : 'Relay paths are unavailable. Selected traffic is not getting through — stop the session to use your normal connection.'
-        }
-      } catch (error) {
-        try {
-          await serviceBridge.request('stop-session')
-        } catch {}
-        state.session = { status: 'error', message: error.message }
-      }
-    }
+    // The keep-alive below already refreshes this every SESSION_POLL_MS, so the
+    // renderer reads what it last saw rather than issuing a second request.
+    // Only poll inline if the keep-alive somehow is not running.
+    if (!sessionKeepAlive) await pollSessionStatus()
     return publicState()
   })
+}
+
+/**
+ * Asks the service for session state and mirrors it into `state.session`.
+ *
+ * This also renews the service's session lease, which is the reason it runs on
+ * a main-process timer rather than only when the renderer asks. See
+ * `startSessionKeepAlive`.
+ */
+async function pollSessionStatus() {
+  if (state.session.status !== 'connected' || serviceBridge?.status.status !== 'ready') return
+  if (sessionPollInFlight) return
+  sessionPollInFlight = true
+  try {
+    const runtime = await serviceBridge.request('session-status')
+    updateSessionMetrics(runtime)
+    // Selected traffic keeps going into the tunnel while the workers are
+    // alive, so it is not quietly falling back to the normal connection:
+    // it is not getting through, and stopping the session is what fixes it.
+    if (runtime.state !== 'connected') {
+      state.session.message =
+        runtime.mode === 'direct'
+          ? 'The node has stopped answering. Selected traffic is not getting through — stop the session to use your normal connection.'
+          : 'Relay paths are unavailable. Selected traffic is not getting through — stop the session to use your normal connection.'
+    }
+  } catch (error) {
+    try {
+      await serviceBridge.request('stop-session')
+    } catch {}
+    state.session = { status: 'error', message: error.message }
+    stopSessionKeepAlive()
+  } finally {
+    sessionPollInFlight = false
+  }
+}
+
+/**
+ * Keeps the service's session lease alive for as long as a session is up.
+ *
+ * The lease exists so the service tears down routes if the client dies. Only
+ * `session-status` renews it, and that used to be driven solely by a renderer
+ * `setInterval`. Chromium throttles timers in a window that is hidden, occluded
+ * or minimized — which is exactly what a fullscreen game does to this one — so
+ * the poll would stall, the lease would expire, and the service would stop the
+ * capture a few minutes into play. This timer lives in the main process, which
+ * is plain Node and is never throttled.
+ */
+function startSessionKeepAlive() {
+  stopSessionKeepAlive()
+  sessionKeepAlive = setInterval(pollSessionStatus, SESSION_POLL_MS)
+  // Nothing should be kept alive by this timer alone at quit time.
+  sessionKeepAlive.unref?.()
+}
+
+function stopSessionKeepAlive() {
+  if (sessionKeepAlive) clearInterval(sessionKeepAlive)
+  sessionKeepAlive = null
 }
 
 function createWindow() {
@@ -821,6 +895,10 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // A fullscreen game leaves this window occluded, and Chromium then
+      // throttles its timers to a crawl. The session lease no longer depends on
+      // them, but the live metrics the window shows still do.
+      backgroundThrottling: false,
     },
   })
 

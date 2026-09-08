@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod auth;
+pub mod mtu;
 #[cfg(feature = "openvpn")]
 pub mod openvpn;
 pub mod policy;

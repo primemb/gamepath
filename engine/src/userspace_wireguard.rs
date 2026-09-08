@@ -219,6 +219,7 @@ impl UserSpaceWireGuardPath {
     }
 
     fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), String> {
+        let timeout = crate::transport::socket_read_timeout(timeout);
         if self.read_timeout != Some(timeout) {
             self.socket
                 .set_read_timeout(Some(timeout))
@@ -323,8 +324,8 @@ pub fn ipv4_udp_payload(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u16, u16, 
 
 fn ipv4_checksum(header: &[u8]) -> u16 {
     let mut sum = 0_u32;
-    for chunk in header.chunks_exact(2) {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    for chunk in header.as_chunks::<2>().0 {
+        sum += u32::from(u16::from_be_bytes(*chunk));
     }
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -358,12 +359,11 @@ fn section_value<'a>(source: &'a str, wanted_section: &str, wanted_key: &str) ->
             };
             continue;
         }
-        if section == wanted_section {
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim().eq_ignore_ascii_case(wanted_key) {
-                    return Some(value.trim());
-                }
-            }
+        if section == wanted_section
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case(wanted_key)
+        {
+            return Some(value.trim());
         }
     }
     None

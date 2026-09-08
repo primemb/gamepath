@@ -94,6 +94,7 @@ impl Link {
     /// `Ok(None)` means the wait expired with nothing to report, which is the
     /// normal state of an idle tunnel rather than a failure.
     pub fn receive(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
+        let timeout = crate::transport::socket_read_timeout(timeout);
         match self {
             Self::Udp(socket) => {
                 socket

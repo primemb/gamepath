@@ -24,7 +24,7 @@ mod gamepath_service {
     use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -48,7 +48,26 @@ mod gamepath_service {
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
     const DEFAULT_PORT: u16 = 47_983;
     const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
-    const SESSION_LEASE: Duration = Duration::from_secs(10);
+
+    /// How long a connected client has to finish sending its request line. The
+    /// UI writes one line and waits, so this only ever fires on a caller that
+    /// connects and then says nothing - which without it would hold a thread
+    /// for as long as it liked.
+    const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Time allowed to write the response back, so a client that stops reading
+    /// cannot pin a handler either.
+    const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Handlers that may run at once. The UI makes one request at a time; this
+    /// is the ceiling that stops a local process opening threads without end.
+    const MAX_CONCURRENT_REQUESTS: usize = 16;
+    /// How long the service keeps a session alive without hearing from the
+    /// client. The client renews this every few seconds from its main process;
+    /// the window is wide enough that a stalled request or a busy engine cannot
+    /// tear down a working session, and still short enough that routes do not
+    /// outlive a client that has actually died.
+    const SESSION_LEASE: Duration = Duration::from_secs(30);
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -235,12 +254,24 @@ mod gamepath_service {
                 thread::sleep(Duration::from_millis(250));
             }
         });
+        let in_flight = Arc::new(AtomicUsize::new(0));
         while !stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // Refuse rather than spawn once the ceiling is reached: a
+                    // rejected caller retries, a queued thread never leaves.
+                    if in_flight.load(Ordering::Acquire) >= MAX_CONCURRENT_REQUESTS {
+                        reject_overloaded(stream);
+                        continue;
+                    }
+                    in_flight.fetch_add(1, Ordering::AcqRel);
                     let token = expected_token.clone();
                     let state = Arc::clone(&state);
-                    thread::spawn(move || handle_connection(stream, &token, &state));
+                    let in_flight = Arc::clone(&in_flight);
+                    thread::spawn(move || {
+                        handle_connection(stream, &token, &state);
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50))
@@ -252,7 +283,24 @@ mod gamepath_service {
         Ok(())
     }
 
+    /// Tells a caller the service is busy without spending a thread on it.
+    fn reject_overloaded(mut stream: TcpStream) {
+        let _ = stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT));
+        let response = failure(0, "service is busy; retry".into());
+        let _ = serde_json::to_writer(&mut stream, &response);
+        let _ = stream.write_all(b"\n");
+    }
+
     fn handle_connection(mut stream: TcpStream, expected_token: &str, state: &Mutex<RuntimeState>) {
+        // Without these a caller that connects and stalls holds this thread
+        // open indefinitely, which is the whole cost of the attack.
+        if stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).is_err()
+            || stream
+                .set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))
+                .is_err()
+        {
+            return;
+        }
         let mut line = String::new();
         let read = BufReader::new(&stream)
             .take(MAX_REQUEST_BYTES)
@@ -611,6 +659,73 @@ mod gamepath_service {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Accepts one connection and hands it to `handle_connection`, the way
+        /// the serve loop does.
+        fn serve_one(listener: TcpListener) -> thread::JoinHandle<Duration> {
+            thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let state = Mutex::new(RuntimeState::default());
+                let started = Instant::now();
+                handle_connection(stream, "token", &state);
+                started.elapsed()
+            })
+        }
+
+        #[test]
+        fn a_client_that_connects_and_says_nothing_does_not_hold_a_handler_forever() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let handler = serve_one(listener);
+            // Connect, then never send a request line.
+            let _client = TcpStream::connect(address).unwrap();
+            let elapsed = handler.join().unwrap();
+            assert!(
+                elapsed >= REQUEST_READ_TIMEOUT,
+                "returned before the timeout could have fired: {elapsed:?}"
+            );
+            assert!(
+                elapsed < REQUEST_READ_TIMEOUT * 3,
+                "the read timeout did not bound the handler: {elapsed:?}"
+            );
+        }
+
+        #[test]
+        fn a_complete_request_is_answered_without_waiting_for_the_timeout() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let handler = serve_one(listener);
+            let mut client = TcpStream::connect(address).unwrap();
+            client
+                .write_all(b"{\"id\":1,\"command\":\"status\",\"token\":\"token\"}\n")
+                .unwrap();
+            let mut response = String::new();
+            BufReader::new(&client).read_line(&mut response).unwrap();
+            let elapsed = handler.join().unwrap();
+            assert!(elapsed < REQUEST_READ_TIMEOUT, "answered late: {elapsed:?}");
+            let parsed: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(parsed["ok"], serde_json::json!(true));
+        }
+
+        #[test]
+        fn a_rejected_caller_is_told_why_instead_of_being_dropped() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                reject_overloaded(stream);
+            });
+            let client = TcpStream::connect(address).unwrap();
+            let mut response = String::new();
+            BufReader::new(&client).read_line(&mut response).unwrap();
+            server.join().unwrap();
+            let parsed: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(parsed["ok"], serde_json::json!(false));
+            assert!(
+                parsed["error"].as_str().unwrap().contains("busy"),
+                "unhelpful rejection: {parsed}"
+            );
+        }
 
         #[test]
         fn token_comparison_checks_length_and_content() {

@@ -2,6 +2,7 @@ use base64::Engine as _;
 use gamepath_engine::adapter::inspect_library;
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
+use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU};
 use gamepath_engine::relay_path::{
     DirectPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
 };
@@ -176,14 +177,15 @@ struct ActiveWireGuardSession {
     stop: Arc<AtomicBool>,
     paths: Arc<Mutex<Vec<PathSessionStatus>>>,
     workers: Vec<JoinHandle<()>>,
-    skipped_routes: Vec<usize>,
-    commands: Vec<mpsc::Sender<PathCommand>>,
+    skipped_routes: Vec<SkippedRoute>,
+    commands: Vec<mpsc::SyncSender<PathCommand>>,
     data_receiver: Arc<DataReceiver>,
     virtual_ipv4: std::net::Ipv4Addr,
     sequences: Arc<AtomicU64>,
     decision_mask: Arc<AtomicU64>,
+    telemetry: PathTelemetry,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
-    path_worker_iterations: Arc<Vec<AtomicU64>>,
+    effective_mtu: EffectiveMtu,
     bypass_ips: Vec<std::net::Ipv4Addr>,
     // Held for the session so the path workers wake on a millisecond timer
     // instead of Windows' default ~15.6 ms one.
@@ -275,9 +277,104 @@ impl SequenceWindow {
     }
 }
 
+/// A route that is configured and enabled but is not part of the session.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkippedRoute {
+    route: usize,
+    label: String,
+    reason: String,
+}
+
+/// What a path worker needs to open its transport again.
+///
+/// The transport is opened once when the session starts, and for WireGuard that
+/// is enough: BoringTun re-initiates a handshake from its own timers, so a
+/// rekey or a peer restart recovers on its own. A SOCKS5 association and an
+/// OpenVPN link have no such mechanism - once the proxy drops the control
+/// connection or the tunnel dies, that path stays dead for the whole session
+/// unless something dials it again. This is what does that.
+#[derive(Clone)]
+struct PathDialer {
+    node: NodeSpec,
+    relay: SocketAddrV4,
+}
+
+impl PathDialer {
+    fn open(&self) -> Result<Box<dyn RelayPath>, String> {
+        self.node.open(self.relay)
+    }
+}
+
+/// Consecutive failed health checks before a path's transport is redialled.
+/// Three of them is a little over a second of silence, long enough that a
+/// single lost probe or a brief stall does not tear down a working socket.
+const RECONNECT_AFTER_FAILURES: u32 = 3;
+
+/// First wait before redialling, doubled after each failed attempt.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+
+/// Longest wait between redial attempts. A provider that is down for an hour
+/// is retried every half minute rather than hammered.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 struct PathCommand {
     frame: Vec<u8>,
+    /// When the scheduler handed this packet over. A packet that waited longer
+    /// than [`PATH_QUEUE_MAX_AGE`] is worth less than the latency it would add
+    /// to everything behind it, so the worker drops it instead of sending it.
+    queued_at: Instant,
 }
+
+/// Per-path counters a worker publishes and [`WireGuardSessionManager::status`]
+/// reads back. Grouped so the workers take one parameter for all of it.
+#[derive(Clone)]
+struct PathTelemetry {
+    iterations: Arc<Vec<AtomicU64>>,
+    queue_depth: Arc<Vec<AtomicU64>>,
+    dropped: Arc<Vec<AtomicU64>>,
+    healthy_mask: Arc<AtomicU64>,
+}
+
+/// How long a session waits for a path to become usable before giving up.
+const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How long a relay session waits for every path before starting on the ones
+/// that answered.
+///
+/// Only a slow route set pays this: a session whose paths are all up returns as
+/// soon as the last one answers. A route that answers after capture has started
+/// is not shut out either - its first pong puts it back in the dispatcher - so
+/// this trades a little completeness at startup for a session that connects
+/// promptly instead of failing on one bad route.
+const DEGRADED_START_SETTLE: Duration = Duration::from_millis(1500);
+
+/// How long a worker waits on its socket per iteration. Short, because an
+/// outbound packet handed over during the wait is only sent once it ends.
+const WORKER_RECEIVE_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// Outbound packets a path worker sends before it goes back to servicing
+/// inbound frames, probes and timers. Draining the whole queue first is what
+/// lets a burst delay the replies that decide whether the path is still alive.
+///
+/// Sized so the cap bounds starvation without bounding throughput. A worker
+/// iterates at least once per [`WORKER_RECEIVE_TIMEOUT`], so this is a floor of
+/// ~128k packets per second per path - well past any line rate this runs on -
+/// while the batch itself is a few hundred microseconds of `send` calls, an
+/// order of magnitude under the wait it sits next to.
+const PATH_SEND_BATCH: usize = 128;
+
+/// Outbound queue depth per path. At [`PATH_SEND_BATCH`] this drains in about
+/// 8 ms, which is the most latency the queue itself can add before
+/// [`PATH_QUEUE_MAX_AGE`] starts shedding. Past that, holding a packet costs
+/// more latency than dropping it saves.
+const PATH_QUEUE_DEPTH: usize = 1024;
+
+/// Inbound queue depth shared by every path worker.
+const INBOUND_QUEUE_DEPTH: usize = 2048;
+
+/// How long a queued packet stays worth sending.
+const PATH_QUEUE_MAX_AGE: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
 struct WireGuardSessionManager {
@@ -395,19 +492,34 @@ impl WireGuardSessionManager {
         let (client_id, key) = enrollment.material()?;
         let relay_ip = resolve_ipv4(&input.relay_host, input.relay_port)?;
         let relay = SocketAddrV4::new(relay_ip, input.relay_port);
-        let mut paths: Vec<(usize, String, Box<dyn RelayPath>)> = Vec::new();
+        let mut paths: Vec<(usize, String, NodeSpec, Box<dyn RelayPath>)> = Vec::new();
         let mut skipped_routes = Vec::new();
         for (index, node) in nodes.iter().enumerate() {
             let route = index + 1;
-            // A SOCKS5 node dials its proxy here, so name the failing node.
-            let path = node
-                .open(relay)
-                .map_err(|error| format!("route {route} ({}): {error}", node.describe()))?;
+            // A SOCKS5 node dials its proxy here and an OpenVPN node completes
+            // a handshake, so this is where a dead provider shows up. One node
+            // failing costs its own route: the session runs on the rest, and
+            // the worker set does not include a path that was never opened.
+            let path = match node.open(relay) {
+                Ok(path) => path,
+                Err(error) => {
+                    skipped_routes.push(SkippedRoute {
+                        route,
+                        label: node.describe(),
+                        reason: error,
+                    });
+                    continue;
+                }
+            };
             if paths
                 .iter()
-                .any(|(_, _, current)| current.identity() == path.identity())
+                .any(|(_, _, _, current)| current.identity() == path.identity())
             {
-                skipped_routes.push(route);
+                skipped_routes.push(SkippedRoute {
+                    route,
+                    label: node.describe(),
+                    reason: "another enabled route already uses this endpoint and key".into(),
+                });
                 continue;
             }
             let label = node
@@ -420,10 +532,27 @@ impl WireGuardSessionManager {
                         .filter(|label| !label.is_empty())
                 })
                 .unwrap_or_else(|| node.default_label(route));
-            paths.push((route, label, path));
+            paths.push((route, label, node.clone(), path));
         }
+        // Every node failed to dial. There is no session to degrade into, so
+        // this reports each one rather than a bare timeout.
+        if paths.is_empty() {
+            return Err(format!(
+                "no route could be opened: {}",
+                skipped_routes
+                    .iter()
+                    .map(|skipped| format!("route {} ({}): {}", skipped.route, skipped.label, skipped.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        let effective_mtu = EffectiveMtu::for_session(
+            SessionMode::Relay,
+            paths.iter().map(|(_, _, _, path)| path.kind()),
+            LINK_MTU,
+        );
         let mut bypass_ips = vec![relay_ip];
-        bypass_ips.extend(paths.iter().filter_map(|(_, _, path)| path.bypass_ipv4()));
+        bypass_ips.extend(paths.iter().filter_map(|(_, _, _, path)| path.bypass_ipv4()));
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
 
@@ -435,7 +564,7 @@ impl WireGuardSessionManager {
         let sequences = Arc::new(AtomicU64::new(1));
         let initial_statuses = paths
             .iter()
-            .map(|(route, label, path)| {
+            .map(|(route, label, _, path)| {
                 initial_status(*route, path.kind(), label.clone(), path.endpoint())
             })
             .collect::<Vec<_>>();
@@ -452,17 +581,25 @@ impl WireGuardSessionManager {
             (1_u64 << route_count) - 1
         };
         let decision_mask = Arc::new(AtomicU64::new(initial_mask));
-        let path_worker_iterations = Arc::new(
-            (0..route_count)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>(),
-        );
+        let counters = || {
+            Arc::new(
+                (0..route_count)
+                    .map(|_| AtomicU64::new(0))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let telemetry = PathTelemetry {
+            iterations: counters(),
+            queue_depth: counters(),
+            dropped: counters(),
+            healthy_mask: Arc::new(AtomicU64::new(0)),
+        };
         let mut workers = Vec::with_capacity(route_count);
         let mut commands = Vec::with_capacity(route_count);
-        let (inbound_tx, inbound_rx) = mpsc::channel();
-        for (index, (_, _, path)) in paths.into_iter().enumerate() {
+        let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
+        for (index, (_, _, node, path)) in paths.into_iter().enumerate() {
             let status_index = index;
-            let (command_tx, command_rx) = mpsc::channel();
+            let (command_tx, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
             commands.push(command_tx);
             let worker_stop = Arc::clone(&stop);
             let worker_statuses = Arc::clone(&statuses);
@@ -470,7 +607,8 @@ impl WireGuardSessionManager {
             let worker_inbound = inbound_tx.clone();
             let worker_metrics = Arc::clone(&scheduler_metrics);
             let worker_decision = Arc::clone(&decision_mask);
-            let worker_iterations = Arc::clone(&path_worker_iterations);
+            let worker_telemetry = telemetry.clone();
+            let worker_dialer = PathDialer { node, relay };
             let worker_kind = path.kind();
             workers.push(
                 thread::Builder::new()
@@ -490,7 +628,8 @@ impl WireGuardSessionManager {
                             worker_metrics,
                             worker_decision,
                             initial_mask,
-                            worker_iterations,
+                            worker_telemetry,
+                            worker_dialer,
                         )
                     })
                     .map_err(|error| format!("could not start path worker: {error}"))?,
@@ -519,8 +658,9 @@ impl WireGuardSessionManager {
             virtual_ipv4: enrollment.virtual_ipv4,
             sequences,
             decision_mask,
+            telemetry,
             scheduler_metrics,
-            path_worker_iterations,
+            effective_mtu,
             bypass_ips,
             timer,
         });
@@ -552,15 +692,21 @@ impl WireGuardSessionManager {
         let timer = HighResolutionTimer::raise();
         let stop = Arc::new(AtomicBool::new(false));
         let kind = path.kind();
+        let effective_mtu = EffectiveMtu::for_session(SessionMode::Direct, [kind], LINK_MTU);
         let statuses = Arc::new(Mutex::new(vec![initial_status(1, kind, label, endpoint)]));
         let scheduler_metrics = Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())]));
-        let path_worker_iterations = Arc::new(vec![AtomicU64::new(0)]);
-        let (command_tx, command_rx) = mpsc::channel();
-        let (inbound_tx, inbound_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
+        let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
+        let telemetry = PathTelemetry {
+            iterations: Arc::new(vec![AtomicU64::new(0)]),
+            queue_depth: Arc::new(vec![AtomicU64::new(0)]),
+            dropped: Arc::new(vec![AtomicU64::new(0)]),
+            healthy_mask: Arc::new(AtomicU64::new(0)),
+        };
+        let worker_telemetry = telemetry.clone();
         let worker_stop = Arc::clone(&stop);
         let worker_statuses = Arc::clone(&statuses);
         let worker_metrics = Arc::clone(&scheduler_metrics);
-        let worker_iterations = Arc::clone(&path_worker_iterations);
         let worker = thread::Builder::new()
             .name("gamepath-direct-1".into())
             .spawn(move || {
@@ -572,7 +718,7 @@ impl WireGuardSessionManager {
                     command_rx,
                     inbound_tx,
                     worker_metrics,
-                    worker_iterations,
+                    worker_telemetry,
                 )
             })
             .map_err(|error| format!("could not start path worker: {error}"))?;
@@ -594,20 +740,31 @@ impl WireGuardSessionManager {
             sequences: Arc::new(AtomicU64::new(1)),
             // One path, always selected: there is nothing to schedule between.
             decision_mask: Arc::new(AtomicU64::new(1)),
+            telemetry,
             scheduler_metrics,
-            path_worker_iterations,
+            effective_mtu,
             bypass_ips,
             timer,
         });
         Ok(())
     }
 
-    /// Holds until every path reports itself usable, so traffic is never
-    /// captured into a session that cannot carry it yet.
+    /// Holds until the session can carry traffic, so nothing is captured into
+    /// a session with nowhere to send it.
+    ///
+    /// A relay session needs one working path, not all of them: the point of
+    /// multipath is that an expired, blocked or offline route costs a route
+    /// rather than the session. Paths that are still down stay out of the
+    /// scheduler's pick and keep probing, and join in when they answer. A
+    /// direct session has exactly one path, so for it this is unchanged.
     fn wait_until_ready(&mut self) -> Result<Value, String> {
-        let deadline = Instant::now() + Duration::from_secs(12);
+        let deadline = Instant::now() + SESSION_READY_TIMEOUT;
+        let settle = Instant::now() + DEGRADED_START_SETTLE;
         while Instant::now() < deadline {
             if self.all_paths_reachable() {
+                return Ok(self.status());
+            }
+            if Instant::now() >= settle && self.any_path_reachable() {
                 return Ok(self.status());
             }
             thread::sleep(Duration::from_millis(100));
@@ -739,23 +896,46 @@ impl WireGuardSessionManager {
             // wrap it in and no sequence for anyone to compare copies by.
             SessionOverlay::Direct => packet.to_vec(),
         };
-        let mut dispatched = 0;
+        // The scheduler's pick, narrowed to the paths that are actually
+        // carrying traffic. A path that never came up would otherwise take a
+        // copy of every packet and throw it away.
         let decision = session.decision_mask.load(Ordering::Acquire);
+        let healthy = session.telemetry.healthy_mask.load(Ordering::Acquire);
+        let selected = selected_paths(decision, healthy);
+        let mut selected_paths = 0;
+        let queued_at = Instant::now();
         for (index, sender) in session.commands.iter().enumerate() {
             let bit = 1_u64.checked_shl(index as u32).unwrap_or(0);
-            if decision & bit == 0 {
+            if selected & bit == 0 {
                 continue;
             }
-            if sender
-                .send(PathCommand {
-                    frame: frame.clone(),
-                })
-                .is_ok()
-            {
-                dispatched += 1;
+            selected_paths += 1;
+            match sender.try_send(PathCommand {
+                frame: frame.clone(),
+                queued_at,
+            }) {
+                Ok(()) => {
+                    if let Some(depth) = session.telemetry.queue_depth.get(index) {
+                        depth.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                // A full queue means the path is already behind. Shedding the
+                // newest packet keeps the backlog bounded: game traffic is
+                // stale by the time it would drain, and TCP retransmits.
+                Err(mpsc::TrySendError::Full(_)) => {
+                    if let Some(dropped) = session.telemetry.dropped.get(index) {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {}
             }
         }
-        if dispatched == 0 {
+        // Nothing to send down. Split mode reads this as the relay being
+        // unavailable and lets the packet take the normal route; that fail-open
+        // is only correct here, when no path was ever chosen. A packet dropped
+        // because every chosen path is saturated must not bypass: half a flow
+        // arriving from a different source address breaks it at the server.
+        if selected_paths == 0 {
             return Err("no active path workers accepted the packet".into());
         }
         Ok(())
@@ -779,6 +959,10 @@ impl WireGuardSessionManager {
         self.active.as_ref().map(|session| session.virtual_ipv4)
     }
 
+    fn effective_mtu(&self) -> Option<EffectiveMtu> {
+        self.active.as_ref().map(|session| session.effective_mtu)
+    }
+
     fn bypass_ips(&self) -> Vec<std::net::Ipv4Addr> {
         self.active
             .as_ref()
@@ -796,21 +980,38 @@ impl WireGuardSessionManager {
             .unwrap_or(false)
     }
 
+    fn any_path_reachable(&self) -> bool {
+        self.active
+            .as_ref()
+            .map(|session| session.paths.lock().unwrap().iter().any(|path| path.reachable))
+            .unwrap_or(false)
+    }
+
     fn status(&self) -> Value {
         let Some(session) = &self.active else {
             return json!({ "state": "idle", "paths": [] });
         };
         let paths = session.paths.lock().unwrap().clone();
         let decision = session.decision_mask.load(Ordering::Acquire);
+        let healthy = session.telemetry.healthy_mask.load(Ordering::Acquire);
+        // What the dispatcher will actually use. Reporting the raw pick would
+        // show a route as carrying traffic while it is being skipped.
+        let effective = selected_paths(decision, healthy);
         let selected_routes = paths
             .iter()
             .enumerate()
-            .filter(|(index, _)| decision & 1_u64.checked_shl(*index as u32).unwrap_or(0) != 0)
+            .filter(|(index, _)| effective & 1_u64.checked_shl(*index as u32).unwrap_or(0) != 0)
             .map(|(_, path)| path.route)
+            .collect::<Vec<_>>();
+        let degraded_routes = paths
+            .iter()
+            .filter(|path| !path.reachable)
+            .map(|path| path.route)
             .collect::<Vec<_>>();
         let scheduler_metrics = session.scheduler_metrics.lock().unwrap().clone();
         let path_worker_iterations = session
-            .path_worker_iterations
+            .telemetry
+            .iterations
             .iter()
             .map(|count| count.load(Ordering::Relaxed))
             .collect::<Vec<_>>();
@@ -832,8 +1033,26 @@ impl WireGuardSessionManager {
                 SessionMode::Direct => "single-path",
             },
             "selectedRoutes": selected_routes,
+            // Routes the session started or carried on without. Present so the
+            // UI can say a path is down without implying the session is.
+            "degradedRoutes": degraded_routes,
             "schedulerMetrics": scheduler_metrics,
             "pathWorkerIterations": path_worker_iterations,
+            "queueDepth": session
+                .telemetry
+                .queue_depth
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            "droppedPackets": session
+                .telemetry
+                .dropped
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            "queueCapacity": PATH_QUEUE_DEPTH,
+            "effectiveMtu": session.effective_mtu.mtu,
+            "transportOverhead": session.effective_mtu.overhead,
             "highResolutionTimer": session.timer.active(),
         })
     }
@@ -884,7 +1103,7 @@ impl PacketCaptureManager {
         let input: PacketCaptureRequest = serde_json::from_value(payload)
             .map_err(|error| format!("invalid packet capture request: {error}"))?;
         self.stop();
-        let (virtual_ipv4, bypass_ips, data_receiver) = {
+        let (virtual_ipv4, bypass_ips, data_receiver, effective_mtu) = {
             let manager = sessions.lock().unwrap();
             (
                 manager
@@ -893,6 +1112,9 @@ impl PacketCaptureManager {
                 manager.bypass_ips(),
                 manager
                     .data_receiver()
+                    .ok_or("start the multipath session before packet capture")?,
+                manager
+                    .effective_mtu()
                     .ok_or("start the multipath session before packet capture")?,
             )
         };
@@ -903,6 +1125,7 @@ impl PacketCaptureManager {
                 &bypass_ips,
                 sessions,
                 data_receiver,
+                effective_mtu,
             )?;
             let target_count = split.target_count();
             self.active_split = Some(split);
@@ -911,6 +1134,12 @@ impl PacketCaptureManager {
                 "backend": "windivert",
                 "trafficMode": "split",
                 "targetCount": target_count,
+                "effectiveMtu": effective_mtu.mtu,
+                "tcpMss": effective_mtu.tcp_mss(),
+                // Selected targets are matched as IPv4. A game reaching the
+                // same server over IPv6 is not captured at all, so the
+                // exposure is worth reporting in split mode too.
+                "ipv6": ipv6_exposure(),
             }));
         }
         if input.traffic_mode != "all" {
@@ -943,7 +1172,7 @@ impl PacketCaptureManager {
                     &wintun,
                     "GamePath",
                     "GamePath",
-                    Some(0x7f0a_9828_52ef_4ddd_913d_c11ff0d4a58a_u128),
+                    Some(0x7f0a_9828_52ef_4ddd_913d_c11f_f0d4_a58a_u128),
                 )
             })
             .map_err(|error| format!("could not create GamePath adapter: {error}"))?;
@@ -958,8 +1187,10 @@ impl PacketCaptureManager {
                 None,
             )
             .map_err(|error| format!("could not configure GamePath adapter: {error}"))?;
+        // Sized from what the selected transports actually add to a packet, so
+        // a full-size packet still fits the physical link once it is wrapped.
         adapter
-            .set_mtu(1380)
+            .set_mtu(usize::from(effective_mtu.mtu))
             .map_err(|error| format!("could not set GamePath MTU: {error}"))?;
         let session = Arc::new(
             adapter
@@ -1023,6 +1254,9 @@ impl PacketCaptureManager {
             "adapterIndex": adapter_index,
             "virtualIpv4": virtual_ipv4,
             "trafficMode": input.traffic_mode,
+            "effectiveMtu": effective_mtu.mtu,
+            "transportOverhead": effective_mtu.overhead,
+            "ipv6": ipv6_exposure(),
         }))
     }
 
@@ -1272,6 +1506,55 @@ const DIRECT_PROBE_ATTEMPTS: u64 = 3;
 /// this only decides when the user is told, and a twitchier number would
 /// report a hiccup as an outage.
 const DIRECT_LOSS_LIMIT: u64 = 3;
+
+/// How recently the node must have sent something authenticated for the path to
+/// count as carrying traffic regardless of what the ICMP probes say.
+const DIRECT_LIVENESS_WINDOW: Duration = Duration::from_secs(5);
+
+/// Probe interval once a node has shown it will not answer ICMP. Slow enough
+/// to be free, frequent enough that a node which starts answering is noticed.
+const DIRECT_QUIET_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// Whether `address` is one this machine could reach the Internet from.
+///
+/// Loopback, link-local and unique-local addresses exist on machines with no
+/// IPv6 connectivity at all, so treating them as an exposure would warn
+/// everyone.
+fn is_globally_routable_ipv6(address: std::net::Ipv6Addr) -> bool {
+    let first = address.segments()[0];
+    !address.is_loopback()
+        && !address.is_unspecified()
+        // fe80::/10 link-local
+        && first & 0xffc0 != 0xfe80
+        // fc00::/7 unique local
+        && first & 0xfe00 != 0xfc00
+}
+
+/// What IPv6 traffic this session does and does not carry.
+///
+/// GamePath tunnels IPv4 only: the capture filter, the address rewriting and
+/// the relay framing are all IPv4. On a dual-stack connection IPv6 therefore
+/// keeps using the normal route, which is a leak if the user believed
+/// all-traffic mode meant all traffic. Reporting it is the honest minimum
+/// until IPv6 is carried end to end.
+fn ipv6_exposure() -> Value {
+    // Connecting a UDP socket sends nothing; it only makes the OS choose a
+    // source address, which is exactly the question being asked.
+    let source = std::net::UdpSocket::bind("[::]:0")
+        .and_then(|socket| {
+            socket.connect("[2606:4700:4700::1111]:53")?;
+            socket.local_addr()
+        })
+        .ok()
+        .and_then(|address| match address.ip() {
+            std::net::IpAddr::V6(address) => Some(address),
+            std::net::IpAddr::V4(_) => None,
+        });
+    json!({
+        "carried": false,
+        "systemHasRoute": source.is_some_and(is_globally_routable_ipv6),
+    })
+}
+
 /// Where a direct session's latency probe is aimed. A public resolver that
 /// answers echo requests, reached through the node like any game server.
 const DIRECT_PROBE_TARGET: std::net::Ipv4Addr = std::net::Ipv4Addr::new(1, 1, 1, 1);
@@ -1293,9 +1576,9 @@ fn run_direct_path(
     stop: Arc<AtomicBool>,
     statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
     commands: mpsc::Receiver<PathCommand>,
-    inbound: mpsc::Sender<Vec<u8>>,
+    inbound: mpsc::SyncSender<Vec<u8>>,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
-    worker_iterations: Arc<Vec<AtomicU64>>,
+    telemetry: PathTelemetry,
 ) {
     let identifier = rand::random::<u16>();
     let mut probe_sequence = 0_u16;
@@ -1304,7 +1587,6 @@ fn run_direct_path(
     let mut probes_attempted = 0_u64;
     let mut consecutive_losses = 0_u64;
     let mut icmp_answered = false;
-    let mut probing = true;
     let mut published_health = (None, false);
     let mut published_error = false;
     // Set once this worker has a specific answer for why the node is not
@@ -1313,15 +1595,30 @@ fn run_direct_path(
     let mut verdict = false;
     let started = Instant::now();
     let mut reported_silence = false;
+    // Any packet the node sends back has already passed WireGuard's or
+    // OpenVPN's authentication, so it proves the tunnel is alive whether or not
+    // ICMP is carried. Handshake age alone does not: a node can complete one
+    // and then stop forwarding.
+    let mut last_authenticated_receive: Option<Instant> = None;
+    let mut published_healthy = false;
     let endpoint = path.endpoint();
 
     while !stop.load(Ordering::Acquire) {
-        worker_iterations[0].fetch_add(1, Ordering::Relaxed);
+        telemetry.iterations[0].fetch_add(1, Ordering::Relaxed);
         // Health is decided first so the rest of the iteration can see it, and
         // published only when it moves: this lock is on the hot path.
         let handshake = path.handshake_latency_ms();
-        let losing = icmp_answered && consecutive_losses >= DIRECT_LOSS_LIMIT;
+        // Authenticated return traffic outranks the probe verdict: a node that
+        // is demonstrably carrying packets is not down because ICMP to
+        // 1.1.1.1 is being filtered somewhere past it.
+        let carrying = last_authenticated_receive
+            .is_some_and(|seen| seen.elapsed() <= DIRECT_LIVENESS_WINDOW);
+        let losing = icmp_answered && consecutive_losses >= DIRECT_LOSS_LIMIT && !carrying;
         let reachable = handshake.is_some() && !losing;
+        if reachable != published_healthy {
+            publish_path_health(&telemetry.healthy_mask, 0, reachable);
+            published_healthy = reachable;
+        }
         if (handshake, reachable) != published_health {
             let mut current = statuses.lock().unwrap();
             current[0].reachable = reachable;
@@ -1337,12 +1634,15 @@ fn run_direct_path(
             verdict = losing;
             published_health = (handshake, reachable);
         }
-        while let Ok(command) = commands.try_recv() {
-            let length = command.frame.len();
-            let result = path.send_packet(&command.frame);
-            record_path_send(&statuses, 0, length, result);
-        }
-        if probing && pending_probe.is_none() && Instant::now() >= next_probe {
+        drain_send_queue(
+            &commands,
+            0,
+            &telemetry.queue_depth,
+            &telemetry.dropped,
+            |frame| (frame.len(), path.send_packet(frame)),
+            |length, result| record_path_send(&statuses, 0, length, result),
+        );
+        if pending_probe.is_none() && Instant::now() >= next_probe {
             probe_sequence = probe_sequence.wrapping_add(1);
             let probe = icmp_echo_packet(
                 address,
@@ -1373,7 +1673,7 @@ fn run_direct_path(
             }
             next_probe = Instant::now() + Duration::from_millis(500);
         }
-        match path.receive_packets(Duration::from_millis(1)) {
+        match path.receive_packets(WORKER_RECEIVE_TIMEOUT) {
             Ok(packets) => {
                 for packet in packets {
                     if is_matching_icmp_reply(&packet, DIRECT_PROBE_TARGET, address, identifier) {
@@ -1393,10 +1693,16 @@ fn run_direct_path(
                             current[0].latency_ms = Some(latency);
                         }
                         scheduler_metrics.lock().unwrap()[0].record_probe(latency);
+                        last_authenticated_receive = Some(Instant::now());
                         continue;
                     }
                     record_path_receive(&statuses, 0, packet.len());
-                    let _ = inbound.send(packet);
+                    last_authenticated_receive = Some(Instant::now());
+                    // Blocking here would stall the probe and timer work that
+                    // decides whether this path is still usable.
+                    if let Err(mpsc::TrySendError::Full(_)) = inbound.try_send(packet) {
+                        telemetry.dropped[0].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 // Windows reports an unreachable endpoint on the next read of a
                 // connected UDP socket, so a restarting node leaves an error
@@ -1437,13 +1743,16 @@ fn run_direct_path(
                 scheduler_metrics.lock().unwrap()[0].record_loss();
             } else if probes_attempted >= DIRECT_PROBE_ATTEMPTS {
                 // Never answered once: this node does not carry ICMP, which
-                // says nothing about the traffic it does carry.
-                probing = false;
+                // says nothing about the traffic it does carry. Back off to a
+                // slow retry rather than stopping for the session, so a node
+                // that starts answering later is measured again.
+                next_probe = Instant::now() + DIRECT_QUIET_PROBE_INTERVAL;
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_path(
     mut path: Box<dyn RelayPath>,
     index: usize,
@@ -1454,11 +1763,12 @@ fn run_path(
     stop: Arc<AtomicBool>,
     statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
     commands: mpsc::Receiver<PathCommand>,
-    inbound: mpsc::Sender<Vec<u8>>,
+    inbound: mpsc::SyncSender<Vec<u8>>,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     decision_mask: Arc<AtomicU64>,
     fallback_mask: u64,
-    worker_iterations: Arc<Vec<AtomicU64>>,
+    telemetry: PathTelemetry,
+    dialer: PathDialer,
 ) {
     use gamepath_engine::auth::SessionCrypto;
     use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
@@ -1469,12 +1779,82 @@ fn run_path(
     let mut next_probe = Instant::now();
     let mut pending_probe = None;
     let mut published_setup_latency = None;
+    // Consecutive failed health checks, and how long to wait before the next
+    // redial. Both reset the moment the path answers again.
+    let mut failures = 0_u32;
+    let mut backoff = RECONNECT_BACKOFF_MIN;
+    let mut next_redial: Option<Instant> = None;
+    // A dial can take seconds - a SOCKS5 connect allows eight, an OpenVPN
+    // handshake its own - so it runs on its own thread and the result is
+    // collected here. The worker keeps probing and keeps checking `stop` while
+    // it is in flight, which is what stops a dead route delaying a session stop.
+    let mut dialing: Option<mpsc::Receiver<Result<Box<dyn RelayPath>, String>>> = None;
     while !stop.load(Ordering::Acquire) {
-        worker_iterations[index].fetch_add(1, Ordering::Relaxed);
-        while let Ok(command) = commands.try_recv() {
-            let result = path.send_frame(&command.frame);
-            record_path_send(&statuses, index, command.frame.len(), result);
+        telemetry.iterations[index].fetch_add(1, Ordering::Relaxed);
+        match dialing.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(Ok(replacement))) => {
+                dialing = None;
+                path = replacement;
+                failures = 0;
+                backoff = RECONNECT_BACKOFF_MIN;
+                next_redial = None;
+                pending_probe = None;
+                published_setup_latency = None;
+                // The new transport has to prove itself: only an answered probe
+                // puts this path back into the dispatcher's selection.
+                next_probe = Instant::now();
+                let mut current = statuses.lock().unwrap();
+                current[index].endpoint = path.endpoint();
+                current[index].last_error = Some("reconnected; waiting for a probe".into());
+            }
+            Some(Ok(Err(error))) => {
+                dialing = None;
+                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                next_redial = Some(Instant::now() + backoff);
+                statuses.lock().unwrap()[index].last_error =
+                    Some(format!("reconnect failed, retrying: {error}"));
+            }
+            // The dial thread went away without answering. Treat it as a failed
+            // attempt rather than waiting on a receiver that will never fill.
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                dialing = None;
+                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                next_redial = Some(Instant::now() + backoff);
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
         }
+        if dialing.is_none() && next_redial.is_some_and(|at| Instant::now() >= at) {
+            next_redial = None;
+            let (result_tx, result_rx) = mpsc::channel();
+            let attempt = dialer.clone();
+            match thread::Builder::new()
+                .name(format!("gamepath-redial-{}", index + 1))
+                .spawn(move || {
+                    // The worker may already have stopped; nothing depends on
+                    // this send arriving.
+                    let _ = result_tx.send(attempt.open());
+                }) {
+                Ok(_) => {
+                    dialing = Some(result_rx);
+                    statuses.lock().unwrap()[index].last_error =
+                        Some("reconnecting".to_owned());
+                }
+                Err(error) => {
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    next_redial = Some(Instant::now() + backoff);
+                    statuses.lock().unwrap()[index].last_error =
+                        Some(format!("could not start a reconnect attempt: {error}"));
+                }
+            }
+        }
+        drain_send_queue(
+            &commands,
+            index,
+            &telemetry.queue_depth,
+            &telemetry.dropped,
+            |frame| (frame.len(), path.send_frame(frame)),
+            |length, result| record_path_send(&statuses, index, length, result),
+        );
         if Instant::now() >= next_probe && pending_probe.is_none() {
             let sequence = sequences.fetch_add(1, Ordering::Relaxed);
             let result = (|| {
@@ -1504,11 +1884,13 @@ fn run_path(
                         None,
                     );
                     update_path_status(&statuses, index, Err(error));
+                    failures += 1;
+                    schedule_redial(failures, backoff, &mut next_redial);
                     next_probe = Instant::now() + Duration::from_millis(500);
                 }
             }
         }
-        match path.receive_frames(Duration::from_millis(1)) {
+        match path.receive_frames(WORKER_RECEIVE_TIMEOUT) {
             Ok(frames) => {
                 for frame in frames {
                     if let Ok((header, plaintext)) = crypto.open_server(&frame) {
@@ -1517,6 +1899,14 @@ fn run_path(
                                 let latency = started.elapsed().as_secs_f64() * 1000.0;
                                 statuses.lock().unwrap()[index].probes_received += 1;
                                 update_path_status(&statuses, index, Ok(latency));
+                                // An authenticated pong is the one unambiguous
+                                // sign this path is carrying traffic, so this
+                                // is where it rejoins the dispatcher, and where
+                                // any pending reconnect is called off.
+                                publish_path_health(&telemetry.healthy_mask, index, true);
+                                failures = 0;
+                                backoff = RECONNECT_BACKOFF_MIN;
+                                next_redial = None;
                                 update_scheduler_probe(
                                     &scheduler_metrics,
                                     &decision_mask,
@@ -1528,11 +1918,21 @@ fn run_path(
                             }
                         } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
                             record_path_receive(&statuses, index, frame.len());
-                            let _ = inbound.send(frame);
+                            // Blocking on a saturated inbound queue would stall
+                            // this path's probes and timers, which is how a
+                            // busy path ends up reported as a dead one.
+                            if let Err(mpsc::TrySendError::Full(_)) = inbound.try_send(frame) {
+                                telemetry.dropped[index].fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
             }
+            // Not a health verdict: Windows surfaces an earlier send's ICMP
+            // unreachable on the next read, and a restarting node's next reply
+            // disproves it. The probe timeout below is what takes a path out of
+            // the dispatcher, so a transient like this cannot interrupt
+            // duplication.
             Err(error) => update_path_status(&statuses, index, Err(error)),
         }
         // Setup latency is fixed once a path is up, and this lock is shared by
@@ -1553,6 +1953,11 @@ fn run_path(
                 None,
             );
             let note = path.health_note();
+            // A probe that went unanswered for 1.5 s is evidence, so this is
+            // where a path leaves the dispatcher's selection.
+            publish_path_health(&telemetry.healthy_mask, index, false);
+            failures += 1;
+            schedule_redial(failures, backoff, &mut next_redial);
             update_path_status(
                 &statuses,
                 index,
@@ -1563,6 +1968,72 @@ fn run_path(
             );
             next_probe = Instant::now() + Duration::from_millis(500);
         }
+    }
+}
+
+/// The paths a packet is actually dispatched to: the scheduler's pick,
+/// narrowed to the ones known to be carrying traffic.
+///
+/// When that intersection is empty the scheduler's pick stands. Either nothing
+/// has reported healthy yet - the first packets of a session, with probes still
+/// in flight - or the two disagree, and dropping the packet on a disagreement
+/// is worse than sending it down a path that may be down.
+fn selected_paths(decision: u64, healthy: u64) -> u64 {
+    if decision & healthy != 0 {
+        decision & healthy
+    } else {
+        decision
+    }
+}
+
+/// Sends at most [`PATH_SEND_BATCH`] queued packets, shedding any that waited
+/// past [`PATH_QUEUE_MAX_AGE`], and returns without draining the rest so the
+/// caller can service inbound frames, probes and timers.
+fn drain_send_queue(
+    commands: &mpsc::Receiver<PathCommand>,
+    index: usize,
+    queue_depth: &[AtomicU64],
+    dropped: &[AtomicU64],
+    mut send: impl FnMut(&[u8]) -> (usize, Result<(), String>),
+    mut record: impl FnMut(usize, Result<(), String>),
+) {
+    for _ in 0..PATH_SEND_BATCH {
+        let Ok(command) = commands.try_recv() else {
+            return;
+        };
+        if let Some(depth) = queue_depth.get(index) {
+            depth.fetch_sub(1, Ordering::Relaxed);
+        }
+        if command.queued_at.elapsed() > PATH_QUEUE_MAX_AGE {
+            if let Some(dropped) = dropped.get(index) {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        let (length, result) = send(&command.frame);
+        record(length, result);
+    }
+}
+
+/// Arms the next redial once a path has failed [`RECONNECT_AFTER_FAILURES`]
+/// health checks in a row, leaving an already-armed one alone so the backoff
+/// is not restarted by every further failure.
+fn schedule_redial(failures: u32, backoff: Duration, next_redial: &mut Option<Instant>) {
+    if failures >= RECONNECT_AFTER_FAILURES && next_redial.is_none() {
+        *next_redial = Some(Instant::now() + backoff);
+    }
+}
+
+/// Records whether `index` is carrying traffic, so the dispatcher can leave a
+/// dead path out of the pick without reading the status mutex per packet.
+fn publish_path_health(healthy_mask: &AtomicU64, index: usize, healthy: bool) {
+    let Some(bit) = 1_u64.checked_shl(index as u32) else {
+        return;
+    };
+    if healthy {
+        healthy_mask.fetch_or(bit, Ordering::Release);
+    } else {
+        healthy_mask.fetch_and(!bit, Ordering::Release);
     }
 }
 
@@ -1700,11 +2171,11 @@ fn is_matching_icmp_reply(
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0_u32;
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    for chunk in pairs {
+        sum += u32::from(u16::from_be_bytes(*chunk));
     }
-    if let Some(last) = chunks.remainder().first() {
+    if let Some(last) = remainder.first() {
         sum += u32::from(*last) << 8;
     }
     while sum > 0xffff {
@@ -2072,6 +2543,160 @@ fn scheduler_demo() -> Value {
 mod tests {
     use super::*;
 
+    fn queued(frame: Vec<u8>, age: Duration) -> PathCommand {
+        PathCommand {
+            frame,
+            queued_at: Instant::now() - age,
+        }
+    }
+
+    #[test]
+    fn a_worker_sends_a_bounded_batch_and_leaves_the_rest_queued() {
+        let (sender, receiver) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
+        let depth = vec![AtomicU64::new(0)];
+        let dropped = vec![AtomicU64::new(0)];
+        for _ in 0..PATH_SEND_BATCH * 2 {
+            sender.try_send(queued(vec![0; 64], Duration::ZERO)).unwrap();
+            depth[0].fetch_add(1, Ordering::Relaxed);
+        }
+        let mut sent = 0;
+        drain_send_queue(
+            &receiver,
+            0,
+            &depth,
+            &dropped,
+            |frame| (frame.len(), Ok(())),
+            |_, _| sent += 1,
+        );
+        // The point is that the loop gets back to inbound frames and probes
+        // rather than emptying a burst first.
+        assert_eq!(sent, PATH_SEND_BATCH);
+        assert_eq!(depth[0].load(Ordering::Relaxed) as usize, PATH_SEND_BATCH);
+        assert_eq!(dropped[0].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_packet_that_waited_too_long_is_dropped_rather_than_sent_late() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let depth = vec![AtomicU64::new(2)];
+        let dropped = vec![AtomicU64::new(0)];
+        sender
+            .try_send(queued(vec![1; 64], PATH_QUEUE_MAX_AGE * 2))
+            .unwrap();
+        sender.try_send(queued(vec![2; 64], Duration::ZERO)).unwrap();
+        let mut sent = Vec::new();
+        drain_send_queue(
+            &receiver,
+            0,
+            &depth,
+            &dropped,
+            |frame| (frame.len(), Ok(())),
+            |length, _| sent.push(length),
+        );
+        assert_eq!(sent, [64]);
+        assert_eq!(dropped[0].load(Ordering::Relaxed), 1);
+        assert_eq!(depth[0].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_saturated_queue_sheds_packets_instead_of_growing() {
+        let (sender, _receiver) = mpsc::sync_channel::<PathCommand>(2);
+        assert!(sender.try_send(queued(vec![0; 8], Duration::ZERO)).is_ok());
+        assert!(sender.try_send(queued(vec![0; 8], Duration::ZERO)).is_ok());
+        assert!(matches!(
+            sender.try_send(queued(vec![0; 8], Duration::ZERO)),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn a_path_is_not_redialled_until_it_has_failed_repeatedly() {
+        let mut next_redial = None;
+        for failures in 1..RECONNECT_AFTER_FAILURES {
+            schedule_redial(failures, RECONNECT_BACKOFF_MIN, &mut next_redial);
+            assert!(
+                next_redial.is_none(),
+                "a working socket was torn down after {failures} lost probes"
+            );
+        }
+        schedule_redial(RECONNECT_AFTER_FAILURES, RECONNECT_BACKOFF_MIN, &mut next_redial);
+        assert!(next_redial.is_some());
+    }
+
+    #[test]
+    fn further_failures_do_not_restart_an_armed_backoff() {
+        let armed = Instant::now() + Duration::from_secs(9);
+        let mut next_redial = Some(armed);
+        schedule_redial(RECONNECT_AFTER_FAILURES + 5, RECONNECT_BACKOFF_MIN, &mut next_redial);
+        assert_eq!(next_redial, Some(armed));
+    }
+
+    #[test]
+    fn the_reconnect_backoff_doubles_up_to_its_ceiling() {
+        let mut backoff = RECONNECT_BACKOFF_MIN;
+        let mut waits = vec![backoff];
+        for _ in 0..12 {
+            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+            waits.push(backoff);
+        }
+        assert_eq!(waits[0], RECONNECT_BACKOFF_MIN);
+        assert!(waits[1] > waits[0], "the backoff has to grow");
+        assert_eq!(*waits.last().unwrap(), RECONNECT_BACKOFF_MAX);
+        // A provider that stays down is retried forever, never faster than the
+        // ceiling and never so slowly that recovery is missed.
+        assert!(waits.iter().all(|wait| *wait <= RECONNECT_BACKOFF_MAX));
+    }
+
+    #[test]
+    fn the_health_mask_tracks_each_path_independently() {
+        let mask = AtomicU64::new(0);
+        publish_path_health(&mask, 0, true);
+        publish_path_health(&mask, 2, true);
+        assert_eq!(mask.load(Ordering::Acquire), 0b101);
+        publish_path_health(&mask, 0, false);
+        assert_eq!(mask.load(Ordering::Acquire), 0b100);
+        // Out of range is ignored rather than corrupting the mask.
+        publish_path_health(&mask, 64, true);
+        assert_eq!(mask.load(Ordering::Acquire), 0b100);
+    }
+
+    #[test]
+    fn a_dead_route_is_left_out_of_the_pick_but_never_leaves_it_empty() {
+        // Two routes selected, only the second one up.
+        // Two routes picked, only the second one up.
+        assert_eq!(selected_paths(0b11, 0b10), 0b10);
+        // Nothing reported healthy yet: the scheduler's pick still stands, so
+        // the first packets of a session are not dropped while probes fly.
+        assert_eq!(selected_paths(0b11, 0b00), 0b11);
+        // A pick that disagrees with the health gate is honoured rather than
+        // silently emptied.
+        assert_eq!(selected_paths(0b01, 0b10), 0b01);
+        assert_eq!(selected_paths(0b11, 0b11), 0b11);
+    }
+
+    #[test]
+    fn only_a_globally_routable_address_counts_as_ipv6_exposure() {
+        use std::net::Ipv6Addr;
+        assert!(is_globally_routable_ipv6(
+            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap()
+        ));
+        assert!(!is_globally_routable_ipv6(Ipv6Addr::LOCALHOST));
+        assert!(!is_globally_routable_ipv6(Ipv6Addr::UNSPECIFIED));
+        assert!(!is_globally_routable_ipv6(
+            "fe80::1".parse::<Ipv6Addr>().unwrap()
+        ));
+        assert!(!is_globally_routable_ipv6(
+            "fd00::1".parse::<Ipv6Addr>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn ipv6_is_always_reported_as_uncarried() {
+        let exposure = ipv6_exposure();
+        assert_eq!(exposure["carried"], json!(false));
+        assert!(exposure["systemHasRoute"].is_boolean());
+    }
+
     fn session_request(payload: Value) -> SessionRequest {
         serde_json::from_value(payload).unwrap()
     }
@@ -2262,8 +2887,14 @@ mod tests {
             format!("127.0.0.1:{port}"),
         )]));
         let stop = Arc::new(AtomicBool::new(false));
-        let (_commands, command_rx) = mpsc::channel();
-        let (inbound_tx, _inbound) = mpsc::channel();
+        let (_commands, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
+        let (inbound_tx, _inbound) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
+        let telemetry = PathTelemetry {
+            iterations: Arc::new(vec![AtomicU64::new(0)]),
+            queue_depth: Arc::new(vec![AtomicU64::new(0)]),
+            dropped: Arc::new(vec![AtomicU64::new(0)]),
+            healthy_mask: Arc::new(AtomicU64::new(0)),
+        };
         let worker = thread::spawn({
             let (stop, statuses) = (Arc::clone(&stop), Arc::clone(&statuses));
             move || {
@@ -2275,7 +2906,7 @@ mod tests {
                     command_rx,
                     inbound_tx,
                     Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())])),
-                    Arc::new(vec![AtomicU64::new(0)]),
+                    telemetry,
                 )
             }
         });

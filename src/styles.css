@@ -49,7 +49,7 @@ button {
   min-width: 0;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   white-space: nowrap;
 }
 .address-with-country > span:first-child {
@@ -58,25 +58,19 @@ button {
   text-overflow: ellipsis;
 }
 .country-flag {
-  width: 28px;
-  height: 19px;
+  width: 22px;
+  height: 15px;
   flex: 0 0 auto;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.28);
-  border-radius: 4px;
-  background-color: rgba(255, 255, 255, 0.06);
-  box-shadow:
-    0 0 0 2px rgba(255, 255, 255, 0.035),
-    0 2px 6px rgba(0, 0, 0, 0.34);
-  filter: saturate(1.06);
+  border: 0;
+  border-radius: 2px;
+  background-color: transparent;
+  box-shadow: none;
 }
 .flag-orb .country-flag {
-  width: 46px;
-  height: 31px;
-  border-radius: 6px;
-  box-shadow:
-    0 0 0 3px rgba(138, 124, 255, 0.08),
-    0 4px 12px rgba(0, 0, 0, 0.32);
+  width: 42px;
+  height: 28px;
+  border-radius: 3px;
 }
 
 .loading {
@@ -2054,6 +2048,14 @@ select:focus-visible {
   gap: 11px;
   color: var(--violet);
   background: rgba(138, 124, 255, 0.045);
+}
+.all-traffic-banner.is-warning {
+  border-color: rgba(255, 176, 92, 0.22);
+  color: #ffb05c;
+  background: rgba(255, 176, 92, 0.05);
+}
+.all-traffic-banner.is-warning strong {
+  color: #f0c79a;
 }
 .all-traffic-banner strong {
   display: block;

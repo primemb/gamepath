@@ -30,6 +30,7 @@ import {
   Server,
   Settings,
   Share2,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -506,6 +507,7 @@ function TelemetryPanel({
   const connections = capture?.handledConnections ?? []
   const captureP99 = histogramPercentile(capture?.captureLoopHistogram, 0.99)
   const paths = state.session.pathMetrics ?? []
+  const degradedRoutes = state.session.degradedRoutes ?? []
   const live = state.session.status === 'connected'
   const bestPath = paths
     .filter((path) => path.reachable && path.latencyMs != null)
@@ -614,7 +616,13 @@ function TelemetryPanel({
           <h3>{direct ? 'Node quality' : 'Route quality'}</h3>
         </div>
         <small>
-          {direct ? 'One node, no duplication' : `${paths.length} active route${paths.length === 1 ? '' : 's'}`}
+          {direct
+            ? 'One node, no duplication'
+            : degradedRoutes.length
+              ? // The session runs on the routes that answered rather than
+                // failing outright, so say which ones it is running without.
+                `${paths.length - degradedRoutes.length} of ${paths.length} routes carrying traffic`
+              : `${paths.length} active route${paths.length === 1 ? '' : 's'}`}
         </small>
       </div>
       {paths.length ? (
@@ -1855,6 +1863,9 @@ function App() {
     state?.rules.filter((rule) => rule.enabled && (!rule.groupId || enabledRuleGroupIds.has(rule.groupId))).length ?? 0
   const relay = state?.relays.find((item) => item.id === state.activeRelayId)
   const trafficMode = state?.trafficMode ?? 'split'
+  // The engine reports this when capture starts. GamePath tunnels IPv4, so a
+  // machine with a working IPv6 route keeps sending IPv6 outside the session.
+  const ipv6Exposed = state?.session.capture?.ipv6?.systemHasRoute === true
   const connectionMode = state?.connectionMode ?? 'relay'
   const direct = connectionMode === 'direct'
   // Both tunnelling kinds route packets themselves, so both can be the single
@@ -1918,7 +1929,7 @@ function App() {
       title: 'Choose traffic mode',
       detail:
         state.trafficMode === 'all'
-          ? 'All system traffic'
+          ? 'All IPv4 system traffic'
           : `${enabledRules} active split-tunnel target${enabledRules === 1 ? '' : 's'}`,
       action: 'Configure',
       onClick: () => setView('split'),
@@ -2279,22 +2290,37 @@ function App() {
                   >
                     <Globe2 size={15} />
                     <span>
-                      All traffic<small>Whole system</small>
+                      All IPv4 traffic<small>Whole system</small>
                     </span>
                   </button>
                 </div>
               </div>
               {state.trafficMode === 'all' && (
-                <div className="all-traffic-banner">
-                  <Globe2 size={19} />
-                  <div>
-                    <strong>All-traffic mode is active</strong>
-                    <p>
-                      Every compatible connection on this PC will use the multipath relay. The rules below are saved but
-                      ignored.
-                    </p>
+                <>
+                  <div className="all-traffic-banner">
+                    <Globe2 size={19} />
+                    <div>
+                      <strong>All-IPv4-traffic mode is active</strong>
+                      <p>
+                        Every IPv4 connection on this PC will use the multipath relay. The rules below are saved but
+                        ignored.
+                      </p>
+                    </div>
                   </div>
-                </div>
+                  {ipv6Exposed && (
+                    <div className="all-traffic-banner is-warning">
+                      <ShieldAlert size={19} />
+                      <div>
+                        <strong>IPv6 is not carried</strong>
+                        <p>
+                          This PC has a working IPv6 route, and IPv6 connections keep using your normal connection while
+                          GamePath is running. Disable IPv6 on the adapter if every connection must go through the
+                          relay.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
               <div className={state.trafficMode === 'all' ? 'rules-disabled' : ''}>
                 {selectedRuleGroup ? (

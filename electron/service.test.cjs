@@ -31,3 +31,25 @@ test('authenticates and parses a network service response', async (context) => {
   assert.equal(status.status, 'ready')
   assert.equal(status.elevated, true)
 })
+
+test('the session lease is renewed from the main process, well inside its window', () => {
+  const main = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8')
+  const service = fs.readFileSync(path.join(__dirname, '..', 'service', 'src', 'main.rs'), 'utf8')
+
+  const pollMs = Number(main.match(/const SESSION_POLL_MS = (\d+)/)[1])
+  const leaseSeconds = Number(service.match(/const SESSION_LEASE: Duration = Duration::from_secs\((\d+)\)/)[1])
+
+  // The lease is what stops the service tearing down a live session. Renewing
+  // it has to survive several consecutive failures, or a slow request during a
+  // game drops the connection.
+  assert.ok(
+    pollMs * 5 <= leaseSeconds * 1000,
+    `a ${pollMs}ms poll leaves too little headroom in a ${leaseSeconds}s lease`,
+  )
+
+  // It must be renewed by a main-process timer. Chromium throttles renderer
+  // timers in an occluded window, which is what a fullscreen game makes this.
+  assert.match(main, /sessionKeepAlive = setInterval\(pollSessionStatus, SESSION_POLL_MS\)/)
+  assert.match(main, /startSessionKeepAlive\(\)/)
+  assert.match(main, /backgroundThrottling: false/)
+})
