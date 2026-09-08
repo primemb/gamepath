@@ -82,6 +82,7 @@ let mockTelemetryTick = 0
 
 export const mockApi: GamePathApi = {
   bootstrap: async () => snapshot(),
+  lookupIpCountry: async () => null,
   importWireGuard: async () => ({ canceled: true }),
   chooseOpenVpnFiles: async () => {
     // The mock stands in when no preload bridge is present, which happens when

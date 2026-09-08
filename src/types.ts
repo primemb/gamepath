@@ -59,6 +59,8 @@ export type OpenVpnAddResult = {
   failures: OpenVpnRejection[]
 }
 
+export type IpCountry = { ip: string; country: string; countryCode: string }
+
 export type Socks5NodeInput = {
   address: string
   label?: string
@@ -207,6 +209,7 @@ export type AddRuleInput = Pick<SplitRule, 'kind' | 'value' | 'label'>
 
 export type GamePathApi = {
   bootstrap: () => Promise<AppState>
+  lookupIpCountry: (target: string) => Promise<IpCountry | null>
   importWireGuard: () => Promise<{ canceled: boolean; state?: AppState; errors?: string[] }>
   chooseOpenVpnFiles: () => Promise<OpenVpnChoice>
   addOpenVpnNodes: (input: { filePaths: string[]; username?: string; password?: string }) => Promise<OpenVpnAddResult>

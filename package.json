@@ -36,6 +36,7 @@
   },
   "dependencies": {
     "@fontsource-variable/inter": "latest",
+    "country-flag-icons": "^1.6.20",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",

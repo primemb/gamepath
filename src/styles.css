@@ -33,6 +33,34 @@ button {
   color: inherit;
 }
 
+.address-with-country {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.address-with-country > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.country-flag {
+  width: 18px;
+  height: 12px;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+}
+.flag-orb .country-flag {
+  width: 38px;
+  height: 25px;
+  border-radius: 5px;
+}
+
 .loading {
   height: 100vh;
   display: flex;

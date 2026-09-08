@@ -10,6 +10,9 @@ const { directNodeSelection, directSelectionAfterSwitch } = require('./connectio
 const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
 const { provisionRelay, removeRelay } = require('./vps.cjs')
+const { createIpCountryLookup } = require('./ip-country.cjs')
+
+const lookupIpCountry = createIpCountryLookup()
 
 const defaultState = () => ({
   tunnels: [],
@@ -236,6 +239,7 @@ function activeRelayWithToken() {
 
 function registerIpc() {
   ipcMain.handle('app:bootstrap', () => publicState())
+  ipcMain.handle('ip-country:lookup', (_event, target) => lookupIpCountry(String(target ?? '').slice(0, 300)))
 
   ipcMain.handle('node:add-socks5', (_event, input) => {
     const { node, credentials } = parseSocks5Node(input ?? {}, crypto.randomUUID())

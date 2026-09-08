@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import {
   Activity,
   AppWindow,
@@ -35,6 +36,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { mockApi } from './mockApi'
+import { AddressWithCountry, CountryFlag, IpCountryFlag } from './IpLocation'
 import type {
   AddRuleInput,
   AppState,
@@ -183,7 +185,7 @@ function Endpoint({
   onTest: () => Promise<Socks5ProbeResult>
 }) {
   const [testing, setTesting] = useState(false)
-  const [outcome, setOutcome] = useState<{ ok: boolean; message: string } | null>(null)
+  const [outcome, setOutcome] = useState<{ ok: boolean; message: ReactNode } | null>(null)
   const isProxy = tunnel.kind === 'socks5'
   const isOpenVpn = tunnel.kind === 'openvpn'
   // A proxy has no way to route on its own, so in direct mode it stays in the
@@ -208,7 +210,9 @@ function Endpoint({
             </span>
           )}
         </div>
-        <p>{tunnel.endpoint}</p>
+        <p>
+          <AddressWithCountry value={tunnel.endpoint} />
+        </p>
         <div className="route-meta">
           {isProxy ? (
             <>
@@ -237,10 +241,16 @@ function Endpoint({
           ) : (
             <>
               <span>
-                Address <strong>{tunnel.address}</strong>
+                Address{' '}
+                <strong>
+                  <AddressWithCountry value={tunnel.address} />
+                </strong>
               </span>
               <span>
-                DNS <strong>{tunnel.dns}</strong>
+                DNS{' '}
+                <strong>
+                  <AddressWithCountry value={tunnel.dns} />
+                </strong>
               </span>
               <span>
                 <ShieldCheck size={13} /> Key protected
@@ -281,7 +291,12 @@ function Endpoint({
                 const probe = await onTest()
                 setOutcome({
                   ok: true,
-                  message: `Relay answered through ${probe.proxy} in ${Math.round(probe.latencyMs)} ms (${Math.round(probe.setupLatencyMs)} ms to open the association).`,
+                  message: (
+                    <>
+                      Relay answered through <AddressWithCountry value={probe.proxy} /> in {Math.round(probe.latencyMs)}{' '}
+                      ms ({Math.round(probe.setupLatencyMs)} ms to open the association).
+                    </>
+                  ),
                 })
               } catch (error) {
                 setOutcome({ ok: false, message: (error as Error).message })
@@ -499,21 +514,27 @@ function TelemetryPanel({
     bestPath?.nodeLatencyMs != null && bestPath.latencyMs != null
       ? Math.max(0, bestPath.latencyMs - bestPath.nodeLatencyMs)
       : null
-  const serverStage = [
+  const serverStage: [string, number | null | undefined, ReactNode] = [
     direct ? 'VPN node → server' : 'Relay → server',
     metrics?.relayToServerMs,
-    metrics?.benchmarkServer ? `Benchmark ${metrics.benchmarkServer}` : 'Awaiting target',
-  ] as const
-  const stages = direct
-    ? ([
+    metrics?.benchmarkServer ? (
+      <span className="journey-endpoint">
+        Benchmark <AddressWithCountry value={metrics.benchmarkServer} />
+      </span>
+    ) : (
+      'Awaiting target'
+    ),
+  ]
+  const stages: Array<[string, number | null | undefined, ReactNode]> = direct
+    ? [
         ['You → VPN node', bestPath?.nodeLatencyMs, bestPath ? `${bestPath.label} handshake` : 'Awaiting node'],
         serverStage,
-      ] as const)
-    : ([
+      ]
+    : [
         ['User → VPN node', bestPath?.nodeLatencyMs, bestPath ? `${bestPath.label} handshake` : 'Awaiting route'],
         ['VPN node → relay', bestNodeToRelay, bestPath ? `${bestPath.label} estimate` : 'Awaiting route'],
         serverStage,
-      ] as const)
+      ]
   return (
     <section className="telemetry-panel">
       <div className="telemetry-head">
@@ -611,7 +632,9 @@ function TelemetryPanel({
                   <span className="node-color" style={{ background: pathColors[index % pathColors.length] }} />
                   <div>
                     <strong>{path.label}</strong>
-                    <small>{path.endpoint}</small>
+                    <small>
+                      <AddressWithCountry value={path.endpoint} />
+                    </small>
                   </div>
                   <span className={`route-health ${path.reachable ? 'online' : ''}`}>
                     <i />
@@ -704,8 +727,10 @@ function TelemetryPanel({
                       <strong>{connection.application}</strong>
                     </span>
                     <code>
-                      {connection.destinationIp}
-                      {connection.destinationPort ? `:${connection.destinationPort}` : ''}
+                      <AddressWithCountry
+                        value={connection.destinationIp}
+                        suffix={connection.destinationPort ? `:${connection.destinationPort}` : ''}
+                      />
                     </code>
                     <em>{connection.protocol}</em>
                     <time>
@@ -926,7 +951,7 @@ function OpenVpnLoginModal({
             <li key={file.path}>
               <strong>{file.name}</strong>
               <span>
-                {file.endpoint} · {file.protocol.toUpperCase()}
+                <AddressWithCountry value={file.endpoint} /> · {file.protocol.toUpperCase()}
               </span>
             </li>
           ))}
@@ -2082,7 +2107,9 @@ function App() {
                             <strong>{rule.label}</strong>
                           </span>
                           <span className="kind-label">{rule.kind}</span>
-                          <span className="truncate">{rule.value}</span>
+                          <span className="truncate">
+                            {rule.kind === 'ip' ? <AddressWithCountry value={rule.value} /> : rule.value}
+                          </span>
                           <span>
                             <Toggle
                               checked={rule.enabled}
@@ -2146,7 +2173,17 @@ function App() {
                       Add VPS relay
                     </button>
                   </div>
-                  <div className="flag-orb">{relay?.code ?? 'GP'}</div>
+                  <div className="flag-orb">
+                    {relay ? (
+                      relay.address ? (
+                        <IpCountryFlag target={relay.address} />
+                      ) : (
+                        <CountryFlag countryCode={relay.code} country={relay.country} />
+                      )
+                    ) : (
+                      'GP'
+                    )}
+                  </div>
                 </div>
                 <div className="relay-grid">
                   {state.relays.map((item) => (
@@ -2163,7 +2200,11 @@ function App() {
                           <div>
                             <strong>{item.city}</strong>
                             <small>
-                              {item.address ? `${item.address}:${item.port}` : `${item.country} · VPS not configured`}
+                              {item.address ? (
+                                <AddressWithCountry value={item.address} suffix={`:${item.port}`} />
+                              ) : (
+                                `${item.country} · VPS not configured`
+                              )}
                             </small>
                           </div>
                         </div>
