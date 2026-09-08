@@ -33,9 +33,18 @@ let state: AppState = {
       value: 'C:\\Games\\VALORANT\\VALORANT.exe',
       label: 'VALORANT.exe',
       enabled: true,
+      groupId: 'group-competitive',
     },
-    { id: 'rule-2', kind: 'hostname', value: '*.riotgames.com', label: 'Riot game services', enabled: true },
+    {
+      id: 'rule-2',
+      kind: 'hostname',
+      value: '*.riotgames.com',
+      label: 'Riot game services',
+      enabled: true,
+      groupId: 'group-competitive',
+    },
   ],
+  ruleGroups: [{ id: 'group-competitive', name: 'Competitive games', enabled: true }],
   trafficMode: 'split',
   connectionMode: 'relay',
   relays: [
@@ -154,8 +163,29 @@ export const mockApi: GamePathApi = {
     state.rules = state.rules.map((item) => (item.id === id ? { ...item, enabled } : item))
     return snapshot()
   },
+  setRuleGroup: async (id, groupId) => {
+    state.rules = state.rules.map((item) => (item.id === id ? { ...item, groupId } : item))
+    return snapshot()
+  },
   removeRule: async (id) => {
     state.rules = state.rules.filter((item) => item.id !== id)
+    return snapshot()
+  },
+  addRuleGroup: async (name) => {
+    state.ruleGroups.push({ id: crypto.randomUUID(), name: name.trim(), enabled: true })
+    return snapshot()
+  },
+  renameRuleGroup: async (id, name) => {
+    state.ruleGroups = state.ruleGroups.map((group) => (group.id === id ? { ...group, name: name.trim() } : group))
+    return snapshot()
+  },
+  setRuleGroupEnabled: async (id, enabled) => {
+    state.ruleGroups = state.ruleGroups.map((group) => (group.id === id ? { ...group, enabled } : group))
+    return snapshot()
+  },
+  removeRuleGroup: async (id) => {
+    state.ruleGroups = state.ruleGroups.filter((group) => group.id !== id)
+    state.rules = state.rules.map((rule) => (rule.groupId === id ? { ...rule, groupId: null } : rule))
     return snapshot()
   },
   setTrafficMode: async (mode) => {

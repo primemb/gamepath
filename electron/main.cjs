@@ -19,6 +19,7 @@ const defaultState = () => ({
   encryptedConfigs: {},
   encryptedRelayTokens: {},
   rules: [],
+  ruleGroups: [],
   trafficMode: 'split',
   connectionMode: 'relay',
   relays: [
@@ -70,6 +71,12 @@ function loadState() {
     const loaded = JSON.parse(fs.readFileSync(statePath(), 'utf8'))
     state = { ...defaultState(), ...loaded, session: { status: 'idle' } }
     state.encryptedRelayTokens ??= {}
+    state.ruleGroups = Array.isArray(state.ruleGroups) ? state.ruleGroups : []
+    const groupIds = new Set(state.ruleGroups.map((group) => group.id))
+    state.rules = state.rules.map((rule) => ({
+      ...rule,
+      groupId: groupIds.has(rule.groupId) ? rule.groupId : null,
+    }))
     // Sessions saved before direct mode existed all went through a relay.
     if (state.connectionMode !== 'direct') state.connectionMode = 'relay'
     // Nodes imported before SOCKS5 support existed are all WireGuard routes.
@@ -424,6 +431,7 @@ function registerIpc() {
       value,
       label: String(input.label || path.basename(value) || value),
       enabled: true,
+      groupId: state.ruleGroups.some((group) => group.id === input.groupId) ? input.groupId : null,
     })
     saveState()
     return publicState()
@@ -436,8 +444,54 @@ function registerIpc() {
     return publicState()
   })
 
+  ipcMain.handle('rule:set-group', (_event, id, groupId) => {
+    const rule = state.rules.find((item) => item.id === id)
+    if (rule) rule.groupId = state.ruleGroups.some((group) => group.id === groupId) ? groupId : null
+    saveState()
+    return publicState()
+  })
+
   ipcMain.handle('rule:remove', (_event, id) => {
     state.rules = state.rules.filter((item) => item.id !== id)
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('rule-group:add', (_event, rawName) => {
+    const name = String(rawName ?? '').trim()
+    if (!name) throw new Error('A group name is required')
+    if (state.ruleGroups.some((group) => group.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      throw new Error('A group with that name already exists')
+    }
+    state.ruleGroups.push({ id: crypto.randomUUID(), name, enabled: true })
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('rule-group:rename', (_event, id, rawName) => {
+    const name = String(rawName ?? '').trim()
+    if (!name) throw new Error('A group name is required')
+    if (
+      state.ruleGroups.some((group) => group.id !== id && group.name.toLocaleLowerCase() === name.toLocaleLowerCase())
+    ) {
+      throw new Error('A group with that name already exists')
+    }
+    const group = state.ruleGroups.find((item) => item.id === id)
+    if (group) group.name = name
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('rule-group:set-enabled', (_event, id, enabled) => {
+    const group = state.ruleGroups.find((item) => item.id === id)
+    if (group) group.enabled = Boolean(enabled)
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('rule-group:remove', (_event, id) => {
+    state.ruleGroups = state.ruleGroups.filter((group) => group.id !== id)
+    for (const rule of state.rules) if (rule.groupId === id) rule.groupId = null
     saveState()
     return publicState()
   })
@@ -629,7 +683,10 @@ function registerIpc() {
   ipcMain.handle('engine:start', async () => {
     const mode = state.connectionMode === 'direct' ? 'direct' : 'relay'
     const enabledTunnels = state.tunnels.filter((tunnel) => tunnel.enabled)
-    const enabledRules = state.rules.filter((rule) => rule.enabled)
+    const enabledGroupIds = new Set(state.ruleGroups.filter((group) => group.enabled).map((group) => group.id))
+    const enabledRules = state.rules.filter(
+      (rule) => rule.enabled && (!rule.groupId || enabledGroupIds.has(rule.groupId)),
+    )
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     const encryptedRelayToken = relay && state.encryptedRelayTokens[relay.id]
     const direct = mode === 'direct'

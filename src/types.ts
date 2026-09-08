@@ -84,6 +84,13 @@ export type SplitRule = {
   value: string
   label: string
   enabled: boolean
+  groupId: string | null
+}
+
+export type SplitRuleGroup = {
+  id: string
+  name: string
+  enabled: boolean
 }
 
 export type Relay = {
@@ -129,6 +136,7 @@ export type AppState = {
   clientVersion?: string
   tunnels: Tunnel[]
   rules: SplitRule[]
+  ruleGroups: SplitRuleGroup[]
   trafficMode: 'all' | 'split'
   connectionMode: ConnectionMode
   relays: Relay[]
@@ -205,7 +213,7 @@ export type AppState = {
   }
 }
 
-export type AddRuleInput = Pick<SplitRule, 'kind' | 'value' | 'label'>
+export type AddRuleInput = Pick<SplitRule, 'kind' | 'value' | 'label' | 'groupId'>
 
 export type GamePathApi = {
   bootstrap: () => Promise<AppState>
@@ -221,7 +229,12 @@ export type GamePathApi = {
   browseRuleTarget: (kind: RuleKind) => Promise<{ canceled: boolean; value?: string; label?: string }>
   addRule: (input: AddRuleInput) => Promise<AppState>
   setRuleEnabled: (id: string, enabled: boolean) => Promise<AppState>
+  setRuleGroup: (id: string, groupId: string | null) => Promise<AppState>
   removeRule: (id: string) => Promise<AppState>
+  addRuleGroup: (name: string) => Promise<AppState>
+  renameRuleGroup: (id: string, name: string) => Promise<AppState>
+  setRuleGroupEnabled: (id: string, enabled: boolean) => Promise<AppState>
+  removeRuleGroup: (id: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
   setConnectionMode: (mode: ConnectionMode) => Promise<AppState>
   setRelay: (id: string) => Promise<AppState>

@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import {
   Activity,
   AppWindow,
+  ArrowLeft,
   ArrowDownRight,
   ArrowUpRight,
   Check,
@@ -22,6 +23,7 @@ import {
   MapPin,
   Network,
   Plus,
+  Pencil,
   Power,
   Radio,
   Route,
@@ -45,6 +47,8 @@ import type {
   PathMetric,
   Relay,
   RuleKind,
+  SplitRule,
+  SplitRuleGroup,
   OpenVpnCandidate,
   OpenVpnRejection,
   Socks5NodeInput,
@@ -771,10 +775,83 @@ function TelemetryPanel({
   )
 }
 
-function RuleModal({ onClose, onSave }: { onClose: () => void; onSave: (input: AddRuleInput) => Promise<void> }) {
+function RuleRow({
+  rule,
+  groups,
+  groupEnabled,
+  onToggle,
+  onMove,
+  onRemove,
+}: {
+  rule: SplitRule
+  groups: SplitRuleGroup[]
+  groupEnabled: boolean
+  onToggle: (enabled: boolean) => Promise<void>
+  onMove: (groupId: string | null) => Promise<void>
+  onRemove: () => Promise<void>
+}) {
+  const Icon =
+    rule.kind === 'application'
+      ? AppWindow
+      : rule.kind === 'folder'
+        ? FolderOpen
+        : rule.kind === 'hostname'
+          ? Globe2
+          : Network
+  const active = rule.enabled && groupEnabled
+
+  return (
+    <div className={`table-row ${groupEnabled ? '' : 'is-group-paused'}`}>
+      <span className="target-cell">
+        <i aria-hidden="true">
+          <Icon size={16} />
+        </i>
+        <strong>{rule.label}</strong>
+      </span>
+      <span className="kind-label">{rule.kind}</span>
+      <span className="truncate">{rule.kind === 'ip' ? <AddressWithCountry value={rule.value} /> : rule.value}</span>
+      <label className="rule-group-field">
+        <span className="sr-only">Group for {rule.label}</span>
+        <select value={rule.groupId ?? ''} onChange={(event) => void onMove(event.target.value || null)}>
+          <option value="">Ungrouped</option>
+          {groups.map((group) => (
+            <option key={group.id} value={group.id}>
+              {group.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <span className="rule-status-control">
+        {!groupEnabled && <small>Paused</small>}
+        <Toggle
+          checked={rule.enabled}
+          onChange={onToggle}
+          label={`${rule.enabled ? 'Disable' : 'Enable'} ${rule.label}`}
+        />
+        <span className="sr-only">{active ? 'Active' : 'Inactive'}</span>
+      </span>
+      <button className="icon-button danger" onClick={onRemove} aria-label={`Remove ${rule.label}`}>
+        <Trash2 size={16} aria-hidden="true" />
+      </button>
+    </div>
+  )
+}
+
+function RuleModal({
+  groups,
+  initialGroupId,
+  onClose,
+  onSave,
+}: {
+  groups: SplitRuleGroup[]
+  initialGroupId: string | null
+  onClose: () => void
+  onSave: (input: AddRuleInput) => Promise<void>
+}) {
   const [kind, setKind] = useState<RuleKind>('application')
   const [value, setValue] = useState('')
   const [label, setLabel] = useState('')
+  const [groupId, setGroupId] = useState(initialGroupId ?? '')
   const kinds: { id: RuleKind; label: string; icon: typeof AppWindow }[] = [
     { id: 'application', label: 'Application', icon: AppWindow },
     { id: 'folder', label: 'Folder', icon: FolderOpen },
@@ -806,8 +883,8 @@ function RuleModal({ onClose, onSave }: { onClose: () => void; onSave: (input: A
             <span className="eyebrow">Traffic rule</span>
             <h2>Add a split-tunnel target</h2>
           </div>
-          <button className="icon-button" onClick={onClose}>
-            <X size={18} />
+          <button className="icon-button" onClick={onClose} aria-label="Close add target dialog">
+            <X size={18} aria-hidden="true" />
           </button>
         </div>
         <p className="modal-intro">
@@ -856,6 +933,18 @@ function RuleModal({ onClose, onSave }: { onClose: () => void; onSave: (input: A
             />
           </label>
         )}
+        <label className="field-label">
+          Group
+          <select value={groupId} onChange={(event) => setGroupId(event.target.value)}>
+            <option value="">Ungrouped</option>
+            {groups.map((group) => (
+              <option key={group.id} value={group.id}>
+                {group.name}
+              </option>
+            ))}
+          </select>
+          <small>Groups let you pause a whole game or workflow without changing its individual targets.</small>
+        </label>
         <div className="modal-actions">
           <button className="button secondary" onClick={onClose}>
             Cancel
@@ -863,13 +952,94 @@ function RuleModal({ onClose, onSave }: { onClose: () => void; onSave: (input: A
           <button
             className="button primary"
             disabled={!value.trim()}
-            onClick={() => onSave({ kind, value, label: label || value })}
+            onClick={() => onSave({ kind, value, label: label || value, groupId: groupId || null })}
           >
             <Plus size={16} />
             Add target
           </button>
         </div>
       </section>
+    </div>
+  )
+}
+
+function RuleGroupModal({
+  initialName = '',
+  onClose,
+  onSave,
+}: {
+  initialName?: string
+  onClose: () => void
+  onSave: (name: string) => Promise<void>
+}) {
+  const [name, setName] = useState(initialName)
+  const [busy, setBusy] = useState(false)
+  const [problem, setProblem] = useState<string | null>(null)
+
+  const submit = async () => {
+    if (!name.trim() || busy) return
+    setBusy(true)
+    setProblem(null)
+    try {
+      await onSave(name.trim())
+    } catch (error) {
+      setProblem(error instanceof Error ? error.message : String(error))
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <form
+        className="modal group-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        onSubmit={(event) => {
+          event.preventDefault()
+          void submit()
+        }}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="new-group-title"
+      >
+        <div className="modal-head">
+          <div>
+            <span className="eyebrow">Target collection</span>
+            <h2 id="new-group-title">{initialName ? 'Edit split group' : 'Create a split group'}</h2>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close create group dialog">
+            <X size={18} aria-hidden="true" />
+          </button>
+        </div>
+        <p className="modal-intro">
+          {initialName
+            ? 'Give this group a clear, recognizable name.'
+            : 'Bundle related apps, services, and destinations under one switch.'}
+        </p>
+        <label className="field-label">
+          Group name
+          <input
+            autoFocus
+            value={name}
+            maxLength={64}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="e.g. Competitive games"
+          />
+        </label>
+        {problem && (
+          <p className="field-error" role="alert">
+            {problem}
+          </p>
+        )}
+        <div className="modal-actions">
+          <button type="button" className="button secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="button primary" disabled={!name.trim() || busy}>
+            <Plus size={16} aria-hidden="true" />
+            {busy ? 'Saving…' : initialName ? 'Save changes' : 'Create group'}
+          </button>
+        </div>
+      </form>
     </div>
   )
 }
@@ -1557,6 +1727,10 @@ function App() {
   const [state, setState] = useState<AppState | null>(null)
   const [view, setView] = useState<View>('dashboard')
   const [showRuleModal, setShowRuleModal] = useState(false)
+  const [ruleModalGroupId, setRuleModalGroupId] = useState<string | null>(null)
+  const [showRuleGroupModal, setShowRuleGroupModal] = useState(false)
+  const [editingRuleGroup, setEditingRuleGroup] = useState<SplitRuleGroup | null>(null)
+  const [selectedRuleGroupId, setSelectedRuleGroupId] = useState<string | null>(null)
   const [showRelayModal, setShowRelayModal] = useState(false)
   const [showAddRelay, setShowAddRelay] = useState(false)
   const [showSocks5Modal, setShowSocks5Modal] = useState(false)
@@ -1633,7 +1807,9 @@ function App() {
 
   const enabledNodes = state?.tunnels.filter((item) => item.enabled) ?? []
   const enabledRoutes = enabledNodes.length
-  const enabledRules = state?.rules.filter((item) => item.enabled).length ?? 0
+  const enabledRuleGroupIds = new Set(state?.ruleGroups.filter((group) => group.enabled).map((group) => group.id) ?? [])
+  const enabledRules =
+    state?.rules.filter((rule) => rule.enabled && (!rule.groupId || enabledRuleGroupIds.has(rule.groupId))).length ?? 0
   const relay = state?.relays.find((item) => item.id === state.activeRelayId)
   const trafficMode = state?.trafficMode ?? 'split'
   const connectionMode = state?.connectionMode ?? 'relay'
@@ -1781,6 +1957,14 @@ function App() {
     relays: ['Connection', 'Choose how your traffic leaves this PC.'],
     settings: ['Settings', 'Control startup, diagnostics, and client behavior.'],
   }
+  const ungroupedRules = state.rules.filter((rule) => !rule.groupId)
+  const selectedRuleGroup =
+    selectedRuleGroupId === '__ungrouped__'
+      ? ({ id: null, name: 'Ungrouped targets', enabled: true } as const)
+      : (state.ruleGroups.find((group) => group.id === selectedRuleGroupId) ?? null)
+  const selectedGroupRules = selectedRuleGroup
+    ? state.rules.filter((rule) => rule.groupId === selectedRuleGroup.id)
+    : []
 
   return (
     <div className="app-shell">
@@ -2069,76 +2253,193 @@ function App() {
                   </div>
                 </div>
               )}
-              <div className="toolbar">
-                <div>
-                  <span className="count-badge">{enabledRules} active</span>
-                  <span className="muted">Rules are matched from most specific to least specific.</span>
-                </div>
-                <button className="button primary" onClick={() => setShowRuleModal(true)}>
-                  <Plus size={16} />
-                  Add target
-                </button>
-              </div>
               <div className={state.trafficMode === 'all' ? 'rules-disabled' : ''}>
-                {state.rules.length ? (
-                  <div className="rules-table">
-                    <div className="table-head">
-                      <span>Target</span>
-                      <span>Type</span>
-                      <span>Destination</span>
-                      <span>Status</span>
-                      <span />
+                {selectedRuleGroup ? (
+                  <div className="group-detail">
+                    <button className="back-button" onClick={() => setSelectedRuleGroupId(null)}>
+                      <ArrowLeft size={16} aria-hidden="true" /> All groups
+                    </button>
+                    <div className={`group-detail-hero ${selectedRuleGroup.enabled ? '' : 'is-paused'}`}>
+                      <span className="group-detail-icon" aria-hidden="true">
+                        <Layers size={24} />
+                      </span>
+                      <div>
+                        <span className="eyebrow">Split group</span>
+                        <h2>{selectedRuleGroup.name}</h2>
+                        <p>
+                          {selectedGroupRules.length} target{selectedGroupRules.length === 1 ? '' : 's'} ·{' '}
+                          {selectedGroupRules.filter((rule) => rule.enabled && selectedRuleGroup.enabled).length} active
+                        </p>
+                      </div>
+                      <div className="group-detail-actions">
+                        {selectedRuleGroup.id !== null && (
+                          <>
+                            <button className="button secondary" onClick={() => setEditingRuleGroup(selectedRuleGroup)}>
+                              <Pencil size={15} aria-hidden="true" /> Edit name
+                            </button>
+                            <span className="group-power">
+                              <span>{selectedRuleGroup.enabled ? 'Group on' : 'Group off'}</span>
+                              <Toggle
+                                checked={selectedRuleGroup.enabled}
+                                onChange={async (enabled) =>
+                                  setState(await api.setRuleGroupEnabled(selectedRuleGroup.id!, enabled))
+                                }
+                                label={`${selectedRuleGroup.enabled ? 'Disable' : 'Enable'} ${selectedRuleGroup.name} group`}
+                              />
+                            </span>
+                          </>
+                        )}
+                        <button
+                          className="button primary"
+                          onClick={() => {
+                            setRuleModalGroupId(selectedRuleGroup.id)
+                            setShowRuleModal(true)
+                          }}
+                        >
+                          <Plus size={16} aria-hidden="true" /> Add target
+                        </button>
+                      </div>
                     </div>
-                    {state.rules.map((rule) => {
-                      const Icon =
-                        rule.kind === 'application'
-                          ? AppWindow
-                          : rule.kind === 'folder'
-                            ? FolderOpen
-                            : rule.kind === 'hostname'
-                              ? Globe2
-                              : Network
-                      return (
-                        <div className="table-row" key={rule.id}>
-                          <span className="target-cell">
-                            <i>
-                              <Icon size={16} />
-                            </i>
-                            <strong>{rule.label}</strong>
-                          </span>
-                          <span className="kind-label">{rule.kind}</span>
-                          <span className="truncate">
-                            {rule.kind === 'ip' ? <AddressWithCountry value={rule.value} /> : rule.value}
-                          </span>
-                          <span>
-                            <Toggle
-                              checked={rule.enabled}
-                              onChange={async (enabled) => setState(await api.setRuleEnabled(rule.id, enabled))}
-                              label={`${rule.enabled ? 'Disable' : 'Enable'} ${rule.label}`}
-                            />
-                          </span>
-                          <button
-                            className="icon-button danger"
-                            onClick={async () => setState(await api.removeRule(rule.id))}
-                          >
-                            <Trash2 size={16} />
-                          </button>
+                    {selectedGroupRules.length ? (
+                      <div className="rules-table">
+                        <div className="table-head">
+                          <span>Target</span>
+                          <span>Type</span>
+                          <span>Destination</span>
+                          <span>Group</span>
+                          <span>Status</span>
+                          <span />
                         </div>
-                      )
-                    })}
+                        {selectedGroupRules.map((rule) => (
+                          <RuleRow
+                            key={rule.id}
+                            rule={rule}
+                            groups={state.ruleGroups}
+                            groupEnabled={selectedRuleGroup.enabled}
+                            onToggle={async (enabled) => setState(await api.setRuleEnabled(rule.id, enabled))}
+                            onMove={async (groupId) => setState(await api.setRuleGroup(rule.id, groupId))}
+                            onRemove={async () => setState(await api.removeRule(rule.id))}
+                          />
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="group-detail-empty">
+                        <Network size={24} aria-hidden="true" />
+                        <h3>This group is ready for targets</h3>
+                        <p>Add an app, folder, hostname, or IP range. You can move targets between groups later.</p>
+                        <button
+                          className="button primary"
+                          onClick={() => {
+                            setRuleModalGroupId(selectedRuleGroup.id)
+                            setShowRuleModal(true)
+                          }}
+                        >
+                          <Plus size={16} aria-hidden="true" /> Add first target
+                        </button>
+                      </div>
+                    )}
+                    {selectedRuleGroup.id !== null && (
+                      <div className="group-danger-zone">
+                        <span>Removing this group keeps its targets in Ungrouped.</span>
+                        <button
+                          className="button danger-text"
+                          onClick={async () => {
+                            setState(await api.removeRuleGroup(selectedRuleGroup.id!))
+                            setSelectedRuleGroupId(null)
+                          }}
+                        >
+                          <Trash2 size={15} aria-hidden="true" /> Remove group
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ) : (
-                  <div className="empty-state">
-                    <span>
-                      <Network size={28} />
-                    </span>
-                    <h2>No traffic targets</h2>
-                    <p>Add a game executable, installation folder, hostname, or IP range.</p>
-                    <button className="button primary" onClick={() => setShowRuleModal(true)}>
-                      <Plus size={16} />
-                      Add first target
-                    </button>
-                  </div>
+                  <>
+                    <div className="toolbar group-overview-toolbar">
+                      <div>
+                        <span className="count-badge">{enabledRules} active</span>
+                        <span className="muted">Open a group to manage its traffic targets.</span>
+                      </div>
+                      <button className="button primary" onClick={() => setShowRuleGroupModal(true)}>
+                        <Plus size={16} aria-hidden="true" /> New group
+                      </button>
+                    </div>
+                    {state.ruleGroups.length || ungroupedRules.length ? (
+                      <div className="split-group-grid">
+                        {state.ruleGroups.map((group) => {
+                          const rules = state.rules.filter((rule) => rule.groupId === group.id)
+                          const activeCount = rules.filter((rule) => rule.enabled && group.enabled).length
+                          return (
+                            <article className={`split-group-card ${group.enabled ? '' : 'is-paused'}`} key={group.id}>
+                              <button className="split-group-open" onClick={() => setSelectedRuleGroupId(group.id)}>
+                                <span className="split-group-card-icon" aria-hidden="true">
+                                  <Layers size={22} />
+                                </span>
+                                <span className="split-group-card-copy">
+                                  <strong>{group.name}</strong>
+                                  <small>
+                                    {group.enabled ? `${activeCount} active` : 'Paused'} · {rules.length} targets
+                                  </small>
+                                </span>
+                                <ChevronRight size={18} aria-hidden="true" />
+                              </button>
+                              <div className="split-group-card-footer">
+                                <span>{group.enabled ? 'Traffic enabled' : 'Traffic paused'}</span>
+                                <Toggle
+                                  checked={group.enabled}
+                                  onChange={async (enabled) =>
+                                    setState(await api.setRuleGroupEnabled(group.id, enabled))
+                                  }
+                                  label={`${group.enabled ? 'Disable' : 'Enable'} ${group.name} group`}
+                                />
+                              </div>
+                            </article>
+                          )
+                        })}
+                        {ungroupedRules.length > 0 && (
+                          <article className="split-group-card is-ungrouped">
+                            <button
+                              className="split-group-open"
+                              onClick={() => setSelectedRuleGroupId('__ungrouped__')}
+                            >
+                              <span className="split-group-card-icon" aria-hidden="true">
+                                <Network size={22} />
+                              </span>
+                              <span className="split-group-card-copy">
+                                <strong>Ungrouped targets</strong>
+                                <small>
+                                  {ungroupedRules.filter((rule) => rule.enabled).length} active ·{' '}
+                                  {ungroupedRules.length} targets
+                                </small>
+                              </span>
+                              <ChevronRight size={18} aria-hidden="true" />
+                            </button>
+                            <div className="split-group-card-footer">
+                              <span>Move these into a group anytime</span>
+                            </div>
+                          </article>
+                        )}
+                        <button className="create-group-card" onClick={() => setShowRuleGroupModal(true)}>
+                          <span aria-hidden="true">
+                            <Plus size={21} />
+                          </span>
+                          <strong>Create another group</strong>
+                          <small>Bundle targets under one on/off switch</small>
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="empty-state group-empty-state">
+                        <span>
+                          <Layers size={28} aria-hidden="true" />
+                        </span>
+                        <h2>Create your first split group</h2>
+                        <p>Keep each game and its related services together, then turn the whole group on or off.</p>
+                        <button className="button primary" onClick={() => setShowRuleGroupModal(true)}>
+                          <Plus size={16} aria-hidden="true" /> Create group
+                        </button>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             </section>
@@ -2429,10 +2730,31 @@ function App() {
 
       {showRuleModal && (
         <RuleModal
+          groups={state.ruleGroups}
+          initialGroupId={ruleModalGroupId}
           onClose={() => setShowRuleModal(false)}
           onSave={async (input) => {
             setState(await api.addRule(input))
             setShowRuleModal(false)
+          }}
+        />
+      )}
+      {showRuleGroupModal && (
+        <RuleGroupModal
+          onClose={() => setShowRuleGroupModal(false)}
+          onSave={async (name) => {
+            setState(await api.addRuleGroup(name))
+            setShowRuleGroupModal(false)
+          }}
+        />
+      )}
+      {editingRuleGroup && (
+        <RuleGroupModal
+          initialName={editingRuleGroup.name}
+          onClose={() => setEditingRuleGroup(null)}
+          onSave={async (name) => {
+            setState(await api.renameRuleGroup(editingRuleGroup.id, name))
+            setEditingRuleGroup(null)
           }}
         />
       )}
