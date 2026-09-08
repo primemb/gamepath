@@ -1,3 +1,5 @@
+#[cfg(feature = "openvpn")]
+use crate::openvpn::{Credentials, UserSpaceOpenVpnPath};
 use crate::socks5::{Socks5NodeConfig, Socks5UdpPath};
 use crate::userspace_wireguard::{UserSpaceWireGuardPath, ipv4_udp_packet, ipv4_udp_payload};
 use rand::Rng;
@@ -7,6 +9,10 @@ use std::time::Duration;
 
 pub const KIND_WIREGUARD: &str = "wireguard";
 pub const KIND_SOCKS5: &str = "socks5";
+/// Only the client speaks OpenVPN. The relay links this crate for its frame and
+/// session types and is built without the feature, so the kind is gated with it.
+#[cfg(feature = "openvpn")]
+pub const KIND_OPENVPN: &str = "openvpn";
 
 /// How a session reaches the Internet.
 ///
@@ -57,6 +63,18 @@ pub enum NodeSpec {
         #[serde(default)]
         label: Option<String>,
     },
+    /// A provider's `.ovpn` file, plus the credentials it asks for.
+    #[cfg(feature = "openvpn")]
+    #[serde(rename = "openvpn")]
+    OpenVpn {
+        config: String,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+        #[serde(default)]
+        label: Option<String>,
+    },
 }
 
 impl NodeSpec {
@@ -64,6 +82,8 @@ impl NodeSpec {
         match self {
             Self::WireGuard { .. } => KIND_WIREGUARD,
             Self::Socks5 { .. } => KIND_SOCKS5,
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn { .. } => KIND_OPENVPN,
         }
     }
 
@@ -76,6 +96,20 @@ impl NodeSpec {
             }
             Self::Socks5 { .. } => Ok(Box::new(Socks5RelayPath::open(
                 &self.socks5_config().ok_or("node is not a SOCKS5 node")?,
+                relay,
+            )?)),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn {
+                config,
+                username,
+                password,
+                ..
+            } => Ok(Box::new(OpenVpnRelayPath::from_config(
+                config,
+                Credentials {
+                    username: username.clone(),
+                    password: password.clone(),
+                },
                 relay,
             )?)),
         }
@@ -95,11 +129,33 @@ impl NodeSpec {
                 .socks5_config()
                 .ok_or("node is not a SOCKS5 node")?
                 .validate(),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn {
+                config,
+                username,
+                password,
+                ..
+            } => {
+                let parsed = crate::openvpn::OpenVpnConfig::parse(config)?;
+                if parsed.wants_credentials && username.as_deref().unwrap_or_default().is_empty() {
+                    return Err(
+                        "this OpenVPN configuration uses `auth-user-pass`, so it needs the \
+                         username and password the provider gave you"
+                            .into(),
+                    );
+                }
+                if parsed.wants_credentials && password.as_deref().unwrap_or_default().is_empty() {
+                    return Err("this OpenVPN node has a username but no password".into());
+                }
+                Ok(())
+            }
         }
     }
 
     pub fn socks5_config(&self) -> Option<Socks5NodeConfig> {
         match self {
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn { .. } => None,
             Self::WireGuard { .. } => None,
             Self::Socks5 {
                 host,
@@ -121,6 +177,8 @@ impl NodeSpec {
     pub fn is_loopback_proxy(&self) -> bool {
         match self {
             Self::WireGuard { .. } => false,
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn { .. } => false,
             Self::Socks5 { host, .. } => {
                 let host = host.trim();
                 host.eq_ignore_ascii_case("localhost")
@@ -134,6 +192,8 @@ impl NodeSpec {
     pub fn label(&self) -> Option<String> {
         let label = match self {
             Self::WireGuard { label, .. } | Self::Socks5 { label, .. } => label.as_deref()?,
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn { label, .. } => label.as_deref()?,
         };
         Some(label.trim())
             .filter(|label| !label.is_empty())
@@ -144,6 +204,8 @@ impl NodeSpec {
         match self {
             Self::WireGuard { .. } => format!("WireGuard route {route}"),
             Self::Socks5 { .. } => format!("SOCKS5 route {route}"),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn { .. } => format!("OpenVPN route {route}"),
         }
     }
 
@@ -154,26 +216,54 @@ impl NodeSpec {
     /// that; a SOCKS5 proxy speaks in connections and datagrams instead and
     /// has nothing to route with, which is why it is turned away here rather
     /// than failing later with a confusing transport error.
-    pub fn open_direct(&self) -> Result<DirectWireGuardPath, String> {
+    pub fn open_direct(&self) -> Result<DirectPath, String> {
         match self {
-            Self::WireGuard { config, .. } => DirectWireGuardPath::from_config(config),
+            Self::WireGuard { config, .. } => Ok(DirectPath::WireGuard(Box::new(
+                DirectWireGuardPath::from_config(config)?,
+            ))),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn {
+                config,
+                username,
+                password,
+                ..
+            } => Ok(DirectPath::OpenVpn(Box::new(
+                UserSpaceOpenVpnPath::from_config(
+                    config,
+                    Credentials {
+                        username: username.clone(),
+                        password: password.clone(),
+                    },
+                )?,
+            ))),
             Self::Socks5 { .. } => Err(
-                "a SOCKS5 proxy cannot carry a direct session on its own. Use a WireGuard node \
-                 for direct mode, or set up a relay to reach this proxy through."
+                "a SOCKS5 proxy cannot carry a direct session on its own. Use a WireGuard or \
+                 OpenVPN node for direct mode, or set up a relay to reach this proxy through."
                     .into(),
             ),
         }
     }
 
     /// Whether this node can be the single hop of a direct session.
+    ///
+    /// Both tunnelling nodes can: their servers route whatever is put into
+    /// them. A proxy cannot, because it speaks in connections and datagrams and
+    /// has nothing to route with.
     pub fn supports_direct(&self) -> bool {
-        matches!(self, Self::WireGuard { .. })
+        match self {
+            Self::WireGuard { .. } => true,
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn { .. } => true,
+            Self::Socks5 { .. } => false,
+        }
     }
 
     pub fn describe(&self) -> String {
         match self {
             Self::WireGuard { .. } => "WireGuard configuration".to_owned(),
             Self::Socks5 { host, port, .. } => format!("SOCKS5 proxy {host}:{port}"),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn { .. } => "OpenVPN configuration".to_owned(),
         }
     }
 }
@@ -190,6 +280,13 @@ pub enum PathIdentity {
     },
     /// A second association on one proxy works, but carries no path diversity.
     Socks5 { proxy: SocketAddr },
+    /// The same provider account reached at the same server: the second session
+    /// commonly displaces the first.
+    #[cfg(feature = "openvpn")]
+    OpenVpn {
+        endpoint: SocketAddr,
+        fingerprint: [u8; 32],
+    },
 }
 
 /// One outer transport carrying sealed GamePath frames to the relay.
@@ -359,6 +456,191 @@ impl DirectWireGuardPath {
         // handed back to the capture layer.
         packets.retain(|packet| ipv4_destination(packet) == Some(address));
         Ok(packets)
+    }
+}
+
+/// The single hop of a direct session, whichever kind of node provides it.
+///
+/// A direct session has no relay to frame traffic for, so the node's own server
+/// does the routing and the captured packets go through unchanged. Both
+/// tunnelling nodes can do that, and the session above does not care which one
+/// it got.
+pub enum DirectPath {
+    WireGuard(Box<DirectWireGuardPath>),
+    #[cfg(feature = "openvpn")]
+    OpenVpn(Box<UserSpaceOpenVpnPath>),
+}
+
+impl DirectPath {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::WireGuard(_) => KIND_WIREGUARD,
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn(_) => KIND_OPENVPN,
+        }
+    }
+
+    /// The tunnel's own address, which captured packets are rewritten to use
+    /// and which replies come back addressed to.
+    pub fn address(&self) -> Ipv4Addr {
+        match self {
+            Self::WireGuard(path) => path.address(),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn(path) => path.address(),
+        }
+    }
+
+    pub fn endpoint(&self) -> SocketAddr {
+        match self {
+            Self::WireGuard(path) => path.endpoint(),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn(path) => path.endpoint(),
+        }
+    }
+
+    /// The node's public address, which must keep reaching the Internet
+    /// directly once the tunnel owns the default route.
+    pub fn bypass_ipv4(&self) -> Option<Ipv4Addr> {
+        match self {
+            Self::WireGuard(path) => path.bypass_ipv4(),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn(path) => match path.endpoint().ip() {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            },
+        }
+    }
+
+    /// Round trip of the node's own setup, and the proof that it completed: a
+    /// direct session has no relay to ping, so this is what says the node
+    /// answered at all.
+    pub fn handshake_latency_ms(&self) -> Option<f64> {
+        match self {
+            Self::WireGuard(path) => path.handshake_latency_ms(),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn(path) => path.handshake_latency_ms(),
+        }
+    }
+
+    pub fn send_packet(&mut self, packet: &[u8]) -> Result<(), String> {
+        match self {
+            Self::WireGuard(path) => path.send_packet(packet),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn(path) => path.send_inner(packet),
+        }
+    }
+
+    /// Collects the packets the node routed back to us, waiting at most
+    /// `timeout` for the first one.
+    pub fn receive_packets(&mut self, timeout: Duration) -> Result<Vec<Vec<u8>>, String> {
+        match self {
+            Self::WireGuard(path) => path.receive_packets(timeout),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn(path) => {
+                let address = path.address();
+                let mut packets = path.receive_inner(timeout)?;
+                // A provider's tunnel carries its own network's broadcast and
+                // multicast traffic as well as our replies. Only what is
+                // addressed to this tunnel can go back to the capture layer.
+                packets.retain(|packet| ipv4_destination(packet) == Some(address));
+                Ok(packets)
+            }
+        }
+    }
+}
+
+/// Carries relay frames inside an inner IPv4/UDP packet through an OpenVPN
+/// tunnel.
+///
+/// This is the WireGuard arrangement exactly: the node is a tunnel that routes
+/// IP packets, so a frame for the relay is wrapped in a datagram addressed to
+/// it and handed over.
+#[cfg(feature = "openvpn")]
+pub struct OpenVpnRelayPath {
+    path: Box<UserSpaceOpenVpnPath>,
+    relay: SocketAddrV4,
+    source_port: u16,
+}
+
+#[cfg(feature = "openvpn")]
+impl OpenVpnRelayPath {
+    pub fn from_config(
+        source: &str,
+        credentials: Credentials,
+        relay: SocketAddrV4,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            path: Box::new(UserSpaceOpenVpnPath::from_config(source, credentials)?),
+            relay,
+            source_port: rand::rng().random_range(49_152..=65_535),
+        })
+    }
+
+    /// Which transport the session settled on, which is worth reporting because
+    /// a udp configuration falls back to tcp when udp cannot get through.
+    pub fn protocol(&self) -> &'static str {
+        self.path.protocol().as_str()
+    }
+}
+
+#[cfg(feature = "openvpn")]
+impl RelayPath for OpenVpnRelayPath {
+    fn send_frame(&mut self, frame: &[u8]) -> Result<(), String> {
+        let inner = ipv4_udp_packet(
+            self.path.address(),
+            *self.relay.ip(),
+            self.source_port,
+            self.relay.port(),
+            frame,
+        )?;
+        self.path.send_inner(&inner)
+    }
+
+    fn receive_frames(&mut self, timeout: Duration) -> Result<Vec<Vec<u8>>, String> {
+        let packets = self.path.receive_inner(timeout)?;
+        let mut frames = Vec::new();
+        for packet in packets {
+            let Some((source_ip, destination_ip, source_port, destination_port, payload)) =
+                ipv4_udp_payload(&packet)
+            else {
+                continue;
+            };
+            if source_ip != *self.relay.ip()
+                || destination_ip != self.path.address()
+                || source_port != self.relay.port()
+                || destination_port != self.source_port
+            {
+                continue;
+            }
+            frames.push(payload.to_vec());
+        }
+        Ok(frames)
+    }
+
+    fn kind(&self) -> &'static str {
+        KIND_OPENVPN
+    }
+
+    fn endpoint(&self) -> String {
+        format!("{} over {}", self.path.endpoint(), self.protocol())
+    }
+
+    fn setup_latency_ms(&self) -> Option<f64> {
+        self.path.handshake_latency_ms()
+    }
+
+    fn identity(&self) -> PathIdentity {
+        PathIdentity::OpenVpn {
+            endpoint: self.path.endpoint(),
+            fingerprint: self.path.identity_fingerprint(),
+        }
+    }
+
+    fn bypass_ipv4(&self) -> Option<Ipv4Addr> {
+        match self.path.endpoint().ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        }
     }
 }
 
@@ -533,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn only_wireguard_nodes_can_carry_a_direct_session() {
+    fn only_a_tunnelling_node_can_carry_a_direct_session() {
         let private = STANDARD.encode([3_u8; 32]);
         let wireguard = NodeSpec::WireGuard {
             config: wireguard_config(&private, "127.0.0.1:51820"),
@@ -550,8 +832,26 @@ mod tests {
         // The refusal has to name the way forward, since the node itself is
         // perfectly usable in the other mode.
         let error = proxy.open_direct().err().unwrap();
-        assert!(error.contains("WireGuard node for direct mode"), "{error}");
+        assert!(
+            error.contains("WireGuard or OpenVPN node for direct mode"),
+            "{error}"
+        );
         assert!(error.contains("relay"), "{error}");
+
+        // An OpenVPN node routes IP packets just as a WireGuard one does, so it
+        // is offered for direct mode too. Opening it would dial a server, which
+        // is what the live test covers.
+        #[cfg(feature = "openvpn")]
+        {
+            let openvpn = NodeSpec::OpenVpn {
+                config: String::new(),
+                username: None,
+                password: None,
+                label: None,
+            };
+            assert!(openvpn.supports_direct());
+            assert_eq!(openvpn.kind(), KIND_OPENVPN);
+        }
     }
 
     #[test]

@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron')
 contextBridge.exposeInMainWorld('gamepath', {
   bootstrap: () => ipcRenderer.invoke('app:bootstrap'),
   importWireGuard: () => ipcRenderer.invoke('tunnel:import'),
+  chooseOpenVpnFiles: () => ipcRenderer.invoke('openvpn:choose'),
+  addOpenVpnNodes: (input) => ipcRenderer.invoke('openvpn:add', input),
   addSocks5Node: (input) => ipcRenderer.invoke('node:add-socks5', input),
   testSocks5Node: (input) => ipcRenderer.invoke('node:test-socks5', input),
   testSavedSocks5Node: (id) => ipcRenderer.invoke('node:test-saved-socks5', id),

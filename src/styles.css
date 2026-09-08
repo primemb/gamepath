@@ -1979,6 +1979,107 @@ main {
   font-size: 10px;
   line-height: 1.5;
 }
+/* An aside under a field, for the case a form cannot ask about directly. */
+.modal-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 12px 0 0;
+  color: #788396;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.modal-note svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.modal-note code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  font-family: inherit;
+}
+/* What an import rejected, listed per file. It takes focus after a failed
+   submit, so it carries a focus ring of its own. */
+.import-summary {
+  margin-top: 16px;
+  padding: 12px 13px;
+  border: 1px solid rgba(255, 138, 128, 0.28);
+  border-left: 2px solid #ff8a80;
+  border-radius: 9px;
+  background: rgba(255, 138, 128, 0.06);
+  outline: none;
+}
+.import-summary:focus-visible {
+  border-color: rgba(255, 138, 128, 0.55);
+  box-shadow: 0 0 0 3px rgba(255, 138, 128, 0.12);
+}
+.import-summary h3 {
+  margin: 0;
+  color: #ffb4ab;
+  font-size: 10px;
+  letter-spacing: -0.01em;
+}
+/* The files a login is being asked for, so the question names its subject. */
+.chosen-files {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.chosen-files li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #0b1018;
+}
+.chosen-files strong {
+  color: #e5eaf1;
+  font-family: 'Cascadia Code', monospace;
+  font-size: 10px;
+}
+.chosen-files span {
+  color: #6b7688;
+  font-size: 9px;
+  white-space: nowrap;
+}
+.import-summary p {
+  margin: 8px 0 0;
+  color: #a6b2c5;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.import-summary ul {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.import-summary li {
+  color: #a6b2c5;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.import-summary li strong {
+  display: block;
+  color: #e5eaf1;
+  font-family: 'Cascadia Code', monospace;
+}
+/* Every control in a dialog is reachable by keyboard, so each one shows where
+   the focus is rather than relying on the pointer. */
+.modal .button:focus-visible,
+.modal .icon-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(38, 230, 205, 0.22);
+}
 .kind-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

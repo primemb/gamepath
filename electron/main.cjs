@@ -4,6 +4,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { parseWireGuardConfig } = require('./wireguard.cjs')
+const { parseOpenVpnConfig } = require('./openvpn.cjs')
 const { parseSocks5Node } = require('./socks5.cjs')
 const { directNodeSelection, directSelectionAfterSwitch } = require('./connection.cjs')
 const { EngineBridge } = require('./engine.cjs')
@@ -89,6 +90,15 @@ function saveState() {
   fs.renameSync(temporary, destination)
 }
 
+/**
+ * The `.ovpn` files the picker last offered.
+ *
+ * A retry sends paths back rather than making the user choose the same files
+ * again, and this is what makes that safe: nothing outside the set the user
+ * themselves selected is ever read.
+ */
+let offeredOpenVpnFiles = new Set()
+
 function encryptConfig(source) {
   if (!safeStorage.isEncryptionAvailable()) {
     throw new Error('Windows secure storage is unavailable')
@@ -153,7 +163,7 @@ function updateSessionMetrics(runtime, dataPlane) {
  * Decrypts each enabled node into the tagged list the engine expects. Secrets
  * live in Windows secure storage until this moment and never reach the
  * renderer: a WireGuard node yields its configuration body, a SOCKS5 node its
- * stored credentials.
+ * stored credentials, and an OpenVPN node both its file and its credentials.
  */
 function sessionNodes(enabledTunnels) {
   return enabledTunnels.map((tunnel) => {
@@ -168,6 +178,16 @@ function sessionNodes(enabledTunnels) {
         kind: 'socks5',
         host: tunnel.host,
         port: tunnel.port,
+        username: username || null,
+        password: password || null,
+        label: tunnel.name,
+      }
+    }
+    if (tunnel.kind === 'openvpn') {
+      const { config, username, password } = JSON.parse(secret)
+      return {
+        kind: 'openvpn',
+        config,
         username: username || null,
         password: password || null,
         label: tunnel.name,
@@ -249,6 +269,76 @@ function registerIpc() {
       tunnel.port,
       JSON.parse(safeStorage.decryptString(Buffer.from(stored, 'base64'))),
     )
+  })
+
+  // Choosing the files comes first, because only the files can say whether a
+  // login is even wanted. Nothing is stored here: this reads each file, reports
+  // what it is, and leaves the decision to the window.
+  //
+  // Only metadata goes back. The file body stays in this process, since it can
+  // carry a private key.
+  ipcMain.handle('openvpn:choose', async () => {
+    const result = await dialog.showOpenDialog({
+      title: 'Choose OpenVPN configurations',
+      buttonLabel: 'Choose files',
+      properties: ['openFile', 'multiSelections'],
+      filters: [{ name: 'OpenVPN configuration', extensions: ['ovpn'] }],
+    })
+    if (result.canceled) return { canceled: true }
+    offeredOpenVpnFiles = new Set(result.filePaths)
+
+    const files = []
+    const failures = []
+    for (const filePath of result.filePaths) {
+      try {
+        const source = fs.readFileSync(filePath, 'utf8')
+        const node = parseOpenVpnConfig(source, filePath, 'preview')
+        files.push({
+          path: filePath,
+          name: node.name,
+          endpoint: node.endpoint,
+          protocol: node.protocol,
+          wantsCredentials: node.wantsCredentials,
+        })
+      } catch (error) {
+        failures.push({ file: path.basename(filePath), path: filePath, message: error.message })
+      }
+    }
+    return { canceled: false, files, failures }
+  })
+
+  // Adds the files already chosen, with the login if they asked for one. Only
+  // paths the picker itself offered are read, so the window cannot use this to
+  // ask for the contents of an arbitrary file.
+  ipcMain.handle('openvpn:add', (_event, input) => {
+    const requested = Array.isArray(input?.filePaths) ? input.filePaths : []
+    if (!requested.length) throw new Error('No files were chosen.')
+    const unknown = requested.find((filePath) => !offeredOpenVpnFiles.has(filePath))
+    if (unknown) throw new Error('Those files are no longer the ones you chose. Choose them again.')
+
+    const username = String(input?.username ?? '').trim()
+    const credentials = { username: username || null, password: input?.password || null }
+
+    const failures = []
+    let added = 0
+    for (const filePath of requested) {
+      try {
+        const source = fs.readFileSync(filePath, 'utf8')
+        const node = parseOpenVpnConfig(source, filePath, crypto.randomUUID())
+        if (node.wantsCredentials && !credentials.username) {
+          throw new Error('This file needs a username and password, and none were entered.')
+        }
+        state.tunnels.push({ ...node, hasCredentials: Boolean(credentials.username) })
+        // The file itself can carry a private key, so it is stored the same way
+        // a WireGuard configuration is and never leaves the main process.
+        state.encryptedConfigs[node.id] = encryptConfig(JSON.stringify({ config: source, ...credentials }))
+        added += 1
+      } catch (error) {
+        failures.push({ file: path.basename(filePath), path: filePath, message: error.message })
+      }
+    }
+    saveState()
+    return { state: publicState(), added, failures }
   })
 
   ipcMain.handle('tunnel:import', async () => {

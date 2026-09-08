@@ -43,6 +43,8 @@ import type {
   PathMetric,
   Relay,
   RuleKind,
+  OpenVpnCandidate,
+  OpenVpnRejection,
   Socks5NodeInput,
   Socks5ProbeResult,
   Tunnel,
@@ -183,8 +185,10 @@ function Endpoint({
   const [testing, setTesting] = useState(false)
   const [outcome, setOutcome] = useState<{ ok: boolean; message: string } | null>(null)
   const isProxy = tunnel.kind === 'socks5'
+  const isOpenVpn = tunnel.kind === 'openvpn'
   // A proxy has no way to route on its own, so in direct mode it stays in the
   // list with the reason attached rather than quietly refusing to switch on.
+  // Both tunnelling kinds route, so both are usable in either mode.
   const unusable = direct && isProxy
   const stateLabel = tunnel.enabled ? (direct ? 'Carrying traffic' : 'Enabled') : 'Disabled'
   return (
@@ -193,7 +197,7 @@ function Endpoint({
       <div className="route-copy">
         <div className="route-title-row">
           <h3>{tunnel.name}</h3>
-          <span className="kind-pill">{isProxy ? 'SOCKS5' : 'WireGuard'}</span>
+          <span className="kind-pill">{isProxy ? 'SOCKS5' : isOpenVpn ? 'OpenVPN' : 'WireGuard'}</span>
           {unusable ? (
             <span className="status-pill">
               <i /> Needs a relay
@@ -218,6 +222,18 @@ function Endpoint({
                 <Info size={13} /> No outer encryption
               </span>
             </>
+          ) : isOpenVpn ? (
+            <>
+              <span>
+                Transport <strong>{tunnel.protocol === 'tcp' ? 'TCP' : 'UDP'}</strong>
+              </span>
+              <span>
+                Auth <strong>{tunnel.hasCredentials ? 'Username and password' : 'Certificate'}</strong>
+              </span>
+              <span title="The server assigns the address and the cipher when the session starts">
+                <ShieldCheck size={13} /> Key protected
+              </span>
+            </>
           ) : (
             <>
               <span>
@@ -235,6 +251,13 @@ function Endpoint({
         {outcome && (
           <p className={`route-note ${outcome.ok ? 'is-good' : 'is-bad'}`}>
             {outcome.ok ? <Check size={13} /> : <Info size={13} />} {outcome.message}
+          </p>
+        )}
+        {isOpenVpn && tunnel.protocol === 'udp' && (
+          <p className="route-note">
+            <Info size={13} /> If this server’s UDP handshake cannot get through, GamePath connects it over TCP on the
+            same port instead. TCP still carries your game’s UDP traffic; it just retransmits, so a lost packet holds up
+            the ones behind it.
           </p>
         )}
         {unusable && (
@@ -826,6 +849,161 @@ function RuleModal({ onClose, onSave }: { onClose: () => void; onSave: (input: A
   )
 }
 
+/**
+ * Asks for the login the chosen `.ovpn` files turned out to need.
+ *
+ * It appears only after the files have been read and at least one of them was
+ * found to use `auth-user-pass`, so the question is never asked speculatively
+ * and the files being added are named while it is asked. A provider issues one
+ * login and a file per server, so the same pair covers all of them.
+ */
+function OpenVpnLoginModal({
+  files,
+  rejected,
+  onClose,
+  onConfirm,
+}: {
+  files: OpenVpnCandidate[]
+  rejected: OpenVpnRejection[]
+  onClose: () => void
+  onConfirm: (credentials: { username: string; password: string }) => Promise<OpenVpnRejection[]>
+}) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [failures, setFailures] = useState<OpenVpnRejection[]>(rejected)
+  const [problem, setProblem] = useState<string | null>(null)
+  const summary = useRef<HTMLDivElement>(null)
+  const complete = username.trim().length > 0 && password.length > 0
+
+  // Moved to the summary so a keyboard or screen-reader user is taken to what
+  // went wrong instead of being left on the button that reported it.
+  useEffect(() => {
+    if (failures.length || problem) summary.current?.focus()
+  }, [failures, problem])
+
+  const confirm = async () => {
+    setBusy(true)
+    setProblem(null)
+    try {
+      setFailures(await onConfirm({ username: username.trim(), password }))
+    } catch (error) {
+      // Without this the dialog would swallow anything the add could throw and
+      // simply sit there, which is indistinguishable from a dead button.
+      setProblem(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section
+        className="modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') onClose()
+        }}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Enter the OpenVPN login"
+      >
+        <div className="modal-head">
+          <div>
+            <span className="eyebrow">OpenVPN</span>
+            <h2>{files.length === 1 ? 'This file needs a login' : 'These files need a login'}</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+        <p className="modal-intro">
+          {files.length === 1 ? 'It uses' : 'They use'} <code>auth-user-pass</code>, so the server expects the username
+          and password your provider gave you. They are encrypted by Windows and reused every session.
+        </p>
+        <ul className="chosen-files">
+          {files.map((file) => (
+            <li key={file.path}>
+              <strong>{file.name}</strong>
+              <span>
+                {file.endpoint} · {file.protocol.toUpperCase()}
+              </span>
+            </li>
+          ))}
+        </ul>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault()
+            void confirm()
+          }}
+        >
+          <label className="field-label">
+            Username
+            <input
+              autoFocus
+              value={username}
+              onChange={(event) => {
+                setUsername(event.target.value)
+                setFailures([])
+                setProblem(null)
+              }}
+              placeholder="The login from your provider"
+            />
+          </label>
+          <label className="field-label">
+            Password
+            <input
+              type="password"
+              value={password}
+              onChange={(event) => {
+                setPassword(event.target.value)
+                setFailures([])
+                setProblem(null)
+              }}
+              placeholder="Stored encrypted and never shown again"
+            />
+          </label>
+          {(problem || failures.length > 0) && (
+            <div className="import-summary" ref={summary} tabIndex={-1} role="alert">
+              {problem ? (
+                <>
+                  <h3>The node could not be added</h3>
+                  <p>{problem}</p>
+                </>
+              ) : (
+                <>
+                  <h3>
+                    {failures.length === 1
+                      ? '1 file could not be added'
+                      : `${failures.length} files could not be added`}
+                  </h3>
+                  <ul>
+                    {failures.map((failure) => (
+                      <li key={failure.path}>
+                        <strong>{failure.file}</strong>
+                        {failure.message}
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
+          <div className="modal-actions">
+            <button type="button" className="button secondary" onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" className="button primary" disabled={busy || !complete}>
+              <Check size={16} />
+              {busy ? 'Adding…' : files.length === 1 ? 'Add node' : `Add ${files.length} nodes`}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  )
+}
+
 function RelayModal({
   relay,
   onClose,
@@ -1357,6 +1535,12 @@ function App() {
   const [showRelayModal, setShowRelayModal] = useState(false)
   const [showAddRelay, setShowAddRelay] = useState(false)
   const [showSocks5Modal, setShowSocks5Modal] = useState(false)
+  // Set once files have been chosen and found to need a login, which is the
+  // only reason a dialog is shown at all.
+  const [openVpnLogin, setOpenVpnLogin] = useState<{
+    files: OpenVpnCandidate[]
+    rejected: OpenVpnRejection[]
+  } | null>(null)
   const [vpsTarget, setVpsTarget] = useState<{ id: string; action: 'provision' | 'remove' } | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [installingService, setInstallingService] = useState(false)
@@ -1429,10 +1613,12 @@ function App() {
   const trafficMode = state?.trafficMode ?? 'split'
   const connectionMode = state?.connectionMode ?? 'relay'
   const direct = connectionMode === 'direct'
-  const wireguardNodes = state?.tunnels.filter((item) => item.kind === 'wireguard').length ?? 0
+  // Both tunnelling kinds route packets themselves, so both can be the single
+  // hop of a direct session; a proxy cannot.
+  const routingNodes = state?.tunnels.filter((item) => item.kind !== 'socks5').length ?? 0
   // Direct mode is ready when exactly one node is chosen and that node can
   // actually route, which is the same rule the engine enforces.
-  const directNode = enabledRoutes === 1 && enabledNodes[0].kind === 'wireguard' ? enabledNodes[0] : null
+  const directNode = enabledRoutes === 1 && enabledNodes[0].kind !== 'socks5' ? enabledNodes[0] : null
   const bestRouteLatency = state?.session.routeLatencies?.length ? Math.min(...state.session.routeLatencies) : null
   const readiness = useMemo(
     () => ({
@@ -1446,7 +1632,7 @@ function App() {
   const stepCount = Object.keys(readiness).length
   // Point at the mode the user's current setup can actually start in.
   const recommendedMode: ConnectionMode | null =
-    relay?.status === 'ready' ? 'relay' : wireguardNodes > 0 ? 'direct' : null
+    relay?.status === 'ready' ? 'relay' : routingNodes > 0 ? 'direct' : null
 
   if (!state)
     return (
@@ -1478,7 +1664,7 @@ function App() {
       detail: direct
         ? directNode
           ? `${directNode.name} will carry your traffic`
-          : `${wireguardNodes} WireGuard node${wireguardNodes === 1 ? '' : 's'} added; pick exactly one`
+          : `${routingNodes} routing node${routingNodes === 1 ? '' : 's'} added; pick exactly one`
         : `${state.tunnels.length} node${state.tunnels.length === 1 ? '' : 's'} added; the relay is reached only through enabled nodes`,
       action: 'Configure',
       onClick: () => setView('routes'),
@@ -1514,6 +1700,40 @@ function App() {
     if (result.errors?.length) setNotice(result.errors.join('\n'))
   }
 
+  /**
+   * Chooses `.ovpn` files, then asks for a login only if they need one.
+   *
+   * A certificate-based file is added straight away with nothing to fill in;
+   * only `auth-user-pass` brings up a dialog, and by then the files are known
+   * and can be named in it.
+   */
+  const chooseAndAddOpenVpn = async () => {
+    try {
+      const choice = await api.chooseOpenVpnFiles()
+      if (choice.canceled) return
+      const files = choice.files ?? []
+      const rejected = choice.failures ?? []
+      if (!files.length) {
+        setNotice(
+          rejected.length
+            ? rejected.map((failure) => `${failure.file}: ${failure.message}`).join('\n')
+            : 'No files were chosen.',
+        )
+        return
+      }
+      if (files.some((file) => file.wantsCredentials)) {
+        setOpenVpnLogin({ files, rejected })
+        return
+      }
+      const result = await api.addOpenVpnNodes({ filePaths: files.map((file) => file.path) })
+      setState(result.state)
+      const failures = [...rejected, ...result.failures]
+      if (failures.length) setNotice(failures.map((failure) => `${failure.file}: ${failure.message}`).join('\n'))
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+    }
+  }
+
   const addSocks5Node = async (input: Socks5NodeInput) => {
     const result = await api.addSocks5Node(input)
     setState(result.state)
@@ -1531,7 +1751,7 @@ function App() {
 
   const title: Record<View, [string, string]> = {
     dashboard: ['Overview', 'Session control and live route telemetry.'],
-    routes: ['Routes and nodes', 'Import WireGuard configurations and add SOCKS5 proxies GamePath can use.'],
+    routes: ['Routes and nodes', 'Import WireGuard or OpenVPN configurations and add SOCKS5 proxies GamePath can use.'],
     split: ['Split tunnel', 'Choose exactly which traffic should enter the multipath tunnel.'],
     relays: ['Connection', 'Choose how your traffic leaves this PC.'],
     settings: ['Settings', 'Control startup, diagnostics, and client behavior.'],
@@ -1706,8 +1926,8 @@ function App() {
                   </span>
                   <span className="muted">
                     {direct
-                      ? 'Direct mode sends your traffic through one WireGuard node, which routes it onward. SOCKS5 proxies need a relay on the other side.'
-                      : 'Each active node carries relay traffic through its own hop, a WireGuard tunnel or a SOCKS5 proxy. Direct ISP relay access is disabled.'}
+                      ? 'Direct mode sends your traffic through one WireGuard or OpenVPN node, which routes it onward. SOCKS5 proxies need a relay on the other side.'
+                      : 'Each active node carries relay traffic through its own hop: a WireGuard tunnel, an OpenVPN tunnel or a SOCKS5 proxy. Direct ISP relay access is disabled.'}
                   </span>
                 </div>
                 <div className="toolbar-actions">
@@ -1719,6 +1939,10 @@ function App() {
                       Add SOCKS5
                     </button>
                   )}
+                  <button className="button secondary" onClick={chooseAndAddOpenVpn}>
+                    <Import size={16} />
+                    Add OpenVPN
+                  </button>
                   <button className="button primary" onClick={importTunnels}>
                     <Import size={16} />
                     Import .conf
@@ -1746,13 +1970,17 @@ function App() {
                   <h2>No nodes yet</h2>
                   <p>
                     {direct
-                      ? 'Import the WireGuard configuration file from your VPN provider. Direct mode routes through it, so it is all you need. Private keys are encrypted using Windows secure storage.'
-                      : 'Import your purchased WireGuard configuration files, or add a SOCKS5 proxy that supports UDP. Private keys and proxy passwords are encrypted using Windows secure storage.'}
+                      ? 'Import the WireGuard or OpenVPN configuration file from your VPN provider. Direct mode routes through it, so it is all you need. Private keys are encrypted using Windows secure storage.'
+                      : 'Import your purchased WireGuard or OpenVPN configuration files, or add a SOCKS5 proxy that supports UDP. Private keys and passwords are encrypted using Windows secure storage.'}
                   </p>
                   <div className="empty-actions">
                     <button className="button primary" onClick={importTunnels}>
                       <Import size={16} />
-                      Import configurations
+                      Import .conf files
+                    </button>
+                    <button className="button secondary" onClick={chooseAndAddOpenVpn}>
+                      <Import size={16} />
+                      Add an OpenVPN node
                     </button>
                     {/* A proxy cannot carry a direct session, so offering one
                         here would only lead to a node that will not start. */}
@@ -2164,6 +2392,24 @@ function App() {
           onSave={async (input) => {
             setState(await api.addRule(input))
             setShowRuleModal(false)
+          }}
+        />
+      )}
+      {openVpnLogin && (
+        <OpenVpnLoginModal
+          files={openVpnLogin.files}
+          rejected={openVpnLogin.rejected}
+          onClose={() => setOpenVpnLogin(null)}
+          onConfirm={async (credentials) => {
+            const result = await api.addOpenVpnNodes({
+              filePaths: openVpnLogin.files.map((file) => file.path),
+              ...credentials,
+            })
+            // Whatever was added is saved either way, so the list is refreshed
+            // before the dialog decides whether it still has something to say.
+            setState(result.state)
+            if (!result.failures.length) setOpenVpnLogin(null)
+            return result.failures
           }}
         />
       )}

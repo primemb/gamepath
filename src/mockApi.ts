@@ -83,6 +83,15 @@ let mockTelemetryTick = 0
 export const mockApi: GamePathApi = {
   bootstrap: async () => snapshot(),
   importWireGuard: async () => ({ canceled: true }),
+  chooseOpenVpnFiles: async () => {
+    // The mock stands in when no preload bridge is present, which happens when
+    // the window is opened outside Electron. Saying so beats appearing to do
+    // nothing at all.
+    throw new Error('Choosing files needs the desktop app: this window has no file picker.')
+  },
+  addOpenVpnNodes: async () => {
+    throw new Error('Adding a node needs the desktop app.')
+  },
   addSocks5Node: async (input) => {
     const [host, port] = input.address
       .replace(/^socks5h?:\/\//, '')

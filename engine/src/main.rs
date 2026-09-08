@@ -3,7 +3,7 @@ use gamepath_engine::adapter::inspect_library;
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::relay_path::{
-    DirectWireGuardPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
+    DirectPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
 };
 use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
 use gamepath_engine::socks5::{Socks5NodeConfig, Socks5UdpPath};
@@ -527,7 +527,7 @@ impl WireGuardSessionManager {
         Ok(())
     }
 
-    /// Brings up a direct session: no relay, and one WireGuard node doing the
+    /// Brings up a direct session: no relay, and one tunnelling node doing the
     /// routing that a relay would otherwise do.
     fn start_direct(&mut self, nodes: &[NodeSpec]) -> Result<(), String> {
         // Duplication is the only reason to run several paths, and duplication
@@ -551,12 +551,8 @@ impl WireGuardSessionManager {
         self.stop();
         let timer = HighResolutionTimer::raise();
         let stop = Arc::new(AtomicBool::new(false));
-        let statuses = Arc::new(Mutex::new(vec![initial_status(
-            1,
-            KIND_WIREGUARD,
-            label,
-            endpoint,
-        )]));
+        let kind = path.kind();
+        let statuses = Arc::new(Mutex::new(vec![initial_status(1, kind, label, endpoint)]));
         let scheduler_metrics = Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())]));
         let path_worker_iterations = Arc::new(vec![AtomicU64::new(0)]);
         let (command_tx, command_rx) = mpsc::channel();
@@ -1292,7 +1288,7 @@ const DIRECT_PROBE_TARGET: std::net::Ipv4Addr = std::net::Ipv4Addr::new(1, 1, 1,
 /// loss, rather than reporting a healthy node as totally lossy.
 #[allow(clippy::too_many_arguments)]
 fn run_direct_path(
-    mut path: DirectWireGuardPath,
+    mut path: DirectPath,
     address: std::net::Ipv4Addr,
     stop: Arc<AtomicBool>,
     statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
@@ -1421,6 +1417,7 @@ fn run_direct_path(
         // A silent peer is the usual way a direct session fails to start, and
         // the timeout alone would not say which part of the file to look at.
         if !reported_silence
+            && path.kind() == KIND_WIREGUARD
             && path.handshake_latency_ms().is_none()
             && started.elapsed() > Duration::from_secs(3)
         {

@@ -1,8 +1,8 @@
-export type NodeKind = 'wireguard' | 'socks5'
+export type NodeKind = 'wireguard' | 'socks5' | 'openvpn'
 
 /**
  * How traffic reaches the Internet. `relay` combines every enabled node at a
- * relay the user runs; `direct` sends it through one WireGuard node instead,
+ * relay the user runs; `direct` sends it through one tunnelling node instead,
  * for people with no server of their own.
  */
 export type ConnectionMode = 'relay' | 'direct'
@@ -21,6 +21,42 @@ export type Tunnel = {
   host?: string
   port?: number
   hasCredentials?: boolean
+  /** OpenVPN nodes only: the transport its file asks for, before any fallback. */
+  protocol?: 'udp' | 'tcp'
+  /** OpenVPN nodes only: whether the file uses `auth-user-pass`. */
+  wantsCredentials?: boolean
+}
+
+/** Why one chosen file could not be used. */
+export type OpenVpnRejection = { file: string; path: string; message: string }
+
+/**
+ * One `.ovpn` file the user chose, described well enough to decide what to ask
+ * them next. The file's own contents stay in the main process.
+ */
+export type OpenVpnCandidate = {
+  path: string
+  name: string
+  endpoint: string
+  protocol: 'udp' | 'tcp'
+  /** True when the file uses `auth-user-pass` and so needs a login. */
+  wantsCredentials: boolean
+}
+
+export type OpenVpnChoice = {
+  canceled: boolean
+  files?: OpenVpnCandidate[]
+  failures?: OpenVpnRejection[]
+}
+
+/**
+ * Adding several files can partly succeed, so the result carries both how many
+ * nodes were added and which files were rejected and why.
+ */
+export type OpenVpnAddResult = {
+  state: AppState
+  added: number
+  failures: OpenVpnRejection[]
 }
 
 export type Socks5NodeInput = {
@@ -172,6 +208,8 @@ export type AddRuleInput = Pick<SplitRule, 'kind' | 'value' | 'label'>
 export type GamePathApi = {
   bootstrap: () => Promise<AppState>
   importWireGuard: () => Promise<{ canceled: boolean; state?: AppState; errors?: string[] }>
+  chooseOpenVpnFiles: () => Promise<OpenVpnChoice>
+  addOpenVpnNodes: (input: { filePaths: string[]; username?: string; password?: string }) => Promise<OpenVpnAddResult>
   addSocks5Node: (input: Socks5NodeInput) => Promise<{ state: AppState; nodeId: string }>
   testSocks5Node: (input: Socks5NodeInput) => Promise<Socks5ProbeResult>
   testSavedSocks5Node: (id: string) => Promise<Socks5ProbeResult>

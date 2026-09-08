@@ -6,7 +6,9 @@ description = "Authenticated multipath relay for GamePath"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-gamepath-engine = { path = "../engine" }
+# The relay only needs the frame, auth and session types, so it opts out of
+# the client-only OpenVPN feature and the TLS stack that comes with it.
+gamepath-engine = { path = "../engine", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tun-rs = "2.8.9"

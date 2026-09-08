@@ -38,11 +38,12 @@ cargo test --manifest-path ..\relay\Cargo.toml
 ## Current scope
 
 - Import any number of WireGuard `.conf` files.
+- Import any number of OpenVPN `.ovpn` files, over UDP or TCP, and run several at once without an adapter or a driver.
 - Add any number of SOCKS5 proxy nodes, alone or beside WireGuard routes, and test each one for real UDP support before saving it.
 - Enable, disable, and remove individual routes.
 - Choose all-system traffic or split-tunnel rules.
 - Add split rules for executables, folders, hostnames, and IP ranges.
-- Choose relay mode, which combines every enabled node at a relay you own, or direct mode, which needs no server and routes through a single WireGuard node.
+- Choose relay mode, which combines every enabled node at a relay you own, or direct mode, which needs no server and routes through a single WireGuard or OpenVPN node.
 - Configure and test an authenticated Istanbul relay.
 - Add any number of relay locations and enable zero or one at a time.
 - Provision or remove a Debian VPS over password-authenticated SSH from the client; SSH passwords remain transient and host fingerprints are pinned after first use.
@@ -82,7 +83,7 @@ normal VPN would — GamePath still decides which applications, folders,
 hostnames and addresses enter the tunnel, but nothing is duplicated and there
 is no second path to fall back on.
 
-Direct mode takes a WireGuard node and only a WireGuard node. A SOCKS5 proxy
+Direct mode takes a tunnelling node: WireGuard or OpenVPN. A SOCKS5 proxy
 forwards connections and datagrams; it cannot route the raw packets GamePath
 captures, so it needs a relay on the other side to do that. Exactly one node is
 used, because combining nodes is the relay's job.
@@ -90,6 +91,56 @@ used, because combining nodes is the relay's job.
 Nothing else changes between the modes. Split-tunnel rules, all-traffic mode,
 the capture layer and the privileged service work the same either way, and
 switching modes needs no reconfiguration beyond choosing the node.
+
+## OpenVPN nodes
+
+GamePath speaks OpenVPN itself, in user space, the same way it speaks WireGuard.
+There is no adapter to create, no driver to install and no `openvpn.exe` to
+supervise, so several OpenVPN nodes run side by side in one session and mix
+freely with WireGuard and SOCKS5 nodes. Import a provider's `.ovpn` file, enter
+the username and password it asks for, and it becomes a node like any other.
+
+**A TCP configuration still carries your game's UDP traffic.** This is worth
+being clear about, because it is the opposite of how a TCP-only SOCKS5 proxy
+behaves. OpenVPN over TCP is a full IP tunnel: whole packets, UDP included,
+travel inside the stream. So one WireGuard node on UDP beside one OpenVPN node
+on TCP is a working pair, and both deliver UDP frames to the relay.
+
+The trade-off is that TCP retransmits in order, so a lost segment holds up every
+packet behind it — which hurts most on exactly the bad networks a TCP
+configuration is chosen for. Prefer a UDP configuration where one works.
+
+**A UDP configuration falls back to TCP on the same port.** Some connections
+drop the large packets an OpenVPN server sends during its handshake; the server
+then retransmits the same oversized packet forever and nothing completes. When
+that happens GamePath retries the same server over TCP rather than failing, and
+the node list says which transport a node settled on.
+
+What a configuration may contain:
+
+- `remote` lines over UDP or TCP, including several, and `<connection>` blocks.
+- Inline `<ca>`, and either `auth-user-pass` or an inline `<cert>` and `<key>`.
+- `tls-auth` or `tls-crypt`, inline, with either key direction.
+- `AES-256-GCM`, `AES-128-GCM` or `CHACHA20-POLY1305`, negotiated or named.
+
+What is refused, by name and with the reason:
+
+- `dev tap`, which carries Ethernet frames rather than IP packets.
+- `ca`, `cert`, `key`, `tls-auth`, `tls-crypt` or `pkcs12` kept in a separate
+  file; the block has to be inline, since GamePath stores one self-contained file.
+- `tls-crypt-v2`, and `secret` static-key mode.
+- Compression of any kind, which leaks information about traffic and adds
+  latency. A `no`, `stub` or `stub-v2` stub is accepted.
+- `--fragment`, `http-proxy`, `socks-proxy` and `static-challenge`.
+
+The server's certificate is checked against the `<ca>` in the file, inside its
+validity dates, and must be marked for server use. The hostname is deliberately
+not checked: OpenVPN does not authenticate a server that way, servers are
+routinely reached by bare IP, and their certificates routinely carry a name that
+matches nothing. Verification itself is never skipped.
+
+The file and its credentials are encrypted by Windows secure storage and are
+decrypted only in the privileged process, at the moment the engine needs them.
 
 ## SOCKS5 nodes
 

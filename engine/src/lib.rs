@@ -1,5 +1,7 @@
 pub mod adapter;
 pub mod auth;
+#[cfg(feature = "openvpn")]
+pub mod openvpn;
 pub mod policy;
 pub mod protocol;
 pub mod relay_path;

@@ -115,6 +115,53 @@ A SOCKS5 hop is not encrypted. Frames are already sealed and replay protected be
 
 A proxy on the client machine is refused in all-traffic mode. The tunnel would own the default route the proxy needs for its own upstream, so the proxy's forwarded traffic would be captured and fed back into it. Split-tunnel mode captures only the selected targets and has no such loop. A remote proxy's address joins the relay endpoint and the WireGuard endpoints in the bypass route set.
 
+## OpenVPN routes
+
+The client implements OpenVPN in user space rather than driving the reference
+implementation, for the same reason it implements WireGuard that way: the
+reference client owns an operating system adapter and takes the routing table
+with it, which caps a session at one such node and collides with the capture
+layer. Speaking the protocol directly gives each node its own socket, so N nodes
+run concurrently, the scheduler treats them like any other path, and the
+installer gains nothing to install.
+
+A session is brought up in four steps, each of which must complete before the
+next: a hard reset, a TLS handshake carried inside numbered control packets, an
+exchange of random material under `key-method 2`, and the server's `PUSH_REPLY`.
+Data keys come from OpenVPN's own PRF over the exchanged material rather than
+from the TLS key exporter, which is what makes the client work with servers of
+every vintage. TLS runs on `rustls` with a verifier that checks the chain
+against the configuration's `<ca>` and skips only the hostname, which OpenVPN
+does not use.
+
+Several wire details are ordered the opposite way from how the documentation
+reads, and were settled by trying every combination against a live server rather
+than by inference. They are recorded in `engine/src/openvpn/crypto.rs`: the
+client sends with key slot 0 and receives with slot 1, the implicit half of an
+AEAD nonce is the front of the key's HMAC material, the authentication tag
+precedes the ciphertext it covers, the nonce is the packet id followed by the
+implicit IV, and the associated data is the header together with that packet id.
+`engine/tests/openvpn_live.rs` re-proves all of it against a real provider.
+
+Renegotiation is handled in place. A server asks to rekey roughly once an hour by
+sending a soft reset on a new key id; the client runs a fresh handshake there
+while the old keys stay live, so packets still in flight on the previous
+generation are opened rather than dropped, and the traffic being carried does not
+stop. Two generations are kept, which is what the reference implementation does.
+
+Control packets are chunked well below a typical MTU. A handshake packet that
+does not fit is dropped silently and retransmitted at the same size forever, so
+the extra round trip is worth more than the larger chunk. When a UDP handshake
+stalls anyway — which happens on connections that drop large datagrams — the
+node is retried over TCP on the same port, where each packet is preceded by its
+length. Nothing above the link layer changes between the two.
+
+The tunnel's own address is assigned by the server, so it is not known until the
+session is up, and the node list says so rather than inventing one. The server's
+public address joins the relay endpoint and the WireGuard endpoints in the bypass
+route set. A provider's tunnel also carries its own network's broadcast and
+multicast traffic; only packets addressed to this tunnel reach the capture layer.
+
 ## WireGuard routes
 
 Each purchased configuration is parsed only in memory for the active session. The private key, peer key, optional pre-shared key, endpoint, and assigned address feed its isolated WireGuard protocol instance. Original encrypted configurations are never modified. A validation-only transformer also proves that adapter-based backends would narrow `AllowedIPs` to the resolved relay address and omit DNS and route side effects.

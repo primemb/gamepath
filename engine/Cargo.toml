@@ -12,12 +12,27 @@ path = "src/lib.rs"
 name = "gamepath-engine"
 path = "src/main.rs"
 
+[features]
+default = ["openvpn"]
+# The user-space OpenVPN client. It is the only thing in this crate that needs
+# TLS, so the relay -- which links this crate purely for its frame and session
+# types -- builds without it and keeps a much smaller dependency tree.
+openvpn = ["dep:rustls", "dep:rustls-pemfile", "dep:aes", "dep:ctr", "dep:aes-gcm", "dep:hmac", "dep:sha1", "dep:md-5"]
+
 [dependencies]
+aes = { version = "0.8", optional = true }
+aes-gcm = { version = "0.10", optional = true }
 base64 = "0.22"
 boringtun = "0.7.1"
 chacha20poly1305 = "0.10"
+ctr = { version = "0.9", optional = true }
 hkdf = "0.12"
+hmac = { version = "0.12", optional = true }
+md-5 = { version = "0.10", optional = true }
 rand = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+sha1 = { version = "0.10", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
