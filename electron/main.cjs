@@ -803,12 +803,16 @@ function registerIpc() {
 }
 
 function createWindow() {
+  const icon = app.isPackaged
+    ? path.join(process.resourcesPath, 'icon.png')
+    : path.join(__dirname, '..', 'build', 'icon.png')
   const window = new BrowserWindow({
     width: 1360,
     height: 860,
     minWidth: 1050,
     minHeight: 700,
     backgroundColor: '#080b12',
+    icon,
     title: 'GamePath',
     titleBarStyle: 'hidden',
     titleBarOverlay: { color: '#080b12', symbolColor: '#8b95a9', height: 42 },

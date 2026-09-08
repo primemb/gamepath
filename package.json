@@ -1,6 +1,6 @@
 {
   "name": "gamepath-client",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "author": "GamePath",
   "private": true,
   "type": "module",
@@ -111,10 +111,15 @@
       {
         "from": "deploy",
         "to": "deploy"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
       }
     ],
     "win": {
       "target": "nsis",
+      "icon": "build/icon.png",
       "requestedExecutionLevel": "requireAdministrator",
       "artifactName": "GamePath-Setup-${version}.${ext}"
     },
