@@ -64,7 +64,7 @@ button {
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.28);
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.06);
+  background-color: rgba(255, 255, 255, 0.06);
   box-shadow:
     0 0 0 2px rgba(255, 255, 255, 0.035),
     0 2px 6px rgba(0, 0, 0, 0.34);
@@ -1581,11 +1581,13 @@ select:focus-visible {
 }
 .vps-progress > i b {
   display: block;
+  width: 100%;
   height: 100%;
-  min-width: 2%;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--mint), #65a8ff);
-  transition: width 0.35s ease;
+  transform-origin: left center;
+  transition: transform 0.35s ease;
+  will-change: transform;
 }
 .vps-progress small {
   color: #8794a6;

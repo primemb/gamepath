@@ -1,6 +1,7 @@
 # GamePath relay deployment
 
-Run the installer from a GamePath repository checkout on Debian 13:
+Run the installer from a GamePath repository checkout on Debian 13 or newer,
+or Ubuntu 22.04 or newer:
 
 ```bash
 sudo bash deploy/install-relay.sh \
@@ -12,7 +13,10 @@ sudo bash deploy/install-relay.sh \
 The installer builds the Rust relay, configures IP forwarding and an isolated
 nftables ruleset, installs a hardened systemd service, and creates one unique
 client enrollment file. Running it again updates the binary and preserves all
-existing client secrets.
+existing client secrets. Debian uses its packaged Rust compiler; Ubuntu uses an
+isolated, pinned Rust toolchain under `/var/cache/gamepath` because older Ubuntu
+LTS repositories do not provide the Rust 2024 edition compiler required by the
+relay.
 
 Download the `.enroll` file over SSH, import it in the GamePath relay dialog,
 and delete the downloaded plaintext file after import. The Windows client stores

@@ -1482,6 +1482,22 @@ function AddRelayModal({
   )
 }
 
+const vpsProgressCeilings: Record<string, number> = {
+  preparing: 1,
+  connect: 6,
+  verify: 9,
+  upload: 31,
+  install: 37,
+  dependencies: 54,
+  compile: 71,
+  network: 83,
+  service: 91,
+  enrollment: 95,
+  credential: 99,
+  remove: 99,
+  complete: 100,
+}
+
 function VpsModal({
   relay,
   action,
@@ -1505,21 +1521,40 @@ function VpsModal({
   const [password, setPassword] = useState('')
   const [relayPort, setRelayPort] = useState(String(relay.port || 51821))
   const [busy, setBusy] = useState(false)
-  const [progress, setProgress] = useState({ percent: 0, message: 'Preparing deployment' })
+  const [progress, setProgress] = useState({ stage: 'preparing', percent: 0, message: 'Preparing deployment' })
   useEffect(
     () =>
       api.onRelayVpsProgress((update) => {
-        if (update.relayId === relay.id) setProgress(update)
+        if (update.relayId === relay.id) {
+          setProgress((current) => ({
+            stage: update.stage,
+            percent: Math.max(current.percent, update.percent),
+            message: update.message,
+          }))
+        }
       }),
     [relay.id],
   )
+  useEffect(() => {
+    if (!busy) return undefined
+    const timer = window.setInterval(() => {
+      setProgress((current) => {
+        const ceiling = vpsProgressCeilings[current.stage] ?? 99
+        if (current.percent >= ceiling) return current
+        const remaining = ceiling - current.percent
+        return { ...current, percent: Math.min(ceiling, current.percent + Math.max(0.2, remaining * 0.08)) }
+      })
+    }, 600)
+    return () => window.clearInterval(timer)
+  }, [busy])
+  const displayedPercent = Math.min(100, Math.round(progress.percent))
   return (
     <div className="modal-backdrop" onMouseDown={busy ? undefined : onClose}>
       <section className="modal relay-modal" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-head">
           <div>
             <span className="eyebrow">Secure SSH setup</span>
-            <h2>{action === 'provision' ? 'Configure Debian VPS' : 'Remove relay from VPS'}</h2>
+            <h2>{action === 'provision' ? 'Configure Linux VPS' : 'Remove relay from VPS'}</h2>
           </div>
           <button className="icon-button" disabled={busy} onClick={onClose}>
             <X size={18} />
@@ -1527,7 +1562,7 @@ function VpsModal({
         </div>
         <p className="modal-intro">
           {action === 'provision'
-            ? 'GamePath uploads its relay source, installs dependencies, configures the service and firewall, then imports this PC’s enrollment automatically.'
+            ? "GamePath supports Debian 13+ and Ubuntu 22.04+. It uploads the relay source, installs dependencies, configures the service and firewall, then imports this PC's enrollment automatically."
             : 'This removes the GamePath service, firewall tables, configuration, clients, and binary from this server.'}{' '}
           The SSH password is used only for this operation and is never saved.
         </p>
@@ -1571,11 +1606,19 @@ function VpsModal({
         {busy && (
           <div className="vps-progress">
             <div>
-              <strong>{progress.message}</strong>
-              <span>{progress.percent}%</span>
+              <strong role="status" aria-live="polite">
+                {progress.message}
+              </strong>
+              <span>{displayedPercent}%</span>
             </div>
-            <i>
-              <b style={{ width: `${progress.percent}%` }} />
+            <i
+              role="progressbar"
+              aria-label="VPS configuration progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={displayedPercent}
+            >
+              <b style={{ transform: `scaleX(${progress.percent / 100})` }} />
             </i>
             <small>Keep GamePath open. A first-time Rust build can take several minutes.</small>
           </div>
@@ -1588,7 +1631,7 @@ function VpsModal({
             className={`button ${action === 'remove' ? 'danger' : 'primary'}`}
             disabled={busy || !host.trim() || !username.trim() || !password || !sshPort || !relayPort}
             onClick={async () => {
-              setProgress({ percent: 1, message: 'Preparing deployment' })
+              setProgress({ stage: 'preparing', percent: 1, message: 'Preparing deployment' })
               setBusy(true)
               try {
                 await onSubmit({

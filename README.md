@@ -1,6 +1,6 @@
 # GamePath
 
-GamePath is a Windows multipath gaming client with an authenticated Debian relay.
+GamePath is a Windows multipath gaming client with an authenticated Debian or Ubuntu relay.
 
 ## Run the client
 
@@ -46,7 +46,7 @@ cargo test --manifest-path ..\relay\Cargo.toml
 - Choose relay mode, which combines every enabled node at a relay you own, or direct mode, which needs no server and routes through a single WireGuard or OpenVPN node.
 - Configure and test an authenticated Istanbul relay.
 - Add any number of relay locations and enable zero or one at a time.
-- Provision or remove a Debian VPS over password-authenticated SSH from the client; SSH passwords remain transient and host fingerprints are pinned after first use.
+- Provision or remove a Debian 13+ or Ubuntu 22.04+ VPS over password-authenticated SSH from the client; SSH passwords remain transient and host fingerprints are pinned after first use.
 - Start and monitor the Rust engine through private JSON-line IPC.
 - Detect the installed WireGuard client and active interfaces.
 - Validate complete session plans before any route mutation.
@@ -59,7 +59,7 @@ cargo test --manifest-path ..\relay\Cargo.toml
 - Detect configs that resolve to the same WireGuard endpoint and reuse the same client identity, then hold overlaps as standby instead of allowing their handshakes to replace each other.
 - Hold a second node pointed at one SOCKS5 proxy as standby, since two associations on the same proxy carry no extra path.
 - Install an authenticated Windows network service that owns the Wintun and WinDivert data planes and contains its engine in a kill-on-close Job Object.
-- Provision an idempotent Debian 13 relay with systemd, nftables NAT, TUN forwarding, per-client enrollment, authenticated probes, replay protection, and multipath reply fan-out.
+- Provision an idempotent Debian 13+ or Ubuntu 22.04+ relay with systemd, nftables NAT, TUN forwarding, per-client enrollment, authenticated probes, replay protection, and multipath reply fan-out.
 
 All-traffic mode captures and reinjects IPv4 through Wintun. Split mode uses narrow WinDivert/WFP filters for IP/CIDR targets and dynamically creates port filters from process-aware socket events for executable and folder targets. Exact hostnames resolve at activation; a copy-only DNS observer learns later addresses and wildcard subdomains without diverting unrelated traffic.
 

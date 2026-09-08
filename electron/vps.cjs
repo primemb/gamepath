@@ -103,9 +103,14 @@ function deploymentFiles(root) {
     'engine/Cargo.toml',
     'engine/Cargo.lock',
   ]
-  for (const folder of ['relay/src', 'engine/src']) {
-    for (const name of fs.readdirSync(path.join(root, folder))) result.push(`${folder}/${name}`)
+  const visit = (folder) => {
+    for (const entry of fs.readdirSync(path.join(root, folder), { withFileTypes: true })) {
+      const relative = `${folder}/${entry.name}`
+      if (entry.isDirectory()) visit(relative)
+      else if (entry.isFile()) result.push(relative)
+    }
   }
+  for (const folder of ['relay/src', 'engine/src']) visit(folder)
   return result
 }
 
@@ -127,7 +132,7 @@ async function provisionRelay(projectRoot, input, onProgress = () => {}) {
     const progressOutput = (text) => {
       outputBuffer += text
       const stages = {
-        dependencies: [38, 'Installing Debian dependencies'],
+        dependencies: [38, 'Installing Linux dependencies'],
         compile: [55, 'Compiling the optimized relay'],
         network: [72, 'Configuring forwarding and firewall'],
         service: [84, 'Installing and starting the relay service'],
@@ -140,7 +145,7 @@ async function provisionRelay(projectRoot, input, onProgress = () => {}) {
       }
       outputBuffer = outputBuffer.split(/\r?\n/).at(-1) ?? ''
     }
-    onProgress({ stage: 'install', percent: 32, message: 'Starting Debian relay installation' })
+    onProgress({ stage: 'install', percent: 32, message: 'Starting relay installation' })
     await rootCommand(
       connection,
       `chmod +x ${quote(remoteRoot)}/deploy/install-relay.sh && bash ${quote(remoteRoot)}/deploy/install-relay.sh --port ${input.relayPort} --client-name windows-client --enrollment-output ${quote(enrollment)}`,
@@ -181,4 +186,4 @@ async function removeRelay(projectRoot, input, onProgress = () => {}) {
   }
 }
 
-module.exports = { provisionRelay, removeRelay }
+module.exports = { deploymentFiles, provisionRelay, removeRelay }
