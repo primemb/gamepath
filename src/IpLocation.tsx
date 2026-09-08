@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { hasFlag } from 'country-flag-icons'
-import 'country-flag-icons/3x2/flags.css'
 import type { IpCountry } from './types'
 
 export function CountryFlag({ countryCode, country }: { countryCode: string; country: string }) {

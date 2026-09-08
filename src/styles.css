@@ -49,7 +49,7 @@ button {
   min-width: 0;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   white-space: nowrap;
 }
 .address-with-country > span:first-child {
@@ -58,19 +58,25 @@ button {
   text-overflow: ellipsis;
 }
 .country-flag {
-  width: 18px;
-  height: 12px;
+  width: 28px;
+  height: 19px;
   flex: 0 0 auto;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 4px;
   background: rgba(255, 255, 255, 0.06);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+  box-shadow:
+    0 0 0 2px rgba(255, 255, 255, 0.035),
+    0 2px 6px rgba(0, 0, 0, 0.34);
+  filter: saturate(1.06);
 }
 .flag-orb .country-flag {
-  width: 38px;
-  height: 25px;
-  border-radius: 5px;
+  width: 46px;
+  height: 31px;
+  border-radius: 6px;
+  box-shadow:
+    0 0 0 3px rgba(138, 124, 255, 0.08),
+    0 4px 12px rgba(0, 0, 0, 0.32);
 }
 
 .loading {
