@@ -23,6 +23,14 @@ jobs:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
       - uses: actions/checkout@v4
+      - name: Verify checkout line endings
+        shell: pwsh
+        run: |
+          $unexpected = git ls-files --eol | Select-String 'w/crlf|w/mixed'
+          if ($unexpected) {
+            $unexpected | ForEach-Object { Write-Error $_.Line }
+            exit 1
+          }
       - uses: actions/setup-node@v4
         with:
           node-version: '24'

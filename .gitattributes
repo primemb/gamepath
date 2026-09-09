@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+# These files are binary and must never be line-ending normalized.
+*.dll binary
+*.exe binary
+*.ico binary
+*.png binary
+*.sys binary
+*.woff binary
+*.woff2 binary
+
