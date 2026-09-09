@@ -86,11 +86,20 @@ pub fn choose_paths(paths: &[PathMetrics], strategy: Strategy) -> Decision {
         };
     }
 
-    let should_duplicate = strategy == Strategy::Duplicate
-        || healthy
-            .iter()
-            .take(2)
-            .any(|path| path.loss_ratio >= 0.01 || path.jitter_ms >= 7.0);
+    // Duplication buys redundancy only when the paths fail independently. If
+    // every path is struggling at once the cause is almost always the one thing
+    // they share - this machine's uplink - and sending each packet twice over a
+    // congested link doubles the load that is already the problem. That is a
+    // feedback loop: congestion raises loss, loss turns duplication on, and the
+    // extra copies deepen the congestion.
+    //
+    // So a degraded path is covered by a healthy one, and when nothing is
+    // healthy the best single path carries the traffic alone.
+    let degraded = |path: &PathMetrics| path.loss_ratio >= 0.01 || path.jitter_ms >= 7.0;
+    let candidates = healthy.iter().take(2).collect::<Vec<_>>();
+    let any_degraded = candidates.iter().any(|path| degraded(path));
+    let all_degraded = candidates.iter().all(|path| degraded(path));
+    let should_duplicate = strategy == Strategy::Duplicate || (any_degraded && !all_degraded);
     if should_duplicate {
         Decision::Duplicate {
             path_ids: healthy.iter().take(2).map(|path| path.id.clone()).collect(),
@@ -121,6 +130,34 @@ mod tests {
                 path_id: "fast".into()
             }
         );
+    }
+
+    /// The uplink is shared, so when every path degrades together duplication
+    /// cannot route around anything and only adds to the congestion.
+    #[test]
+    fn adaptive_mode_stops_duplicating_when_every_path_is_degraded() {
+        let mut first = measured("first", 60.0);
+        let mut second = measured("second", 65.0);
+        for _ in 0..5 {
+            first.record_loss();
+            second.record_loss();
+        }
+        assert!(matches!(
+            choose_paths(&[first, second], Strategy::Adaptive),
+            Decision::Single { .. }
+        ));
+    }
+
+    #[test]
+    fn an_explicit_duplicate_strategy_still_duplicates_when_all_are_degraded() {
+        let mut first = measured("first", 60.0);
+        let mut second = measured("second", 65.0);
+        first.record_loss();
+        second.record_loss();
+        assert!(matches!(
+            choose_paths(&[first, second], Strategy::Duplicate),
+            Decision::Duplicate { .. }
+        ));
     }
 
     #[test]

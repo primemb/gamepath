@@ -214,6 +214,58 @@ cannot delay the inbound frames, probes and timers that decide whether a path is
 still alive, and they shed any packet that has waited past `PATH_QUEUE_MAX_AGE`.
 Queue depth and drop counts per path are reported in session status.
 
+## Declaring a path down
+
+A path is taken out of service after `HEALTH_FAILURE_THRESHOLD` consecutive
+unanswered probes, not after one.
+
+The control probe is a bare UDP datagram on a real network and losing one
+occasionally is ordinary. Measured over an 85-minute session, a healthy
+WireGuard route lost 57 probes — about one every ninety seconds — while needing
+exactly one genuine reconnect; across both routes, 215 of 228 recoveries were
+after a single lost probe. Acting on the first loss pulled the route out of the
+dispatcher and showed it offline each time, which reads to a user as the tunnel
+dropping and reconnecting when nothing of the sort has happened.
+
+The scheduler still sees the first loss immediately through `record_loss`, so a
+path that begins dropping packets is de-prioritised by its score straight away.
+The threshold governs only the harder decision to stop using the path at all,
+and two in a row is reached inside four seconds.
+
+## Common-mode failure
+
+Independent providers do not fail in the same second. When every path stops
+answering at once the cause is the one thing they share — the machine's own
+uplink — and the two reflexes that serve a single failing path both make a local
+outage worse:
+
+- **Duplication is suppressed when every path is degraded.** Sending each packet
+  twice over a link that is already congested doubles the load that is the
+  problem, and it is a feedback loop: congestion raises loss, loss switches
+  duplication on, the extra copies deepen the congestion. A degraded path is
+  covered by a healthy one; when nothing is healthy the best single path carries
+  the traffic alone. `Strategy::Duplicate` still duplicates unconditionally.
+- **A path does not redial while no other path is up.** The dial has nowhere to
+  go, and for WireGuard it throws away a working tunnel to negotiate a new
+  handshake over a link that cannot carry it. Instead the path waits
+  `UPLINK_DOWN_BACKOFF` and keeps probing, because paths recover on their own the
+  moment the uplink does. A single-path session has nothing to compare against
+  and redials as normal.
+
+This is a game client, so recovery is timed to be fast rather than merely safe.
+A path that misses a probe switches to `PROBE_INTERVAL_DEGRADED`, so a route
+that comes back is noticed in milliseconds instead of at the healthy half-second
+cadence. The first redial of a path judged dead waits for nothing at all — by
+then it has missed several probes in a row _and_ another path is up, so the
+uplink is known good and there is nothing to gain by pausing. Only subsequent
+attempts back off, from `RECONNECT_BACKOFF_STEP` up to `RECONNECT_BACKOFF_MAX`.
+A test bounds the whole sequence, from the first missed probe to the first dial,
+at six seconds.
+
+Neither of these repairs the uplink. What they remove is GamePath's own
+contribution to the problem, which was measurable: a local outage used to turn
+into several minutes of reconnect churn after the link itself had recovered.
+
 ## Route retry
 
 A route is dialled once when the session starts and its transport is then owned

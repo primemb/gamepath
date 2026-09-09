@@ -5,6 +5,8 @@ use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU};
 use gamepath_engine::{log_error, log_info, log_warn};
 use gamepath_engine::replay::ReplayWindow;
+use gamepath_engine::rtt::RttEstimator;
+use gamepath_engine::uplink::{self, UplinkMonitor, UplinkState};
 use gamepath_engine::relay_path::{
     DirectPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
 };
@@ -284,17 +286,89 @@ impl PathDialer {
     }
 }
 
+/// Gap between health probes on a path that is answering.
+const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Gap between probes on a path that has missed one.
+///
+/// This is a game client, so the time between a path coming back and GamePath
+/// noticing is time the player spends on fewer routes than they have. At the
+/// healthy cadence a recovered path waits up to half a second to be asked
+/// again; probing hard while a path is in doubt cuts that to milliseconds, and
+/// costs nothing the rest of the time because a healthy path never uses it.
+const PROBE_INTERVAL_DEGRADED: Duration = Duration::from_millis(150);
+
+/// Consecutive unanswered probes before a path is declared down.
+///
+/// One lost probe is not a failure. The control probe is a bare UDP datagram on
+/// a real network, and losing one occasionally is ordinary: over an 85-minute
+/// session a healthy WireGuard route lost 57 of them, roughly one every ninety
+/// seconds. Acting on the first loss took that route out of the dispatcher and
+/// showed it offline every time, which reads as the tunnel dropping and
+/// reconnecting when nothing of the sort happened.
+///
+/// The probe deadline follows the path's own round trip
+/// ([`gamepath_engine::rtt`]), so on a healthy route a cycle costs a few
+/// hundred milliseconds rather than two seconds. That is what lets this be a
+/// real threshold instead of a trade against detection speed: three misses on a
+/// 60 ms path resolve inside a second, where two misses used to take three and
+/// a half.
+///
+/// The scheduler still sees the first loss immediately through `record_loss`,
+/// so a path that starts dropping packets is de-prioritised by its score
+/// straight away. This governs only the harder decision to stop using it.
+const HEALTH_FAILURE_THRESHOLD: u32 = 3;
+
+const _: () = assert!(
+    HEALTH_FAILURE_THRESHOLD >= 2,
+    "one lost probe is ordinary packet loss, not a path failure"
+);
+
 /// Consecutive failed health checks before a path's transport is redialled.
 /// Three of them is a little over a second of silence, long enough that a
 /// single lost probe or a brief stall does not tear down a working socket.
 const RECONNECT_AFTER_FAILURES: u32 = 3;
 
-/// First wait before redialling, doubled after each failed attempt.
-const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+/// Wait before the *first* redial once a path is judged dead.
+///
+/// Zero: by this point the path has missed several probes in a row and another
+/// path is up, so the uplink is known good and there is nothing to gain by
+/// waiting. Later attempts back off from [`RECONNECT_BACKOFF_STEP`].
+const RECONNECT_BACKOFF_MIN: Duration = Duration::ZERO;
+
+/// The wait the backoff grows from after the immediate first attempt.
+const RECONNECT_BACKOFF_STEP: Duration = Duration::from_secs(1);
 
 /// Longest wait between redial attempts. A provider that is down for an hour
 /// is retried every half minute rather than hammered.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// How long a path waits before reconsidering a redial while no other path is
+/// up.
+///
+/// Independent providers do not fail in the same second. When every path stops
+/// answering at once, the cause is the one thing they share - this machine's
+/// uplink - and redialling cannot fix that: the dial has nowhere to go, and a
+/// WireGuard redial throws away a working tunnel to negotiate a new handshake
+/// over a link that is already struggling.
+///
+/// This only defers the *transport* redial. Probing continues throughout at its
+/// normal cadence, so a path whose transport is still intact recovers the
+/// instant the uplink does, without waiting for this at all. What it does bound
+/// is recovery for a transport that genuinely cannot come back without a new
+/// dial - a dropped OpenVPN connection, where WireGuard would rehandshake on
+/// its own - so it is kept to three probe cycles, the same rhythm as
+/// [`RECONNECT_AFTER_FAILURES`], rather than anything longer.
+const UPLINK_DOWN_BACKOFF: Duration = Duration::from_secs(6);
+
+/// Whether any path other than `index` is currently carrying traffic.
+///
+/// One healthy path proves the uplink works, which is what makes a redial of a
+/// different path worth attempting.
+fn another_path_is_up(healthy_mask: &AtomicU64, index: usize) -> bool {
+    let own = 1_u64.checked_shl(index as u32).unwrap_or(0);
+    healthy_mask.load(Ordering::Acquire) & !own != 0
+}
 
 struct PathCommand {
     frame: Vec<u8>,
@@ -312,6 +386,10 @@ struct PathTelemetry {
     queue_depth: Arc<Vec<AtomicU64>>,
     dropped: Arc<Vec<AtomicU64>>,
     healthy_mask: Arc<AtomicU64>,
+    /// Whether this machine can reach the Internet at all, measured outside
+    /// every node. Session-wide rather than per-path, but it rides here so the
+    /// workers get it with the rest of what they read.
+    uplink: Arc<UplinkMonitor>,
 }
 
 /// How long a session waits for a path to become usable before giving up.
@@ -611,6 +689,7 @@ impl WireGuardSessionManager {
             queue_depth: counters(),
             dropped: counters(),
             healthy_mask: Arc::new(AtomicU64::new(0)),
+            uplink: Arc::new(UplinkMonitor::new()),
         };
         let mut workers = Vec::with_capacity(route_count);
         let mut commands = Vec::with_capacity(route_count);
@@ -648,6 +727,7 @@ impl WireGuardSessionManager {
                             initial_mask,
                             worker_telemetry,
                             worker_dialer,
+                            route_count,
                         )
                     })
                     .map_err(|error| format!("could not start path worker: {error}"))?,
@@ -662,6 +742,7 @@ impl WireGuardSessionManager {
                 server_replay: Mutex::new(ReplayWindow::default()),
             })),
         });
+        workers.extend(spawn_uplink_monitor(&stop, &telemetry));
         let summary = spawn_session_summary(
             session_id,
             &stop,
@@ -736,6 +817,7 @@ impl WireGuardSessionManager {
             queue_depth: Arc::new(vec![AtomicU64::new(0)]),
             dropped: Arc::new(vec![AtomicU64::new(0)]),
             healthy_mask: Arc::new(AtomicU64::new(0)),
+            uplink: Arc::new(UplinkMonitor::new()),
         };
         let worker_telemetry = telemetry.clone();
         let worker_stop = Arc::clone(&stop);
@@ -758,6 +840,7 @@ impl WireGuardSessionManager {
             .map_err(|error| format!("could not start path worker: {error}"))?;
         let session_id = rand::random::<u64>();
         let mut workers = vec![worker];
+        workers.extend(spawn_uplink_monitor(&stop, &telemetry));
         workers.extend(spawn_session_summary(
             session_id,
             &stop,
@@ -1101,6 +1184,11 @@ impl WireGuardSessionManager {
             "queueCapacity": PATH_QUEUE_DEPTH,
             "effectiveMtu": session.effective_mtu.mtu,
             "transportOverhead": session.effective_mtu.overhead,
+            "uplink": match session.telemetry.uplink.state() {
+                UplinkState::Up => "up",
+                UplinkState::Down => "down",
+                UplinkState::Unknown => "unknown",
+            },
             "highResolutionTimer": session.timer.active(),
         })
     }
@@ -1638,6 +1726,9 @@ fn run_direct_path(
     let mut probe_sequence = 0_u16;
     let mut next_probe = Instant::now();
     let mut pending_probe: Option<Instant> = None;
+    // The probe deadline follows this node's own round trip, so a provider that
+    // is simply distant is not mistaken for one that is losing packets.
+    let mut rtt = RttEstimator::default();
     let mut probes_attempted = 0_u64;
     let mut consecutive_losses = 0_u64;
     let mut icmp_answered = false;
@@ -1729,7 +1820,7 @@ fn run_direct_path(
                     }
                 }
             }
-            next_probe = Instant::now() + Duration::from_millis(500);
+            next_probe = Instant::now() + PROBE_INTERVAL;
         }
         match path.receive_packets(WORKER_RECEIVE_TIMEOUT) {
             Ok(packets) => {
@@ -1738,7 +1829,9 @@ fn run_direct_path(
                         let Some(started) = pending_probe.take() else {
                             continue;
                         };
-                        let latency = started.elapsed().as_secs_f64() * 1000.0;
+                        let elapsed = started.elapsed();
+                        rtt.record(elapsed);
+                        let latency = elapsed.as_secs_f64() * 1000.0;
                         let first = !icmp_answered;
                         icmp_answered = true;
                         consecutive_losses = 0;
@@ -1793,7 +1886,7 @@ fn run_direct_path(
                  PrivateKey and Peer PublicKey"
             ));
         }
-        if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_millis(1500)) {
+        if pending_probe.is_some_and(|started| started.elapsed() > rtt.timeout()) {
             pending_probe = None;
             if icmp_answered {
                 consecutive_losses += 1;
@@ -1827,6 +1920,7 @@ fn run_path(
     fallback_mask: u64,
     telemetry: PathTelemetry,
     dialer: PathDialer,
+    route_count: usize,
 ) {
     use gamepath_engine::auth::SessionCrypto;
     use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
@@ -1837,6 +1931,9 @@ fn run_path(
     let mut next_probe = Instant::now();
     let mut pending_probe = None;
     let mut published_setup_latency = None;
+    // The probe deadline tracks this path rather than being a constant that has
+    // to suit both a 60 ms route and a congested one.
+    let mut rtt = RttEstimator::default();
     // Consecutive failed health checks, and how long to wait before the next
     // redial. Both reset the moment the path answers again.
     let mut failures = 0_u32;
@@ -1868,7 +1965,7 @@ fn run_path(
             }
             Some(Ok(Err(error))) => {
                 dialing = None;
-                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                backoff = next_backoff(backoff);
                 next_redial = Some(Instant::now() + backoff);
                 log_warn!(
                     "route {} reconnect failed, retrying in {} s: {error}",
@@ -1882,12 +1979,30 @@ fn run_path(
             // attempt rather than waiting on a receiver that will never fill.
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 dialing = None;
-                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                backoff = next_backoff(backoff);
                 next_redial = Some(Instant::now() + backoff);
             }
             Some(Err(mpsc::TryRecvError::Empty)) | None => {}
         }
-        if dialing.is_none() && next_redial.is_some_and(|at| Instant::now() >= at) {
+        // A redial is only worth making when something proves the uplink is
+        // there. The monitor answers that directly when it can; when it cannot
+        // - a router that filters ICMP - fall back to inferring it from whether
+        // any other path is up, which is all that was available before.
+        let uplink_down = match telemetry.uplink.state() {
+            UplinkState::Down => true,
+            UplinkState::Up => false,
+            UplinkState::Unknown => {
+                route_count > 1 && !another_path_is_up(&telemetry.healthy_mask, index)
+            }
+        };
+        if dialing.is_none() && uplink_down && next_redial.is_some_and(|at| Instant::now() >= at) {
+            next_redial = Some(Instant::now() + UPLINK_DOWN_BACKOFF);
+            log_warn!(
+                "route {} is not redialling: no path is up, so the uplink is the likely cause",
+                index + 1
+            );
+        }
+        if dialing.is_none() && !uplink_down && next_redial.is_some_and(|at| Instant::now() >= at) {
             next_redial = None;
             let (result_tx, result_rx) = mpsc::channel();
             let attempt = dialer.clone();
@@ -1905,7 +2020,7 @@ fn run_path(
                         Some("reconnecting".to_owned());
                 }
                 Err(error) => {
-                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                    backoff = next_backoff(backoff);
                     next_redial = Some(Instant::now() + backoff);
                     statuses.lock().unwrap()[index].last_error =
                         Some(format!("could not start a reconnect attempt: {error}"));
@@ -1951,7 +2066,7 @@ fn run_path(
                     update_path_status(&statuses, index, Err(error));
                     failures += 1;
                     schedule_redial(failures, backoff, &mut next_redial);
-                    next_probe = Instant::now() + Duration::from_millis(500);
+                    next_probe = Instant::now() + PROBE_INTERVAL_DEGRADED;
                 }
             }
         }
@@ -1961,7 +2076,9 @@ fn run_path(
                     if let Ok((header, plaintext)) = crypto.open_server(&frame) {
                         if header.flags & FLAG_CONTROL != 0 && plaintext == b"pong" {
                             if let Some(started) = pending_probe.take() {
-                                let latency = started.elapsed().as_secs_f64() * 1000.0;
+                                let elapsed = started.elapsed();
+                                rtt.record(elapsed);
+                                let latency = elapsed.as_secs_f64() * 1000.0;
                                 statuses.lock().unwrap()[index].probes_received += 1;
                                 update_path_status(&statuses, index, Ok(latency));
                                 // An authenticated pong is the one unambiguous
@@ -1969,7 +2086,7 @@ fn run_path(
                                 // is where it rejoins the dispatcher, and where
                                 // any pending reconnect is called off.
                                 publish_path_health(&telemetry.healthy_mask, index, true);
-                                if failures > 0 {
+                                if failures >= HEALTH_FAILURE_THRESHOLD {
                                     log_info!(
                                         "route {} is carrying traffic again after {failures} \
                                          failed check(s), {latency:.0} ms",
@@ -1986,7 +2103,7 @@ fn run_path(
                                     index,
                                     Some(latency),
                                 );
-                                next_probe = Instant::now() + Duration::from_millis(500);
+                                next_probe = Instant::now() + PROBE_INTERVAL;
                             }
                         } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
                             record_path_receive(&statuses, index, frame.len());
@@ -2016,7 +2133,7 @@ fn run_path(
             current[index].handshake_round_trips = path.setup_round_trips();
             published_setup_latency = setup_latency;
         }
-        if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_millis(1500)) {
+        if pending_probe.is_some_and(|started| started.elapsed() > rtt.timeout()) {
             pending_probe = None;
             statuses.lock().unwrap()[index].probes_lost += 1;
             update_scheduler_probe(
@@ -2027,9 +2144,6 @@ fn run_path(
                 None,
             );
             let note = path.health_note();
-            // A probe that went unanswered for 1.5 s is evidence, so this is
-            // where a path leaves the dispatcher's selection.
-            publish_path_health(&telemetry.healthy_mask, index, false);
             failures += 1;
             schedule_redial(failures, backoff, &mut next_redial);
             log_warn!(
@@ -2039,15 +2153,21 @@ fn run_path(
                     .map(|note| format!(": {note}"))
                     .unwrap_or_default()
             );
-            update_path_status(
-                &statuses,
-                index,
-                Err(match note {
-                    Some(note) => format!("path health check timed out: {note}"),
-                    None => "path health check timed out".to_owned(),
-                }),
-            );
-            next_probe = Instant::now() + Duration::from_millis(500);
+            // Only a run of unanswered probes takes the path out of service.
+            // A single loss has already been recorded against the path's score
+            // above, which is the proportionate response to it.
+            if failures >= HEALTH_FAILURE_THRESHOLD {
+                publish_path_health(&telemetry.healthy_mask, index, false);
+                update_path_status(
+                    &statuses,
+                    index,
+                    Err(match note {
+                        Some(note) => format!("path health check timed out: {note}"),
+                        None => "path health check timed out".to_owned(),
+                    }),
+                );
+            }
+            next_probe = Instant::now() + PROBE_INTERVAL_DEGRADED;
         }
     }
 }
@@ -2093,6 +2213,43 @@ fn drain_send_queue(
         }
         let (length, result) = send(&command.frame);
         record(length, result);
+    }
+}
+
+/// Starts the uplink monitor, which answers "can this machine reach the
+/// Internet at all" without going through any node.
+///
+/// The probe is pinned to the adapter that currently carries the default route,
+/// captured here while that is still the physical one - once capture starts,
+/// the tunnel owns it.
+fn spawn_uplink_monitor(
+    stop: &Arc<AtomicBool>,
+    telemetry: &PathTelemetry,
+) -> Option<JoinHandle<()>> {
+    let source = physical_source_address();
+    let (stop, monitor) = (Arc::clone(stop), Arc::clone(&telemetry.uplink));
+    thread::Builder::new()
+        .name("gamepath-uplink".into())
+        .spawn(move || {
+            uplink::run(monitor, stop, source, |previous, next| {
+                log_warn!("uplink {previous:?} -> {next:?}");
+            })
+        })
+        .inspect_err(|error| log_warn!("uplink monitoring is unavailable: {error}"))
+        .ok()
+}
+
+/// The local address the default route currently uses.
+///
+/// Connecting a UDP socket sends nothing; it only makes the OS pick a source,
+/// which is exactly the question. `None` leaves the probe unpinned, which still
+/// works whenever the tunnel does not own the default route.
+fn physical_source_address() -> Option<std::net::Ipv4Addr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect((uplink::PROBE_TARGET, 53)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(address) if !address.is_unspecified() => Some(address),
+        _ => None,
     }
 }
 
@@ -2171,7 +2328,20 @@ fn run_session_summary(
             })
             .collect::<Vec<_>>()
             .join(" | ");
-        log_info!("session {session_id}: {routes}");
+        log_info!(
+            "session {session_id}: uplink {:?} | {routes}",
+            telemetry.uplink.state()
+        );
+    }
+}
+
+/// The wait after a failed redial. The first attempt is immediate, so the
+/// sequence grows from [`RECONNECT_BACKOFF_STEP`] rather than doubling zero.
+fn next_backoff(current: Duration) -> Duration {
+    if current.is_zero() {
+        RECONNECT_BACKOFF_STEP
+    } else {
+        (current * 2).min(RECONNECT_BACKOFF_MAX)
     }
 }
 
@@ -2769,6 +2939,120 @@ mod tests {
         ));
     }
 
+    /// A redial is worth making only when something proves the uplink works.
+    /// Two independent providers do not fail in the same second, so when no
+    /// path is up the machine's own link is the cause and redialling each path
+    /// separately just burns handshakes over a link that cannot carry them.
+    /// A single lost probe is ordinary on a real network. Acting on it took a
+    /// healthy WireGuard route out of service roughly once every ninety seconds
+    /// and reported it as a disconnect.
+    #[test]
+    fn one_lost_probe_does_not_take_a_path_out_of_service() {
+        let mask = AtomicU64::new(0);
+        publish_path_health(&mask, 0, true);
+        // What the worker does on each consecutive timeout: it stays up until
+        // the threshold is reached, then goes down and stays down.
+        let expected: Vec<bool> = (1..=HEALTH_FAILURE_THRESHOLD + 1)
+            .map(|failures| failures < HEALTH_FAILURE_THRESHOLD)
+            .collect();
+        let mut failures = 0_u32;
+        for expected_up in expected {
+            failures += 1;
+            if failures >= HEALTH_FAILURE_THRESHOLD {
+                publish_path_health(&mask, 0, false);
+            }
+            assert_eq!(
+                mask.load(Ordering::Acquire) & 1 != 0,
+                expected_up,
+                "after {failures} consecutive lost probe(s)"
+            );
+        }
+    }
+
+    /// Detection has to be quick enough to matter in a game. The deadline is
+    /// the path's own, so this is what the threshold actually costs on a
+    /// healthy route rather than on the old worst-case constant.
+    #[test]
+    fn a_dead_path_on_a_fast_route_is_noticed_within_a_second() {
+        // A settled 60 ms route sits at the estimator's floor, and a missed
+        // probe drops the gap to the degraded interval.
+        let cycle = gamepath_engine::rtt::MIN_TIMEOUT + PROBE_INTERVAL_DEGRADED;
+        let detection = cycle * HEALTH_FAILURE_THRESHOLD;
+        assert!(
+            detection <= Duration::from_secs(2),
+            "a dead path would take {detection:?} to notice"
+        );
+    }
+
+    /// Even a path slow enough to sit at the ceiling has to resolve in seconds.
+    #[test]
+    fn a_dead_path_on_the_slowest_route_still_resolves_in_seconds() {
+        let cycle = gamepath_engine::rtt::MAX_TIMEOUT + PROBE_INTERVAL_DEGRADED;
+        let detection = cycle * HEALTH_FAILURE_THRESHOLD;
+        assert!(
+            detection <= Duration::from_secs(6),
+            "the worst case is {detection:?}"
+        );
+    }
+
+    /// Raising the threshold only pays for itself because the deadline shrank.
+    /// If someone puts the constant back, this says why that is not free.
+    #[test]
+    fn the_threshold_is_affordable_because_the_deadline_adapts() {
+        let adaptive = (gamepath_engine::rtt::MIN_TIMEOUT + PROBE_INTERVAL_DEGRADED)
+            * HEALTH_FAILURE_THRESHOLD;
+        let fixed = (Duration::from_millis(1500) + PROBE_INTERVAL) * HEALTH_FAILURE_THRESHOLD;
+        assert!(
+            adaptive * 4 < fixed,
+            "the adaptive deadline should be far cheaper: {adaptive:?} vs {fixed:?}"
+        );
+    }
+
+    /// The monitor answers directly where it can, and the old inference is
+    /// kept only for where it cannot.
+    #[test]
+    fn a_measured_uplink_overrides_the_inference_in_both_directions() {
+        let decide = |state: UplinkState, route_count: usize, others_up: bool| match state {
+            UplinkState::Down => true,
+            UplinkState::Up => false,
+            UplinkState::Unknown => route_count > 1 && !others_up,
+        };
+        // Measured down: no redial, even though another path looks up.
+        assert!(decide(UplinkState::Down, 2, true));
+        // Measured up: redial, even though nothing else is up. This is the case
+        // the inference could never get right, and the only case for a
+        // single-path session.
+        assert!(!decide(UplinkState::Up, 1, false));
+        assert!(!decide(UplinkState::Up, 2, false));
+        // No opinion: exactly the previous behaviour.
+        assert!(decide(UplinkState::Unknown, 2, false));
+        assert!(!decide(UplinkState::Unknown, 2, true));
+        assert!(!decide(UplinkState::Unknown, 1, false));
+    }
+
+    #[test]
+    fn a_path_only_redials_while_another_path_proves_the_uplink_is_up() {
+        let mask = AtomicU64::new(0);
+        // Nothing is up: from route 0's view the uplink is the suspect.
+        assert!(!another_path_is_up(&mask, 0));
+        assert!(!another_path_is_up(&mask, 1));
+        // Route 0 alone being up says nothing to route 0 itself, but proves the
+        // uplink to route 1.
+        publish_path_health(&mask, 0, true);
+        assert!(!another_path_is_up(&mask, 0));
+        assert!(another_path_is_up(&mask, 1));
+        // Both up: each can see the other.
+        publish_path_health(&mask, 1, true);
+        assert!(another_path_is_up(&mask, 0));
+        assert!(another_path_is_up(&mask, 1));
+    }
+
+    #[test]
+    fn the_uplink_backoff_is_longer_than_the_ordinary_one() {
+        // Otherwise the guard would not actually slow anything down.
+        assert!(UPLINK_DOWN_BACKOFF > RECONNECT_BACKOFF_STEP);
+    }
+
     #[test]
     fn a_path_is_not_redialled_until_it_has_failed_repeatedly() {
         let mut next_redial = None;
@@ -2792,19 +3076,40 @@ mod tests {
     }
 
     #[test]
-    fn the_reconnect_backoff_doubles_up_to_its_ceiling() {
+    fn the_first_redial_is_immediate_and_later_ones_back_off() {
         let mut backoff = RECONNECT_BACKOFF_MIN;
         let mut waits = vec![backoff];
         for _ in 0..12 {
-            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+            backoff = next_backoff(backoff);
             waits.push(backoff);
         }
-        assert_eq!(waits[0], RECONNECT_BACKOFF_MIN);
-        assert!(waits[1] > waits[0], "the backoff has to grow");
-        assert_eq!(*waits.last().unwrap(), RECONNECT_BACKOFF_MAX);
+        // The path has already missed several probes and another path is up, so
+        // the uplink is known good: the first attempt waits for nothing.
+        assert_eq!(waits[0], Duration::ZERO);
+        assert_eq!(waits[1], RECONNECT_BACKOFF_STEP);
+        assert_eq!(waits[2], RECONNECT_BACKOFF_STEP * 2);
+        assert!(
+            waits.windows(2).skip(1).all(|pair| pair[1] > pair[0] || pair[1] == RECONNECT_BACKOFF_MAX),
+            "the backoff has to keep growing until it reaches the ceiling"
+        );
         // A provider that stays down is retried forever, never faster than the
         // ceiling and never so slowly that recovery is missed.
+        assert_eq!(*waits.last().unwrap(), RECONNECT_BACKOFF_MAX);
         assert!(waits.iter().all(|wait| *wait <= RECONNECT_BACKOFF_MAX));
+    }
+
+    /// The whole point of this path is speed: a route that dies while another
+    /// is up has to be back in service quickly enough to matter in a match.
+    #[test]
+    fn a_dead_route_is_redialled_within_a_few_seconds() {
+        // On a settled fast route every cycle is the estimator's floor plus the
+        // degraded gap, and the first dial itself waits for nothing.
+        let cycle = gamepath_engine::rtt::MIN_TIMEOUT + PROBE_INTERVAL_DEGRADED;
+        let total = cycle * RECONNECT_AFTER_FAILURES + RECONNECT_BACKOFF_MIN;
+        assert!(
+            total <= Duration::from_secs(3),
+            "a dead route would take {total:?} to redial"
+        );
     }
 
     #[test]
@@ -3054,6 +3359,7 @@ mod tests {
             queue_depth: Arc::new(vec![AtomicU64::new(0)]),
             dropped: Arc::new(vec![AtomicU64::new(0)]),
             healthy_mask: Arc::new(AtomicU64::new(0)),
+            uplink: Arc::new(UplinkMonitor::new()),
         };
         let worker = thread::spawn({
             let (stop, statuses) = (Arc::clone(&stop), Arc::clone(&statuses));
