@@ -145,6 +145,12 @@ impl UserSpaceOpenVpnPath {
         self.session.send_inner(packet)
     }
 
+    /// Protects an inner health probe from TCP queue shedding.
+    pub fn send_probe(&mut self, packet: &[u8]) -> Result<(), String> {
+        self.session
+            .send_inner_with_urgency(packet, link::Urgency::Reliable)
+    }
+
     pub fn receive_inner(&mut self, timeout: Duration) -> Result<Vec<Vec<u8>>, String> {
         self.session.receive_inner(timeout)
     }

@@ -1,19 +1,19 @@
 use base64::Engine as _;
 use gamepath_engine::adapter::inspect_library;
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
-use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU};
-use gamepath_engine::{log_error, log_info, log_warn};
-use gamepath_engine::replay::ReplayWindow;
-use gamepath_engine::rtt::RttEstimator;
-use gamepath_engine::uplink::{self, UplinkMonitor, UplinkState};
+use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::relay_path::{
     DirectPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
 };
+use gamepath_engine::replay::ReplayWindow;
+use gamepath_engine::rtt::RttEstimator;
 use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
 use gamepath_engine::socks5::{Socks5NodeConfig, Socks5UdpPath};
 use gamepath_engine::timer::HighResolutionTimer;
+use gamepath_engine::uplink::{self, UplinkMonitor, UplinkState};
 use gamepath_engine::wfp::inspect_backend;
+use gamepath_engine::{log_error, log_info, log_warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -255,7 +255,6 @@ impl DataReceiver {
         Ok(Some(plaintext))
     }
 }
-
 
 /// A route that is configured and enabled but is not part of the session.
 #[derive(Clone, Debug, Serialize)]
@@ -632,7 +631,10 @@ impl WireGuardSessionManager {
                 "no route could be opened: {}",
                 skipped_routes
                     .iter()
-                    .map(|skipped| format!("route {} ({}): {}", skipped.route, skipped.label, skipped.reason))
+                    .map(|skipped| format!(
+                        "route {} ({}): {}",
+                        skipped.route, skipped.label, skipped.reason
+                    ))
                     .collect::<Vec<_>>()
                     .join("; ")
             ));
@@ -648,7 +650,11 @@ impl WireGuardSessionManager {
             .collect::<Vec<_>>()
             .join(", ");
         let mut bypass_ips = vec![relay_ip];
-        bypass_ips.extend(paths.iter().filter_map(|(_, _, _, path)| path.bypass_ipv4()));
+        bypass_ips.extend(
+            paths
+                .iter()
+                .filter_map(|(_, _, _, path)| path.bypass_ipv4()),
+        );
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
 
@@ -743,13 +749,8 @@ impl WireGuardSessionManager {
             })),
         });
         workers.extend(spawn_uplink_monitor(&stop, &telemetry));
-        let summary = spawn_session_summary(
-            session_id,
-            &stop,
-            &statuses,
-            &telemetry,
-            &decision_mask,
-        );
+        let summary =
+            spawn_session_summary(session_id, &stop, &statuses, &telemetry, &decision_mask);
         workers.extend(summary);
         log_info!(
             "relay session {session_id} up: {route_count} route(s) [{route_summary}], \
@@ -1114,7 +1115,14 @@ impl WireGuardSessionManager {
     fn any_path_reachable(&self) -> bool {
         self.active
             .as_ref()
-            .map(|session| session.paths.lock().unwrap().iter().any(|path| path.reachable))
+            .map(|session| {
+                session
+                    .paths
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path.reachable)
+            })
             .unwrap_or(false)
     }
 
@@ -1756,8 +1764,8 @@ fn run_direct_path(
         // Authenticated return traffic outranks the probe verdict: a node that
         // is demonstrably carrying packets is not down because ICMP to
         // 1.1.1.1 is being filtered somewhere past it.
-        let carrying = last_authenticated_receive
-            .is_some_and(|seen| seen.elapsed() <= DIRECT_LIVENESS_WINDOW);
+        let carrying =
+            last_authenticated_receive.is_some_and(|seen| seen.elapsed() <= DIRECT_LIVENESS_WINDOW);
         let losing = icmp_answered && consecutive_losses >= DIRECT_LOSS_LIMIT && !carrying;
         let reachable = handshake.is_some() && !losing;
         if reachable != published_healthy {
@@ -1932,8 +1940,10 @@ fn run_path(
     let mut pending_probe = None;
     let mut published_setup_latency = None;
     // The probe deadline tracks this path rather than being a constant that has
-    // to suit both a 60 ms route and a congested one.
-    let mut rtt = RttEstimator::default();
+    // to suit both a 60 ms route and a congested one. Its floor comes from the
+    // transport, because a stream-carried path stalls for its own retransmit
+    // and answering later than that is not the same as not answering.
+    let mut rtt = RttEstimator::with_floor(path.probe_deadline_floor());
     // Consecutive failed health checks, and how long to wait before the next
     // redial. Both reset the moment the path answers again.
     let mut failures = 0_u32;
@@ -1950,6 +1960,9 @@ fn run_path(
             Some(Ok(Ok(replacement))) => {
                 dialing = None;
                 path = replacement;
+                // A redial may fall back from UDP to TCP (or recover to UDP).
+                // Neither the old samples nor its deadline floor apply.
+                rtt = RttEstimator::with_floor(path.probe_deadline_floor());
                 failures = 0;
                 backoff = RECONNECT_BACKOFF_MIN;
                 next_redial = None;
@@ -2016,8 +2029,7 @@ fn run_path(
                 Ok(_) => {
                     dialing = Some(result_rx);
                     log_info!("route {} is reconnecting", index + 1);
-                    statuses.lock().unwrap()[index].last_error =
-                        Some("reconnecting".to_owned());
+                    statuses.lock().unwrap()[index].last_error = Some("reconnecting".to_owned());
                 }
                 Err(error) => {
                     backoff = next_backoff(backoff);
@@ -2050,7 +2062,7 @@ fn run_path(
                     current[index].packets_sent += 1;
                     current[index].probes_sent += 1;
                 }
-                path.send_frame(&overlay)
+                path.send_probe(&overlay)
             })();
             match result {
                 Ok(()) => pending_probe = Some(Instant::now()),
@@ -2886,7 +2898,9 @@ mod tests {
         let depth = vec![AtomicU64::new(0)];
         let dropped = vec![AtomicU64::new(0)];
         for _ in 0..PATH_SEND_BATCH * 2 {
-            sender.try_send(queued(vec![0; 64], Duration::ZERO)).unwrap();
+            sender
+                .try_send(queued(vec![0; 64], Duration::ZERO))
+                .unwrap();
             depth[0].fetch_add(1, Ordering::Relaxed);
         }
         let mut sent = 0;
@@ -2913,7 +2927,9 @@ mod tests {
         sender
             .try_send(queued(vec![1; 64], PATH_QUEUE_MAX_AGE * 2))
             .unwrap();
-        sender.try_send(queued(vec![2; 64], Duration::ZERO)).unwrap();
+        sender
+            .try_send(queued(vec![2; 64], Duration::ZERO))
+            .unwrap();
         let mut sent = Vec::new();
         drain_send_queue(
             &receiver,
@@ -2995,6 +3011,23 @@ mod tests {
         );
     }
 
+    /// A stream-carried path waits out one retransmission before calling a
+    /// probe lost, so it is slower to declare dead. That is the point, but it
+    /// still has to land inside a few seconds.
+    #[test]
+    fn a_dead_stream_path_costs_more_to_notice_but_still_resolves() {
+        let cycle = gamepath_engine::rtt::STREAMED_MIN_TIMEOUT + PROBE_INTERVAL_DEGRADED;
+        let detection = cycle * HEALTH_FAILURE_THRESHOLD;
+        assert!(
+            detection > gamepath_engine::rtt::MIN_TIMEOUT * HEALTH_FAILURE_THRESHOLD,
+            "the whole point is that it waits longer"
+        );
+        assert!(
+            detection <= Duration::from_secs(4),
+            "a dead stream path would take {detection:?} to notice"
+        );
+    }
+
     /// Raising the threshold only pays for itself because the deadline shrank.
     /// If someone puts the constant back, this says why that is not free.
     #[test]
@@ -3063,7 +3096,11 @@ mod tests {
                 "a working socket was torn down after {failures} lost probes"
             );
         }
-        schedule_redial(RECONNECT_AFTER_FAILURES, RECONNECT_BACKOFF_MIN, &mut next_redial);
+        schedule_redial(
+            RECONNECT_AFTER_FAILURES,
+            RECONNECT_BACKOFF_MIN,
+            &mut next_redial,
+        );
         assert!(next_redial.is_some());
     }
 
@@ -3071,7 +3108,11 @@ mod tests {
     fn further_failures_do_not_restart_an_armed_backoff() {
         let armed = Instant::now() + Duration::from_secs(9);
         let mut next_redial = Some(armed);
-        schedule_redial(RECONNECT_AFTER_FAILURES + 5, RECONNECT_BACKOFF_MIN, &mut next_redial);
+        schedule_redial(
+            RECONNECT_AFTER_FAILURES + 5,
+            RECONNECT_BACKOFF_MIN,
+            &mut next_redial,
+        );
         assert_eq!(next_redial, Some(armed));
     }
 
@@ -3089,7 +3130,10 @@ mod tests {
         assert_eq!(waits[1], RECONNECT_BACKOFF_STEP);
         assert_eq!(waits[2], RECONNECT_BACKOFF_STEP * 2);
         assert!(
-            waits.windows(2).skip(1).all(|pair| pair[1] > pair[0] || pair[1] == RECONNECT_BACKOFF_MAX),
+            waits
+                .windows(2)
+                .skip(1)
+                .all(|pair| pair[1] > pair[0] || pair[1] == RECONNECT_BACKOFF_MAX),
             "the backoff has to keep growing until it reaches the ceiling"
         );
         // A provider that stays down is retried forever, never faster than the

@@ -1,5 +1,5 @@
 #[cfg(feature = "openvpn")]
-use crate::openvpn::{Credentials, UserSpaceOpenVpnPath};
+use crate::openvpn::{Credentials, Protocol, UserSpaceOpenVpnPath};
 use crate::socks5::{Socks5NodeConfig, Socks5UdpPath};
 use crate::userspace_wireguard::{UserSpaceWireGuardPath, ipv4_udp_packet, ipv4_udp_payload};
 use rand::Rng;
@@ -297,6 +297,12 @@ pub enum PathIdentity {
 pub trait RelayPath: Send {
     fn send_frame(&mut self, frame: &[u8]) -> Result<(), String>;
 
+    /// Sends a health probe without shedding it in a stream's game-data queue.
+    /// Datagram paths keep their normal send behavior.
+    fn send_probe(&mut self, frame: &[u8]) -> Result<(), String> {
+        self.send_frame(frame)
+    }
+
     /// Collects the frames that have arrived from the relay, waiting at most
     /// `timeout` for the first one.
     fn receive_frames(&mut self, timeout: Duration) -> Result<Vec<Vec<u8>>, String>;
@@ -332,6 +338,17 @@ pub trait RelayPath: Send {
     /// transports have nothing useful to say beyond the timeout itself.
     fn health_note(&mut self) -> Option<String> {
         None
+    }
+
+    /// The shortest deadline a health probe on this path may be given.
+    ///
+    /// A transport that hides packet loss by retransmitting underneath us
+    /// cannot answer a probe during its own recovery, so it needs a deadline
+    /// wider than that recovery takes or every stall reads as a dead path. A
+    /// datagram transport has nothing underneath it and keeps the tight
+    /// default.
+    fn probe_deadline_floor(&self) -> Duration {
+        crate::rtt::MIN_TIMEOUT
     }
 }
 
@@ -604,6 +621,17 @@ impl OpenVpnRelayPath {
 
 #[cfg(feature = "openvpn")]
 impl RelayPath for OpenVpnRelayPath {
+    fn send_probe(&mut self, frame: &[u8]) -> Result<(), String> {
+        let inner = ipv4_udp_packet(
+            self.path.address(),
+            *self.relay.ip(),
+            self.source_port,
+            self.relay.port(),
+            frame,
+        )?;
+        self.path.send_probe(&inner)
+    }
+
     fn send_frame(&mut self, frame: &[u8]) -> Result<(), String> {
         let inner = ipv4_udp_packet(
             self.path.address(),
@@ -667,6 +695,17 @@ impl RelayPath for OpenVpnRelayPath {
         match self.path.endpoint().ip() {
             IpAddr::V4(ip) => Some(ip),
             IpAddr::V6(_) => None,
+        }
+    }
+
+    /// OpenVPN is the one transport that can be either, so this follows the
+    /// protocol actually in use: over UDP a lost packet is simply lost and the
+    /// tight deadline is honest, but over TCP the stream retransmits it and the
+    /// probe waits behind it.
+    fn probe_deadline_floor(&self) -> Duration {
+        match self.path.protocol() {
+            Protocol::Udp => crate::rtt::MIN_TIMEOUT,
+            Protocol::Tcp => crate::rtt::STREAMED_MIN_TIMEOUT,
         }
     }
 }

@@ -19,12 +19,30 @@
 
 use std::time::Duration;
 
-/// Shortest probe deadline.
+/// Shortest probe deadline for a path carried by datagrams.
 ///
 /// Well above any plausible round trip on a working path, so ordinary jitter
 /// never expires a probe, while still an order of magnitude under the old
-/// constant.
+/// constant. Nothing underneath a datagram transport retries a lost packet, so
+/// a probe unanswered for this long really is lost.
 pub const MIN_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Shortest probe deadline for a path carried by a byte stream, which in
+/// practice means OpenVPN over TCP.
+///
+/// A stream transport hides loss instead of passing it up: the segment is
+/// retransmitted and everything behind it waits in the receive buffer until it
+/// arrives. That recovery has a floor of its own - the operating system's
+/// minimum retransmission timeout, 200 ms on Linux and 300 ms on Windows - and
+/// a sparse game flow rarely has the three following segments that fast
+/// retransmit needs, so the timer is the common case rather than the rare one.
+///
+/// A deadline under that floor cannot tell "this path stalled for one
+/// retransmission" from "this path is dead", and will keep reporting the first
+/// as the second. So a stream-carried path is given room for one full recovery
+/// plus its own round trip. It is still half the old constant, and a path
+/// genuinely slower than this widens past it on the measurement like any other.
+pub const STREAMED_MIN_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Longest probe deadline. A path slower than this is unusable for a game
 /// whether or not the probe is still outstanding.
@@ -40,13 +58,32 @@ const BETA_RECIPROCAL: u32 = 4;
 const VARIATION_MULTIPLIER: u32 = 4;
 
 /// Tracks a path's round trip and derives a probe deadline from it.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct RttEstimator {
     smoothed: Option<Duration>,
     variation: Duration,
+    /// The lower bound on this path's deadline, which depends on what carries
+    /// the path rather than on how fast it is.
+    floor: Duration,
+}
+
+impl Default for RttEstimator {
+    fn default() -> Self {
+        Self::with_floor(MIN_TIMEOUT)
+    }
 }
 
 impl RttEstimator {
+    /// An estimator for a path whose transport cannot recover faster than
+    /// `floor`, however quick the measured round trip turns out to be.
+    pub fn with_floor(floor: Duration) -> Self {
+        Self {
+            smoothed: None,
+            variation: Duration::ZERO,
+            floor: floor.clamp(MIN_TIMEOUT, MAX_TIMEOUT),
+        }
+    }
+
     /// Folds in one measured round trip.
     pub fn record(&mut self, sample: Duration) {
         match self.smoothed {
@@ -57,11 +94,10 @@ impl RttEstimator {
             }
             Some(smoothed) => {
                 let deviation = sample.abs_diff(smoothed);
-                self.variation = (self.variation * (BETA_RECIPROCAL - 1) + deviation)
-                    / BETA_RECIPROCAL;
-                self.smoothed = Some(
-                    (smoothed * (ALPHA_RECIPROCAL - 1) + sample) / ALPHA_RECIPROCAL,
-                );
+                self.variation =
+                    (self.variation * (BETA_RECIPROCAL - 1) + deviation) / BETA_RECIPROCAL;
+                self.smoothed =
+                    Some((smoothed * (ALPHA_RECIPROCAL - 1) + sample) / ALPHA_RECIPROCAL);
             }
         }
     }
@@ -74,7 +110,7 @@ impl RttEstimator {
         let Some(smoothed) = self.smoothed else {
             return MAX_TIMEOUT;
         };
-        (smoothed + self.variation * VARIATION_MULTIPLIER).clamp(MIN_TIMEOUT, MAX_TIMEOUT)
+        (smoothed + self.variation * VARIATION_MULTIPLIER).clamp(self.floor, MAX_TIMEOUT)
     }
 
     /// The smoothed round trip, once there is one.
@@ -88,7 +124,11 @@ mod tests {
     use super::*;
 
     fn settled(rtt_ms: u64, jitter_ms: u64) -> RttEstimator {
-        let mut estimator = RttEstimator::default();
+        settled_with_floor(MIN_TIMEOUT, rtt_ms, jitter_ms)
+    }
+
+    fn settled_with_floor(floor: Duration, rtt_ms: u64, jitter_ms: u64) -> RttEstimator {
+        let mut estimator = RttEstimator::with_floor(floor);
         for index in 0..40 {
             let wobble = if index % 2 == 0 { jitter_ms } else { 0 };
             estimator.record(Duration::from_millis(rtt_ms + wobble));
@@ -136,6 +176,52 @@ mod tests {
             "steady {:?} vs erratic {:?}",
             steady.timeout(),
             erratic.timeout()
+        );
+    }
+
+    /// The bug this floor exists for. A 55 ms OpenVPN-over-TCP node sat at the
+    /// datagram floor of 200 ms, but one retransmission underneath it takes the
+    /// operating system's minimum RTO plus a round trip - around 350 ms - so
+    /// every such stall was logged as a failed health check. Nine in five
+    /// minutes on a node whose measured latency never left the fifties.
+    #[test]
+    fn a_stream_carried_path_outlasts_one_retransmission_underneath_it() {
+        let stalled = Duration::from_millis(355);
+        let datagram = settled(55, 4);
+        assert!(
+            datagram.timeout() < stalled,
+            "a datagram path should not wait for a retransmission it never makes"
+        );
+        let streamed = settled_with_floor(STREAMED_MIN_TIMEOUT, 55, 4);
+        assert!(
+            streamed.timeout() > stalled,
+            "a {:?} deadline still cuts off a stall of {stalled:?}",
+            streamed.timeout()
+        );
+    }
+
+    /// The floor is a floor, not an override: a stream path that is genuinely
+    /// slow still widens past it on its own measurement.
+    #[test]
+    fn a_slow_stream_path_widens_past_its_floor() {
+        let estimator = settled_with_floor(STREAMED_MIN_TIMEOUT, 700, 200);
+        assert!(
+            estimator.timeout() > STREAMED_MIN_TIMEOUT,
+            "got {:?}",
+            estimator.timeout()
+        );
+    }
+
+    /// And it never becomes an excuse to wait longer than the ceiling.
+    #[test]
+    fn a_floor_is_held_inside_the_bounds() {
+        let absurd = RttEstimator::with_floor(Duration::from_secs(60));
+        assert_eq!(absurd.timeout(), MAX_TIMEOUT);
+        let below = RttEstimator::with_floor(Duration::from_millis(1));
+        assert_eq!(below.timeout(), MAX_TIMEOUT);
+        assert_eq!(
+            settled_with_floor(Duration::from_millis(1), 55, 4).timeout(),
+            MIN_TIMEOUT
         );
     }
 

@@ -8,7 +8,7 @@
 use super::config::{DataCipher, OpenVpnConfig, Protocol, Remote};
 use super::control::{ControlChannel, Received, is_data, opcode_of};
 use super::crypto::{DataChannel, KeyMaterial, KeySource};
-use super::link::Link;
+use super::link::{Link, Urgency};
 use super::verify::EmbeddedCaVerifier;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection};
@@ -169,13 +169,21 @@ impl Session {
 
     /// Sends one inner IP packet through the tunnel.
     pub fn send_inner(&mut self, packet: &[u8]) -> Result<(), String> {
+        self.send_inner_with_urgency(packet, Urgency::Realtime)
+    }
+
+    pub(super) fn send_inner_with_urgency(
+        &mut self,
+        packet: &[u8],
+        urgency: Urgency,
+    ) -> Result<(), String> {
         let sealed = self
             .channels
             .last_mut()
             .ok_or("the OpenVPN data channel is not up")?
             .seal(packet)?;
         self.last_keepalive = Instant::now();
-        self.link.send(&sealed)
+        self.link.send(&sealed, urgency)
     }
 
     /// Collects the inner IP packets that have arrived, waiting at most
@@ -264,7 +272,7 @@ impl Session {
             .ok_or("the OpenVPN data channel is not up")?
             .keepalive()?;
         self.last_keepalive = Instant::now();
-        self.link.send(&ping)
+        self.link.send(&ping, Urgency::Reliable)
     }
 
     /// Drives the setup to completion.
@@ -635,9 +643,11 @@ impl Session {
             }
         }
         while let Some(packet) = self.control.take_outgoing() {
-            self.link.send(&packet)?;
+            self.link.send(&packet, Urgency::Reliable)?;
         }
-        Ok(())
+        // Whatever the socket could not take is queued rather than dropped or
+        // waited on, so every pass of the loop gets another chance to move it.
+        self.link.flush_outbound()
     }
 }
 

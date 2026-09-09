@@ -232,6 +232,107 @@ path that begins dropping packets is de-prioritised by its score straight away.
 The threshold governs only the harder decision to stop using the path at all,
 and two in a row is reached inside four seconds.
 
+### The deadline floor depends on the transport
+
+The estimator answers "how long should this path take", but not every path can
+answer as fast as it is. A datagram transport passes loss straight up: nothing
+underneath WireGuard or a SOCKS5 association retries a dropped packet, so a
+probe still unanswered after `rtt::MIN_TIMEOUT` really is lost.
+
+A stream transport does the opposite. OpenVPN over TCP hides loss by
+retransmitting the segment, and every packet behind it waits in the receive
+buffer until it arrives. That recovery has a floor of its own — the operating
+system's minimum retransmission timeout, 200 ms on Linux and 300 ms on Windows
+— and a sparse game flow rarely supplies the three following segments fast
+retransmit needs, so the timer is the ordinary case rather than the rare one.
+One recovery therefore costs roughly `RTO_min` plus a round trip before the
+probe can possibly be answered.
+
+Measured on a live session, a `tr2` OpenVPN/TCP node whose latency never left
+the fifties logged nine failed health checks in five minutes, while the
+WireGuard route beside it on the same uplink logged none. The 200 ms deadline
+was under the stall it was measuring, so every retransmission read as a dead
+path.
+
+So `RelayPath::probe_deadline_floor` lets the transport set its own lower bound:
+`rtt::MIN_TIMEOUT` for datagrams, `rtt::STREAMED_MIN_TIMEOUT` for a byte stream.
+It is a floor and not an override — a stream path that is genuinely slow still
+widens past it on its own measurement, and the ceiling still applies. OpenVPN
+answers from the protocol it actually negotiated, which matters because a `udp`
+configuration falls back to `tcp` when UDP cannot get through.
+
+The cost is that a dead stream-carried path takes longer to declare, and a test
+bounds that at four seconds. That is the correct trade: on a transport that
+retransmits underneath us, "stalled" and "dead" genuinely take longer to tell
+apart, and reporting the first as the second is the more expensive mistake.
+
+### The stream transport keeps its own send queue
+
+The other half of carrying datagrams over TCP is what happens on the way out.
+
+Every path's send queue sheds packets older than `PATH_QUEUE_MAX_AGE`, because a
+game packet that has waited 50 ms describes a world that has moved on and the
+bandwidth is better spent on the one behind it. On a datagram transport that
+rule is the last word: `send` hands the packet to the wire and returns.
+
+On TCP it was not. The link handed the kernel a four-megabyte send buffer and
+called a blocking `write_all`, so the moment congestion control slowed down, the
+backlog moved somewhere the staleness rule could not reach it. Bytes the kernel
+has accepted go out in order, at whatever rate is allowed, and cannot be dropped
+or reordered — so a game packet queued behind a megabyte of older data arrives
+late no matter what any policy above decides. The queue simply left the building
+through the socket.
+
+Two changes put it back:
+
+- **The kernel gets `SEND_BUFFER` (256 KiB) instead of four megabytes**.
+  The receive buffer stays large to preserve bursts between reads.
+  The send-buffer/RTT throughput estimate is about 35 Mbit/s on a 60 ms path,
+  not a measured guarantee. This reduces hidden backlog rather than bounding
+  latency: 256 KiB takes about 210 ms to serialize at 10 Mbit/s. Downloads can
+  also be affected when their tunneled TCP acknowledgements queue on upload.
+- **The rest of the backlog stays in `Link`**, as a queue of framed packets that
+  can still be shed, with a 50 ms rule and a `MAX_OUTBOUND_BYTES` backstop.
+  Each queue measures its own residence time; this is not an end-to-end
+  50 ms delivery guarantee.
+
+Writes are non-blocking, which is what makes the queue safe rather than merely
+useful. A blocking write on a stalled socket would hold the worker thread that
+also runs the path's health probes and timers, so a congested link would present
+as a dead one — the exact failure the deadline floor above exists to prevent.
+Non-blocking writes mean short writes are routine, so the offset into the packet
+at the head is kept and the next pass continues from there: a `write_all`
+interrupted part-way would leave a truncated frame on a length-prefixed stream
+and desynchronise the reader permanently. The socket is switched to
+non-blocking only around the write and restored afterwards, including on
+failure, because reads rely on `SO_RCVTIMEO` and a non-blocking read would spin
+the session loop.
+
+Shedding distinguishes two kinds of traffic, which is why `Link::send` takes an
+`Urgency`:
+
+- `Realtime` — tunnelled traffic. The overlay already treats loss on a path as
+  ordinary, so dropping a stale packet is better than delivering it late.
+- `Reliable` — the TLS handshake, rekeys, keepalives and overlay health probes.
+  Probes use `RelayPath::send_probe` so local shedding cannot turn a brief TCP
+  stall into an unanswered health check. These packets retain stream order.
+  If control traffic alone
+  ever exceeds the budget the link reports an error, because that much of it
+  unsent means the stream is not moving at all.
+
+Two packets are never shed regardless: anything `Reliable`, and the packet at
+the head of the queue once part of it is on the wire. Removing a frame the
+reader has begun to see would desynchronise a length-prefixed stream for good,
+which is far worse than the delay being avoided. Shedding is otherwise
+oldest-first, because the newest game packet is the one still worth arriving.
+
+WireGuard and SOCKS5 keep their existing datagram send behavior. They do not
+use this application stream queue; a successful send is not proof of delivery.
+
+After a redial, the RTT estimator is recreated using the replacement path's
+deadline floor. A UDP-to-TCP fallback must acquire the wider deadline, and a
+return to UDP must restore faster failure detection.
+
 ## Common-mode failure
 
 Independent providers do not fail in the same second. When every path stops
