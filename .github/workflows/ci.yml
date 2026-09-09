@@ -105,13 +105,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Check every release, drafts included: `gh release view` only queries the
+          # published-by-tag endpoint, and swallowing its exit code also hid real API
+          # errors. A draft here is debris from a failed run, so clear it and retry.
+          mapfile -t existing < <(gh api --paginate "repos/$GH_REPO/releases" \
+            --jq '.[] | select(.tag_name == env.RELEASE_TAG) | "\(.id) \(.draft)"')
+          for release in "${existing[@]}"; do
+            id="${release% *}"
+            if [[ "${release#* }" == "true" ]]; then
+              echo "Removing stale draft release $id for $RELEASE_TAG."
+              gh api -X DELETE "repos/$GH_REPO/releases/$id"
+            else
+              echo "Release $id is already published for $RELEASE_TAG; refusing to overwrite its assets."
+              exit 1
+            fi
+          done
           flags=()
           if [[ "$RELEASE_TAG" == *-* ]]; then
             flags+=(--prerelease --latest=false)
           fi
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release already exists; refusing to overwrite published assets."
-            exit 1
-          fi
+          # --target pins the release to the tagged commit. gh uploads assets to a
+          # draft first, and a draft with no target resolves to the default branch on
+          # publish, which then tries to recreate the tag there and fails validation.
           gh release create "$RELEASE_TAG" release/*.exe release/SHA256SUMS.txt \
-            --verify-tag --generate-notes --title "GamePath $RELEASE_TAG" "${flags[@]}"
+            --verify-tag --target "$GITHUB_SHA" --generate-notes \
+            --title "GamePath $RELEASE_TAG" "${flags[@]}"
