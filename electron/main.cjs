@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, safeStorage } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } = require('electron')
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -947,6 +947,13 @@ function createWindow() {
       // them, but the live metrics the window shows still do.
       backgroundThrottling: false,
     },
+  })
+
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    if (url === 'https://github.com/primemb/gamepath') {
+      void shell.openExternal(url).catch((error) => logger.warn(`Could not open project link: ${error.message}`))
+    }
+    return { action: 'deny' }
   })
 
   if (app.isPackaged) {

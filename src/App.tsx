@@ -2,6 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   Activity,
+  CircleCheck,
+  CircleX,
+  TriangleAlert,
+  Code2,
+  Copy,
+  MessageCircle,
+  ExternalLink,
   AppWindow,
   ArrowLeft,
   ArrowDownRight,
@@ -56,6 +63,16 @@ import type {
   Socks5ProbeResult,
   Tunnel,
 } from './types'
+
+type NoticeKind = 'success' | 'info' | 'warning' | 'error'
+type Notice = { message: string; kind: NoticeKind }
+const noticeIcons = { success: CircleCheck, info: Info, warning: TriangleAlert, error: CircleX }
+const noticeLabels = {
+  success: 'Success',
+  info: 'Information',
+  warning: 'Attention needed',
+  error: 'Something went wrong',
+}
 
 type View = 'dashboard' | 'routes' | 'split' | 'relays' | 'settings'
 
@@ -1797,7 +1814,8 @@ function App() {
     rejected: OpenVpnRejection[]
   } | null>(null)
   const [vpsTarget, setVpsTarget] = useState<{ id: string; action: 'provision' | 'remove' } | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
+  const [notice, setNotice] = useState<Notice | null>(null)
+  const showNotice = (message: string, kind: NoticeKind = 'info') => setNotice({ message, kind })
   const [installingService, setInstallingService] = useState(false)
   const [setupOpen, setSetupOpen] = useState<boolean | null>(null)
   const [pathHistories, setPathHistories] = useState<PathHistory>({})
@@ -1957,7 +1975,7 @@ function App() {
   const importTunnels = async () => {
     const result = await api.importWireGuard()
     if (result.state) setState(result.state)
-    if (result.errors?.length) setNotice(result.errors.join('\n'))
+    if (result.errors?.length) showNotice(result.errors.join('\n'), 'warning')
   }
 
   /**
@@ -1974,10 +1992,11 @@ function App() {
       const files = choice.files ?? []
       const rejected = choice.failures ?? []
       if (!files.length) {
-        setNotice(
+        showNotice(
           rejected.length
             ? rejected.map((failure) => `${failure.file}: ${failure.message}`).join('\n')
             : 'No files were chosen.',
+          rejected.length ? 'error' : 'info',
         )
         return
       }
@@ -1988,9 +2007,10 @@ function App() {
       const result = await api.addOpenVpnNodes({ filePaths: files.map((file) => file.path) })
       setState(result.state)
       const failures = [...rejected, ...result.failures]
-      if (failures.length) setNotice(failures.map((failure) => `${failure.file}: ${failure.message}`).join('\n'))
+      if (failures.length)
+        showNotice(failures.map((failure) => `${failure.file}: ${failure.message}`).join('\n'), 'warning')
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error))
+      showNotice(error instanceof Error ? error.message : String(error), 'error')
     }
   }
 
@@ -2006,7 +2026,11 @@ function App() {
     }
     const next = state.session.status === 'connected' ? await api.stopSession() : await api.startSession()
     setState(next)
-    if (next.session.message) setNotice(next.session.message)
+    if (next.session.message)
+      showNotice(
+        next.session.message,
+        next.session.status === 'error' ? 'error' : next.session.status === 'connected' ? 'success' : 'info',
+      )
   }
 
   const title: Record<View, [string, string]> = {
@@ -2067,6 +2091,7 @@ function App() {
           <div className="version">
             Client {state.clientVersion ?? 'development'} <i /> Alpha build
           </div>
+          <small className="creator-copyright">&copy; {new Date().getFullYear()} primemb</small>
         </div>
       </aside>
 
@@ -2607,11 +2632,12 @@ function App() {
                               try {
                                 const tested = await api.testRelay(item.id)
                                 setState(tested.state)
-                                setNotice(
+                                showNotice(
                                   `Authenticated relay ready · ${Math.round(tested.result.latencyMs)} ms · ${tested.result.virtualIpv4}`,
+                                  'success',
                                 )
                               } catch (error) {
-                                setNotice(error instanceof Error ? error.message : String(error))
+                                showNotice(error instanceof Error ? error.message : String(error), 'error')
                               }
                             }}
                           >
@@ -2666,6 +2692,49 @@ function App() {
 
           {view === 'settings' && (
             <section className="page-section settings-list">
+              <section className="creator-card" aria-labelledby="creator-title">
+                <div className="creator-heading">
+                  <span className="creator-mark">
+                    <Zap size={24} aria-hidden="true" />
+                  </span>
+                  <div>
+                    <span className="eyebrow">Behind GamePath</span>
+                    <h2 id="creator-title">Built by primemb</h2>
+                    <p>A better path to your next game.</p>
+                  </div>
+                  <span className="creator-badge">Creator</span>
+                </div>
+                <div className="creator-links">
+                  <a href="https://github.com/primemb/gamepath" target="_blank" rel="noopener noreferrer">
+                    <Code2 size={20} aria-hidden="true" />
+                    <span>
+                      <strong>GamePath on GitHub</strong>
+                      <small>primemb / gamepath</small>
+                    </span>
+                    <ExternalLink size={16} aria-hidden="true" />
+                  </a>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText('prime_lifesoul')
+                        showNotice('Discord username copied: prime_lifesoul', 'success')
+                      } catch {
+                        showNotice('Could not copy the username. You can add prime_lifesoul on Discord.', 'error')
+                      }
+                    }}
+                    aria-label="Copy Discord username prime_lifesoul"
+                  >
+                    <MessageCircle size={20} aria-hidden="true" />
+                    <span>
+                      <strong>Connect on Discord</strong>
+                      <small>prime_lifesoul</small>
+                    </span>
+                    <Copy size={16} aria-hidden="true" />
+                  </button>
+                </div>
+                <p className="creator-legal">&copy; {new Date().getFullYear()} primemb. GamePath.</p>
+              </section>
               <div className="settings-card">
                 <div>
                   <span className="setting-icon">
@@ -2770,9 +2839,9 @@ function App() {
                       setInstallingService(true)
                       try {
                         setState(await api.installService())
-                        setNotice('GamePath Network Service installed and running.')
+                        showNotice('GamePath Network Service installed and running.', 'success')
                       } catch (error) {
-                        setNotice(error instanceof Error ? error.message : String(error))
+                        showNotice(error instanceof Error ? error.message : String(error), 'error')
                       } finally {
                         setInstallingService(false)
                       }
@@ -2866,7 +2935,7 @@ function App() {
               const result = await api.importRelayEnrollment(relay.id)
               if (result.state) setState(result.state)
             } catch (error) {
-              setNotice(error instanceof Error ? error.message : String(error))
+              showNotice(error instanceof Error ? error.message : String(error), 'error')
             }
           }}
           onSave={async (input) => {
@@ -2874,7 +2943,7 @@ function App() {
               setState(await api.configureRelay(relay.id, input))
               setShowRelayModal(false)
             } catch (error) {
-              setNotice(error instanceof Error ? error.message : String(error))
+              showNotice(error instanceof Error ? error.message : String(error), 'error')
             }
           }}
         />
@@ -2905,28 +2974,40 @@ function App() {
                       ? await api.provisionRelayVps(target.id, input)
                       : await api.removeRelayVps(target.id, input)
                   setState(next)
-                  setNotice(
+                  showNotice(
                     vpsTarget.action === 'provision'
                       ? 'VPS configured and enrollment protected by Windows.'
                       : 'GamePath was removed from the VPS.',
+                    'success',
                   )
                   setVpsTarget(null)
                 } catch (error) {
-                  setNotice(error instanceof Error ? error.message : String(error))
+                  showNotice(error instanceof Error ? error.message : String(error), 'error')
                 }
               }}
             />
           ) : null
         })()}
-      {notice && (
-        <div className="toast">
-          <Info size={17} />
-          <span>{notice}</span>
-          <button onClick={() => setNotice(null)}>
-            <X size={15} />
-          </button>
-        </div>
-      )}
+      {notice &&
+        (() => {
+          const Icon = noticeIcons[notice.kind]
+          return (
+            <div
+              className={`toast toast-${notice.kind}`}
+              role={notice.kind === 'error' ? 'alert' : 'status'}
+              aria-atomic="true"
+            >
+              <Icon size={21} aria-hidden="true" />
+              <div className="toast-content">
+                <strong>{noticeLabels[notice.kind]}</strong>
+                <span>{notice.message}</span>
+              </div>
+              <button type="button" aria-label="Dismiss notification" onClick={() => setNotice(null)}>
+                <X size={18} aria-hidden="true" />
+              </button>
+            </div>
+          )
+        })()}
     </div>
   )
 }

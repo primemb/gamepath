@@ -2564,33 +2564,186 @@ select:focus-visible {
   align-items: center;
   gap: 7px;
 }
+.creator-copyright {
+  display: block;
+  padding: 0 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.creator-card {
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: linear-gradient(120deg, rgba(38, 230, 205, 0.06), transparent 65%), var(--panel);
+}
+.creator-heading {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.creator-mark {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border: 1px solid rgba(38, 230, 205, 0.22);
+  border-radius: 15px;
+  color: var(--cyan);
+  background: var(--cyan-soft);
+}
+.creator-heading h2 {
+  margin: 6px 0;
+  font-size: 20px;
+  letter-spacing: -0.5px;
+}
+.creator-heading p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.creator-badge {
+  margin-left: auto;
+  padding: 5px 10px;
+  color: var(--cyan);
+  border: 1px solid rgba(38, 230, 205, 0.2);
+  border-radius: 20px;
+  font-size: 11px;
+}
+.creator-links {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 24px;
+}
+.creator-links a,
+.creator-links button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-raised);
+  color: inherit;
+  text-decoration: none;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
+}
+.creator-links a:hover,
+.creator-links button:hover {
+  border-color: var(--cyan);
+  background: var(--cyan-soft);
+}
+.creator-links span {
+  flex: 1;
+  min-width: 0;
+}
+.creator-links strong,
+.creator-links small {
+  display: block;
+}
+.creator-links strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.creator-links small {
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.creator-links svg {
+  flex-shrink: 0;
+  color: var(--cyan);
+}
+.creator-legal {
+  margin: 18px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
 .toast {
+  --notice-color: #91c8ff;
+  --notice-bg: #101e30;
   position: fixed;
   right: 28px;
   bottom: 26px;
-  z-index: 30;
-  max-width: 430px;
-  min-height: 48px;
-  padding: 10px 10px 10px 13px;
-  border: 1px solid rgba(229, 180, 81, 0.22);
-  border-radius: 10px;
+  z-index: 100;
+  width: min(450px, calc(100vw - 40px));
+  max-height: min(50vh, 420px);
+  overflow-y: auto;
+  min-height: 64px;
+  padding: 12px 8px 12px 16px;
+  border: 1px solid color-mix(in srgb, var(--notice-color) 35%, transparent);
+  border-left: 3px solid var(--notice-color);
+  border-radius: 12px;
   display: flex;
-  align-items: center;
-  gap: 9px;
-  color: #e5b451;
-  background: #171713;
+  align-items: flex-start;
+  gap: 12px;
+  color: var(--notice-color);
+  background: var(--notice-bg);
   box-shadow: 0 15px 40px rgba(0, 0, 0, 0.35);
-  font-size: 9px;
-  white-space: pre-line;
 }
-.toast span {
+.toast-success {
+  --notice-color: #71e6ae;
+  --notice-bg: #10251f;
+}
+.toast-warning {
+  --notice-color: #f2c66d;
+  --notice-bg: #292215;
+}
+.toast-error {
+  --notice-color: #ff9caa;
+  --notice-bg: #2c1820;
+}
+.toast > svg {
+  flex-shrink: 0;
+  margin-top: 4px;
+}
+.toast-content {
   flex: 1;
+  min-width: 0;
+}
+.toast-content strong {
+  display: block;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.toast-content span {
+  display: block;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #edf1f7;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
 }
 .toast button {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
   border: 0;
+  border-radius: 8px;
   background: transparent;
-  color: #8d7c57;
+  color: var(--notice-color);
   cursor: pointer;
+}
+.toast button:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+.toast button:focus-visible,
+.creator-links a:focus-visible,
+.creator-links button:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .creator-links a,
+  .creator-links button {
+    transition: none;
+  }
 }
 
 @media (max-width: 1150px) {
