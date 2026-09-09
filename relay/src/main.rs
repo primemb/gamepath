@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader, HEADER_LEN};
+use gamepath_engine::mtu::{LINK_MTU, relay_tun_mtu};
+use gamepath_engine::replay::ReplayWindow;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -25,6 +27,11 @@ const SESSION_TTL: Duration = Duration::from_secs(180);
 /// paths need a few; an enrolled client cycling session ids to grow the map
 /// does not get to keep them.
 const MAX_SESSIONS_PER_CLIENT: usize = 8;
+
+/// How often the relay prints a line of counters. Frames turned away by the
+/// replay window are invisible from both ends otherwise: the client sees
+/// unanswered probes and the relay sees nothing at all.
+const STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(name = "gamepath-relay", version, about)]
@@ -92,6 +99,10 @@ struct SessionState {
     endpoints: Vec<(SocketAddr, Instant)>,
     outbound_sequence: u64,
     last_seen: Instant,
+    /// Frames the replay window turned away. Duplicates from a second path are
+    /// expected and counted here too; a count climbing far faster than the
+    /// duplicate rate means frames are arriving outside the window.
+    rejected_frames: u64,
 }
 
 impl RelayClient {
@@ -127,6 +138,7 @@ impl SessionState {
             endpoints: Vec::new(),
             outbound_sequence: 0,
             last_seen: Instant::now(),
+            rejected_frames: 0,
         }
     }
 
@@ -151,45 +163,14 @@ impl SessionState {
     }
 }
 
-#[derive(Default)]
-struct ReplayWindow {
-    highest: u64,
-    bitmap: u64,
-    initialized: bool,
-}
-
-impl ReplayWindow {
-    fn accept(&mut self, sequence: u64) -> bool {
-        if !self.initialized {
-            self.highest = sequence;
-            self.bitmap = 1;
-            self.initialized = true;
-            return true;
-        }
-        if sequence > self.highest {
-            let shift = sequence - self.highest;
-            self.bitmap = if shift >= 64 {
-                1
-            } else {
-                (self.bitmap << shift) | 1
-            };
-            self.highest = sequence;
-            return true;
-        }
-        let age = self.highest - sequence;
-        if age >= 64 || self.bitmap & (1_u64 << age) != 0 {
-            return false;
-        }
-        self.bitmap |= 1_u64 << age;
-        true
-    }
-}
-
 fn main() {
+    gamepath_engine::log::init("relay", Some(gamepath_engine::log::log_path("relay")), true);
     if let Err(error) = run() {
-        eprintln!("gamepath-relay: {error}");
+        gamepath_engine::log_error!("{error}");
+        gamepath_engine::log::flush();
         std::process::exit(1);
     }
+    gamepath_engine::log::flush();
 }
 
 fn run() -> Result<(), String> {
@@ -304,9 +285,39 @@ fn serve(
         DeviceBuilder::new()
             .name(tun_name)
             .ipv4(tun_address, tun_prefix, None)
-            .mtu(1380)
+            // Sized from what a client's transports add on the way back,
+            // not from the physical link: a packet written here is sealed and
+            // re-encapsulated before it reaches anyone.
+            .mtu(relay_tun_mtu(LINK_MTU))
             .build_sync()?,
     );
+    let stats_clients = Arc::clone(&clients);
+    thread::Builder::new()
+        .name("gamepath-relay-stats".into())
+        .spawn(move || {
+            let mut reported = 0_u64;
+            loop {
+                thread::sleep(STATS_INTERVAL);
+                let (sessions, endpoints, rejected) = {
+                    let clients = stats_clients.lock().unwrap();
+                    clients.values().fold((0, 0, 0), |totals, client| {
+                        client.sessions.values().fold(totals, |(s, e, r), session| {
+                            (s + 1, e + session.endpoints.len(), r + session.rejected_frames)
+                        })
+                    })
+                };
+                // Only speak up when something changed, so an idle relay stays
+                // quiet in the journal.
+                if rejected != reported || sessions > 0 {
+                    gamepath_engine::log_info!(
+                        "sessions={sessions} endpoints={endpoints} rejected_frames={rejected} \
+                         (+{} since last report)",
+                        rejected.saturating_sub(reported)
+                    );
+                    reported = rejected;
+                }
+            }
+        })?;
     let tun_writer = Arc::clone(&tun);
     let reply_socket = Arc::clone(&socket);
     let reply_clients = Arc::clone(&clients);
@@ -318,7 +329,7 @@ fn serve(
                 match tun.recv(&mut packet) {
                     Ok(length) => forward_reply(&reply_socket, &reply_clients, &packet[..length]),
                     Err(error) => {
-                        eprintln!("TUN receive error: {error}");
+                        gamepath_engine::log_error!("TUN receive failed: {error}");
                         thread::sleep(Duration::from_millis(100));
                     }
                 }
@@ -358,6 +369,11 @@ fn serve(
         let session = client.admit_session(header.session_id, Instant::now());
         session.observe_endpoint(endpoint);
         if !session.replay.accept(verified_header.sequence) {
+            // Either a genuine duplicate from a second path, or a frame so far
+            // behind that the window has forgotten it. The counter separates a
+            // relay that is deduplicating from one that is dropping real
+            // traffic, which is otherwise invisible from either end.
+            session.rejected_frames += 1;
             continue;
         }
         if verified_header.flags & FLAG_CONTROL != 0 {
@@ -377,7 +393,7 @@ fn serve(
             continue;
         }
         if let Err(error) = tun_writer.send(&plaintext) {
-            eprintln!("TUN send error: {error}");
+            gamepath_engine::log_error!("TUN send failed: {error}");
         }
     }
 }

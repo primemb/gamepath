@@ -3,6 +3,8 @@ use gamepath_engine::adapter::inspect_library;
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU};
+use gamepath_engine::{log_error, log_info, log_warn};
+use gamepath_engine::replay::ReplayWindow;
 use gamepath_engine::relay_path::{
     DirectPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
 };
@@ -194,15 +196,19 @@ struct ActiveWireGuardSession {
 
 /// How the inbound queue's contents have to be unwrapped.
 enum ReceiveMode {
-    Relay {
-        client_id: [u8; 16],
-        session_id: u64,
-        crypto: Arc<SessionCrypto>,
-        server_replay: Mutex<SequenceWindow>,
-    },
+    // Boxed: the replay window is a kilobyte of bitmap, and a direct session
+    // carries none of this.
+    Relay(Box<RelayReceive>),
     /// The worker already checked that these packets came out of the tunnel
     /// addressed to us, and WireGuard already authenticated them.
     Direct,
+}
+
+struct RelayReceive {
+    client_id: [u8; 16],
+    session_id: u64,
+    crypto: Arc<SessionCrypto>,
+    server_replay: Mutex<ReplayWindow>,
 }
 
 pub(crate) struct DataReceiver {
@@ -221,15 +227,15 @@ impl DataReceiver {
                 return Err("all path receivers stopped".into());
             }
         };
-        let ReceiveMode::Relay {
+        let ReceiveMode::Relay(relay) = &self.mode else {
+            return Ok(Some(response));
+        };
+        let RelayReceive {
             client_id,
             session_id,
             crypto,
             server_replay,
-        } = &self.mode
-        else {
-            return Ok(Some(response));
-        };
+        } = relay.as_ref();
         let (header, plaintext) = crypto.open_server(&response)?;
         if header.client_id != *client_id
             || header.session_id != *session_id
@@ -243,39 +249,6 @@ impl DataReceiver {
     }
 }
 
-#[derive(Default)]
-struct SequenceWindow {
-    highest: u64,
-    bitmap: u64,
-    initialized: bool,
-}
-
-impl SequenceWindow {
-    fn accept(&mut self, sequence: u64) -> bool {
-        if !self.initialized {
-            self.highest = sequence;
-            self.bitmap = 1;
-            self.initialized = true;
-            return true;
-        }
-        if sequence > self.highest {
-            let shift = sequence - self.highest;
-            self.bitmap = if shift >= 64 {
-                1
-            } else {
-                (self.bitmap << shift) | 1
-            };
-            self.highest = sequence;
-            return true;
-        }
-        let age = self.highest - sequence;
-        if age >= 64 || self.bitmap & (1_u64 << age) != 0 {
-            return false;
-        }
-        self.bitmap |= 1_u64 << age;
-        true
-    }
-}
 
 /// A route that is configured and enabled but is not part of the session.
 #[derive(Clone, Debug, Serialize)]
@@ -373,6 +346,14 @@ const PATH_QUEUE_DEPTH: usize = 1024;
 /// Inbound queue depth shared by every path worker.
 const INBOUND_QUEUE_DEPTH: usize = 2048;
 
+// A frame is numbered when it is queued but a probe is numbered later and sent
+// immediately, so a probe overtakes everything still in the queue. The relay
+// has to still remember the oldest of those when it arrives.
+const _: () = assert!(
+    PATH_QUEUE_DEPTH as u64 <= gamepath_engine::replay::MAX_REORDERING,
+    "a full outbound queue can reorder further than the replay window covers"
+);
+
 /// How long a queued packet stays worth sending.
 const PATH_QUEUE_MAX_AGE: Duration = Duration::from_millis(50);
 
@@ -398,6 +379,15 @@ struct PacketCaptureManager {
 }
 
 fn main() {
+    // stdout carries the JSON-RPC the service reads, so the log must not go
+    // there. The file is shared with the other components; stderr is off
+    // because the service captures it and would record every line twice.
+    gamepath_engine::log::init(
+        "engine",
+        Some(gamepath_engine::log::log_path("engine")),
+        false,
+    );
+    log_info!("gamepath-engine {} started", env!("CARGO_PKG_VERSION"));
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     let sessions = Arc::new(Mutex::new(WireGuardSessionManager::default()));
@@ -416,6 +406,14 @@ fn main() {
                 error: Some(format!("invalid request: {error}")),
             },
         };
+        if !response.ok {
+            // The service turns this into one user-facing message; the log
+            // keeps the request that actually failed, in order.
+            log_error!(
+                "request failed: {}",
+                response.error.as_deref().unwrap_or("unknown error")
+            );
+        }
         if serde_json::to_writer(&mut stdout, &response).is_err() {
             break;
         }
@@ -534,6 +532,16 @@ impl WireGuardSessionManager {
                 .unwrap_or_else(|| node.default_label(route));
             paths.push((route, label, node.clone(), path));
         }
+        for skipped in &skipped_routes {
+            // A route silently missing from the session is the thing nobody can
+            // explain later, so each one says why on its own line.
+            log_warn!(
+                "route {} ({}) did not join: {}",
+                skipped.route,
+                skipped.label,
+                skipped.reason
+            );
+        }
         // Every node failed to dial. There is no session to degrade into, so
         // this reports each one rather than a bare timeout.
         if paths.is_empty() {
@@ -551,6 +559,11 @@ impl WireGuardSessionManager {
             paths.iter().map(|(_, _, _, path)| path.kind()),
             LINK_MTU,
         );
+        let route_summary = paths
+            .iter()
+            .map(|(route, label, _, path)| format!("{route}:{label}/{}", path.kind()))
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut bypass_ips = vec![relay_ip];
         bypass_ips.extend(paths.iter().filter_map(|(_, _, _, path)| path.bypass_ipv4()));
         bypass_ips.sort_unstable();
@@ -637,13 +650,28 @@ impl WireGuardSessionManager {
         }
         let data_receiver = Arc::new(DataReceiver {
             inbound: Mutex::new(inbound_rx),
-            mode: ReceiveMode::Relay {
+            mode: ReceiveMode::Relay(Box::new(RelayReceive {
                 client_id,
                 session_id,
                 crypto: Arc::clone(&crypto),
-                server_replay: Mutex::new(SequenceWindow::default()),
-            },
+                server_replay: Mutex::new(ReplayWindow::default()),
+            })),
         });
+        let summary = spawn_session_summary(
+            session_id,
+            &stop,
+            &statuses,
+            &telemetry,
+            &decision_mask,
+        );
+        workers.extend(summary);
+        log_info!(
+            "relay session {session_id} up: {route_count} route(s) [{route_summary}], \
+             mtu {} overhead {}, {} skipped",
+            effective_mtu.mtu,
+            effective_mtu.overhead,
+            skipped_routes.len()
+        );
         self.active = Some(ActiveWireGuardSession {
             mode: SessionMode::Relay,
             overlay: SessionOverlay::Relay { client_id, crypto },
@@ -692,6 +720,7 @@ impl WireGuardSessionManager {
         let timer = HighResolutionTimer::raise();
         let stop = Arc::new(AtomicBool::new(false));
         let kind = path.kind();
+        let label_for_log = label.clone();
         let effective_mtu = EffectiveMtu::for_session(SessionMode::Direct, [kind], LINK_MTU);
         let statuses = Arc::new(Mutex::new(vec![initial_status(1, kind, label, endpoint)]));
         let scheduler_metrics = Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())]));
@@ -722,14 +751,28 @@ impl WireGuardSessionManager {
                 )
             })
             .map_err(|error| format!("could not start path worker: {error}"))?;
+        let session_id = rand::random::<u64>();
+        let mut workers = vec![worker];
+        workers.extend(spawn_session_summary(
+            session_id,
+            &stop,
+            &statuses,
+            &telemetry,
+            &Arc::new(AtomicU64::new(1)),
+        ));
+        log_info!(
+            "direct session up: {label_for_log} ({kind}), mtu {} overhead {}",
+            effective_mtu.mtu,
+            effective_mtu.overhead
+        );
         self.active = Some(ActiveWireGuardSession {
             mode: SessionMode::Direct,
             overlay: SessionOverlay::Direct,
-            session_id: rand::random::<u64>(),
+            session_id,
             started_at: unix_time_millis(),
             stop,
             paths: statuses,
-            workers: vec![worker],
+            workers,
             skipped_routes: Vec::new(),
             commands: vec![command_tx],
             data_receiver: Arc::new(DataReceiver {
@@ -1061,6 +1104,11 @@ impl WireGuardSessionManager {
         let Some(mut session) = self.active.take() else {
             return json!({ "state": "idle", "paths": [] });
         };
+        log_info!(
+            "session {} stopping after {} s",
+            session.session_id,
+            unix_time_millis().saturating_sub(session.started_at) / 1000
+        );
         session.stop.store(true, Ordering::Release);
         session.commands.clear();
         for worker in session.workers.drain(..) {
@@ -1803,6 +1851,7 @@ fn run_path(
                 // The new transport has to prove itself: only an answered probe
                 // puts this path back into the dispatcher's selection.
                 next_probe = Instant::now();
+                log_info!("route {} reconnected via {}", index + 1, path.endpoint());
                 let mut current = statuses.lock().unwrap();
                 current[index].endpoint = path.endpoint();
                 current[index].last_error = Some("reconnected; waiting for a probe".into());
@@ -1811,6 +1860,11 @@ fn run_path(
                 dialing = None;
                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
                 next_redial = Some(Instant::now() + backoff);
+                log_warn!(
+                    "route {} reconnect failed, retrying in {} s: {error}",
+                    index + 1,
+                    backoff.as_secs()
+                );
                 statuses.lock().unwrap()[index].last_error =
                     Some(format!("reconnect failed, retrying: {error}"));
             }
@@ -1836,6 +1890,7 @@ fn run_path(
                 }) {
                 Ok(_) => {
                     dialing = Some(result_rx);
+                    log_info!("route {} is reconnecting", index + 1);
                     statuses.lock().unwrap()[index].last_error =
                         Some("reconnecting".to_owned());
                 }
@@ -1904,6 +1959,13 @@ fn run_path(
                                 // is where it rejoins the dispatcher, and where
                                 // any pending reconnect is called off.
                                 publish_path_health(&telemetry.healthy_mask, index, true);
+                                if failures > 0 {
+                                    log_info!(
+                                        "route {} is carrying traffic again after {failures} \
+                                         failed check(s), {latency:.0} ms",
+                                        index + 1
+                                    );
+                                }
                                 failures = 0;
                                 backoff = RECONNECT_BACKOFF_MIN;
                                 next_redial = None;
@@ -1958,6 +2020,13 @@ fn run_path(
             publish_path_health(&telemetry.healthy_mask, index, false);
             failures += 1;
             schedule_redial(failures, backoff, &mut next_redial);
+            log_warn!(
+                "route {} health check timed out ({failures} in a row){}",
+                index + 1,
+                note.as_deref()
+                    .map(|note| format!(": {note}"))
+                    .unwrap_or_default()
+            );
             update_path_status(
                 &statuses,
                 index,
@@ -2012,6 +2081,85 @@ fn drain_send_queue(
         }
         let (length, result) = send(&command.frame);
         record(length, result);
+    }
+}
+
+/// Starts the summary thread, or logs why it could not start and carries on:
+/// a session that runs without its log line is better than one that refuses to
+/// start because of it.
+fn spawn_session_summary(
+    session_id: u64,
+    stop: &Arc<AtomicBool>,
+    statuses: &Arc<Mutex<Vec<PathSessionStatus>>>,
+    telemetry: &PathTelemetry,
+    decision_mask: &Arc<AtomicU64>,
+) -> Option<JoinHandle<()>> {
+    let (stop, statuses) = (Arc::clone(stop), Arc::clone(statuses));
+    let (telemetry, decision_mask) = (telemetry.clone(), Arc::clone(decision_mask));
+    thread::Builder::new()
+        .name("gamepath-session-summary".into())
+        .spawn(move || run_session_summary(session_id, stop, statuses, telemetry, decision_mask))
+        .inspect_err(|error| log_warn!("session summary logging is unavailable: {error}"))
+        .ok()
+}
+
+/// How often a running session writes its summary line.
+const SESSION_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Writes one line a minute describing every path while a session runs.
+///
+/// This is the context a transition on its own does not give: what the other
+/// routes were doing at the time, whether queues were backing up, and how much
+/// had been shed. One line a minute is about 1.5 KB an hour, which the rotation
+/// cap absorbs easily.
+fn run_session_summary(
+    session_id: u64,
+    stop: Arc<AtomicBool>,
+    statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
+    telemetry: PathTelemetry,
+    decision_mask: Arc<AtomicU64>,
+) {
+    let mut next = Instant::now() + SESSION_SUMMARY_INTERVAL;
+    while !stop.load(Ordering::Acquire) {
+        if Instant::now() < next {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        next = Instant::now() + SESSION_SUMMARY_INTERVAL;
+        let selected = selected_paths(
+            decision_mask.load(Ordering::Acquire),
+            telemetry.healthy_mask.load(Ordering::Acquire),
+        );
+        let routes = statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let carrying = selected & 1_u64.checked_shl(index as u32).unwrap_or(0) != 0;
+                let latency = path
+                    .latency_ms
+                    .map(|value| format!("{value:.0}ms"))
+                    .unwrap_or_else(|| "-".into());
+                format!(
+                    "{}:{}{} {latency} lost={} q={} drop={}",
+                    path.route,
+                    if path.reachable { "up" } else { "down" },
+                    if carrying { "/active" } else { "" },
+                    path.probes_lost,
+                    telemetry
+                        .queue_depth
+                        .get(index)
+                        .map_or(0, |depth| depth.load(Ordering::Relaxed)),
+                    telemetry
+                        .dropped
+                        .get(index)
+                        .map_or(0, |dropped| dropped.load(Ordering::Relaxed)),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        log_info!("session {session_id}: {routes}");
     }
 }
 

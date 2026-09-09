@@ -1,10 +1,12 @@
 pub mod adapter;
 pub mod auth;
+pub mod log;
 pub mod mtu;
 #[cfg(feature = "openvpn")]
 pub mod openvpn;
 pub mod policy;
 pub mod protocol;
+pub mod replay;
 pub mod relay_path;
 pub mod scheduler;
 pub mod socks5;

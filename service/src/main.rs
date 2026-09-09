@@ -141,6 +141,17 @@ mod gamepath_service {
     }
 
     pub fn run() -> ServiceResult<()> {
+        // A service has no console to print to, so the file is the only record
+        // of what it did. Mirrored to stderr as well for `--console` runs.
+        gamepath_engine::log::init(
+            "service",
+            Some(gamepath_engine::log::log_path("service")),
+            true,
+        );
+        gamepath_engine::log_info!(
+            "gamepath-service {} starting",
+            env!("CARGO_PKG_VERSION")
+        );
         if env::args().any(|argument| argument == "--console") {
             let token_file = argument("--token-file")
                 .map(PathBuf::from)
@@ -523,17 +534,7 @@ mod gamepath_service {
     }
 
     fn log_event(message: &str) {
-        use std::fs::OpenOptions;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let path = default_token_file().with_file_name("service.log");
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{timestamp} {message}");
-        }
+        gamepath_engine::log_info!("{message}");
     }
 
     fn session_status(state: &Mutex<RuntimeState>) -> Result<Value, String> {

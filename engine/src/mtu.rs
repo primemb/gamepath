@@ -60,6 +60,16 @@ pub fn path_overhead_bytes(mode: SessionMode, kind: &str) -> u16 {
     OUTER_IPV4_UDP + transport + overlay
 }
 
+/// MTU for the relay's own TUN interface.
+///
+/// Whatever the relay writes there is sealed and sent back to the client, so it
+/// has to fit inside the smallest tunnel any client might be using. The relay
+/// does not know which transports a given client opened, so this is the worst
+/// case across all of them.
+pub fn relay_tun_mtu(link_mtu: u16) -> u16 {
+    EffectiveMtu::for_session(SessionMode::Relay, ["openvpn", "wireguard", "socks5"], link_mtu).mtu
+}
+
 /// The MTU a session can carry, and the TCP MSS that fits inside it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EffectiveMtu {
@@ -130,6 +140,21 @@ mod tests {
         assert_eq!(mtu.tcp_mss(), 1316);
         // The old fixed clamp cost 316 bytes of payload on every segment.
         assert!(mtu.tcp_mss() > 1000);
+    }
+
+    #[test]
+    fn the_relay_tun_fits_inside_every_client_transport() {
+        let relay = relay_tun_mtu(LINK_MTU);
+        for kind in ["wireguard", "socks5", "openvpn"] {
+            let client = EffectiveMtu::for_session(SessionMode::Relay, [kind], LINK_MTU);
+            assert!(
+                relay <= client.mtu,
+                "a {kind} client cannot carry a {relay}-byte packet back"
+            );
+            assert!(u32::from(relay) + u32::from(client.overhead) <= u32::from(LINK_MTU));
+        }
+        // The old fixed 1380 did not, which is what this guards.
+        assert!(relay < 1380);
     }
 
     #[test]

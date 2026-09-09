@@ -144,8 +144,13 @@ function directSessionMessage(plan, node, dataPlane) {
  */
 const SESSION_POLL_MS = 3000
 
+const logger = require('./logger.cjs')
+
 let sessionKeepAlive = null
 let sessionPollInFlight = false
+// Only a change in the relay's view is worth a line; the poll runs every few
+// seconds and logging each one would bury everything else.
+let lastRuntimeState = null
 
 function updateSessionMetrics(runtime, dataPlane) {
   const paths = runtime.paths ?? []
@@ -785,12 +790,21 @@ function registerIpc() {
         state.session.capture = serviceSession.capture
         updateSessionMetrics(paths, dataPlane)
         startSessionKeepAlive()
+        logger.info(
+          `session started: mode=${mode} traffic=${state.trafficMode} ` +
+            `routes=${paths.paths.length} skipped=${(paths.skippedRoutes ?? []).length} ` +
+            `mtu=${serviceSession.capture?.effectiveMtu ?? 'unknown'}`,
+        )
+        for (const route of paths.skippedRoutes ?? []) {
+          logger.warn(`route ${route.route} (${route.label}) did not join: ${route.reason}`)
+        }
       } catch (error) {
         try {
           await serviceBridge.request('stop-session')
         } catch {}
         state.session = { status: 'error', message: error.message }
         stopSessionKeepAlive()
+        logger.error(`session failed to start: ${error.message}`)
       }
     }
     saveState()
@@ -799,6 +813,7 @@ function registerIpc() {
 
   ipcMain.handle('engine:stop', async () => {
     stopSessionKeepAlive()
+    logger.info('session stop requested')
     try {
       if (engineBridge?.status.status === 'ready') await engineBridge.request('stop-wireguard-session')
       if (serviceBridge?.status.status === 'ready') await serviceBridge.request('stop-session')
@@ -836,6 +851,12 @@ async function pollSessionStatus() {
     // Selected traffic keeps going into the tunnel while the workers are
     // alive, so it is not quietly falling back to the normal connection:
     // it is not getting through, and stopping the session is what fixes it.
+    if (runtime.state !== 'connected' && lastRuntimeState === 'connected') {
+      logger.warn(`session degraded: relay state is ${runtime.state}`)
+    } else if (runtime.state === 'connected' && lastRuntimeState && lastRuntimeState !== 'connected') {
+      logger.info('session recovered')
+    }
+    lastRuntimeState = runtime.state
     if (runtime.state !== 'connected') {
       state.session.message =
         runtime.mode === 'direct'
@@ -848,6 +869,7 @@ async function pollSessionStatus() {
     } catch {}
     state.session = { status: 'error', message: error.message }
     stopSessionKeepAlive()
+    logger.error(`session lost: ${error.message}`)
   } finally {
     sessionPollInFlight = false
   }
@@ -866,6 +888,7 @@ async function pollSessionStatus() {
  */
 function startSessionKeepAlive() {
   stopSessionKeepAlive()
+  lastRuntimeState = null
   sessionKeepAlive = setInterval(pollSessionStatus, SESSION_POLL_MS)
   // Nothing should be kept alive by this timer alone at quit time.
   sessionKeepAlive.unref?.()
@@ -910,6 +933,12 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  logger.init()
+  logger.info(`gamepath-client ${app.getVersion()} starting on ${process.platform}`)
+  app.on('will-quit', () => {
+    logger.info('client shutting down')
+    logger.flush()
+  })
   loadState()
   const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
   engineBridge = new EngineBridge(projectRoot, app.isPackaged)

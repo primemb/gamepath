@@ -26,6 +26,67 @@ All IPv4 traffic is routed into the signed Wintun adapter. This avoids process c
 
 **IPv6 is not carried.** Capture, address rewriting and relay framing are IPv4 throughout, and the mode installs only the IPv4 `0.0.0.0/1` and `128.0.0.0/1` routes. On a dual-stack connection, IPv6 keeps using the normal route while a session runs. The engine probes for a globally routable IPv6 source address when capture starts and reports it as `ipv6.systemHasRoute`; the client shows a warning when it is true. Carrying IPv6 end to end is a separate milestone.
 
+## Replay window
+
+Every frame in a session is numbered from one counter, which is what lets the
+relay recognise the same packet arriving down two paths and forward only the
+first copy. The receiver keeps a sliding window of sequences it has already
+accepted.
+
+That window has to be wide, because a frame's sequence says very little about
+when it will arrive:
+
+- A data frame is numbered when the capture layer hands it over and then waits
+  in its path's send queue. A control probe is numbered _later_ but sent
+  immediately, so it overtakes everything still queued ahead of it.
+- Paths have different latencies, so a frame sent earlier on a slow path can
+  land after later frames on a fast one.
+
+`replay::WINDOW` is therefore 8192 and a compile-time assertion ties it to
+`PATH_QUEUE_DEPTH`: a probe that overtakes a full outbound queue must still find
+the oldest frame in that queue inside the window. Too narrow a window does not
+look like a replay problem from either end — the relay silently drops real
+frames, so the client sees unanswered health probes and unexplained loss. The
+relay counts every frame the window turns away and reports it alongside session
+and endpoint counts, so that case is distinguishable from ordinary duplicate
+suppression.
+
+## Logging
+
+All four components write the same line format to one directory, so a problem
+report is a single folder rather than four places to look:
+
+```
+C:\ProgramData\GamePath\logs\   service.log  engine.log  client.log   (+ .1 rotations)
+/var/log/gamepath/                relay.log
+```
+
+```
+2026-09-09T06:56:15.042Z INFO  engine relay session 8f2a up: 2 route(s) [...], mtu 1356 overhead 144, 0 skipped
+2026-09-09T06:57:15.108Z WARN  engine route 2 health check timed out (3 in a row)
+2026-09-09T06:57:21.004Z INFO  engine route 2 is reconnecting
+```
+
+What is logged is **transitions and decisions** — a session coming up with the
+routes and MTU it settled on, a route failing to join and why, a path going
+unhealthy or recovering, a reconnect being attempted, the lease expiring — plus
+one summary line a minute per session giving every path's state, latency, lost
+probes, queue depth and drop count. Nothing is logged per packet.
+
+Three things keep it useful rather than noisy:
+
+- **Level filter.** `info` by default; `GAMEPATH_LOG=debug` raises it, and an
+  unrecognised value leaves the default rather than silently disabling the log.
+- **Repeat collapsing.** Consecutive identical messages become one line and a
+  count, so a path failing every two seconds costs one line, not eighteen
+  hundred an hour.
+- **Rotation.** 4 MB per component with one previous file kept, so a machine
+  left running for a month cannot fill its disk.
+
+Secrets never go in. Node configurations, enrollment tokens, pre-shared keys and
+the service token stay out entirely; where a value has to be correlated across
+lines, `log::fingerprint` gives a short stable tag instead of the value.
+
 ## Session lease
 
 The privileged service holds a lease on every session and tears down capture and
@@ -239,7 +300,7 @@ Each purchased configuration is parsed only in memory for the active session. Th
 
 ## Privileged service
 
-The Electron UI remains unprivileged. `GamePathService` runs through Windows Service Control Manager and owns the native engine behind a token-authenticated loopback API on `127.0.0.1`. The installer creates a random 256-bit control token under `%ProgramData%\GamePath`, protects it for Local System, administrators, and the installing user, and installs the signed Wintun and WinDivert runtime files beside the service. A Windows Job Object with `KILL_ON_JOB_CLOSE` prevents the capture engine from surviving a service exit. The GUI's two-second telemetry poll also renews a ten-second session lease; if the GUI disappears, the service closes the engine and its capture handles automatically.
+The Electron UI remains unprivileged. `GamePathService` runs through Windows Service Control Manager and owns the native engine behind a token-authenticated loopback API on `127.0.0.1`. The installer creates a random 256-bit control token under `%ProgramData%\GamePath`, protects it for Local System, administrators, and the installing user, and installs the signed Wintun and WinDivert runtime files beside the service. A Windows Job Object with `KILL_ON_JOB_CLOSE` prevents the capture engine from surviving a service exit. The client renews a thirty-second session lease from its main process every three seconds; if the client disappears, the service closes the engine and its capture handles automatically. The renewal cannot be driven from the renderer, whose timers Chromium throttles whenever the window is hidden or occluded — see _Session lease_.
 
 ## WireSock option
 
