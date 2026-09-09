@@ -1937,7 +1937,9 @@ fn run_path(
         return;
     };
     let mut next_probe = Instant::now();
-    let mut pending_probe = None;
+    let mut pending_probe: Option<(u64, Instant)> = None;
+    let mut correlated_probes = false;
+    let mut warned_legacy_probes = false;
     let mut published_setup_latency = None;
     // The probe deadline tracks this path rather than being a constant that has
     // to suit both a 60 ms route and a congested one. Its floor comes from the
@@ -2056,7 +2058,8 @@ fn run_path(
                     session_id,
                     sequence,
                 };
-                let overlay = crypto.seal_client(header, b"ping")?;
+                let overlay = crypto
+                    .seal_client(header, &gamepath_engine::protocol::probe_request(sequence))?;
                 {
                     let mut current = statuses.lock().unwrap();
                     current[index].packets_sent += 1;
@@ -2065,7 +2068,7 @@ fn run_path(
                 path.send_probe(&overlay)
             })();
             match result {
-                Ok(()) => pending_probe = Some(Instant::now()),
+                Ok(()) => pending_probe = Some((sequence, Instant::now())),
                 Err(error) => {
                     statuses.lock().unwrap()[index].probes_lost += 1;
                     update_scheduler_probe(
@@ -2086,8 +2089,28 @@ fn run_path(
             Ok(frames) => {
                 for frame in frames {
                     if let Ok((header, plaintext)) = crypto.open_server(&frame) {
-                        if header.flags & FLAG_CONTROL != 0 && plaintext == b"pong" {
-                            if let Some(started) = pending_probe.take() {
+                        if header.flags & FLAG_CONTROL != 0 {
+                            if let Some((sequence, started)) = pending_probe {
+                                if header.flags & FLAG_SERVER_TO_CLIENT == 0
+                                    || !gamepath_engine::protocol::probe_reply_matches(
+                                        &plaintext,
+                                        sequence,
+                                        !correlated_probes,
+                                    )
+                                {
+                                    continue;
+                                }
+                                if plaintext.len() == 12 {
+                                    correlated_probes = true;
+                                } else if !warned_legacy_probes {
+                                    log_warn!(
+                                        "route {} relay uses legacy probe replies; update the relay \
+                                         for accurate RTT matching after timeouts",
+                                        index + 1
+                                    );
+                                    warned_legacy_probes = true;
+                                }
+                                pending_probe = None;
                                 let elapsed = started.elapsed();
                                 rtt.record(elapsed);
                                 let latency = elapsed.as_secs_f64() * 1000.0;
@@ -2145,7 +2168,7 @@ fn run_path(
             current[index].handshake_round_trips = path.setup_round_trips();
             published_setup_latency = setup_latency;
         }
-        if pending_probe.is_some_and(|started| started.elapsed() > rtt.timeout()) {
+        if pending_probe.is_some_and(|(_, started)| started.elapsed() > rtt.timeout()) {
             pending_probe = None;
             statuses.lock().unwrap()[index].probes_lost += 1;
             update_scheduler_probe(
@@ -2187,13 +2210,15 @@ fn run_path(
 /// The paths a packet is actually dispatched to: the scheduler's pick,
 /// narrowed to the ones known to be carrying traffic.
 ///
-/// When that intersection is empty the scheduler's pick stands. Either nothing
-/// has reported healthy yet - the first packets of a session, with probes still
-/// in flight - or the two disagree, and dropping the packet on a disagreement
-/// is worse than sending it down a path that may be down.
+/// If the scheduler's pick has gone down, immediately use the healthy routes.
+/// Health and scheduling are published separately, so their snapshots can
+/// disagree during failure or recovery. Keep the original pick only when no
+/// route has proved healthy, including startup before the first probe reply.
 fn selected_paths(decision: u64, healthy: u64) -> u64 {
     if decision & healthy != 0 {
         decision & healthy
+    } else if healthy != 0 {
+        healthy
     } else {
         decision
     }
@@ -3171,16 +3196,45 @@ mod tests {
 
     #[test]
     fn a_dead_route_is_left_out_of_the_pick_but_never_leaves_it_empty() {
-        // Two routes selected, only the second one up.
         // Two routes picked, only the second one up.
         assert_eq!(selected_paths(0b11, 0b10), 0b10);
         // Nothing reported healthy yet: the scheduler's pick still stands, so
         // the first packets of a session are not dropped while probes fly.
         assert_eq!(selected_paths(0b11, 0b00), 0b11);
-        // A pick that disagrees with the health gate is honoured rather than
-        // silently emptied.
-        assert_eq!(selected_paths(0b01, 0b10), 0b01);
+        // A stale pick must not blackhole packets while another route is up.
+        assert_eq!(selected_paths(0b01, 0b10), 0b10);
         assert_eq!(selected_paths(0b11, 0b11), 0b11);
+    }
+
+    #[test]
+    fn openvpn_failure_and_recovery_keep_the_other_route_available() {
+        let healthy = AtomicU64::new(0b11);
+        let stale_openvpn_pick = 0b10;
+        publish_path_health(&healthy, 1, false);
+        // The scheduler has not republished yet. WireGuard must carry traffic
+        // immediately, without waiting for another probe or reconnect.
+        assert_eq!(
+            selected_paths(stale_openvpn_pick, healthy.load(Ordering::Acquire)),
+            0b01
+        );
+        publish_path_health(&healthy, 1, true);
+        // Recovery allows both routes to carry copies again.
+        assert_eq!(selected_paths(0b11, healthy.load(Ordering::Acquire)), 0b11);
+        publish_path_health(&healthy, 0, false);
+        assert_eq!(selected_paths(0b01, healthy.load(Ordering::Acquire)), 0b10);
+    }
+
+    #[test]
+    fn dispatch_never_chooses_a_dead_route_when_a_healthy_route_exists() {
+        // Cover every scheduler/health snapshot for four independent routes,
+        // including an empty scheduler pick during initialization.
+        for decision in 0_u64..16 {
+            for healthy in 1_u64..16 {
+                let selected = selected_paths(decision, healthy);
+                assert_ne!(selected, 0);
+                assert_eq!(selected & !healthy, 0);
+            }
+        }
     }
 
     #[test]

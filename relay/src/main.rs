@@ -377,6 +377,9 @@ fn serve(
             continue;
         }
         if verified_header.flags & FLAG_CONTROL != 0 {
+            let Some(response) = gamepath_engine::protocol::probe_response(&plaintext) else {
+                continue;
+            };
             session.outbound_sequence = session.outbound_sequence.wrapping_add(1);
             let response_header = FrameHeader {
                 flags: FLAG_CONTROL | FLAG_SERVER_TO_CLIENT,
@@ -384,7 +387,7 @@ fn serve(
                 session_id: header.session_id,
                 sequence: session.outbound_sequence,
             };
-            if let Ok(response) = crypto.seal_server(response_header, b"pong") {
+            if let Ok(response) = crypto.seal_server(response_header, &response) {
                 let _ = socket.send_to(&response, endpoint);
             }
             continue;

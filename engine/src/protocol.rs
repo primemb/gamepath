@@ -5,6 +5,31 @@ pub const HEADER_LEN: usize = 40;
 pub const FLAG_CONTROL: u8 = 1;
 pub const FLAG_SERVER_TO_CLIENT: u8 = 2;
 
+/// Echo the request identity in the payload, not the encrypted frame sequence:
+/// server sequences are independent and must remain unique for AEAD nonces.
+pub fn probe_request(sequence: u64) -> Vec<u8> {
+    let mut payload = b"ping".to_vec();
+    payload.extend_from_slice(&sequence.to_be_bytes());
+    payload
+}
+
+/// Retains the original response for clients that send an untagged ping.
+pub fn probe_response(request: &[u8]) -> Option<Vec<u8>> {
+    if request != b"ping" && !(request.len() == 12 && request.starts_with(b"ping")) {
+        return None;
+    }
+    let mut response = b"pong".to_vec();
+    response.extend_from_slice(&request[4..]);
+    Some(response)
+}
+
+/// A legacy response cannot identify its request. Once a relay demonstrates
+/// support for tagged responses, never accept an untagged one again.
+pub fn probe_reply_matches(reply: &[u8], sequence: u64, allow_legacy: bool) -> bool {
+    (allow_legacy && reply == b"pong")
+        || (reply.len() == 12 && reply.starts_with(b"pong") && reply[4..] == sequence.to_be_bytes())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     pub flags: u8,
@@ -59,6 +84,55 @@ impl FrameHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delayed_reply_cannot_answer_the_next_probe() {
+        let expired = probe_response(&probe_request(41)).unwrap();
+        let current = probe_response(&probe_request(42)).unwrap();
+        assert!(!probe_reply_matches(&expired, 42, true));
+        assert!(!probe_reply_matches(&expired, 42, false));
+        assert!(probe_reply_matches(&current, 42, false));
+    }
+
+    #[test]
+    fn legacy_peers_remain_compatible_without_downgrading_tagged_peers() {
+        assert_eq!(probe_response(b"ping"), Some(b"pong".to_vec()));
+        assert!(probe_reply_matches(b"pong", 42, true));
+        assert!(!probe_reply_matches(b"pong", 42, false));
+        for malformed in [b"pongx".as_slice(), b"pong123456789", b"ping12345678"] {
+            assert!(!probe_reply_matches(malformed, 42, true));
+        }
+        assert_eq!(probe_response(b"pingx"), None);
+        assert_eq!(probe_response(b"unknown"), None);
+    }
+
+    #[test]
+    fn encrypted_reply_matches_request_independently_of_server_sequence() {
+        use crate::auth::SessionCrypto;
+        let crypto = SessionCrypto::new(&[7; 32], 123).unwrap();
+        let request_header = FrameHeader {
+            flags: FLAG_CONTROL,
+            client_id: [3; 16],
+            session_id: 123,
+            sequence: 42,
+        };
+        let request = crypto
+            .seal_client(request_header, &probe_request(42))
+            .unwrap();
+        let (_, plaintext) = crypto.open_client(&request).unwrap();
+        let response_header = FrameHeader {
+            flags: FLAG_CONTROL | FLAG_SERVER_TO_CLIENT,
+            sequence: 900,
+            ..request_header
+        };
+        let response = crypto
+            .seal_server(response_header, &probe_response(&plaintext).unwrap())
+            .unwrap();
+        let (header, plaintext) = crypto.open_server(&response).unwrap();
+        assert_eq!(header.sequence, 900);
+        assert!(probe_reply_matches(&plaintext, 42, false));
+        assert!(!probe_reply_matches(&plaintext, 43, false));
+    }
 
     #[test]
     fn frame_header_round_trips() {
