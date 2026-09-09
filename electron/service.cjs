@@ -61,7 +61,14 @@ class ServiceBridge {
         if (newline < 0) return
         try {
           const message = JSON.parse(response.slice(0, newline))
-          if (message.id !== id) return finish(new Error('Network service returned a mismatched response'))
+          // The service answers with id 0 when it could not attribute the
+          // request at all: a malformed line, a read that failed, a rejection
+          // made before parsing. Its message is then the only account of what
+          // happened, so it is surfaced instead of being replaced by a mismatch
+          // that says nothing about the cause.
+          if (message.id !== id && message.id !== 0) {
+            return finish(new Error('Network service returned a mismatched response'))
+          }
           if (!message.ok) return finish(new Error(message.error || 'Network service request failed'))
           finish(null, message.result)
         } catch (error) {

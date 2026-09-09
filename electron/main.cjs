@@ -144,13 +144,25 @@ function directSessionMessage(plan, node, dataPlane) {
  */
 const SESSION_POLL_MS = 3000
 
+/**
+ * Consecutive failed polls before the session is given up.
+ *
+ * The service's lease is far longer than this many polls, so retrying costs
+ * nothing and a transient loopback hiccup no longer ends a working session.
+ * Tearing down on the first failure is what turned one bad reply into a
+ * disconnect after thirty-seven minutes of clean play.
+ */
+const SESSION_POLL_MAX_FAILURES = 3
+
 const logger = require('./logger.cjs')
+const { deriveJourney } = require('./journey.cjs')
 
 let sessionKeepAlive = null
 let sessionPollInFlight = false
 // Only a change in the relay's view is worth a line; the poll runs every few
 // seconds and logging each one would bury everything else.
 let lastRuntimeState = null
+let sessionPollFailures = 0
 
 function updateSessionMetrics(runtime, dataPlane) {
   const paths = runtime.paths ?? []
@@ -163,11 +175,13 @@ function updateSessionMetrics(runtime, dataPlane) {
   const probesLost = paths.reduce((total, path) => total + (path.probesLost ?? 0), 0)
   const completedProbes = probesReceived + probesLost
   const direct = (runtime.mode ?? state.session.mode) === 'direct'
-  const userToNode = fastest?.nodeLatencyMs ?? null
+  const journey = deriveJourney({
+    paths,
+    selectedRoutes: runtime.selectedRoutes ?? [],
+    direct,
+  })
   // A direct session's node is the last hop, so there is no second leg to
   // report — reporting one would invent a hop the traffic never takes.
-  const nodeToRelay =
-    !direct && userToNode != null && fastest?.latencyMs != null ? Math.max(0, fastest.latencyMs - userToNode) : null
   state.session.mode = runtime.mode ?? state.session.mode ?? 'relay'
   state.session.pathMetrics = paths
   state.session.selectedRoutes = runtime.selectedRoutes ?? []
@@ -190,9 +204,10 @@ function updateSessionMetrics(runtime, dataPlane) {
   state.session.routeLatencies = paths
     .filter((path) => path.latencyMs != null)
     .map((path) => Math.max(1, Math.round(path.latencyMs)))
+  state.session.journey = journey
   state.session.metrics = {
-    userToNodeMs: userToNode,
-    nodeToRelayMs: nodeToRelay,
+    userToNodeMs: journey.userToNodeMs,
+    nodeToRelayMs: journey.nodeToRelayMs,
     relayToServerMs: dataPlane?.relayToServerMs ?? state.session.metrics?.relayToServerMs ?? null,
     endToEndMs: dataPlane?.latencyMs ?? state.session.metrics?.endToEndMs ?? null,
     benchmarkServer: dataPlane?.benchmarkServer ?? state.session.metrics?.benchmarkServer ?? '',
@@ -857,6 +872,7 @@ async function pollSessionStatus() {
       logger.info('session recovered')
     }
     lastRuntimeState = runtime.state
+    sessionPollFailures = 0
     if (runtime.state !== 'connected') {
       state.session.message =
         runtime.mode === 'direct'
@@ -864,12 +880,19 @@ async function pollSessionStatus() {
           : 'Relay paths are unavailable. Selected traffic is not getting through — stop the session to use your normal connection.'
     }
   } catch (error) {
+    sessionPollFailures += 1
+    if (sessionPollFailures < SESSION_POLL_MAX_FAILURES) {
+      // The paths are almost certainly still carrying traffic; only the status
+      // request failed. Say so and let the next poll decide.
+      logger.warn(`session status failed (${sessionPollFailures}/${SESSION_POLL_MAX_FAILURES}): ${error.message}`)
+      return
+    }
     try {
       await serviceBridge.request('stop-session')
     } catch {}
     state.session = { status: 'error', message: error.message }
     stopSessionKeepAlive()
-    logger.error(`session lost: ${error.message}`)
+    logger.error(`session lost after ${sessionPollFailures} failed status requests: ${error.message}`)
   } finally {
     sessionPollInFlight = false
   }
@@ -889,6 +912,7 @@ async function pollSessionStatus() {
 function startSessionKeepAlive() {
   stopSessionKeepAlive()
   lastRuntimeState = null
+  sessionPollFailures = 0
   sessionKeepAlive = setInterval(pollSessionStatus, SESSION_POLL_MS)
   // Nothing should be kept alive by this timer alone at quit time.
   sessionKeepAlive.unref?.()

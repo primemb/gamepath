@@ -297,19 +297,28 @@ mod gamepath_service {
     /// Tells a caller the service is busy without spending a thread on it.
     fn reject_overloaded(mut stream: TcpStream) {
         let _ = stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT));
+        gamepath_engine::log_warn!("refused a request: too many in flight");
         let response = failure(0, "service is busy; retry".into());
         let _ = serde_json::to_writer(&mut stream, &response);
         let _ = stream.write_all(b"\n");
     }
 
     fn handle_connection(mut stream: TcpStream, expected_token: &str, state: &Mutex<RuntimeState>) {
-        // Without these a caller that connects and stalls holds this thread
-        // open indefinitely, which is the whole cost of the attack.
-        if stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).is_err()
+        // The listener is non-blocking so the accept loop can poll `stop`, and
+        // on Windows an accepted socket inherits that. Left alone, `read_line`
+        // below fails the instant the request has not landed yet - which on
+        // loopback is pure scheduling luck - and the timeouts are ignored
+        // entirely. Both depend on this being a blocking socket.
+        //
+        // Without the timeouts a caller that connects and then stalls holds
+        // this thread open indefinitely.
+        if stream.set_nonblocking(false).is_err()
+            || stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).is_err()
             || stream
                 .set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))
                 .is_err()
         {
+            gamepath_engine::log_warn!("dropping a connection that could not be configured");
             return;
         }
         let mut line = String::new();
@@ -320,9 +329,15 @@ mod gamepath_service {
             Ok(0) => return,
             Ok(_) => match serde_json::from_str::<Request>(&line) {
                 Ok(request) => handle_request(request, expected_token, state),
-                Err(error) => failure(0, format!("invalid request: {error}")),
+                Err(error) => {
+                    gamepath_engine::log_warn!("could not parse a request: {error}");
+                    failure(0, format!("invalid request: {error}"))
+                }
             },
-            Err(error) => failure(0, format!("request read failed: {error}")),
+            Err(error) => {
+                gamepath_engine::log_warn!("could not read a request: {error}");
+                failure(0, format!("request read failed: {error}"))
+            }
         };
         let _ = serde_json::to_writer(&mut stream, &response);
         let _ = stream.write_all(b"\n");
@@ -671,6 +686,46 @@ mod gamepath_service {
                 handle_connection(stream, "token", &state);
                 started.elapsed()
             })
+        }
+
+        /// Mirrors the real accept path, which the other tests do not: the
+        /// production listener is non-blocking, and on Windows an accepted
+        /// socket inherits that from its listener.
+        #[test]
+        fn a_request_is_read_even_when_it_arrives_after_the_accept() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = thread::spawn(move || {
+                let mut socket = TcpStream::connect(address).unwrap();
+                // The request lands after the handler has already started
+                // reading, which on loopback is a matter of scheduling luck.
+                thread::sleep(Duration::from_millis(300));
+                socket
+                    .write_all(b"{\"id\":7,\"command\":\"status\",\"token\":\"token\"}
+")
+                    .unwrap();
+                let mut response = String::new();
+                BufReader::new(&socket).read_line(&mut response).unwrap();
+                response
+            });
+            let (stream, _) = loop {
+                match listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            let state = Mutex::new(RuntimeState::default());
+            handle_connection(stream, "token", &state);
+            let response = client.join().unwrap();
+            let parsed: Value = serde_json::from_str(&response).unwrap();
+            // The id has to come back, or the client cannot match the reply to
+            // its request and reports a mismatch instead of the real outcome.
+            assert_eq!(parsed["id"], serde_json::json!(7), "got: {response}");
+            assert_eq!(parsed["ok"], serde_json::json!(true), "got: {response}");
         }
 
         #[test]

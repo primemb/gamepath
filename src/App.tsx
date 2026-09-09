@@ -509,6 +509,13 @@ function TelemetryPanel({
   const paths = state.session.pathMetrics ?? []
   const degradedRoutes = state.session.degradedRoutes ?? []
   const live = state.session.status === 'connected'
+  // Derived once in the main process by deriveJourney, which pins the
+  // breakdown to the route actually carrying traffic and refuses to invent a
+  // hop from a handshake whose round-trip count is not fixed.
+  const journey = state.session.journey
+  // Separate from the journey's pinned route on purpose: this heading reports
+  // the best latency on offer, which is a different question from which route
+  // the breakdown below describes.
   const bestPath = paths
     .filter((path) => path.reachable && path.latencyMs != null)
     .sort((a, b) => (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity))[0]
@@ -516,10 +523,11 @@ function TelemetryPanel({
   // and the middle stage would only ever read as an empty measurement. Before
   // a session starts there is no session mode, so the chosen one stands in.
   const direct = (state.session.mode ?? state.connectionMode) === 'direct'
-  const bestNodeToRelay =
-    bestPath?.nodeLatencyMs != null && bestPath.latencyMs != null
-      ? Math.max(0, bestPath.latencyMs - bestPath.nodeLatencyMs)
-      : null
+  const hopCaption = () => {
+    if (!journey?.label) return 'Awaiting route'
+    if (journey.estimable) return `${journey.label} · estimated from handshake`
+    return `${journey.label} · not measurable on ${journey.kind}`
+  }
   const serverStage: [string, number | null | undefined, ReactNode] = [
     direct ? 'VPN node → server' : 'Relay → server',
     metrics?.relayToServerMs,
@@ -532,13 +540,10 @@ function TelemetryPanel({
     ),
   ]
   const stages: Array<[string, number | null | undefined, ReactNode]> = direct
-    ? [
-        ['You → VPN node', bestPath?.nodeLatencyMs, bestPath ? `${bestPath.label} handshake` : 'Awaiting node'],
-        serverStage,
-      ]
+    ? [['You → VPN node', journey?.userToNodeMs, hopCaption()], serverStage]
     : [
-        ['User → VPN node', bestPath?.nodeLatencyMs, bestPath ? `${bestPath.label} handshake` : 'Awaiting route'],
-        ['VPN node → relay', bestNodeToRelay, bestPath ? `${bestPath.label} estimate` : 'Awaiting route'],
+        ['User → VPN node', journey?.userToNodeMs, hopCaption()],
+        ['VPN node → relay', journey?.nodeToRelayMs, hopCaption()],
         serverStage,
       ]
   return (
@@ -631,8 +636,8 @@ function TelemetryPanel({
             const samples = histories[path.route] ?? []
             const carryingTraffic = state.session.selectedRoutes?.includes(path.route) ?? path.reachable
             const nodeToRelay =
-              path.nodeLatencyMs != null && path.latencyMs != null
-                ? Math.max(0, path.latencyMs - path.nodeLatencyMs)
+              path.handshakeMs != null && path.handshakeRoundTrips && path.latencyMs != null
+                ? path.latencyMs - path.handshakeMs / path.handshakeRoundTrips
                 : null
             const rate = rates[path.route]
             return (
@@ -669,7 +674,7 @@ function TelemetryPanel({
                 </div>
                 <div className="node-secondary">
                   <span>
-                    User → node <strong>{formatMetric(path.nodeLatencyMs)}</strong>
+                    Handshake <strong>{formatMetric(path.handshakeMs)}</strong>
                   </span>
                   {!direct && (
                     <span>

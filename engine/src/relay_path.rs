@@ -306,8 +306,21 @@ pub trait RelayPath: Send {
     /// The outer endpoint shown in telemetry.
     fn endpoint(&self) -> String;
 
-    /// Latency of the transport's own setup: the user-to-node hop.
+    /// How long this path's transport took to establish, measured once.
+    ///
+    /// This is a setup cost, not a hop latency. How many round trips it
+    /// contains depends entirely on the protocol, which is what
+    /// [`RelayPath::setup_round_trips`] exists to say.
     fn setup_latency_ms(&self) -> Option<f64>;
+
+    /// Round trips inside [`RelayPath::setup_latency_ms`], where that is a
+    /// fixed number.
+    ///
+    /// Dividing the setup cost by this gives a usable estimate of the hop out
+    /// to the node. `None` means the count varies with the server's
+    /// configuration, so no honest estimate can be derived and none should be
+    /// shown.
+    fn setup_round_trips(&self) -> Option<u8>;
 
     fn identity(&self) -> PathIdentity;
 
@@ -383,6 +396,12 @@ impl RelayPath for WireGuardRelayPath {
 
     fn setup_latency_ms(&self) -> Option<f64> {
         self.path.handshake_latency_ms()
+    }
+
+    /// One: the handshake is an initiation out and a response back, so the
+    /// setup cost is a single round trip to the node.
+    fn setup_round_trips(&self) -> Option<u8> {
+        Some(1)
     }
 
     fn identity(&self) -> PathIdentity {
@@ -629,6 +648,14 @@ impl RelayPath for OpenVpnRelayPath {
         self.path.handshake_latency_ms()
     }
 
+    /// Unknowable. Setup is timed until the server pushes its configuration,
+    /// which spans a TCP connect, a full TLS handshake and the push exchange -
+    /// and how many round trips that is depends on the cipher suite, the
+    /// certificate chain and the server's own directives.
+    fn setup_round_trips(&self) -> Option<u8> {
+        None
+    }
+
     fn identity(&self) -> PathIdentity {
         PathIdentity::OpenVpn {
             endpoint: self.path.endpoint(),
@@ -676,6 +703,11 @@ impl RelayPath for Socks5RelayPath {
 
     fn setup_latency_ms(&self) -> Option<f64> {
         Some(self.path.setup_latency_ms())
+    }
+
+    /// Three: the TCP connect, the method negotiation and `UDP ASSOCIATE`.
+    fn setup_round_trips(&self) -> Option<u8> {
+        Some(3)
     }
 
     fn identity(&self) -> PathIdentity {

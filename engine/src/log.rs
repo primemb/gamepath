@@ -168,15 +168,17 @@ pub fn flush() {
 
 impl Sink {
     fn emit(&mut self, level: Level, message: String) {
-        if let Some(repeat) = &mut self.repeat
-            && repeat.level == level
-            && repeat.message == message
-        {
-            repeat.count += 1;
-            if repeat.since.elapsed() < REPEAT_WINDOW {
+        let continues_a_repeat = matches!(
+            &self.repeat,
+            Some(repeat) if repeat.level == level && repeat.message == message
+        );
+        if continues_a_repeat {
+            let held = self.repeat.as_mut().expect("checked just above");
+            held.count += 1;
+            if held.since.elapsed() < REPEAT_WINDOW {
                 return;
             }
-            let count = repeat.count;
+            let count = held.count;
             self.repeat = None;
             self.line(level, &format!("{message} (repeated {count} times)"));
             self.repeat = Some(Repeat {
@@ -228,9 +230,11 @@ impl Sink {
         if self.written + line.len() as u64 > MAX_BYTES {
             self.rotate(&path);
         }
-        if let Some(file) = self.file.as_mut()
-            && file.write_all(line.as_bytes()).is_ok()
-        {
+        let wrote = self
+            .file
+            .as_mut()
+            .is_some_and(|file| file.write_all(line.as_bytes()).is_ok());
+        if wrote {
             self.written += line.len() as u64;
         }
     }

@@ -53,3 +53,43 @@ test('the session lease is renewed from the main process, well inside its window
   assert.match(main, /startSessionKeepAlive\(\)/)
   assert.match(main, /backgroundThrottling: false/)
 })
+
+test('the declared MSRV matches the toolchain the relay is built with', () => {
+  const script = fs.readFileSync(path.join(__dirname, '..', 'deploy', 'install-relay.sh'), 'utf8')
+  const pinned = script.match(/RUST_TOOLCHAIN="(\d+)\.(\d+)\.(\d+)"/)
+  assert.ok(pinned, 'install-relay.sh must pin a toolchain')
+  const [, pinnedMajor, pinnedMinor] = pinned
+
+  // The relay compiles from source on its own host with that pinned toolchain,
+  // so no crate it pulls in may need anything newer. Cargo and clippy both read
+  // rust-version, which is what stops a newer language feature or std API being
+  // used here and only failing at deploy time.
+  for (const crate of ['engine', 'relay', 'service']) {
+    const manifest = fs.readFileSync(path.join(__dirname, '..', crate, 'Cargo.toml'), 'utf8')
+    const declared = manifest.match(/rust-version = "(\d+)\.(\d+)"/)
+    assert.ok(declared, `${crate}/Cargo.toml must declare rust-version`)
+    assert.equal(
+      `${declared[1]}.${declared[2]}`,
+      `${pinnedMajor}.${pinnedMinor}`,
+      `${crate} declares an MSRV that the relay's pinned toolchain cannot build`,
+    )
+  }
+})
+
+test('a server-level error reaches the caller instead of a bare mismatch', async (context) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gamepath-service-test-'))
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const tokenFile = path.join(directory, 'token')
+  fs.writeFileSync(tokenFile, 'test-token-that-is-long-enough-for-the-bridge')
+  const server = net.createServer((socket) => {
+    socket.on('data', () => {
+      // id 0 is what the service sends when it could not attribute the request
+      // at all. Its message is the only account of what went wrong.
+      socket.end(`${JSON.stringify({ id: 0, ok: false, error: 'service is busy; retry' })}\n`)
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  context.after(() => server.close())
+  const bridge = new ServiceBridge({ tokenFile, port: server.address().port })
+  await assert.rejects(() => bridge.request('session-status'), /service is busy; retry/)
+})

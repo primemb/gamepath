@@ -2,6 +2,10 @@
 name = "gamepath-engine"
 version = "0.1.0"
 edition = "2024"
+# The relay is compiled on its own host, and deploy/install-relay.sh pins the
+# toolchain there for distros that ship an older Rust. Nothing here may use a
+# language feature or std API newer than this.
+rust-version = "1.85"
 description = "Native multipath packet engine for the GamePath Windows client"
 
 [lib]

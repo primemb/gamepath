@@ -26,6 +26,36 @@ All IPv4 traffic is routed into the signed Wintun adapter. This avoids process c
 
 **IPv6 is not carried.** Capture, address rewriting and relay framing are IPv4 throughout, and the mode installs only the IPv4 `0.0.0.0/1` and `128.0.0.0/1` routes. On a dual-stack connection, IPv6 keeps using the normal route while a session runs. The engine probes for a globally routable IPv6 source address when capture starts and reports it as `ipv6.systemHasRoute`; the client shows a warning when it is true. Carrying IPv6 end to end is a separate milestone.
 
+## Capture throughput
+
+On an `all-outbound` scope every outbound packet on the machine passes through
+the capture layer, so the cost of handling one is latency the _next_ selected
+packet inherits. Two things keep the game's traffic off that critical path:
+
+- **Reinjection runs on its own thread.** Putting a packet that is not ours back
+  on the network stack is a syscall, and it happened on the same loop that
+  carries game packets. Unselected packets are now handed to a bounded queue and
+  reinjected by a single dedicated thread, which preserves their order. A full
+  queue never drops: the packet is handed back and reinjected inline, because
+  losing it would break some other application's connection. `bypassQueueFull`
+  counts how often that happens.
+- **Several capture threads share the handle.** WinDivert allows concurrent
+  receives on one handle, so a burst of unrelated traffic no longer queues ahead
+  of the game's packets waiting for a single reader. The count is 2-4, because
+  the per-packet work is a parse and a hash lookup and the tunnel enqueue
+  serialises regardless.
+
+The second one admits reordering in principle: two packets taken by different
+threads can reach the tunnel in the opposite order. In practice the window is
+the few microseconds between a receive returning and the session lock being
+taken, while consecutive packets of one game flow are milliseconds apart, so it
+only applies inside a burst — and the relay's replay window accepts reordering
+by design.
+
+Neither of these removes the underlying cost of classifying in user space. That
+needs the WFP callout described under _Split-tunnel capture_; a plan built only
+from destination rules avoids it entirely.
+
 ## Replay window
 
 Every frame in a session is numbered from one counter, which is what lets the

@@ -113,7 +113,10 @@ export type PathMetric = {
   endpoint: string
   reachable: boolean
   latencyMs: number | null
-  nodeLatencyMs: number | null
+  /** One-time cost of establishing this path's transport, not a hop latency. */
+  handshakeMs: number | null
+  /** Round trips inside `handshakeMs`; null when the protocol's count varies. */
+  handshakeRoundTrips: number | null
   packetsSent: number
   packetsReceived: number
   bytesSent: number
@@ -150,6 +153,18 @@ export type AppState = {
     selectedRoutes?: number[]
     /** Routes that are enabled but not currently carrying traffic. */
     degradedRoutes?: number[]
+    /**
+     * The one route the journey breakdown describes, and whether its transport
+     * allows a hop estimate to be derived from its handshake at all.
+     */
+    journey?: {
+      route: number | null
+      label: string | null
+      kind: string | null
+      estimable: boolean
+      userToNodeMs: number | null
+      nodeToRelayMs: number | null
+    }
     /** Routes that are enabled but were left out of the session entirely. */
     skippedRoutes?: Array<{ route: number; label: string; reason: string }>
     /** What the chosen transports leave for payload, and how the queues fare. */

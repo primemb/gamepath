@@ -8,7 +8,7 @@ use std::ffi::{CString, OsString, c_char, c_void};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -278,6 +278,56 @@ struct HandledConnection {
     started_at: u64,
 }
 
+/// A packet that is not ours, waiting to be put back on the network stack.
+///
+/// Reinjection is a syscall, and on this configuration it happens for every
+/// outbound packet on the machine that is not selected. Doing it on the capture
+/// loop puts the game's packets behind a download's: they share one loop, so
+/// each reinject syscall is latency the next selected packet inherits. Handing
+/// them to a dedicated thread takes that cost off the path game traffic uses.
+struct Bypass {
+    packet: Vec<u8>,
+    address: Address,
+}
+
+/// Bypass packets held before the capture loop reinjects inline instead.
+///
+/// Deep enough to absorb a burst, and overflow is never a drop: the packet
+/// belongs to some other application, and losing it to make room would break
+/// that application's connection.
+const BYPASS_QUEUE_DEPTH: usize = 2048;
+
+/// Bytes the bypass queue may hold, checked alongside the depth.
+///
+/// The depth alone does not bound memory: with send offload Windows hands
+/// WinDivert segments far larger than an MTU, so 2048 of them could be well
+/// over a hundred megabytes. This is the bound that actually holds.
+const BYPASS_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Capture threads reading the shared WinDivert handle.
+///
+/// WinDivert supports concurrent receives on one handle, which is what stops a
+/// burst of unrelated traffic from queueing ahead of the game's packets. Kept
+/// small: the work each thread does per packet is a parse and a hash lookup,
+/// and the tunnel enqueue serialises anyway, so a handful is enough to keep the
+/// driver's queue drained.
+fn capture_thread_count() -> usize {
+    // Overridable so a machine that misbehaves with concurrent receives can be
+    // pinned to a single reader without a rebuild.
+    if let Some(count) = std::env::var("GAMEPATH_CAPTURE_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        return count.clamp(1, 8);
+    }
+    // Never more readers than the machine has cores: on a single-core box the
+    // extra threads would only take turns, and a capture thread blocked in
+    // `recv` is not what needs parallelising there.
+    std::thread::available_parallelism()
+        .map(|count| count.get().min(4))
+        .unwrap_or(1)
+}
+
 struct PendingSyn {
     packet: Vec<u8>,
     address: Address,
@@ -384,6 +434,13 @@ struct Registry {
     applications: Vec<String>,
     folders: Vec<String>,
     matched_sockets: AtomicU64,
+    /// Times the bypass queue was full and the capture loop had to reinject
+    /// inline. A climbing count means the reinjector cannot keep up.
+    bypass_queue_full: AtomicU64,
+    /// Bytes currently sitting in the bypass queue, so memory is bounded by
+    /// size and not only by packet count.
+    bypass_queued_bytes: AtomicUsize,
+    capture_threads: AtomicU64,
     /// MSS advertised on captured TCP handshakes, derived from what the chosen
     /// transports add to a packet rather than fixed at a guess.
     tcp_mss: u16,
@@ -523,6 +580,9 @@ impl SplitPacketCapture {
             applications: plan.application_paths.clone(),
             folders: plan.folder_prefixes.clone(),
             matched_sockets: AtomicU64::new(0),
+            bypass_queue_full: AtomicU64::new(0),
+            bypass_queued_bytes: AtomicUsize::new(0),
+            capture_threads: AtomicU64::new(0),
             captured_packets: AtomicU64::new(0),
             captured_bytes: AtomicU64::new(0),
             relayed_packets: AtomicU64::new(0),
@@ -607,25 +667,47 @@ impl SplitPacketCapture {
             })
             .map_err(|error| format!("could not start pending SYN classifier: {error}"))?;
         registry.workers.lock().unwrap().push(worker);
-        let capture_registry = Arc::clone(&registry);
-        let capture_stop = Arc::clone(&stop);
-        let capture_sessions = Arc::clone(&sessions);
-        let capture_returns = Arc::clone(&return_paths);
+        let (bypass_tx, bypass_rx) = mpsc::sync_channel(BYPASS_QUEUE_DEPTH);
+        let bypass_handle = Arc::clone(&network_handle);
+        let bypass_stop = Arc::clone(&stop);
+        let bypass_registry = Arc::clone(&registry);
         let worker = thread::Builder::new()
-            .name("gamepath-windivert-selected".into())
+            .name("gamepath-windivert-bypass".into())
             .spawn(move || {
-                run_selected_capture(
-                    network_handle,
-                    capture_stop,
-                    capture_sessions,
-                    capture_returns,
-                    virtual_ipv4,
-                    capture_registry,
-                    pending_tx,
-                )
+                run_bypass_injector(bypass_handle, bypass_stop, bypass_registry, bypass_rx)
             })
-            .map_err(|error| format!("could not start selected packet capture: {error}"))?;
+            .map_err(|error| format!("could not start the bypass injector: {error}"))?;
         registry.workers.lock().unwrap().push(worker);
+
+        let threads = capture_thread_count();
+        registry
+            .capture_threads
+            .store(threads as u64, Ordering::Relaxed);
+        for index in 0..threads {
+            let capture_handle = Arc::clone(&network_handle);
+            let capture_registry = Arc::clone(&registry);
+            let capture_stop = Arc::clone(&stop);
+            let capture_sessions = Arc::clone(&sessions);
+            let capture_returns = Arc::clone(&return_paths);
+            let capture_pending = pending_tx.clone();
+            let capture_bypass = bypass_tx.clone();
+            let worker = thread::Builder::new()
+                .name(format!("gamepath-windivert-selected-{}", index + 1))
+                .spawn(move || {
+                    run_selected_capture(
+                        capture_handle,
+                        capture_stop,
+                        capture_sessions,
+                        capture_returns,
+                        virtual_ipv4,
+                        capture_registry,
+                        capture_pending,
+                        capture_bypass,
+                    )
+                })
+                .map_err(|error| format!("could not start selected packet capture: {error}"))?;
+            registry.workers.lock().unwrap().push(worker);
+        }
 
         let inject_stop = Arc::clone(&stop);
         let inject_returns = Arc::clone(&return_paths);
@@ -679,6 +761,9 @@ impl SplitPacketCapture {
             "matchedSockets": self.registry.matched_sockets.load(Ordering::Relaxed),
             "captureFilterCount": selector_table(&self.registry).len,
             "captureScope": if self.scope.broad { "all-outbound" } else { "destinations" },
+            "captureThreads": self.registry.capture_threads.load(Ordering::Relaxed),
+            "bypassQueueFull": self.registry.bypass_queue_full.load(Ordering::Relaxed),
+            "bypassQueuedBytes": self.registry.bypass_queued_bytes.load(Ordering::Relaxed),
             "captureScopeReason": self.scope.reason,
             "captureFilter": self.scope.clause,
             "tcpMss": self.registry.tcp_mss,
@@ -754,6 +839,7 @@ impl Drop for CaptureLoopTimer<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_selected_capture(
     handle: Arc<Handle>,
     stop: Arc<AtomicBool>,
@@ -762,6 +848,7 @@ fn run_selected_capture(
     virtual_ipv4: Ipv4Addr,
     registry: Arc<Registry>,
     pending_syns: mpsc::SyncSender<PendingSyn>,
+    bypass: mpsc::SyncSender<Bypass>,
 ) {
     let mut packet_buffer = vec![0_u8; 65_535];
     let mut tunnel_buffer = Vec::with_capacity(65_535);
@@ -796,7 +883,7 @@ fn run_selected_capture(
         }
         let packet = &packet_buffer[..packet_length];
         let Some(fields) = ipv4_fields(packet) else {
-            let _ = handle.send(packet, &address);
+            reinject(&handle, &bypass, &registry, packet, address);
             continue;
         };
         let (mut selected, mut application) = match table.lookup(fields) {
@@ -851,7 +938,7 @@ fn run_selected_capture(
             }
         }
         if !selected {
-            let _ = handle.send(packet, &address);
+            reinject(&handle, &bypass, &registry, packet, address);
             continue;
         }
         route_selected_packet(
@@ -866,6 +953,86 @@ fn run_selected_capture(
             application,
             &mut tunnel_buffer,
         );
+    }
+}
+
+/// Hands a packet that is not ours to the reinjector, or puts it back inline
+/// if that queue is full.
+///
+/// Falling back inline costs this loop a syscall, which is the thing being
+/// avoided - but dropping the packet would break some other application's
+/// connection, and that is worse than the latency.
+fn reinject(
+    handle: &Handle,
+    bypass: &mpsc::SyncSender<Bypass>,
+    registry: &Registry,
+    packet: &[u8],
+    address: Address,
+) {
+    // Reserved before the packet is copied, so the byte bound holds even with
+    // every capture thread queueing at once. A failed reservation reinjects
+    // inline, which costs this loop a syscall but never loses the packet.
+    let reserved = registry
+        .bypass_queued_bytes
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            (queued + packet.len() <= BYPASS_QUEUE_BYTES).then(|| queued + packet.len())
+        });
+    if reserved.is_ok() {
+        let length = packet.len();
+        match bypass.try_send(Bypass {
+            packet: packet.to_vec(),
+            address,
+        }) {
+            Ok(()) => return,
+            Err(mpsc::TrySendError::Full(held) | mpsc::TrySendError::Disconnected(held)) => {
+                // The depth bound rejected it, so give the reservation back
+                // before falling through to the inline path.
+                registry
+                    .bypass_queued_bytes
+                    .fetch_sub(length, Ordering::AcqRel);
+                registry.bypass_queue_full.fetch_add(1, Ordering::Relaxed);
+                let _ = handle.send(&held.packet, &held.address);
+                return;
+            }
+        }
+    }
+    registry.bypass_queue_full.fetch_add(1, Ordering::Relaxed);
+    let _ = handle.send(packet, &address);
+}
+
+/// Puts packets that were not selected back on the network stack.
+///
+/// One thread, so the traffic it carries keeps its order: these are other
+/// applications' packets and reordering them is a cost with no upside.
+fn run_bypass_injector(
+    handle: Arc<Handle>,
+    stop: Arc<AtomicBool>,
+    registry: Arc<Registry>,
+    bypass: mpsc::Receiver<Bypass>,
+) {
+    let send = |item: &Bypass| {
+        let _ = handle.send(&item.packet, &item.address);
+        registry
+            .bypass_queued_bytes
+            .fetch_sub(item.packet.len(), Ordering::AcqRel);
+    };
+    loop {
+        match bypass.recv_timeout(Duration::from_millis(50)) {
+            Ok(item) => send(&item),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+            // Every capture thread has gone; drain what is left so nothing is
+            // taken out of the network stack and never put back.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                while let Ok(item) = bypass.try_recv() {
+                    send(&item);
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -1175,10 +1342,8 @@ fn dword_rows(buffer: &[u8], width: usize) -> Vec<Vec<u32>> {
             let bytes = buffer.get(start..start + row_bytes)?;
             Some(
                 bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|part| u32::from_ne_bytes(*part))
+                    .chunks_exact(4)
+                    .map(|part| u32::from_ne_bytes(part.try_into().unwrap()))
                     .collect(),
             )
         })
@@ -1473,14 +1638,15 @@ fn record_handled_connection(
     application: Option<String>,
 ) {
     let mut connections = registry.handled_connections.lock().unwrap();
-    if connections.len() >= 64
-        && !connections.contains_key(&key)
-        && let Some(oldest) = connections
+    if connections.len() >= 64 && !connections.contains_key(&key) {
+        let oldest = connections
             .iter()
             .min_by_key(|(_, connection)| connection.started_at)
-            .map(|(key, _)| *key)
-    {
-        connections.remove(&oldest);
+            .map(|(key, _)| *key);
+        // `None` only when the map is empty, which the length check rules out.
+        if let Some(oldest) = oldest {
+            connections.remove(&oldest);
+        }
     }
     connections.entry(key).or_insert_with(|| HandledConnection {
         application: application.unwrap_or_else(|| "Matched destination".into()),
@@ -1643,6 +1809,121 @@ mod tests {
             })
             .collect::<Vec<_>>();
         compile("split", &rules).unwrap()
+    }
+
+    /// The byte reservation is what actually bounds bypass memory, and every
+    /// capture thread contends on it at once. It must never exceed the budget
+    /// and must never leak a reservation.
+    #[test]
+    fn concurrent_bypass_reservations_stay_inside_the_byte_budget() {
+        use std::sync::Barrier;
+
+        let queued = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let granted = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let packet = 60_000_usize;
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let (queued, peak, granted, barrier) = (
+                Arc::clone(&queued),
+                Arc::clone(&peak),
+                Arc::clone(&granted),
+                Arc::clone(&barrier),
+            );
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..500 {
+                    let reserved = queued.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |held| (held + packet <= BYPASS_QUEUE_BYTES).then(|| held + packet),
+                    );
+                    if let Ok(previous) = reserved {
+                        granted.fetch_add(1, Ordering::Relaxed);
+                        peak.fetch_max(previous + packet, Ordering::Relaxed);
+                        // The injector releases it again.
+                        queued.fetch_sub(packet, Ordering::AcqRel);
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(granted.load(Ordering::Relaxed) > 0, "nothing was ever queued");
+        assert!(
+            peak.load(Ordering::Relaxed) <= BYPASS_QUEUE_BYTES,
+            "the byte budget was exceeded: {} > {BYPASS_QUEUE_BYTES}",
+            peak.load(Ordering::Relaxed)
+        );
+        // Every reservation was released, so nothing leaked.
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_packet_larger_than_the_whole_budget_is_never_queued() {
+        let queued = AtomicUsize::new(0);
+        let oversized = BYPASS_QUEUE_BYTES + 1;
+        let reserved = queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            (held + oversized <= BYPASS_QUEUE_BYTES).then(|| held + oversized)
+        });
+        assert!(reserved.is_err(), "it would have to be reinjected inline");
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_capture_thread_count_stays_within_its_bounds() {
+        let threads = capture_thread_count();
+        assert!(
+            (1..=4).contains(&threads),
+            "{threads} capture threads is outside the intended range"
+        );
+        assert!(
+            threads <= std::thread::available_parallelism().map(|count| count.get()).unwrap_or(1),
+            "more capture threads than cores"
+        );
+    }
+
+    /// A bypassed packet belongs to some other application. Losing one breaks
+    /// that application's connection, so a full queue has to hand the packet
+    /// back for the caller to reinject inline rather than swallow it.
+    #[test]
+    fn a_full_bypass_queue_hands_the_packet_back_instead_of_dropping_it() {
+        let (sender, _receiver) = mpsc::sync_channel::<Bypass>(1);
+        let address = Address::default();
+        assert!(
+            sender
+                .try_send(Bypass { packet: vec![1, 2, 3], address })
+                .is_ok()
+        );
+        let overflow = sender.try_send(Bypass {
+            packet: vec![4, 5, 6],
+            address,
+        });
+        let held = match &overflow {
+            Err(mpsc::TrySendError::Full(held) | mpsc::TrySendError::Disconnected(held)) => held,
+            Ok(()) => panic!("the queue should have been full"),
+        };
+        // The exact bytes come back, which is what makes the inline fallback in
+        // `reinject` able to put this packet on the wire unchanged.
+        assert_eq!(held.packet, vec![4, 5, 6]);
+    }
+
+    /// A disconnected queue must also hand the packet back, so a capture thread
+    /// outliving the injector still puts traffic back on the network stack.
+    #[test]
+    fn a_disconnected_bypass_queue_also_hands_the_packet_back() {
+        let (sender, receiver) = mpsc::sync_channel::<Bypass>(4);
+        drop(receiver);
+        let result = sender.try_send(Bypass {
+            packet: vec![7, 8],
+            address: Address::default(),
+        });
+        match &result {
+            Err(mpsc::TrySendError::Disconnected(held)) => assert_eq!(held.packet, vec![7, 8]),
+            other => panic!("expected the packet back, got {:?}", other.is_ok()),
+        }
     }
 
     #[test]

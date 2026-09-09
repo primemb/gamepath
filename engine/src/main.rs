@@ -145,7 +145,12 @@ struct PathSessionStatus {
     endpoint: String,
     reachable: bool,
     latency_ms: Option<f64>,
-    node_latency_ms: Option<f64>,
+    /// One-time cost of establishing this path's transport. Not a hop
+    /// latency: see `handshake_round_trips`.
+    handshake_ms: Option<f64>,
+    /// Round trips inside `handshake_ms`, when the protocol has a fixed
+    /// number. `None` means no hop estimate can be derived from it.
+    handshake_round_trips: Option<u8>,
     packets_sent: u64,
     packets_received: u64,
     bytes_sent: u64,
@@ -1535,7 +1540,8 @@ fn initial_status(
         endpoint,
         reachable: false,
         latency_ms: None,
-        node_latency_ms: None,
+        handshake_ms: None,
+        handshake_round_trips: None,
         packets_sent: 0,
         packets_received: 0,
         bytes_sent: 0,
@@ -1670,7 +1676,11 @@ fn run_direct_path(
         if (handshake, reachable) != published_health {
             let mut current = statuses.lock().unwrap();
             current[0].reachable = reachable;
-            current[0].node_latency_ms = handshake;
+            current[0].handshake_ms = handshake;
+            // WireGuard's handshake is one round trip, so it doubles as a hop
+            // estimate. OpenVPN's spans a TLS negotiation whose round-trip
+            // count depends on the server, so none is offered.
+            current[0].handshake_round_trips = (path.kind() == KIND_WIREGUARD).then_some(1);
             if let Some(latency) = handshake {
                 // Stand in for the end-to-end number until a probe answers, so
                 // a node that filters ICMP still reports a real measurement.
@@ -2001,7 +2011,9 @@ fn run_path(
         // every path worker, so it is taken only when the value actually moves.
         let setup_latency = path.setup_latency_ms();
         if setup_latency != published_setup_latency {
-            statuses.lock().unwrap()[index].node_latency_ms = setup_latency;
+            let mut current = statuses.lock().unwrap();
+            current[index].handshake_ms = setup_latency;
+            current[index].handshake_round_trips = path.setup_round_trips();
             published_setup_latency = setup_latency;
         }
         if pending_probe.is_some_and(|started| started.elapsed() > Duration::from_millis(1500)) {
@@ -2319,11 +2331,11 @@ fn is_matching_icmp_reply(
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0_u32;
-    let (pairs, remainder) = bytes.as_chunks::<2>();
-    for chunk in pairs {
-        sum += u32::from(u16::from_be_bytes(*chunk));
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
     }
-    if let Some(last) = remainder.first() {
+    if let Some(last) = chunks.remainder().first() {
         sum += u32::from(*last) << 8;
     }
     while sum > 0xffff {
@@ -3070,7 +3082,7 @@ mod tests {
             let current = statuses.lock().unwrap();
             // Every answered probe is counted against one that was sent.
             assert!(current[0].probes_sent >= current[0].probes_received);
-            assert!(current[0].node_latency_ms.is_some());
+            assert!(current[0].handshake_ms.is_some());
             assert!(current[0].latency_ms.is_some());
             assert!(current[0].last_error.is_none());
         }
