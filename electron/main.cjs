@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell, Tray } = require('electron')
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -42,6 +42,10 @@ let state
 let engineBridge
 let serviceBridge
 let ruleChangeQueue = Promise.resolve()
+let mainWindow = null
+let tray = null
+let isQuitting = false
+let closePromptOpen = false
 
 function statePath() {
   return path.join(app.getPath('userData'), 'gamepath-state.json')
@@ -972,10 +976,42 @@ function stopSessionKeepAlive() {
   sessionKeepAlive = null
 }
 
+function appIconPath() {
+  return app.isPackaged ? path.join(process.resourcesPath, 'icon.png') : path.join(__dirname, '..', 'build', 'icon.png')
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function createTray() {
+  if (tray) return
+  tray = new Tray(appIconPath())
+  tray.setToolTip('GamePath')
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: 'Open GamePath', click: showMainWindow },
+      { type: 'separator' },
+      {
+        label: 'Quit GamePath',
+        click: () => {
+          isQuitting = true
+          app.quit()
+        },
+      },
+    ]),
+  )
+  tray.on('click', showMainWindow)
+}
+
 function createWindow() {
-  const icon = app.isPackaged
-    ? path.join(process.resourcesPath, 'icon.png')
-    : path.join(__dirname, '..', 'build', 'icon.png')
+  const icon = appIconPath()
   const window = new BrowserWindow({
     width: 1360,
     height: 860,
@@ -996,6 +1032,39 @@ function createWindow() {
       // them, but the live metrics the window shows still do.
       backgroundThrottling: false,
     },
+  })
+  mainWindow = window
+
+  window.on('close', async (event) => {
+    if (isQuitting) return
+    event.preventDefault()
+    if (closePromptOpen) return
+    closePromptOpen = true
+    try {
+      const { response } = await dialog.showMessageBox(window, {
+        type: 'question',
+        title: 'Close GamePath',
+        message: 'Keep GamePath running in the notification area?',
+        detail:
+          'Minimizing keeps your active session and network monitoring running. Use the GamePath tray icon to reopen or quit the app.',
+        buttons: ['Minimize to tray', 'Quit GamePath'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      })
+      if (response === 1) {
+        isQuitting = true
+        app.quit()
+      } else if (!window.isDestroyed()) {
+        window.hide()
+      }
+    } finally {
+      closePromptOpen = false
+    }
+  })
+
+  window.on('closed', () => {
+    if (mainWindow === window) mainWindow = null
   })
 
   window.webContents.setWindowOpenHandler(({ url }) => {
@@ -1027,13 +1096,15 @@ app.whenReady().then(async () => {
   await serviceBridge.inspect()
   registerIpc()
   createWindow()
+  createTray()
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    showMainWindow()
   })
 })
 
-app.on('before-quit', () => engineBridge?.stop())
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+app.on('before-quit', () => {
+  isQuitting = true
+  engineBridge?.stop()
+  tray?.destroy()
+  tray = null
 })

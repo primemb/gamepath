@@ -52,6 +52,7 @@ import type {
   AppState,
   ConnectionMode,
   GamePathApi,
+  HandledConnection,
   PathMetric,
   Relay,
   RuleKind,
@@ -522,6 +523,20 @@ function TelemetryPanel({
   const metrics = state.session.metrics
   const capture = state.session.capture?.diagnostics
   const connections = capture?.handledConnections ?? []
+  const connectionGroups = useMemo(() => {
+    const groups = new Map<string, { application: string; connections: HandledConnection[] }>()
+
+    for (const connection of connections) {
+      const application = connection.application.trim() || 'Unknown application'
+      const key = application.toLowerCase()
+      const group = groups.get(key)
+      if (group) group.connections.push(connection)
+      else groups.set(key, { application, connections: [connection] })
+    }
+
+    return Array.from(groups, ([key, group]) => ({ key, ...group }))
+  }, [connections])
+  const [expandedApplications, setExpandedApplications] = useState<Set<string>>(() => new Set())
   const captureP99 = histogramPercentile(capture?.captureLoopHistogram, 0.99)
   const paths = state.session.pathMetrics ?? []
   const degradedRoutes = state.session.degradedRoutes ?? []
@@ -731,51 +746,104 @@ function TelemetryPanel({
           className="connections-head"
           onClick={() => setShowConnections((current) => !current)}
           aria-expanded={showConnections}
+          aria-controls="handled-connections-content"
         >
           <div>
             <span className="eyebrow">Handled connections</span>
             <h3>Traffic currently routed</h3>
           </div>
           <small>
-            {connections.length} active connection{connections.length === 1 ? '' : 's'}
+            {connections.length} active connection{connections.length === 1 ? '' : 's'} · {connectionGroups.length}{' '}
+            application{connectionGroups.length === 1 ? '' : 's'}
           </small>
-          <ChevronDown size={15} />
+          <ChevronDown size={15} aria-hidden="true" />
         </button>
         {showConnections && (
-          <>
+          <div id="handled-connections-content">
             {connections.length ? (
               <div className="connections-table">
                 <div className="connection-header">
                   <span>Application</span>
-                  <span>Destination</span>
-                  <span>Protocol</span>
-                  <span>Connected</span>
+                  <span>Connections</span>
+                  <span>Protocols</span>
+                  <span>Latest</span>
                 </div>
-                {connections.map((connection, index) => (
-                  <div
-                    className="connection-row"
-                    key={`${connection.application}-${connection.destinationIp}-${connection.destinationPort}-${index}`}
-                  >
-                    <span>
-                      <AppWindow size={14} />
-                      <strong>{connection.application}</strong>
-                    </span>
-                    <code>
-                      <AddressWithCountry
-                        value={connection.destinationIp}
-                        suffix={connection.destinationPort ? `:${connection.destinationPort}` : ''}
-                      />
-                    </code>
-                    <em>{connection.protocol}</em>
-                    <time>
-                      {new Date(connection.startedAt * 1000).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        second: '2-digit',
-                      })}
-                    </time>
-                  </div>
-                ))}
+                {connectionGroups.map((group, groupIndex) => {
+                  const expanded = expandedApplications.has(group.key)
+                  const protocols = Array.from(new Set(group.connections.map((connection) => connection.protocol)))
+                  const latestStartedAt = Math.max(...group.connections.map((connection) => connection.startedAt))
+                  const detailsId = `application-connections-${groupIndex}`
+                  return (
+                    <div className="connection-app" key={group.key}>
+                      <button
+                        className={`connection-app-row ${expanded ? 'is-open' : ''}`}
+                        onClick={() =>
+                          setExpandedApplications((current) => {
+                            const next = new Set(current)
+                            if (next.has(group.key)) next.delete(group.key)
+                            else next.add(group.key)
+                            return next
+                          })
+                        }
+                        aria-expanded={expanded}
+                        aria-controls={detailsId}
+                      >
+                        <span className="connection-app-name">
+                          <ChevronRight className="connection-app-chevron" size={14} aria-hidden="true" />
+                          <AppWindow size={14} aria-hidden="true" />
+                          <strong>{group.application}</strong>
+                        </span>
+                        <span className="connection-count">
+                          <strong>{group.connections.length}</strong>
+                          <small>active</small>
+                        </span>
+                        <span className="connection-protocols">{protocols.join(' / ')}</span>
+                        <time>
+                          {new Date(latestStartedAt * 1000).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                          })}
+                        </time>
+                      </button>
+                      {expanded && (
+                        <div
+                          className="connection-details"
+                          id={detailsId}
+                          role="region"
+                          aria-label={`${group.application} connection details`}
+                        >
+                          <div className="connection-detail-header" aria-hidden="true">
+                            <span>Destination</span>
+                            <span>Protocol</span>
+                            <span>Connected</span>
+                          </div>
+                          {group.connections.map((connection, connectionIndex) => (
+                            <div
+                              className="connection-detail-row"
+                              key={`${connection.destinationIp}-${connection.destinationPort}-${connection.startedAt}-${connectionIndex}`}
+                            >
+                              <code>
+                                <AddressWithCountry
+                                  value={connection.destinationIp}
+                                  suffix={connection.destinationPort ? `:${connection.destinationPort}` : ''}
+                                />
+                              </code>
+                              <em>{connection.protocol}</em>
+                              <time>
+                                {new Date(connection.startedAt * 1000).toLocaleTimeString([], {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit',
+                                })}
+                              </time>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             ) : (
               <p className="connections-empty">
@@ -798,7 +866,7 @@ function TelemetryPanel({
                 </span>
               </div>
             )}
-          </>
+          </div>
         )}
       </div>
     </section>

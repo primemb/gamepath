@@ -1103,7 +1103,7 @@ main {
   margin: 4px 0 10px;
 }
 .connection-header,
-.connection-row {
+.connection-app-row {
   display: grid;
   grid-template-columns: 1.2fr 1fr 80px 90px;
   align-items: center;
@@ -1116,36 +1116,72 @@ main {
   text-transform: uppercase;
   letter-spacing: 0.07em;
 }
-.connection-row {
-  min-height: 38px;
-  padding: 0 8px;
+.connection-app {
   border-top: 1px solid rgba(255, 255, 255, 0.045);
-  color: #8792a4;
-  font-size: 8px;
 }
-.connection-row > span {
+.connection-app-row {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 8px;
+  border: 0;
+  color: #8792a4;
+  background: transparent;
+  font-size: 8px;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease;
+}
+.connection-app-row:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+.connection-app-row:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+}
+.connection-app-name {
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 7px;
 }
-.connection-row svg {
+.connection-app-name svg {
   flex: 0 0 auto;
   color: var(--cyan);
 }
-.connection-row strong {
+.connection-app-name .connection-app-chevron {
+  color: #687487;
+  transition: transform 0.18s ease;
+}
+.connection-app-row.is-open .connection-app-chevron {
+  transform: rotate(90deg);
+}
+.connection-app-name strong {
   overflow: hidden;
   color: #d7dde7;
   font-weight: 590;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.connection-row code {
-  color: #9ba7b8;
-  font-family: 'Cascadia Code', monospace;
-  font-size: 8px;
+.connection-count {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
 }
-.connection-row em {
+.connection-count strong {
+  color: #d7dde7;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.connection-count small {
+  color: #697486;
+  font-size: 7px;
+}
+.connection-protocols,
+.connection-detail-row em {
   width: fit-content;
   padding: 3px 6px;
   border-radius: 5px;
@@ -1154,9 +1190,43 @@ main {
   font-size: 7px;
   font-style: normal;
 }
-.connection-row time {
+.connection-app-row time,
+.connection-detail-row time {
   color: #697486;
   font-variant-numeric: tabular-nums;
+}
+.connection-details {
+  padding: 0 8px 7px 36px;
+  background: rgba(0, 0, 0, 0.12);
+}
+.connection-detail-header,
+.connection-detail-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 80px 90px;
+  align-items: center;
+  gap: 12px;
+}
+.connection-detail-header {
+  padding: 8px 0 5px;
+  color: #505b6d;
+  font-size: 7px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+.connection-detail-row {
+  min-height: 34px;
+  border-top: 1px solid rgba(255, 255, 255, 0.035);
+  color: #8792a4;
+  font-size: 8px;
+}
+.connection-detail-row code {
+  min-width: 0;
+  overflow: hidden;
+  color: #9ba7b8;
+  font-family: 'Cascadia Code', monospace;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .connections-empty {
   margin: 11px 0 1px;
