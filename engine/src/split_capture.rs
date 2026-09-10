@@ -3,6 +3,7 @@
 use crate::{DataReceiver, WireGuardSessionManager};
 use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::policy::{InterceptionPlan, RuleSpec, compile};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString, c_char, c_void};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -266,6 +267,8 @@ struct ReturnPath {
     local_ip: Ipv4Addr,
     interface_index: u32,
     subinterface_index: u32,
+    process_id: Option<u32>,
+    last_seen: Instant,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -276,6 +279,8 @@ struct HandledConnection {
     destination_port: u16,
     protocol: String,
     started_at: u64,
+    #[serde(skip)]
+    process_id: Option<u32>,
 }
 
 /// A packet that is not ours, waiting to be put back on the network stack.
@@ -303,6 +308,28 @@ const BYPASS_QUEUE_DEPTH: usize = 2048;
 /// WinDivert segments far larger than an MTU, so 2048 of them could be well
 /// over a hundred megabytes. This is the bound that actually holds.
 const BYPASS_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Soft ceiling for reply routing state.
+///
+/// Socket close notifications normally remove these entries. The ceiling is a
+/// second line of defence for providers, drivers, or abrupt process exits that
+/// fail to produce a close event. An active path is never evicted to enforce it.
+const RETURN_PATH_TARGET: usize = 4096;
+
+/// Dead process checks are deliberately off the packet path. Two seconds is
+/// quick enough for the UI and port reuse while remaining negligible beside
+/// the socket-event stream.
+const PROCESS_REAP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Never tear down a route from one fallible system snapshot. Socket close
+/// events are authoritative; fallback cleanup requires about 30 seconds of
+/// consecutive evidence so a protected process or a table race cannot disrupt
+/// an active game.
+const STALE_FLOW_CONFIRMATIONS: u8 = 15;
+
+/// The connection list is a live view, not session history. A flow remains
+/// visible briefly between packets so ordinary game traffic does not flicker.
+const ACTIVE_CONNECTION_WINDOW: Duration = Duration::from_secs(30);
 
 /// Capture threads reading the shared WinDivert handle.
 ///
@@ -349,12 +376,44 @@ struct SelectorTable {
     destinations: Vec<(u32, u32)>,
     /// Keyed by the exact tuple a packet presents, so both the port-specific
     /// and the any-port form of a flow selector are direct lookups.
-    flows: HashMap<(u8, u16, Option<u16>), Option<String>>,
+    flows: HashMap<(u8, u16, Option<u16>), Selection>,
     len: usize,
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+struct Selection {
+    application: Option<String>,
+    process_id: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct FlowOwner {
+    endpoint_id: Option<u64>,
+    process_id: u32,
+    path: String,
+    stale_observations: u8,
+}
+
+#[derive(Default)]
+struct SelectorState {
+    selectors: HashMap<TrafficSelector, Option<String>>,
+    flow_owners: HashMap<TrafficSelector, Vec<FlowOwner>>,
+}
+
 impl SelectorTable {
+    #[cfg(test)]
     fn build(selectors: &HashMap<TrafficSelector, Option<String>>) -> Self {
+        Self::build_with_owners(selectors, &HashMap::new())
+    }
+
+    fn build_state(state: &SelectorState) -> Self {
+        Self::build_with_owners(&state.selectors, &state.flow_owners)
+    }
+
+    fn build_with_owners(
+        selectors: &HashMap<TrafficSelector, Option<String>>,
+        flow_owners: &HashMap<TrafficSelector, Vec<FlowOwner>>,
+    ) -> Self {
         let mut destinations = Vec::new();
         let mut flows = HashMap::new();
         for (selector, application) in selectors {
@@ -365,7 +424,16 @@ impl SelectorTable {
                     local_port,
                     remote_port,
                 } => {
-                    flows.insert((protocol, local_port, remote_port), application.clone());
+                    flows.insert(
+                        (protocol, local_port, remote_port),
+                        Selection {
+                            application: application.clone(),
+                            process_id: flow_owners
+                                .get(selector)
+                                .and_then(|owners| owners.last())
+                                .map(|owner| owner.process_id),
+                        },
+                    );
                 }
             }
         }
@@ -390,7 +458,7 @@ impl SelectorTable {
 
     /// The application a packet is selected for, or `None` when nothing
     /// matches. A destination match has no application attached to it.
-    fn lookup(&self, fields: Ipv4Fields) -> Option<Option<String>> {
+    fn lookup(&self, fields: Ipv4Fields) -> Option<(Option<&str>, Option<u32>)> {
         // Flows are checked first: they name the process that owns the
         // connection, which is the more specific of the two answers.
         if let Some(application) = self
@@ -402,14 +470,14 @@ impl SelectorTable {
             ))
             .or_else(|| self.flows.get(&(fields.protocol, fields.source_port, None)))
         {
-            return Some(application.clone());
+            return Some((application.application.as_deref(), application.process_id));
         }
         let destination = u32::from(fields.destination);
         let index = self
             .destinations
             .partition_point(|(first, _)| *first <= destination);
         let (_, last) = self.destinations.get(index.checked_sub(1)?)?;
-        (destination <= *last).then_some(None)
+        (destination <= *last).then_some((None, None))
     }
 }
 
@@ -418,7 +486,7 @@ struct Registry {
     bypass: String,
     handles: Mutex<Vec<Arc<Handle>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
-    selectors: Mutex<HashMap<TrafficSelector, Option<String>>>,
+    selector_state: Mutex<SelectorState>,
     /// Rebuilt from `selectors` on every change. Behind an `RwLock` so
     /// classifying a packet never contends with another classifier.
     table: RwLock<Arc<SelectorTable>>,
@@ -490,6 +558,7 @@ impl TrafficSelector {
 pub struct SplitPacketCapture {
     stop: Arc<AtomicBool>,
     registry: Arc<Registry>,
+    return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
     target_count: usize,
     scope: CaptureScope,
 }
@@ -568,7 +637,7 @@ impl SplitPacketCapture {
             bypass: bypass_clause(bypass_ips),
             handles: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
-            selectors: Mutex::new(HashMap::new()),
+            selector_state: Mutex::new(SelectorState::default()),
             table: RwLock::new(Arc::new(SelectorTable::default())),
             table_version: AtomicU64::new(0),
             handled_connections: Mutex::new(HashMap::new()),
@@ -728,6 +797,7 @@ impl SplitPacketCapture {
         Ok(Self {
             stop,
             registry,
+            return_paths,
             target_count: rules.len(),
             scope,
         })
@@ -738,13 +808,23 @@ impl SplitPacketCapture {
     }
 
     pub fn diagnostics(&self) -> serde_json::Value {
+        let observed_at = Instant::now();
+        let return_paths = self.return_paths.lock().unwrap();
         let mut handled_connections = self
             .registry
             .handled_connections
             .lock()
             .unwrap()
-            .values()
-            .cloned()
+            .iter()
+            .filter_map(|(key, connection)| {
+                return_paths
+                    .get(key)
+                    .is_some_and(|path| {
+                        observed_at.saturating_duration_since(path.last_seen)
+                            <= ACTIVE_CONNECTION_WINDOW
+                    })
+                    .then_some(connection.clone())
+            })
             .collect::<Vec<_>>();
         handled_connections.sort_by_key(|connection| std::cmp::Reverse(connection.started_at));
         let capture_loop_histogram = [10_u64, 25, 50, 100, 250, 500, 1000, u64::MAX]
@@ -796,24 +876,59 @@ impl Drop for SplitPacketCapture {
 }
 
 fn add_selector(registry: &Registry, selector: TrafficSelector) {
-    let mut selectors = registry.selectors.lock().unwrap();
-    if selectors.insert(selector, None).is_none() {
-        publish_selectors(registry, &selectors);
+    let mut state = registry.selector_state.lock().unwrap();
+    if state.selectors.insert(selector, None).is_none() {
+        publish_selectors(registry, &state);
     }
 }
 
-fn add_process_selector(registry: &Registry, selector: TrafficSelector, application: String) {
-    let mut selectors = registry.selectors.lock().unwrap();
-    let previous = selectors.insert(selector, Some(application.clone()));
-    if previous != Some(Some(application)) {
-        publish_selectors(registry, &selectors);
+fn add_process_selector(
+    registry: &Registry,
+    selector: TrafficSelector,
+    path: String,
+    process_id: u32,
+    endpoint_id: Option<u64>,
+) {
+    let application = process_name(&path);
+    let owner = FlowOwner {
+        endpoint_id,
+        process_id,
+        path,
+        stale_observations: 0,
+    };
+    let mut state = registry.selector_state.lock().unwrap();
+    let owners = state.flow_owners.entry(selector).or_default();
+    // A packet-table lookup may discover a TCP flow just before WinDivert's
+    // CONNECT notification arrives. Replace that PID-only fallback with the
+    // endpoint-owned record so the later CLOSE notification can remove it.
+    if endpoint_id.is_some() {
+        owners.retain(|held| !(held.endpoint_id.is_none() && held.process_id == process_id));
+    }
+    let owner_added = match owners.iter_mut().find(|held| {
+        held.endpoint_id == owner.endpoint_id
+            && held.process_id == owner.process_id
+            && held.path == owner.path
+    }) {
+        Some(held) => {
+            held.stale_observations = 0;
+            false
+        }
+        None => {
+            owners.push(owner);
+            true
+        }
+    };
+    let label_changed =
+        state.selectors.insert(selector, Some(application.clone())) != Some(Some(application));
+    if owner_added || label_changed {
+        publish_selectors(registry, &state);
     }
 }
 
 /// Swaps in a fresh classification table. Called with the selector lock held so
 /// the table is never built from a half-applied change.
-fn publish_selectors(registry: &Registry, selectors: &HashMap<TrafficSelector, Option<String>>) {
-    *registry.table.write().unwrap() = Arc::new(SelectorTable::build(selectors));
+fn publish_selectors(registry: &Registry, state: &SelectorState) {
+    *registry.table.write().unwrap() = Arc::new(SelectorTable::build_state(state));
     registry.table_version.fetch_add(1, Ordering::Release);
 }
 
@@ -886,17 +1001,19 @@ fn run_selected_capture(
             reinject(&handle, &bypass, &registry, packet, address);
             continue;
         };
-        let (mut selected, mut application) = match table.lookup(fields) {
-            Some(application) => (true, application),
-            None => (false, None),
+        let (mut selected, application, mut process_id) = match table.lookup(fields) {
+            Some((application, process_id)) => (true, application.map(Cow::Borrowed), process_id),
+            None => (false, None, None),
         };
+        let mut application = application;
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
         if !selected && is_tcp_syn(packet) {
-            if let Some(path) =
+            if let Some((matched_process_id, path)) =
                 tcp_socket_process(fields, &registry.applications, &registry.folders)
             {
-                application = Some(process_name(&path));
+                application = Some(Cow::Owned(process_name(&path)));
+                process_id = Some(matched_process_id);
                 add_process_selector(
                     &registry,
                     TrafficSelector::Flow {
@@ -904,7 +1021,9 @@ fn run_selected_capture(
                         local_port: fields.source_port,
                         remote_port: Some(fields.destination_port),
                     },
-                    application.clone().unwrap(),
+                    path,
+                    matched_process_id,
+                    None,
                 );
                 registry.matched_sockets.fetch_add(1, Ordering::Relaxed);
                 selected = true;
@@ -950,7 +1069,8 @@ fn run_selected_capture(
             packet,
             address,
             fields,
-            application,
+            application.as_deref(),
+            process_id,
             &mut tunnel_buffer,
         );
     }
@@ -972,11 +1092,12 @@ fn reinject(
     // Reserved before the packet is copied, so the byte bound holds even with
     // every capture thread queueing at once. A failed reservation reinjects
     // inline, which costs this loop a syscall but never loses the packet.
-    let reserved = registry
-        .bypass_queued_bytes
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-            (queued + packet.len() <= BYPASS_QUEUE_BYTES).then(|| queued + packet.len())
-        });
+    let reserved =
+        registry
+            .bypass_queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued + packet.len() <= BYPASS_QUEUE_BYTES).then(|| queued + packet.len())
+            });
     if reserved.is_ok() {
         let length = packet.len();
         match bypass.try_send(Bypass {
@@ -1046,24 +1167,41 @@ fn route_selected_packet(
     packet: &[u8],
     address: Address,
     fields: Ipv4Fields,
-    application: Option<String>,
+    application: Option<&str>,
+    process_id: Option<u32>,
     tunnel_buffer: &mut Vec<u8>,
 ) {
     let connection_key = ReturnKey::outbound(fields);
-    let is_new_connection = return_paths
-        .lock()
-        .unwrap()
-        .insert(
-            connection_key,
-            ReturnPath {
-                local_ip: fields.source,
-                interface_index: address.network_data().interface_index,
-                subinterface_index: address.network_data().subinterface_index,
-            },
-        )
-        .is_none();
+    let now = Instant::now();
+    let mut paths = return_paths.lock().unwrap();
+    if !paths.contains_key(&connection_key) && paths.len() >= RETURN_PATH_TARGET {
+        if let Some(oldest) = paths
+            .iter()
+            .filter(|(_, path)| {
+                path.process_id.is_none()
+                    && now.saturating_duration_since(path.last_seen) > ACTIVE_CONNECTION_WINDOW
+            })
+            .min_by_key(|(_, path)| path.last_seen)
+            .map(|(key, _)| *key)
+        {
+            paths.remove(&oldest);
+            registry.handled_connections.lock().unwrap().remove(&oldest);
+        }
+    }
+    let previous = paths.insert(
+        connection_key,
+        ReturnPath {
+            local_ip: fields.source,
+            interface_index: address.network_data().interface_index,
+            subinterface_index: address.network_data().subinterface_index,
+            process_id,
+            last_seen: now,
+        },
+    );
+    drop(paths);
+    let is_new_connection = previous.is_none_or(|path| path.process_id != process_id);
     if is_new_connection {
-        record_handled_connection(registry, connection_key, fields, application);
+        record_handled_connection(registry, connection_key, fields, application, process_id);
     }
     registry.captured_packets.fetch_add(1, Ordering::Relaxed);
     registry
@@ -1117,8 +1255,8 @@ fn run_pending_syns(
         if let Some(wait) = item.deadline.checked_duration_since(Instant::now()) {
             thread::sleep(wait);
         }
-        let application = selector_table(&registry).lookup(item.fields);
-        if let Some(application) = application {
+        let table = selector_table(&registry);
+        if let Some((application, process_id)) = table.lookup(item.fields) {
             route_selected_packet(
                 &handle,
                 &sessions,
@@ -1129,6 +1267,7 @@ fn run_pending_syns(
                 item.address,
                 item.fields,
                 application,
+                process_id,
                 &mut tunnel_buffer,
             );
         } else {
@@ -1151,20 +1290,27 @@ fn spawn_process_tracker(
     let folders = plan.folder_prefixes.clone();
     let worker_registry = Arc::clone(&registry);
     let worker_stop = Arc::clone(&stop);
+    let worker_returns = Arc::clone(&return_paths);
     let worker = thread::Builder::new()
         .name("gamepath-windivert-processes".into())
         .spawn(move || {
             // WinDivert reports only future socket events. Seed UDP filters for game
             // sockets that already existed when the user pressed Start session.
             // Existing TCP connections cannot move to a different public IP safely.
-            for socket in existing_ipv4_udp_sockets() {
+            for socket in existing_ipv4_udp_sockets().unwrap_or_default() {
                 if let Some(path) = process_path(socket.process_id)
                     .filter(|path| path_matches(path, &applications, &folders))
                 {
                     worker_registry
                         .matched_sockets
                         .fetch_add(1, Ordering::Relaxed);
-                    add_process_selector(&worker_registry, socket.selector(), process_name(&path));
+                    add_process_selector(
+                        &worker_registry,
+                        socket.selector(),
+                        path,
+                        socket.process_id,
+                        None,
+                    );
                 }
             }
             while !worker_stop.load(Ordering::Acquire) {
@@ -1174,37 +1320,7 @@ fn spawn_process_tracker(
                 let event_kind = address.event();
                 let event = address.socket_data();
                 if event_kind == 7 {
-                    {
-                        let mut selectors = worker_registry.selectors.lock().unwrap();
-                        let before = selectors.len();
-                        selectors.retain(|selector, _| {
-                            !matches!(
-                                selector,
-                                TrafficSelector::Flow { protocol, local_port, remote_port }
-                                    if *protocol == event.protocol
-                                        && *local_port == event.local_port
-                                        && (remote_port.is_none()
-                                            || *remote_port == Some(event.remote_port))
-                            )
-                        });
-                        if selectors.len() != before {
-                            publish_selectors(&worker_registry, &selectors);
-                        }
-                    }
-                    return_paths.lock().unwrap().retain(|key, _| {
-                        key.protocol != event.protocol
-                            || key.local_port != event.local_port
-                            || (event.remote_port != 0 && key.remote_port != event.remote_port)
-                    });
-                    worker_registry
-                        .handled_connections
-                        .lock()
-                        .unwrap()
-                        .retain(|key, _| {
-                            key.protocol != event.protocol
-                                || key.local_port != event.local_port
-                                || (event.remote_port != 0 && key.remote_port != event.remote_port)
-                        });
+                    remove_closed_socket(&worker_registry, &worker_returns, event);
                     continue;
                 }
                 if !matches!(event_kind, 3 | 4) {
@@ -1235,16 +1351,223 @@ fn spawn_process_tracker(
                         local_port: port,
                         remote_port: (remote_port != 0).then_some(remote_port),
                     },
-                    process_name(&path),
+                    path,
+                    event.process_id,
+                    (event.endpoint_id != 0).then_some(event.endpoint_id),
                 );
             }
         })
         .map_err(|error| format!("could not start process tracker: {error}"))?;
     registry.workers.lock().unwrap().push(worker);
+
+    let reaper_registry = Arc::clone(&registry);
+    let reaper_returns = Arc::clone(&return_paths);
+    let reaper_stop = Arc::clone(&stop);
+    let reaper = thread::Builder::new()
+        .name("gamepath-flow-reaper".into())
+        .spawn(move || {
+            while !reaper_stop.load(Ordering::Acquire) {
+                thread::sleep(PROCESS_REAP_INTERVAL);
+                reap_stale_flows(&reaper_registry, &reaper_returns);
+            }
+        })
+        .map_err(|error| format!("could not start process reaper: {error}"))?;
+    registry.workers.lock().unwrap().push(reaper);
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+fn remove_closed_socket(
+    registry: &Registry,
+    return_paths: &Mutex<HashMap<ReturnKey, ReturnPath>>,
+    event: SocketData,
+) {
+    let mut state = registry.selector_state.lock().unwrap();
+    let mut emptied = Vec::new();
+    let mut relabeled = Vec::new();
+    let mut removed_owners = HashSet::new();
+    for (selector, owners) in &mut state.flow_owners {
+        let before = owners.len();
+        owners.retain(|owner| {
+            let exact_endpoint =
+                event.endpoint_id != 0 && owner.endpoint_id == Some(event.endpoint_id);
+            if exact_endpoint {
+                removed_owners.insert((owner.process_id, *selector));
+            }
+            !exact_endpoint
+        });
+        if owners.is_empty() {
+            emptied.push(*selector);
+        } else if owners.len() != before {
+            relabeled.push((*selector, process_name(&owners.last().unwrap().path)));
+        }
+    }
+    for (selector, application) in relabeled {
+        state.selectors.insert(selector, Some(application));
+    }
+    for selector in &emptied {
+        state.flow_owners.remove(selector);
+        state.selectors.remove(selector);
+    }
+    if !removed_owners.is_empty() {
+        publish_selectors(registry, &state);
+    }
+    // Different endpoints can share the selector's reduced port tuple. Keep
+    // their common reply state while any owner from the same process survives.
+    removed_owners.retain(|(process_id, selector)| {
+        !state
+            .flow_owners
+            .get(selector)
+            .is_some_and(|owners| owners.iter().any(|owner| owner.process_id == *process_id))
+    });
+    drop(state);
+    remove_owned_routes(registry, return_paths, &removed_owners);
+}
+
+fn reap_stale_flows(registry: &Registry, return_paths: &Mutex<HashMap<ReturnKey, ReturnPath>>) {
+    // Missing inventory is uncertainty, not evidence that every socket died.
+    let Some(active_sockets) = existing_ipv4_process_sockets() else {
+        return;
+    };
+    let observed_at = Instant::now();
+    let recently_routed = {
+        let paths = return_paths.lock().unwrap();
+        paths
+            .iter()
+            .filter_map(|(key, path)| {
+                let process_id = path.process_id?;
+                (observed_at.saturating_duration_since(path.last_seen) <= ACTIVE_CONNECTION_WINDOW)
+                    .then_some((
+                        process_id,
+                        TrafficSelector::Flow {
+                            protocol: key.protocol,
+                            local_port: key.local_port,
+                            remote_port: Some(key.remote_port),
+                        },
+                    ))
+            })
+            .flat_map(|(process_id, selector)| {
+                let TrafficSelector::Flow {
+                    protocol,
+                    local_port,
+                    ..
+                } = selector
+                else {
+                    unreachable!();
+                };
+                [
+                    (process_id, selector),
+                    (
+                        process_id,
+                        TrafficSelector::Flow {
+                            protocol,
+                            local_port,
+                            remote_port: None,
+                        },
+                    ),
+                ]
+            })
+            .collect::<HashSet<_>>()
+    };
+    let process_ids = {
+        let state = registry.selector_state.lock().unwrap();
+        state
+            .flow_owners
+            .values()
+            .flatten()
+            .map(|owner| owner.process_id)
+            .collect::<HashSet<_>>()
+    };
+    let process_paths = process_ids
+        .into_iter()
+        .map(|process_id| (process_id, process_path(process_id)))
+        .collect::<HashMap<_, _>>();
+
+    let mut state = registry.selector_state.lock().unwrap();
+    let mut emptied = Vec::new();
+    let mut relabeled = Vec::new();
+    let mut stale_owners = HashSet::new();
+    let mut reaped = 0_u64;
+    for (selector, owners) in &mut state.flow_owners {
+        let before = owners.len();
+        owners.retain_mut(|owner| {
+            let socket_missing = !socket_is_active(*selector, owner.process_id, &active_sockets);
+            let identity_changed = process_paths
+                .get(&owner.process_id)
+                .and_then(|current| current.as_deref())
+                .is_some_and(|current| !current.eq_ignore_ascii_case(&owner.path));
+            let recent_traffic = recently_routed.contains(&(owner.process_id, *selector));
+            if identity_changed || (socket_missing && !recent_traffic) {
+                owner.stale_observations = owner.stale_observations.saturating_add(1);
+            } else {
+                // A present socket or recent routed packet is enough to keep a
+                // protected process whose executable path cannot be queried.
+                owner.stale_observations = 0;
+            }
+            let stale = owner.stale_observations >= STALE_FLOW_CONFIRMATIONS;
+            if stale {
+                stale_owners.insert((owner.process_id, *selector));
+            }
+            !stale
+        });
+        reaped += (before - owners.len()) as u64;
+        if owners.is_empty() {
+            emptied.push(*selector);
+        } else if owners.len() != before {
+            relabeled.push((*selector, process_name(&owners.last().unwrap().path)));
+        }
+    }
+    for (selector, application) in relabeled {
+        state.selectors.insert(selector, Some(application));
+    }
+    for selector in &emptied {
+        state.flow_owners.remove(selector);
+        state.selectors.remove(selector);
+    }
+    if reaped != 0 {
+        publish_selectors(registry, &state);
+    }
+    stale_owners.retain(|(process_id, selector)| {
+        !state
+            .flow_owners
+            .get(selector)
+            .is_some_and(|owners| owners.iter().any(|owner| owner.process_id == *process_id))
+    });
+    drop(state);
+
+    if stale_owners.is_empty() {
+        return;
+    }
+
+    remove_owned_routes(registry, return_paths, &stale_owners);
+}
+
+fn remove_owned_routes(
+    registry: &Registry,
+    return_paths: &Mutex<HashMap<ReturnKey, ReturnPath>>,
+    removed_owners: &HashSet<(u32, TrafficSelector)>,
+) {
+    if removed_owners.is_empty() {
+        return;
+    }
+    let mut paths = return_paths.lock().unwrap();
+    paths.retain(|key, path| {
+        path.process_id.is_none_or(|process_id| {
+            !stale_owner_matches_return_key(removed_owners, process_id, key)
+        })
+    });
+    drop(paths);
+    registry
+        .handled_connections
+        .lock()
+        .unwrap()
+        .retain(|key, connection| {
+            connection.process_id.is_none_or(|process_id| {
+                !stale_owner_matches_return_key(removed_owners, process_id, key)
+            })
+        });
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ExistingSocket {
     process_id: u32,
     protocol: u8,
@@ -1286,7 +1609,7 @@ fn tcp_socket_process(
     fields: Ipv4Fields,
     applications: &[String],
     folders: &[String],
-) -> Option<String> {
+) -> Option<(u32, String)> {
     let buffer = ip_table(|table, size| unsafe { GetExtendedTcpTable(table, size, 0, 2, 5, 0) })?;
     dword_rows(&buffer, 6).into_iter().find_map(|row| {
         if port_from_dword(row[2]) != fields.source_port
@@ -1295,29 +1618,102 @@ fn tcp_socket_process(
         {
             return None;
         }
-        process_path(row[5]).filter(|path| path_matches(path, applications, folders))
+        process_path(row[5])
+            .filter(|path| path_matches(path, applications, folders))
+            .map(|path| (row[5], path))
     })
 }
 
-fn existing_ipv4_udp_sockets() -> Vec<ExistingSocket> {
+fn socket_is_active(
+    selector: TrafficSelector,
+    process_id: u32,
+    sockets: &HashSet<ExistingSocket>,
+) -> bool {
+    let TrafficSelector::Flow {
+        protocol,
+        local_port,
+        remote_port,
+    } = selector
+    else {
+        return true;
+    };
+    if protocol == 17 || remote_port.is_some() {
+        return sockets.contains(&ExistingSocket {
+            process_id,
+            protocol,
+            local_port,
+            remote_port: remote_port.unwrap_or(0),
+        });
+    }
+    sockets.iter().any(|socket| {
+        socket.process_id == process_id
+            && socket.protocol == protocol
+            && socket.local_port == local_port
+    })
+}
+
+fn stale_owner_matches_return_key(
+    stale: &HashSet<(u32, TrafficSelector)>,
+    process_id: u32,
+    key: &ReturnKey,
+) -> bool {
+    stale.contains(&(
+        process_id,
+        TrafficSelector::Flow {
+            protocol: key.protocol,
+            local_port: key.local_port,
+            remote_port: Some(key.remote_port),
+        },
+    )) || stale.contains(&(
+        process_id,
+        TrafficSelector::Flow {
+            protocol: key.protocol,
+            local_port: key.local_port,
+            remote_port: None,
+        },
+    ))
+}
+
+fn existing_ipv4_udp_sockets() -> Option<Vec<ExistingSocket>> {
     let mut sockets = Vec::new();
     // MIB_UDPROW_OWNER_PID is three DWORDs; UDP has no fixed remote endpoint.
-    if let Some(buffer) =
-        ip_table(|table, size| unsafe { GetExtendedUdpTable(table, size, 0, 2, 1, 0) })
-    {
-        for row in dword_rows(&buffer, 3) {
-            let local_port = port_from_dword(row[1]);
-            if local_port != 0 {
-                sockets.push(ExistingSocket {
-                    process_id: row[2],
-                    protocol: 17,
-                    local_port,
-                    remote_port: 0,
-                });
-            }
+    let buffer = ip_table(|table, size| unsafe { GetExtendedUdpTable(table, size, 0, 2, 1, 0) })?;
+    for row in dword_rows(&buffer, 3) {
+        let local_port = port_from_dword(row[1]);
+        if local_port != 0 {
+            sockets.push(ExistingSocket {
+                process_id: row[2],
+                protocol: 17,
+                local_port,
+                remote_port: 0,
+            });
         }
     }
-    sockets
+    Some(sockets)
+}
+
+fn existing_ipv4_process_sockets() -> Option<HashSet<ExistingSocket>> {
+    let mut sockets = existing_ipv4_udp_sockets()?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    // MIB_TCPROW_OWNER_PID is six DWORDs: state, local address/port,
+    // remote address/port, and PID. Closed/TIME_WAIT rows owned by PID zero do
+    // not keep a process flow alive.
+    let buffer = ip_table(|table, size| unsafe { GetExtendedTcpTable(table, size, 0, 2, 5, 0) })?;
+    for row in dword_rows(&buffer, 6) {
+        let local_port = port_from_dword(row[2]);
+        let remote_port = port_from_dword(row[4]);
+        let process_id = row[5];
+        if process_id != 0 && local_port != 0 {
+            sockets.insert(ExistingSocket {
+                process_id,
+                protocol: 6,
+                local_port,
+                remote_port,
+            });
+        }
+    }
+    Some(sockets)
 }
 
 fn ip_table(call: impl Fn(*mut c_void, *mut u32) -> u32) -> Option<Vec<u8>> {
@@ -1327,7 +1723,20 @@ fn ip_table(call: impl Fn(*mut c_void, *mut u32) -> u32) -> Option<Vec<u8>> {
         return None;
     }
     let mut buffer = vec![0_u8; size as usize];
-    (call(buffer.as_mut_ptr().cast(), &mut size) == 0).then_some(buffer)
+    // The table may grow between the size probe and the read. Windows updates
+    // `size` with the new requirement, so retry without ever treating a
+    // temporary inventory failure as an empty table.
+    for _ in 0..3 {
+        let status = call(buffer.as_mut_ptr().cast(), &mut size);
+        if status == 0 {
+            return Some(buffer);
+        }
+        if status != 122 || size < 4 {
+            return None;
+        }
+        buffer.resize(size as usize, 0);
+    }
+    None
 }
 
 fn dword_rows(buffer: &[u8], width: usize) -> Vec<Vec<u32>> {
@@ -1415,13 +1824,13 @@ fn run_reply_injector(
         if fields.destination != virtual_ipv4 {
             continue;
         }
-        let Some(path) = return_paths
-            .lock()
-            .unwrap()
-            .get(&ReturnKey::inbound(fields))
-            .copied()
-        else {
-            continue;
+        let path = {
+            let mut paths = return_paths.lock().unwrap();
+            let Some(path) = paths.get_mut(&ReturnKey::inbound(fields)) else {
+                continue;
+            };
+            path.last_seen = Instant::now();
+            *path
         };
         packet[16..20].copy_from_slice(&path.local_ip.octets());
         clamp_tcp_mss(&mut packet, 1000);
@@ -1635,7 +2044,8 @@ fn record_handled_connection(
     registry: &Registry,
     key: ReturnKey,
     fields: Ipv4Fields,
-    application: Option<String>,
+    application: Option<&str>,
+    process_id: Option<u32>,
 ) {
     let mut connections = registry.handled_connections.lock().unwrap();
     if connections.len() >= 64 && !connections.contains_key(&key) {
@@ -1648,22 +2058,28 @@ fn record_handled_connection(
             connections.remove(&oldest);
         }
     }
-    connections.entry(key).or_insert_with(|| HandledConnection {
-        application: application.unwrap_or_else(|| "Matched destination".into()),
-        destination_ip: fields.destination,
-        destination_port: fields.destination_port,
-        protocol: match fields.protocol {
-            6 => "TCP",
-            17 => "UDP",
-            1 => "ICMP",
-            _ => "IP",
-        }
-        .into(),
-        started_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    });
+    connections.insert(
+        key,
+        HandledConnection {
+            application: application
+                .map(str::to_owned)
+                .unwrap_or_else(|| "Matched destination".into()),
+            destination_ip: fields.destination,
+            destination_port: fields.destination_port,
+            protocol: match fields.protocol {
+                6 => "TCP",
+                17 => "UDP",
+                1 => "ICMP",
+                _ => "IP",
+            }
+            .into(),
+            started_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            process_id,
+        },
+    );
 }
 
 fn process_path(process_id: u32) -> Option<String> {
@@ -1786,7 +2202,12 @@ fn hostname_matches(name: &str, target: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn fields(destination: Ipv4Addr, protocol: u8, source_port: u16, destination_port: u16) -> Ipv4Fields {
+    fn fields(
+        destination: Ipv4Addr,
+        protocol: u8,
+        source_port: u16,
+        destination_port: u16,
+    ) -> Ipv4Fields {
         Ipv4Fields {
             source: Ipv4Addr::new(192, 168, 1, 20),
             destination,
@@ -1834,11 +2255,10 @@ mod tests {
             threads.push(thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..500 {
-                    let reserved = queued.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |held| (held + packet <= BYPASS_QUEUE_BYTES).then(|| held + packet),
-                    );
+                    let reserved =
+                        queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                            (held + packet <= BYPASS_QUEUE_BYTES).then(|| held + packet)
+                        });
                     if let Ok(previous) = reserved {
                         granted.fetch_add(1, Ordering::Relaxed);
                         peak.fetch_max(previous + packet, Ordering::Relaxed);
@@ -1851,7 +2271,10 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        assert!(granted.load(Ordering::Relaxed) > 0, "nothing was ever queued");
+        assert!(
+            granted.load(Ordering::Relaxed) > 0,
+            "nothing was ever queued"
+        );
         assert!(
             peak.load(Ordering::Relaxed) <= BYPASS_QUEUE_BYTES,
             "the byte budget was exceeded: {} > {BYPASS_QUEUE_BYTES}",
@@ -1880,7 +2303,10 @@ mod tests {
             "{threads} capture threads is outside the intended range"
         );
         assert!(
-            threads <= std::thread::available_parallelism().map(|count| count.get()).unwrap_or(1),
+            threads
+                <= std::thread::available_parallelism()
+                    .map(|count| count.get())
+                    .unwrap_or(1),
             "more capture threads than cores"
         );
     }
@@ -1894,7 +2320,10 @@ mod tests {
         let address = Address::default();
         assert!(
             sender
-                .try_send(Bypass { packet: vec![1, 2, 3], address })
+                .try_send(Bypass {
+                    packet: vec![1, 2, 3],
+                    address
+                })
                 .is_ok()
         );
         let overflow = sender.try_send(Bypass {
@@ -1974,9 +2403,7 @@ mod tests {
             fields(Ipv4Addr::new(255, 255, 255, 255), 6, 1, 1),
         ];
         for probe in probes {
-            let expected = entries
-                .iter()
-                .any(|(selector, _)| selector.matches(probe));
+            let expected = entries.iter().any(|(selector, _)| selector.matches(probe));
             assert_eq!(
                 table.lookup(probe).is_some(),
                 expected,
@@ -2006,11 +2433,38 @@ mod tests {
         ]);
         assert_eq!(
             table.lookup(fields(Ipv4Addr::new(8, 8, 8, 8), 6, 51_000, 443)),
-            Some(Some("game.exe".to_owned()))
+            Some((Some("game.exe"), None))
         );
         assert_eq!(
             table.lookup(fields(Ipv4Addr::new(203, 0, 113, 5), 17, 1, 1)),
-            Some(None)
+            Some((None, None))
+        );
+    }
+
+    #[test]
+    fn an_owned_flow_carries_the_process_id_into_the_read_table() {
+        let selector = TrafficSelector::Flow {
+            protocol: 17,
+            local_port: 51_001,
+            remote_port: None,
+        };
+        let mut state = SelectorState::default();
+        state
+            .selectors
+            .insert(selector, Some("game.exe".to_owned()));
+        state.flow_owners.insert(
+            selector,
+            vec![FlowOwner {
+                endpoint_id: Some(99),
+                process_id: 1234,
+                path: r"C:\Games\game.exe".to_owned(),
+                stale_observations: 0,
+            }],
+        );
+        let table = SelectorTable::build_state(&state);
+        assert_eq!(
+            table.lookup(fields(Ipv4Addr::new(8, 8, 8, 8), 17, 51_001, 9999)),
+            Some((Some("game.exe"), Some(1234)))
         );
     }
 
@@ -2033,8 +2487,16 @@ mod tests {
             ),
         ]);
         assert_eq!(table.destinations.len(), 1);
-        assert!(table.lookup(fields(Ipv4Addr::new(203, 0, 113, 40), 6, 1, 1)).is_some());
-        assert!(table.lookup(fields(Ipv4Addr::new(203, 0, 114, 0), 6, 1, 1)).is_none());
+        assert!(
+            table
+                .lookup(fields(Ipv4Addr::new(203, 0, 113, 40), 6, 1, 1))
+                .is_some()
+        );
+        assert!(
+            table
+                .lookup(fields(Ipv4Addr::new(203, 0, 114, 0), 6, 1, 1))
+                .is_none()
+        );
     }
 
     #[test]

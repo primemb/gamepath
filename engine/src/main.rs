@@ -985,11 +985,15 @@ impl WireGuardSessionManager {
                     .reduce(f64::min)
             })
             .unwrap_or(end_to_end);
+        // These timings come from independent samples. If the fresh end-to-end
+        // probe happens to beat the route EWMA, subtraction produces zero or a
+        // negative number; reporting 0 ms invents a physically impossible hop.
+        let relay_to_server = (end_to_end > user_to_relay).then_some(end_to_end - user_to_relay);
         Ok(json!({
             "reachable": true,
             "latencyMs": end_to_end,
             "userToRelayMs": user_to_relay,
-            "relayToServerMs": (end_to_end - user_to_relay).max(0.0),
+            "relayToServerMs": relay_to_server,
             "benchmarkServer": benchmark_server.to_string(),
             "bytes": reply.len(),
         }))

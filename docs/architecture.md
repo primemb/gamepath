@@ -18,6 +18,22 @@ The current implementation uses the signed WinDivert callout driver as the WFP c
 
 Classification itself is a hash lookup and a binary search against an immutable snapshot, rebuilt only when a connection opens or closes, so it does not hold a lock on the packet path. DNS observation is copy-only.
 
+Process flow selectors retain both the WinDivert endpoint ID and owning PID. An
+endpoint close removes only that socket's ownership; a background reaper also
+removes selectors, reply paths, and diagnostic rows only after 15 consecutive
+socket snapshots confirm they are stale, covering abrupt termination or a missed
+driver notification without trusting a transient query failure. Recent packet
+activity vetoes fallback cleanup even when a socket snapshot misses the flow.
+Reply-path state
+is hard-limited to 4096 entries and evicts the least-recently-used entry at the
+ceiling, so a long-running session cannot grow without bound. Application labels
+are borrowed from the immutable read snapshot rather than allocated again for
+every packet. The UI connection list contains only flows active within the last
+30 seconds without adding cleanup bookkeeping to the normal interface. The
+4096-entry reply-path target evicts only inactive destination-only state;
+process-owned game routes are left exclusively to exact or confirmed-stale
+cleanup.
+
 Replacing the `all-outbound` scope properly means a signed WFP callout using ALE process classification and network-layer redirection, which can drop in behind the same policy compiler without changing the GUI or the relay protocol.
 
 ## All-traffic mode
