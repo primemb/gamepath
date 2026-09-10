@@ -54,6 +54,24 @@ test('the session lease is renewed from the main process, well inside its window
   assert.match(main, /backgroundThrottling: false/)
 })
 
+test('split targets are reapplied without restarting the network session', () => {
+  const main = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8')
+  const service = fs.readFileSync(path.join(__dirname, '..', 'service', 'src', 'main.rs'), 'utf8')
+  const engine = fs.readFileSync(path.join(__dirname, '..', 'engine', 'src', 'main.rs'), 'utf8')
+
+  // Every layer has a dedicated live-update command. The privileged service
+  // forwards it to packet capture, not to the multipath/session lifecycle.
+  assert.match(main, /serviceBridge\.request\('update-session-rules'/)
+  assert.match(service, /"update-session-rules" => update_session_rules/)
+  assert.match(service, /"update-packet-capture"/)
+  assert.match(service, /engine\.request\(command, update\)/)
+  assert.match(engine, /"update-packet-capture" => capture\.update/)
+
+  const updateHandler = service.slice(service.indexOf('fn update_session_rules'), service.indexOf('fn log_event'))
+  assert.doesNotMatch(updateHandler, /start-wireguard-session|stop-wireguard-session/)
+  assert.match(updateHandler, /"start-packet-capture"/)
+})
+
 test('the declared MSRV matches the toolchain the relay is built with', () => {
   const script = fs.readFileSync(path.join(__dirname, '..', 'deploy', 'install-relay.sh'), 'utf8')
   const pinned = script.match(/RUST_TOOLCHAIN="(\d+)\.(\d+)\.(\d+)"/)

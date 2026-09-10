@@ -94,6 +94,7 @@ mod gamepath_service {
         session_status: String,
         route_count: usize,
         traffic_mode: String,
+        session_rules: Value,
         engine: Option<EngineProcess>,
         lease_deadline: Option<Instant>,
     }
@@ -256,6 +257,7 @@ mod gamepath_service {
                         runtime.session_status = "idle".into();
                         runtime.route_count = 0;
                         runtime.traffic_mode.clear();
+                        runtime.session_rules = Value::Null;
                         runtime.engine.take()
                     } else {
                         None
@@ -366,6 +368,7 @@ mod gamepath_service {
             }
             "validate-runtime" => validate_runtime(request.payload, state),
             "start-session" => start_session(request.payload, state),
+            "update-session-rules" => update_session_rules(request.payload, state),
             "session-status" => session_status(state),
             "stop-session" => {
                 let mut state = state.lock().unwrap();
@@ -377,6 +380,7 @@ mod gamepath_service {
                 state.session_status = "idle".into();
                 state.route_count = 0;
                 state.traffic_mode.clear();
+                state.session_rules = Value::Null;
                 state.lease_deadline = None;
                 Ok(json!({ "sessionStatus": "idle" }))
             }
@@ -543,9 +547,74 @@ mod gamepath_service {
         log_event("Windows packet capture started");
         runtime.session_status = "connected".into();
         runtime.route_count = paths["paths"].as_array().map_or(0, Vec::len);
+        runtime.traffic_mode = traffic_mode;
+        runtime.session_rules = rules;
         runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
         runtime.engine = Some(engine);
         Ok(json!({ "paths": paths, "dataPlane": data_plane, "capture": capture }))
+    }
+
+    fn update_session_rules(payload: Value, state: &Mutex<RuntimeState>) -> Result<Value, String> {
+        let rules = payload
+            .get("rules")
+            .filter(|rules| rules.is_array())
+            .cloned()
+            .ok_or("live target update requires a rules array")?;
+        let mut runtime = state.lock().unwrap();
+        if runtime.session_status != "connected" || runtime.traffic_mode != "split" {
+            return Err("live target updates require a connected split session".into());
+        }
+        let previous_rules = runtime.session_rules.clone();
+        let rules_are_empty = rules.as_array().is_some_and(Vec::is_empty);
+        let previous_rules_are_empty = previous_rules.as_array().is_some_and(Vec::is_empty);
+        if rules_are_empty {
+            runtime
+                .engine
+                .as_mut()
+                .ok_or("no active network session")?
+                .request("stop-packet-capture", json!({}))?;
+            runtime.session_rules = rules;
+            runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
+            log_event("split capture paused because no targets are enabled");
+            return Ok(json!({
+                "state": "idle",
+                "trafficMode": "split",
+                "targetCount": 0,
+            }));
+        }
+        let update = json!({ "trafficMode": "split", "rules": rules });
+        let engine = runtime.engine.as_mut().ok_or("no active network session")?;
+        let command = if previous_rules_are_empty {
+            "start-packet-capture"
+        } else {
+            "update-packet-capture"
+        };
+        let capture = match engine.request(command, update) {
+            Ok(capture) => capture,
+            Err(error) => {
+                // A failure after WinDivert handles were swapped must not leave
+                // the connected session with no capture. Restore the last
+                // confirmed policy before reporting the rejected edit.
+                let rollback = if previous_rules_are_empty {
+                    engine.request("stop-packet-capture", json!({}))
+                } else {
+                    engine.request(
+                        "start-packet-capture",
+                        json!({ "trafficMode": "split", "rules": previous_rules }),
+                    )
+                };
+                return match rollback {
+                    Ok(_) => Err(format!("could not apply live targets: {error}")),
+                    Err(rollback_error) => Err(format!(
+                        "could not apply live targets: {error}; restoring the previous capture also failed: {rollback_error}"
+                    )),
+                };
+            }
+        };
+        runtime.session_rules = rules;
+        runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
+        log_event("split capture targets updated without restarting the session");
+        Ok(capture)
     }
 
     fn log_event(message: &str) {

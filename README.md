@@ -100,6 +100,8 @@ All-traffic mode captures and reinjects IPv4 through Wintun. IPv6 is not carried
 
 Split mode compiles IP and CIDR targets straight into the WinDivert kernel filter, so unrelated traffic never leaves the kernel. Executable, folder and hostname targets cannot be expressed in a filter that is fixed when the handle opens, so those plans admit all outbound IPv4 and classify in user space, reinjecting what was not selected — a compatibility backend with a measurable cost, reported as `captureScope` in capture diagnostics. Exact hostnames resolve at activation; a copy-only DNS observer learns later addresses and wildcard subdomains.
 
+Targets and rule-group changes made during a connected split session take effect immediately. GamePath replaces only the capture policy and keeps the encrypted relay paths and session keys alive; newly selected TCP applications use the tunnel for new connections, while UDP sockets already open when the rule is added are discovered automatically.
+
 The repository includes the official signed Wintun 0.14.1 AMD64 DLL and its redistribution license under `vendor/wintun`. The downloaded archive is verified against the SHA-256 published by the Wintun project before the binary is copied into the project.
 
 The WFP prototype backend uses the upstream WinDivert 2.2.2-A x64 runtime under `vendor/windivert`. Its signed driver, user-mode DLL, license, package source, and recorded hashes are included.

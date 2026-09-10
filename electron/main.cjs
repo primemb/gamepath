@@ -41,6 +41,7 @@ const defaultState = () => ({
 let state
 let engineBridge
 let serviceBridge
+let ruleChangeQueue = Promise.resolve()
 
 function statePath() {
   return path.join(app.getPath('userData'), 'gamepath-state.json')
@@ -98,6 +99,57 @@ function saveState() {
   fs.mkdirSync(path.dirname(destination), { recursive: true })
   fs.writeFileSync(temporary, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 })
   fs.renameSync(temporary, destination)
+}
+
+function enabledRuleSpecs() {
+  const enabledGroupIds = new Set(state.ruleGroups.filter((group) => group.enabled).map((group) => group.id))
+  return state.rules
+    .filter((rule) => rule.enabled && (!rule.groupId || enabledGroupIds.has(rule.groupId)))
+    .map((rule) => ({ kind: rule.kind, value: rule.value }))
+}
+
+/**
+ * Replaces only the split-capture policy. The relay paths and their session
+ * keys remain alive, so editing a target does not disconnect the session.
+ */
+async function refreshActiveSplitCapture() {
+  if (state.session.status !== 'connected' || state.trafficMode !== 'split') return
+  const rules = enabledRuleSpecs()
+  const capture = await serviceBridge.request('update-session-rules', { rules })
+  state.session.capture = capture
+  logger.info(`live split targets updated: count=${capture.targetCount ?? rules.length}`)
+}
+
+/**
+ * A live capture update can fail (for example if the new path is invalid).
+ * Keep both the saved settings and active capture on the previous policy in
+ * that case instead of showing a rule that is not actually being enforced.
+ */
+function commitRuleChange(change) {
+  const operation = ruleChangeQueue.then(async () => {
+    const previousRules = structuredClone(state.rules)
+    const previousGroups = structuredClone(state.ruleGroups)
+    change()
+    try {
+      await refreshActiveSplitCapture()
+      saveState()
+      return publicState()
+    } catch (error) {
+      state.rules = previousRules
+      state.ruleGroups = previousGroups
+      // The service already restores a capture update that it rejected. This
+      // second pass also covers a local save failure after a successful update.
+      try {
+        await refreshActiveSplitCapture()
+      } catch (rollbackError) {
+        logger.error(`could not restore live split targets: ${rollbackError.message}`)
+      }
+      throw error
+    }
+  })
+  // Keep later edits ordered even when this one is rejected.
+  ruleChangeQueue = operation.catch(() => {})
+  return operation
 }
 
 /**
@@ -475,36 +527,36 @@ function registerIpc() {
   ipcMain.handle('rule:add', (_event, input) => {
     const value = String(input.value ?? '').trim()
     if (!value) throw new Error('A target is required')
-    state.rules.push({
-      id: crypto.randomUUID(),
-      kind: input.kind,
-      value,
-      label: String(input.label || path.basename(value) || value),
-      enabled: true,
-      groupId: state.ruleGroups.some((group) => group.id === input.groupId) ? input.groupId : null,
+    return commitRuleChange(() => {
+      state.rules.push({
+        id: crypto.randomUUID(),
+        kind: input.kind,
+        value,
+        label: String(input.label || path.basename(value) || value),
+        enabled: true,
+        groupId: state.ruleGroups.some((group) => group.id === input.groupId) ? input.groupId : null,
+      })
     })
-    saveState()
-    return publicState()
   })
 
   ipcMain.handle('rule:set-enabled', (_event, id, enabled) => {
-    const rule = state.rules.find((item) => item.id === id)
-    if (rule) rule.enabled = Boolean(enabled)
-    saveState()
-    return publicState()
+    return commitRuleChange(() => {
+      const rule = state.rules.find((item) => item.id === id)
+      if (rule) rule.enabled = Boolean(enabled)
+    })
   })
 
   ipcMain.handle('rule:set-group', (_event, id, groupId) => {
-    const rule = state.rules.find((item) => item.id === id)
-    if (rule) rule.groupId = state.ruleGroups.some((group) => group.id === groupId) ? groupId : null
-    saveState()
-    return publicState()
+    return commitRuleChange(() => {
+      const rule = state.rules.find((item) => item.id === id)
+      if (rule) rule.groupId = state.ruleGroups.some((group) => group.id === groupId) ? groupId : null
+    })
   })
 
   ipcMain.handle('rule:remove', (_event, id) => {
-    state.rules = state.rules.filter((item) => item.id !== id)
-    saveState()
-    return publicState()
+    return commitRuleChange(() => {
+      state.rules = state.rules.filter((item) => item.id !== id)
+    })
   })
 
   ipcMain.handle('rule-group:add', (_event, rawName) => {
@@ -533,17 +585,17 @@ function registerIpc() {
   })
 
   ipcMain.handle('rule-group:set-enabled', (_event, id, enabled) => {
-    const group = state.ruleGroups.find((item) => item.id === id)
-    if (group) group.enabled = Boolean(enabled)
-    saveState()
-    return publicState()
+    return commitRuleChange(() => {
+      const group = state.ruleGroups.find((item) => item.id === id)
+      if (group) group.enabled = Boolean(enabled)
+    })
   })
 
   ipcMain.handle('rule-group:remove', (_event, id) => {
-    state.ruleGroups = state.ruleGroups.filter((group) => group.id !== id)
-    for (const rule of state.rules) if (rule.groupId === id) rule.groupId = null
-    saveState()
-    return publicState()
+    return commitRuleChange(() => {
+      state.ruleGroups = state.ruleGroups.filter((group) => group.id !== id)
+      for (const rule of state.rules) if (rule.groupId === id) rule.groupId = null
+    })
   })
 
   ipcMain.handle('traffic:set-mode', (_event, mode) => {
@@ -733,10 +785,7 @@ function registerIpc() {
   ipcMain.handle('engine:start', async () => {
     const mode = state.connectionMode === 'direct' ? 'direct' : 'relay'
     const enabledTunnels = state.tunnels.filter((tunnel) => tunnel.enabled)
-    const enabledGroupIds = new Set(state.ruleGroups.filter((group) => group.enabled).map((group) => group.id))
-    const enabledRules = state.rules.filter(
-      (rule) => rule.enabled && (!rule.groupId || enabledGroupIds.has(rule.groupId)),
-    )
+    const enabledRules = enabledRuleSpecs()
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     const encryptedRelayToken = relay && state.encryptedRelayTokens[relay.id]
     const direct = mode === 'direct'
@@ -758,7 +807,7 @@ function registerIpc() {
       state.session = { status: 'error', message: 'Install and start the GamePath Network Service in Settings.' }
     } else {
       try {
-        const rules = enabledRules.map((rule) => ({ kind: rule.kind, value: rule.value }))
+        const rules = enabledRules
         const nodes = sessionNodes(enabledTunnels)
         // A relay session addresses and authenticates itself to the relay; a
         // direct session has neither, so it sends neither.

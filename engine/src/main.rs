@@ -525,6 +525,7 @@ fn handle_request(
         "wireguard-session-status" => Ok(sessions.lock().unwrap().status()),
         "probe-data-plane" => sessions.lock().unwrap().probe_data_plane(),
         "start-packet-capture" => capture.start(request.payload, Arc::clone(sessions)),
+        "update-packet-capture" => capture.update(request.payload, Arc::clone(sessions)),
         "packet-capture-status" => Ok(capture.status()),
         "stop-packet-capture" => Ok(capture.stop()),
         "stop-wireguard-session" => {
@@ -1251,6 +1252,15 @@ impl PacketCaptureManager {
     ) -> Result<Value, String> {
         let input: PacketCaptureRequest = serde_json::from_value(payload)
             .map_err(|error| format!("invalid packet capture request: {error}"))?;
+        match input.traffic_mode.as_str() {
+            // Validate before dropping a live capture. This makes a rejected
+            // live rule edit leave the previous policy fully operational.
+            "split" => {
+                compile_policy("split", &input.rules)?;
+            }
+            "all" => {}
+            _ => return Err("traffic mode must be all or split".into()),
+        }
         self.stop();
         let (virtual_ipv4, bypass_ips, data_receiver, effective_mtu) = {
             let manager = sessions.lock().unwrap();
@@ -1290,9 +1300,6 @@ impl PacketCaptureManager {
                 // exposure is worth reporting in split mode too.
                 "ipv6": ipv6_exposure(),
             }));
-        }
-        if input.traffic_mode != "all" {
-            return Err("traffic mode must be all or split".into());
         }
         let (default_gateway, default_interface) = default_ipv4_route()?;
         let executable_dir = std::env::current_exe()
@@ -1411,6 +1418,33 @@ impl PacketCaptureManager {
 
     #[cfg(not(windows))]
     fn start(
+        &mut self,
+        _payload: Value,
+        _sessions: Arc<Mutex<WireGuardSessionManager>>,
+    ) -> Result<Value, String> {
+        Err("packet capture is available only on Windows".into())
+    }
+
+    /// Applies a new split policy without touching the multipath session.
+    /// WinDivert's kernel expression is immutable, so this intentionally
+    /// replaces the capture handles while retaining every relay path.
+    #[cfg(windows)]
+    fn update(
+        &mut self,
+        payload: Value,
+        sessions: Arc<Mutex<WireGuardSessionManager>>,
+    ) -> Result<Value, String> {
+        if self.active_split.is_none() {
+            return Err("live target updates require an active split capture".into());
+        }
+        if payload["trafficMode"].as_str() != Some("split") {
+            return Err("live target updates require split traffic mode".into());
+        }
+        self.start(payload, sessions)
+    }
+
+    #[cfg(not(windows))]
+    fn update(
         &mut self,
         _payload: Value,
         _sessions: Arc<Mutex<WireGuardSessionManager>>,
