@@ -331,8 +331,11 @@ impl<T> ReconnectAttempt<T> {
     }
 }
 
-/// Gap between health probes on a path that is answering.
-const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+/// Gap between health probes on a path that is answering. One small request
+/// and reply per second keeps a route's RTT current without turning an idle
+/// game session into meaningful background data usage. A route in doubt uses
+/// the shorter degraded interval below, so recovery is still noticed quickly.
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Gap between probes on a path that has missed one.
 ///

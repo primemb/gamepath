@@ -17,6 +17,7 @@ rm -f /etc/nftables.d/gamepath.nft
 
 ip link delete gptun0 2>/dev/null || true
 rm -f /usr/local/bin/gamepath-relay
+rm -f /usr/local/lib/gamepath-relay-allow-docker-forward
 rm -rf /etc/gamepath /var/lib/gamepath /var/cache/gamepath
 rm -f /etc/sysctl.d/90-gamepath-relay.conf
 sysctl --system >/dev/null 2>&1 || true

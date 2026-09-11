@@ -230,14 +230,10 @@ function updateSessionMetrics(runtime, dataPlane) {
   const probesReceived = paths.reduce((total, path) => total + (path.probesReceived ?? 0), 0)
   const probesLost = paths.reduce((total, path) => total + (path.probesLost ?? 0), 0)
   const completedProbes = probesReceived + probesLost
-  const direct = (runtime.mode ?? state.session.mode) === 'direct'
   const journey = deriveJourney({
     paths,
     selectedRoutes: runtime.selectedRoutes ?? [],
-    direct,
   })
-  // A direct session's node is the last hop, so there is no second leg to
-  // report — reporting one would invent a hop the traffic never takes.
   state.session.mode = runtime.mode ?? state.session.mode ?? 'relay'
   state.session.pathMetrics = paths
   state.session.selectedRoutes = runtime.selectedRoutes ?? []
@@ -262,8 +258,10 @@ function updateSessionMetrics(runtime, dataPlane) {
     .map((path) => Math.max(1, Math.round(path.latencyMs)))
   state.session.journey = journey
   state.session.metrics = {
-    userToNodeMs: journey.userToNodeMs,
-    nodeToRelayMs: journey.nodeToRelayMs,
+    // No client-side measurement can split an encrypted tunnel RTT at a
+    // third-party VPN node. Keep the legacy fields explicitly unavailable.
+    userToNodeMs: null,
+    nodeToRelayMs: null,
     relayToServerMs: dataPlane?.relayToServerMs ?? state.session.metrics?.relayToServerMs ?? null,
     endToEndMs: dataPlane?.latencyMs ?? state.session.metrics?.endToEndMs ?? null,
     benchmarkServer: dataPlane?.benchmarkServer ?? state.session.metrics?.benchmarkServer ?? '',

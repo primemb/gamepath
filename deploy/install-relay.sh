@@ -157,10 +157,50 @@ nft list table ip gamepath_nat >/dev/null 2>&1 && nft delete table ip gamepath_n
 nft -f /etc/nftables.d/gamepath.nft
 systemctl enable nftables.service >/dev/null
 
+# Docker installs a later FORWARD base chain whose policy is drop. An accept in
+# our earlier base chain therefore is not enough: Docker evaluates afterwards
+# and rejects packets from gptun0. DOCKER-USER is Docker's supported hook for
+# administrator forwarding rules. The service repeats this setup at boot after
+# Docker has created the chain, while these rules fix an already-running host.
+if nft list chain ip filter DOCKER-USER >/dev/null 2>&1; then
+  if ! nft list chain ip filter DOCKER-USER | grep -Fq 'gamepath relay outbound'; then
+    nft insert rule ip filter DOCKER-USER iifname "gptun0" oifname "${UPLINK_INTERFACE}" \
+      ip saddr 10.203.0.0/24 \
+      accept comment '"gamepath relay outbound"'
+  fi
+  if ! nft list chain ip filter DOCKER-USER | grep -Fq 'gamepath relay return'; then
+    nft insert rule ip filter DOCKER-USER iifname "${UPLINK_INTERFACE}" oifname "gptun0" \
+      ip daddr 10.203.0.0/24 \
+      ct state established,related accept comment '"gamepath relay return"'
+  fi
+fi
+
+cat >/usr/local/lib/gamepath-relay-allow-docker-forward <<'EOF'
+#!/bin/sh
+set -eu
+
+UPLINK_INTERFACE="$1"
+if ! nft list chain ip filter DOCKER-USER >/dev/null 2>&1; then
+  exit 0
+fi
+if ! nft list chain ip filter DOCKER-USER | grep -Fq 'gamepath relay outbound'; then
+  nft insert rule ip filter DOCKER-USER iifname "gptun0" oifname "$UPLINK_INTERFACE" \
+    ip saddr 10.203.0.0/24 \
+    accept comment '"gamepath relay outbound"'
+fi
+if ! nft list chain ip filter DOCKER-USER | grep -Fq 'gamepath relay return'; then
+  nft insert rule ip filter DOCKER-USER iifname "$UPLINK_INTERFACE" oifname "gptun0" \
+    ip daddr 10.203.0.0/24 \
+    ct state established,related accept comment '"gamepath relay return"'
+fi
+EOF
+chmod 0755 /usr/local/lib/gamepath-relay-allow-docker-forward
+
 echo "GAMEPATH_PROGRESS:service"
 cat >/etc/gamepath/relay.env <<EOF
 GAMEPATH_BIND=${BIND_ADDRESS}:${PORT}
 GAMEPATH_CLIENTS=/etc/gamepath/clients
+GAMEPATH_UPLINK=${UPLINK_INTERFACE}
 EOF
 chmod 0640 /etc/gamepath/relay.env
 chown root:gamepath /etc/gamepath/relay.env
@@ -168,7 +208,7 @@ chown root:gamepath /etc/gamepath/relay.env
 cat >/etc/systemd/system/gamepath-relay.service <<'EOF'
 [Unit]
 Description=GamePath authenticated multipath relay
-After=network-online.target nftables.service
+After=network-online.target nftables.service docker.service
 Wants=network-online.target
 
 [Service]
@@ -176,6 +216,7 @@ Type=simple
 User=gamepath
 Group=gamepath
 EnvironmentFile=/etc/gamepath/relay.env
+ExecStartPre=+/usr/local/lib/gamepath-relay-allow-docker-forward ${GAMEPATH_UPLINK}
 ExecStart=/usr/local/bin/gamepath-relay serve --bind ${GAMEPATH_BIND} --clients-dir ${GAMEPATH_CLIENTS} --tun-name gptun0 --tun-address 10.203.0.1 --tun-prefix 24
 Restart=on-failure
 RestartSec=2

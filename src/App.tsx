@@ -541,9 +541,8 @@ function TelemetryPanel({
   const paths = state.session.pathMetrics ?? []
   const degradedRoutes = state.session.degradedRoutes ?? []
   const live = state.session.status === 'connected'
-  // Derived once in the main process by deriveJourney, which pins the
-  // breakdown to the route actually carrying traffic and refuses to invent a
-  // hop from a handshake whose round-trip count is not fixed.
+  // Derived once in the main process from the route carrying traffic. Its RTT
+  // is an actual GamePath probe, not a VPN/WireGuard setup duration.
   const journey = state.session.journey
   // Separate from the journey's pinned route on purpose: this heading reports
   // the best latency on offer, which is a different question from which route
@@ -551,33 +550,28 @@ function TelemetryPanel({
   const bestPath = paths
     .filter((path) => path.reachable && path.latencyMs != null)
     .sort((a, b) => (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity))[0]
-  // A direct session's node is the last hop, so its journey has one leg fewer
-  // and the middle stage would only ever read as an empty measurement. Before
-  // a session starts there is no session mode, so the chosen one stands in.
   const direct = (state.session.mode ?? state.connectionMode) === 'direct'
-  const hopCaption = () => {
+  const probeCaption = () => {
     if (!journey?.label) return 'Awaiting route'
-    if (journey.estimable) return `${journey.label} · estimated from handshake`
-    return `${journey.label} · not measurable on ${journey.kind}`
+    return `${journey.label} · measured GamePath probe`
   }
-  const serverStage: [string, number | null | undefined, ReactNode] = [
-    direct ? 'VPN node → server' : 'Relay → server',
-    metrics?.relayToServerMs,
+  const pathStage: [string, number | null | undefined, ReactNode] = [
+    direct ? 'You → benchmark via VPN node' : 'You → relay via VPN node',
+    journey?.probeRttMs,
+    probeCaption(),
+  ]
+  const benchmarkStage: [string, number | null | undefined, ReactNode] = [
+    'You → benchmark through route',
+    metrics?.endToEndMs,
     metrics?.benchmarkServer ? (
       <span className="journey-endpoint">
-        Benchmark <AddressWithCountry value={metrics.benchmarkServer} />
+        One-time packet test · <AddressWithCountry value={metrics.benchmarkServer} />
       </span>
     ) : (
       'Awaiting target'
     ),
   ]
-  const stages: Array<[string, number | null | undefined, ReactNode]> = direct
-    ? [['You → VPN node', journey?.userToNodeMs, hopCaption()], serverStage]
-    : [
-        ['User → VPN node', journey?.userToNodeMs, hopCaption()],
-        ['VPN node → relay', journey?.nodeToRelayMs, hopCaption()],
-        serverStage,
-      ]
+  const stages: Array<[string, number | null | undefined, ReactNode]> = [pathStage, benchmarkStage]
   return (
     <section className="telemetry-panel">
       <div className="telemetry-head">
@@ -598,7 +592,7 @@ function TelemetryPanel({
               <span className="eyebrow">Route latency history</span>
               <h3>{bestPath ? `Best ${formatMetric(bestPath.latencyMs)}` : 'Waiting for probes'}</h3>
             </div>
-            <small>Last 60 probes · one probe per route every 10s</small>
+            <small>Last 60 received probe samples · refreshed every 2s</small>
           </div>
           <LatencyChart histories={histories} paths={paths} />
         </div>
@@ -667,10 +661,6 @@ function TelemetryPanel({
           {paths.map((path, index) => {
             const samples = histories[path.route] ?? []
             const carryingTraffic = state.session.selectedRoutes?.includes(path.route) ?? path.reachable
-            const nodeToRelay =
-              path.handshakeMs != null && path.handshakeRoundTrips && path.latencyMs != null
-                ? path.latencyMs - path.handshakeMs / path.handshakeRoundTrips
-                : null
             const rate = rates[path.route]
             return (
               <article
@@ -692,7 +682,7 @@ function TelemetryPanel({
                 </div>
                 <div className="node-primary">
                   <span>
-                    <small>{direct ? 'Node RTT' : 'Relay RTT'}</small>
+                    <small>{direct ? 'Benchmark RTT' : 'Relay probe RTT'}</small>
                     <strong>{formatMetric(path.latencyMs)}</strong>
                   </span>
                   <span>
@@ -706,13 +696,8 @@ function TelemetryPanel({
                 </div>
                 <div className="node-secondary">
                   <span>
-                    Handshake <strong>{formatMetric(path.handshakeMs)}</strong>
+                    Setup time <strong>{formatMetric(path.handshakeMs)}</strong>
                   </span>
-                  {!direct && (
-                    <span>
-                      Node → relay <strong>{formatMetric(nodeToRelay)}</strong>
-                    </span>
-                  )}
                   <span>
                     Probes{' '}
                     <strong>

@@ -153,17 +153,13 @@ export type AppState = {
     selectedRoutes?: number[]
     /** Routes that are enabled but not currently carrying traffic. */
     degradedRoutes?: number[]
-    /**
-     * The one route the journey breakdown describes, and whether its transport
-     * allows a hop estimate to be derived from its handshake at all.
-     */
+    /** The route used by the live GamePath relay-probe measurement. */
     journey?: {
       route: number | null
       label: string | null
       kind: string | null
-      estimable: boolean
-      userToNodeMs: number | null
-      nodeToRelayMs: number | null
+      /** RTT measured through the VPN/proxy path to the GamePath relay. */
+      probeRttMs: number | null
     }
     /** Routes that are enabled but were left out of the session entirely. */
     skippedRoutes?: Array<{ route: number; label: string; reason: string }>
