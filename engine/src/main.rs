@@ -201,32 +201,51 @@ struct ActiveWireGuardSession {
     timer: HighResolutionTimer,
 }
 
-/// How the inbound queue's contents have to be unwrapped.
-enum ReceiveMode {
-    // Boxed: the replay window is a kilobyte of bitmap, and a direct session
-    // carries none of this.
-    Relay(Box<RelayReceive>),
-    /// The worker already checked that these packets came out of the tunnel
-    /// addressed to us, and WireGuard already authenticated them.
-    Direct,
-}
-
-struct RelayReceive {
+/// Shared by the path workers: admit the first authenticated copy before it
+/// enters the bounded receive queue. No waiting for slower paths or ordering
+/// barrier, and no dependency on the outbound scheduler's current choice.
+struct RelayIngress {
     client_id: [u8; 16],
     session_id: u64,
-    crypto: Arc<SessionCrypto>,
     server_replay: Mutex<ReplayWindow>,
 }
 
+impl RelayIngress {
+    /// `header` and `plaintext` must come from successful `open_server`.
+    fn enqueue_authenticated(
+        &self,
+        header: &gamepath_engine::protocol::FrameHeader,
+        plaintext: Vec<u8>,
+        inbound: &mpsc::SyncSender<Vec<u8>>,
+    ) -> Result<bool, mpsc::TrySendError<Vec<u8>>> {
+        use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT};
+        if header.client_id != self.client_id
+            || header.session_id != self.session_id
+            || header.flags & FLAG_SERVER_TO_CLIENT == 0
+            || header.flags & FLAG_CONTROL != 0
+        {
+            return Ok(false);
+        }
+        let mut replay = self.server_replay.lock().unwrap();
+        if !replay.would_accept(header.sequence) {
+            return Ok(false);
+        }
+        inbound.try_send(plaintext)?;
+        // A full queue must not consume the sequence: a backup arriving after
+        // space is available can still rescue this packet.
+        replay.accept(header.sequence);
+        Ok(true)
+    }
+}
+
 pub(crate) struct DataReceiver {
+    /// Workers authenticate and deduplicate relay traffic before admission;
+    /// direct workers likewise provide validated inner packets.
     inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
-    mode: ReceiveMode,
 }
 
 impl DataReceiver {
     pub(crate) fn receive(&self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
-        use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT};
-
         let response = match self.inbound.lock().unwrap().recv_timeout(timeout) {
             Ok(response) => response,
             Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
@@ -234,27 +253,13 @@ impl DataReceiver {
                 return Err("all path receivers stopped".into());
             }
         };
-        let ReceiveMode::Relay(relay) = &self.mode else {
-            return Ok(Some(response));
-        };
-        let RelayReceive {
-            client_id,
-            session_id,
-            crypto,
-            server_replay,
-        } = relay.as_ref();
-        let (header, plaintext) = crypto.open_server(&response)?;
-        if header.client_id != *client_id
-            || header.session_id != *session_id
-            || header.flags & FLAG_SERVER_TO_CLIENT == 0
-            || header.flags & FLAG_CONTROL != 0
-            || !server_replay.lock().unwrap().accept(header.sequence)
-        {
-            return Ok(None);
-        }
-        Ok(Some(plaintext))
+        Ok(Some(response))
     }
 }
+
+#[cfg(test)]
+#[path = "failover_tests.rs"]
+mod failover_tests;
 
 /// A route that is configured and enabled but is not part of the session.
 #[derive(Clone, Debug, Serialize)]
@@ -282,6 +287,47 @@ struct PathDialer {
 impl PathDialer {
     fn open(&self) -> Result<Box<dyn RelayPath>, String> {
         self.node.open(self.relay)
+    }
+}
+
+/// Keep an obsolete dial in its slot until it finishes, so recovery followed
+/// by another outage cannot spawn overlapping connections to the same node.
+struct ReconnectAttempt<T> {
+    receiver: mpsc::Receiver<Result<T, String>>,
+    superseded: bool,
+}
+
+enum ReconnectPoll<T> {
+    Pending,
+    Discarded,
+    Finished(Result<T, String>),
+}
+
+impl<T> ReconnectAttempt<T> {
+    fn new(receiver: mpsc::Receiver<Result<T, String>>) -> Self {
+        Self {
+            receiver,
+            superseded: false,
+        }
+    }
+
+    fn recovered(&mut self) {
+        self.superseded = true;
+    }
+
+    fn poll(&mut self) -> ReconnectPoll<T> {
+        let result = match self.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return ReconnectPoll::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("reconnect worker stopped without a result".to_owned())
+            }
+        };
+        if self.superseded {
+            ReconnectPoll::Discarded
+        } else {
+            ReconnectPoll::Finished(result)
+        }
     }
 }
 
@@ -383,7 +429,21 @@ struct PathCommand {
 struct PathTelemetry {
     iterations: Arc<Vec<AtomicU64>>,
     queue_depth: Arc<Vec<AtomicU64>>,
+    /// Highest dispatcher queue depth observed during this session. The
+    /// current depth is commonly back at zero by the time a periodic summary
+    /// runs, so without a peak a short burst is invisible in the log.
+    queue_peak: Arc<Vec<AtomicU64>>,
     dropped: Arc<Vec<AtomicU64>>,
+    /// Why `dropped` moved. Kept separately so the next incident distinguishes
+    /// dispatcher saturation, packets that became stale in a worker, and a
+    /// saturated receive queue.
+    queue_full_dropped: Arc<Vec<AtomicU64>>,
+    stale_dropped: Arc<Vec<AtomicU64>>,
+    inbound_dropped: Arc<Vec<AtomicU64>>,
+    /// Longest interval between two worker iterations. A one-second CPU stall
+    /// or a transport call that blocks past its deadline otherwise leaves no
+    /// trace once the worker resumes.
+    worker_gap_peak_ms: Arc<Vec<AtomicU64>>,
     healthy_mask: Arc<AtomicU64>,
     /// Whether this machine can reach the Internet at all, measured outside
     /// every node. Session-wide rather than per-path, but it rides here so the
@@ -438,6 +498,120 @@ const _: () = assert!(
 
 /// How long a queued packet stays worth sending.
 const PATH_QUEUE_MAX_AGE: Duration = Duration::from_millis(50);
+
+/// A worker normally returns to its loop every millisecond. Only log gaps big
+/// enough to be felt in a game, and rate-limit the warning locally because a
+/// persistently blocked transport would otherwise produce a new value (and
+/// defeat identical-message collapsing) on every iteration.
+const WORKER_GAP_WARN: Duration = Duration::from_millis(100);
+const WORKER_GAP_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Queue shedding is logged promptly, but a burst is combined into one update
+/// rather than producing a line for every discarded packet.
+const DROP_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A 10-15 ms step is visible in a competitive game but ordinary sub-frame
+/// jitter is not. Two consecutive samples confirm a modest rise; a severe
+/// spike is reported immediately. Recovery also needs several samples so the
+/// log contains one incident and one recovery instead of a line per probe.
+const LATENCY_RISE_MIN_MS: f64 = 12.0;
+const LATENCY_RISE_RATIO: f64 = 0.10;
+const LATENCY_SEVERE_MIN_MS: f64 = 50.0;
+const LATENCY_SEVERE_RATIO: f64 = 0.75;
+const LATENCY_BASELINE_SAMPLES: u64 = 4;
+const LATENCY_RISE_SAMPLES: u8 = 2;
+const LATENCY_RECOVERY_SAMPLES: u8 = 3;
+
+#[derive(Debug, PartialEq)]
+enum LatencyEvent {
+    Degraded {
+        baseline_ms: f64,
+        observed_ms: f64,
+    },
+    Recovered {
+        baseline_ms: f64,
+        peak_ms: f64,
+        duration: Duration,
+    },
+}
+
+/// Per-worker state for edge-triggered latency diagnostics. The baseline only
+/// moves while the route is not in an incident; otherwise a sustained rise
+/// would teach the detector that the degraded value is normal before recovery.
+#[derive(Default)]
+struct LatencyWatch {
+    baseline_ms: Option<f64>,
+    samples: u64,
+    elevated_samples: u8,
+    recovery_samples: u8,
+    incident_started: Option<Instant>,
+    peak_ms: f64,
+}
+
+impl LatencyWatch {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn observe(&mut self, sample_ms: f64, now: Instant) -> Option<LatencyEvent> {
+        let sample_ms = sample_ms.max(0.0);
+        let Some(baseline_ms) = self.baseline_ms else {
+            self.baseline_ms = Some(sample_ms);
+            self.samples = 1;
+            return None;
+        };
+
+        if let Some(started) = self.incident_started {
+            self.peak_ms = self.peak_ms.max(sample_ms);
+            let recovered_below = baseline_ms + (LATENCY_RISE_MIN_MS / 2.0);
+            if sample_ms <= recovered_below {
+                self.recovery_samples = self.recovery_samples.saturating_add(1);
+            } else {
+                self.recovery_samples = 0;
+            }
+            if self.recovery_samples >= LATENCY_RECOVERY_SAMPLES {
+                let event = LatencyEvent::Recovered {
+                    baseline_ms,
+                    peak_ms: self.peak_ms,
+                    duration: now.saturating_duration_since(started),
+                };
+                self.baseline_ms = Some(sample_ms);
+                self.samples = 1;
+                self.elevated_samples = 0;
+                self.recovery_samples = 0;
+                self.incident_started = None;
+                self.peak_ms = 0.0;
+                return Some(event);
+            }
+            return None;
+        }
+
+        let rise = sample_ms - baseline_ms;
+        let threshold = LATENCY_RISE_MIN_MS.max(baseline_ms * LATENCY_RISE_RATIO);
+        let severe = rise >= LATENCY_SEVERE_MIN_MS.max(baseline_ms * LATENCY_SEVERE_RATIO);
+        let elevated = self.samples >= LATENCY_BASELINE_SAMPLES && rise >= threshold;
+        if elevated {
+            self.elevated_samples = self.elevated_samples.saturating_add(1);
+            self.peak_ms = self.peak_ms.max(sample_ms);
+            if severe || self.elevated_samples >= LATENCY_RISE_SAMPLES {
+                self.incident_started = Some(now);
+                return Some(LatencyEvent::Degraded {
+                    baseline_ms,
+                    observed_ms: self.peak_ms,
+                });
+            }
+            return None;
+        }
+
+        self.elevated_samples = 0;
+        self.peak_ms = 0.0;
+        self.samples = self.samples.saturating_add(1);
+        // A slow EWMA follows normal route drift but preserves enough history
+        // to spot a persistent 105 -> 120 ms step.
+        self.baseline_ms = Some(baseline_ms + 0.05 * (sample_ms - baseline_ms));
+        None
+    }
+}
 
 #[derive(Default)]
 struct WireGuardSessionManager {
@@ -694,13 +868,23 @@ impl WireGuardSessionManager {
         let telemetry = PathTelemetry {
             iterations: counters(),
             queue_depth: counters(),
+            queue_peak: counters(),
             dropped: counters(),
+            queue_full_dropped: counters(),
+            stale_dropped: counters(),
+            inbound_dropped: counters(),
+            worker_gap_peak_ms: counters(),
             healthy_mask: Arc::new(AtomicU64::new(0)),
             uplink: Arc::new(UplinkMonitor::new()),
         };
         let mut workers = Vec::with_capacity(route_count);
         let mut commands = Vec::with_capacity(route_count);
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
+        let ingress = Arc::new(RelayIngress {
+            client_id,
+            session_id,
+            server_replay: Mutex::new(ReplayWindow::default()),
+        });
         for (index, (_, _, node, path)) in paths.into_iter().enumerate() {
             let status_index = index;
             let (command_tx, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
@@ -709,6 +893,7 @@ impl WireGuardSessionManager {
             let worker_statuses = Arc::clone(&statuses);
             let worker_sequences = Arc::clone(&sequences);
             let worker_inbound = inbound_tx.clone();
+            let worker_ingress = Arc::clone(&ingress);
             let worker_metrics = Arc::clone(&scheduler_metrics);
             let worker_decision = Arc::clone(&decision_mask);
             let worker_telemetry = telemetry.clone();
@@ -729,6 +914,7 @@ impl WireGuardSessionManager {
                             worker_statuses,
                             command_rx,
                             worker_inbound,
+                            worker_ingress,
                             worker_metrics,
                             worker_decision,
                             initial_mask,
@@ -742,16 +928,16 @@ impl WireGuardSessionManager {
         }
         let data_receiver = Arc::new(DataReceiver {
             inbound: Mutex::new(inbound_rx),
-            mode: ReceiveMode::Relay(Box::new(RelayReceive {
-                client_id,
-                session_id,
-                crypto: Arc::clone(&crypto),
-                server_replay: Mutex::new(ReplayWindow::default()),
-            })),
         });
         workers.extend(spawn_uplink_monitor(&stop, &telemetry));
-        let summary =
-            spawn_session_summary(session_id, &stop, &statuses, &telemetry, &decision_mask);
+        let summary = spawn_session_summary(
+            session_id,
+            &stop,
+            &statuses,
+            &telemetry,
+            &decision_mask,
+            &scheduler_metrics,
+        );
         workers.extend(summary);
         log_info!(
             "relay session {session_id} up: {route_count} route(s) [{route_summary}], \
@@ -817,7 +1003,12 @@ impl WireGuardSessionManager {
         let telemetry = PathTelemetry {
             iterations: Arc::new(vec![AtomicU64::new(0)]),
             queue_depth: Arc::new(vec![AtomicU64::new(0)]),
+            queue_peak: Arc::new(vec![AtomicU64::new(0)]),
             dropped: Arc::new(vec![AtomicU64::new(0)]),
+            queue_full_dropped: Arc::new(vec![AtomicU64::new(0)]),
+            stale_dropped: Arc::new(vec![AtomicU64::new(0)]),
+            inbound_dropped: Arc::new(vec![AtomicU64::new(0)]),
+            worker_gap_peak_ms: Arc::new(vec![AtomicU64::new(0)]),
             healthy_mask: Arc::new(AtomicU64::new(0)),
             uplink: Arc::new(UplinkMonitor::new()),
         };
@@ -825,6 +1016,7 @@ impl WireGuardSessionManager {
         let worker_stop = Arc::clone(&stop);
         let worker_statuses = Arc::clone(&statuses);
         let worker_metrics = Arc::clone(&scheduler_metrics);
+        let session_id = rand::random::<u64>();
         let worker = thread::Builder::new()
             .name("gamepath-direct-1".into())
             .spawn(move || {
@@ -837,10 +1029,10 @@ impl WireGuardSessionManager {
                     inbound_tx,
                     worker_metrics,
                     worker_telemetry,
+                    session_id,
                 )
             })
             .map_err(|error| format!("could not start path worker: {error}"))?;
-        let session_id = rand::random::<u64>();
         let mut workers = vec![worker];
         workers.extend(spawn_uplink_monitor(&stop, &telemetry));
         workers.extend(spawn_session_summary(
@@ -849,6 +1041,7 @@ impl WireGuardSessionManager {
             &statuses,
             &telemetry,
             &Arc::new(AtomicU64::new(1)),
+            &scheduler_metrics,
         ));
         log_info!(
             "direct session up: {label_for_log} ({kind}), mtu {} overhead {}",
@@ -867,7 +1060,6 @@ impl WireGuardSessionManager {
             commands: vec![command_tx],
             data_receiver: Arc::new(DataReceiver {
                 inbound: Mutex::new(inbound_rx),
-                mode: ReceiveMode::Direct,
             }),
             virtual_ipv4,
             sequences: Arc::new(AtomicU64::new(1)),
@@ -1053,7 +1245,10 @@ impl WireGuardSessionManager {
             }) {
                 Ok(()) => {
                     if let Some(depth) = session.telemetry.queue_depth.get(index) {
-                        depth.fetch_add(1, Ordering::Relaxed);
+                        let current = depth.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(peak) = session.telemetry.queue_peak.get(index) {
+                            peak.fetch_max(current, Ordering::Relaxed);
+                        }
                     }
                 }
                 // A full queue means the path is already behind. Shedding the
@@ -1061,6 +1256,9 @@ impl WireGuardSessionManager {
                 // stale by the time it would drain, and TCP retransmits.
                 Err(mpsc::TrySendError::Full(_)) => {
                     if let Some(dropped) = session.telemetry.dropped.get(index) {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(dropped) = session.telemetry.queue_full_dropped.get(index) {
                         dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1194,6 +1392,22 @@ impl WireGuardSessionManager {
                 .iter()
                 .map(|count| count.load(Ordering::Relaxed))
                 .collect::<Vec<_>>(),
+            "queuePeak": session
+                .telemetry
+                .queue_peak
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            "dropReasons": {
+                "queueFull": session.telemetry.queue_full_dropped.iter()
+                    .map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+                "stale": session.telemetry.stale_dropped.iter()
+                    .map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+                "inboundFull": session.telemetry.inbound_dropped.iter()
+                    .map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            },
+            "workerGapPeakMs": session.telemetry.worker_gap_peak_ms.iter()
+                .map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             "queueCapacity": PATH_QUEUE_DEPTH,
             "effectiveMtu": session.effective_mtu.mtu,
             "transportOverhead": session.effective_mtu.overhead,
@@ -1767,6 +1981,7 @@ fn run_direct_path(
     inbound: mpsc::SyncSender<Vec<u8>>,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     telemetry: PathTelemetry,
+    session_id: u64,
 ) {
     let identifier = rand::random::<u16>();
     let mut probe_sequence = 0_u16;
@@ -1775,6 +1990,9 @@ fn run_direct_path(
     // The probe deadline follows this node's own round trip, so a provider that
     // is simply distant is not mistaken for one that is losing packets.
     let mut rtt = RttEstimator::default();
+    let mut latency_watch = LatencyWatch::default();
+    let mut last_iteration = Instant::now();
+    let mut last_worker_gap_log: Option<Instant> = None;
     let mut probes_attempted = 0_u64;
     let mut consecutive_losses = 0_u64;
     let mut icmp_answered = false;
@@ -1795,6 +2013,22 @@ fn run_direct_path(
     let endpoint = path.endpoint();
 
     while !stop.load(Ordering::Acquire) {
+        let iteration_started = Instant::now();
+        let worker_gap = iteration_started.saturating_duration_since(last_iteration);
+        last_iteration = iteration_started;
+        let worker_gap_ms = worker_gap.as_millis().min(u128::from(u64::MAX)) as u64;
+        telemetry.worker_gap_peak_ms[0].fetch_max(worker_gap_ms, Ordering::Relaxed);
+        if worker_gap >= WORKER_GAP_WARN
+            && last_worker_gap_log.is_none_or(|logged| logged.elapsed() >= WORKER_GAP_LOG_INTERVAL)
+        {
+            last_worker_gap_log = Some(iteration_started);
+            log_warn!(
+                "session {session_id} route 1 worker gap {worker_gap_ms} ms; q={} drop={} uplink={:?}",
+                telemetry.queue_depth[0].load(Ordering::Relaxed),
+                telemetry.dropped[0].load(Ordering::Relaxed),
+                telemetry.uplink.state()
+            );
+        }
         telemetry.iterations[0].fetch_add(1, Ordering::Relaxed);
         // Health is decided first so the rest of the iteration can see it, and
         // published only when it moves: this lock is on the hot path.
@@ -1834,6 +2068,7 @@ fn run_direct_path(
             0,
             &telemetry.queue_depth,
             &telemetry.dropped,
+            &telemetry.stale_dropped,
             |frame| (frame.len(), path.send_packet(frame)),
             |length, result| record_path_send(&statuses, 0, length, result),
         );
@@ -1890,6 +2125,29 @@ fn run_direct_path(
                             current[0].latency_ms = Some(latency);
                         }
                         scheduler_metrics.lock().unwrap()[0].record_probe(latency);
+                        match latency_watch.observe(latency, Instant::now()) {
+                            Some(LatencyEvent::Degraded {
+                                baseline_ms,
+                                observed_ms,
+                            }) => log_warn!(
+                                "session {session_id} route 1 data-plane RTT degraded: \
+                                 {observed_ms:.0} ms vs {baseline_ms:.0} ms baseline; \
+                                 q={} drop={} uplink={:?}",
+                                telemetry.queue_depth[0].load(Ordering::Relaxed),
+                                telemetry.dropped[0].load(Ordering::Relaxed),
+                                telemetry.uplink.state()
+                            ),
+                            Some(LatencyEvent::Recovered {
+                                baseline_ms,
+                                peak_ms,
+                                duration,
+                            }) => log_info!(
+                                "session {session_id} route 1 data-plane RTT recovered after \
+                                 {:.1} s (baseline {baseline_ms:.0} ms, peak {peak_ms:.0} ms)",
+                                duration.as_secs_f64()
+                            ),
+                            None => {}
+                        }
                         last_authenticated_receive = Some(Instant::now());
                         continue;
                     }
@@ -1899,6 +2157,7 @@ fn run_direct_path(
                     // decides whether this path is still usable.
                     if let Err(mpsc::TrySendError::Full(_)) = inbound.try_send(packet) {
                         telemetry.dropped[0].fetch_add(1, Ordering::Relaxed);
+                        telemetry.inbound_dropped[0].fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 // Windows reports an unreachable endpoint on the next read of a
@@ -1961,6 +2220,7 @@ fn run_path(
     statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
     commands: mpsc::Receiver<PathCommand>,
     inbound: mpsc::SyncSender<Vec<u8>>,
+    ingress: Arc<RelayIngress>,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     decision_mask: Arc<AtomicU64>,
     fallback_mask: u64,
@@ -1984,8 +2244,12 @@ fn run_path(
     // transport, because a stream-carried path stalls for its own retransmit
     // and answering later than that is not the same as not answering.
     let mut rtt = RttEstimator::with_floor(path.probe_deadline_floor());
-    // Consecutive failed health checks, and how long to wait before the next
-    // redial. Both reset the moment the path answers again.
+    let mut latency_watch = LatencyWatch::default();
+    let mut last_iteration = Instant::now();
+    let mut last_worker_gap_log: Option<Instant> = None;
+    // Consecutive failed health checks and the next redial deadline reset as
+    // soon as the path answers. An already-running redial stays owned until
+    // it finishes, then is discarded if that recovery made it obsolete.
     let mut failures = 0_u32;
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut next_redial: Option<Instant> = None;
@@ -1993,30 +2257,57 @@ fn run_path(
     // handshake its own - so it runs on its own thread and the result is
     // collected here. The worker keeps probing and keeps checking `stop` while
     // it is in flight, which is what stops a dead route delaying a session stop.
-    let mut dialing: Option<mpsc::Receiver<Result<Box<dyn RelayPath>, String>>> = None;
+    let mut dialing: Option<ReconnectAttempt<Box<dyn RelayPath>>> = None;
     while !stop.load(Ordering::Acquire) {
+        let iteration_started = Instant::now();
+        let worker_gap = iteration_started.saturating_duration_since(last_iteration);
+        last_iteration = iteration_started;
+        let worker_gap_ms = worker_gap.as_millis().min(u128::from(u64::MAX)) as u64;
+        telemetry.worker_gap_peak_ms[index].fetch_max(worker_gap_ms, Ordering::Relaxed);
+        if worker_gap >= WORKER_GAP_WARN
+            && last_worker_gap_log.is_none_or(|logged| logged.elapsed() >= WORKER_GAP_LOG_INTERVAL)
+        {
+            last_worker_gap_log = Some(iteration_started);
+            log_warn!(
+                "session {session_id} route {} worker gap {} ms; q={} drop={} uplink={:?}",
+                index + 1,
+                worker_gap_ms,
+                telemetry.queue_depth[index].load(Ordering::Relaxed),
+                telemetry.dropped[index].load(Ordering::Relaxed),
+                telemetry.uplink.state()
+            );
+        }
         telemetry.iterations[index].fetch_add(1, Ordering::Relaxed);
-        match dialing.as_ref().map(mpsc::Receiver::try_recv) {
-            Some(Ok(Ok(replacement))) => {
+        match dialing.as_mut().map(ReconnectAttempt::poll) {
+            Some(ReconnectPoll::Finished(Ok(replacement))) => {
                 dialing = None;
                 path = replacement;
+                publish_path_health(&telemetry.healthy_mask, index, false);
                 // A redial may fall back from UDP to TCP (or recover to UDP).
                 // Neither the old samples nor its deadline floor apply.
                 rtt = RttEstimator::with_floor(path.probe_deadline_floor());
+                latency_watch.reset();
                 failures = 0;
-                backoff = RECONNECT_BACKOFF_MIN;
+                // Opening a socket is not recovery. Repeated replacements
+                // that never answer must back off until a real pong arrives.
+                backoff = next_backoff(backoff);
                 next_redial = None;
                 pending_probe = None;
                 published_setup_latency = None;
                 // The new transport has to prove itself: only an answered probe
                 // puts this path back into the dispatcher's selection.
                 next_probe = Instant::now();
-                log_info!("route {} reconnected via {}", index + 1, path.endpoint());
+                log_info!(
+                    "route {} transport opened via {}; awaiting relay probe",
+                    index + 1,
+                    path.endpoint()
+                );
                 let mut current = statuses.lock().unwrap();
+                current[index].reachable = false;
                 current[index].endpoint = path.endpoint();
                 current[index].last_error = Some("reconnected; waiting for a probe".into());
             }
-            Some(Ok(Err(error))) => {
+            Some(ReconnectPoll::Finished(Err(error))) => {
                 dialing = None;
                 backoff = next_backoff(backoff);
                 next_redial = Some(Instant::now() + backoff);
@@ -2028,14 +2319,14 @@ fn run_path(
                 statuses.lock().unwrap()[index].last_error =
                     Some(format!("reconnect failed, retrying: {error}"));
             }
-            // The dial thread went away without answering. Treat it as a failed
-            // attempt rather than waiting on a receiver that will never fill.
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+            Some(ReconnectPoll::Discarded) => {
                 dialing = None;
-                backoff = next_backoff(backoff);
-                next_redial = Some(Instant::now() + backoff);
+                log_info!(
+                    "session {session_id} route {} discarded obsolete reconnect after recovery",
+                    index + 1
+                );
             }
-            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+            Some(ReconnectPoll::Pending) | None => {}
         }
         // A redial is only worth making when something proves the uplink is
         // there. The monitor answers that directly when it can; when it cannot
@@ -2067,7 +2358,7 @@ fn run_path(
                     let _ = result_tx.send(attempt.open());
                 }) {
                 Ok(_) => {
-                    dialing = Some(result_rx);
+                    dialing = Some(ReconnectAttempt::new(result_rx));
                     log_info!("route {} is reconnecting", index + 1);
                     statuses.lock().unwrap()[index].last_error = Some("reconnecting".to_owned());
                 }
@@ -2084,6 +2375,7 @@ fn run_path(
             index,
             &telemetry.queue_depth,
             &telemetry.dropped,
+            &telemetry.stale_dropped,
             |frame| (frame.len(), path.send_frame(frame)),
             |length, result| record_path_send(&statuses, index, length, result),
         );
@@ -2115,9 +2407,26 @@ fn run_path(
                         fallback_mask,
                         index,
                         None,
+                        session_id,
                     );
                     update_path_status(&statuses, index, Err(error));
                     failures += 1;
+                    if failures == HEALTH_FAILURE_THRESHOLD - 1 {
+                        log_warn!(
+                            "session {session_id} route {} degraded after {failures} consecutive \
+                             probe send failures; still carrying duplicated traffic",
+                            index + 1
+                        );
+                    } else if failures == HEALTH_FAILURE_THRESHOLD {
+                        log_warn!(
+                            "session {session_id} route {} unavailable after {failures} consecutive \
+                             probe send failures; dispatcher is using available alternatives",
+                            index + 1
+                        );
+                    }
+                    if failures >= HEALTH_FAILURE_THRESHOLD {
+                        publish_path_health(&telemetry.healthy_mask, index, false);
+                    }
                     schedule_redial(failures, backoff, &mut next_redial);
                     next_probe = Instant::now() + PROBE_INTERVAL_DEGRADED;
                 }
@@ -2127,6 +2436,9 @@ fn run_path(
             Ok(frames) => {
                 for frame in frames {
                     if let Ok((header, plaintext)) = crypto.open_server(&frame) {
+                        if header.client_id != client_id || header.session_id != session_id {
+                            continue;
+                        }
                         if header.flags & FLAG_CONTROL != 0 {
                             if let Some((sequence, started)) = pending_probe {
                                 if header.flags & FLAG_SERVER_TO_CLIENT == 0
@@ -2159,7 +2471,7 @@ fn run_path(
                                 // is where it rejoins the dispatcher, and where
                                 // any pending reconnect is called off.
                                 publish_path_health(&telemetry.healthy_mask, index, true);
-                                if failures >= HEALTH_FAILURE_THRESHOLD {
+                                if failures >= HEALTH_FAILURE_THRESHOLD - 1 {
                                     log_info!(
                                         "route {} is carrying traffic again after {failures} \
                                          failed check(s), {latency:.0} ms",
@@ -2169,13 +2481,42 @@ fn run_path(
                                 failures = 0;
                                 backoff = RECONNECT_BACKOFF_MIN;
                                 next_redial = None;
+                                if let Some(attempt) = dialing.as_mut() {
+                                    attempt.recovered();
+                                }
                                 update_scheduler_probe(
                                     &scheduler_metrics,
                                     &decision_mask,
                                     fallback_mask,
                                     index,
                                     Some(latency),
+                                    session_id,
                                 );
+                                match latency_watch.observe(latency, Instant::now()) {
+                                    Some(LatencyEvent::Degraded {
+                                        baseline_ms,
+                                        observed_ms,
+                                    }) => log_warn!(
+                                        "session {session_id} route {} relay RTT degraded: \
+                                         {observed_ms:.0} ms vs {baseline_ms:.0} ms baseline; \
+                                         q={} drop={} uplink={:?}",
+                                        index + 1,
+                                        telemetry.queue_depth[index].load(Ordering::Relaxed),
+                                        telemetry.dropped[index].load(Ordering::Relaxed),
+                                        telemetry.uplink.state()
+                                    ),
+                                    Some(LatencyEvent::Recovered {
+                                        baseline_ms,
+                                        peak_ms,
+                                        duration,
+                                    }) => log_info!(
+                                        "session {session_id} route {} relay RTT recovered after \
+                                         {:.1} s (baseline {baseline_ms:.0} ms, peak {peak_ms:.0} ms)",
+                                        index + 1,
+                                        duration.as_secs_f64()
+                                    ),
+                                    None => {}
+                                }
                                 next_probe = Instant::now() + PROBE_INTERVAL;
                             }
                         } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
@@ -2183,8 +2524,11 @@ fn run_path(
                             // Blocking on a saturated inbound queue would stall
                             // this path's probes and timers, which is how a
                             // busy path ends up reported as a dead one.
-                            if let Err(mpsc::TrySendError::Full(_)) = inbound.try_send(frame) {
+                            if let Err(mpsc::TrySendError::Full(_)) =
+                                ingress.enqueue_authenticated(&header, plaintext, &inbound)
+                            {
                                 telemetry.dropped[index].fetch_add(1, Ordering::Relaxed);
+                                telemetry.inbound_dropped[index].fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -2215,17 +2559,30 @@ fn run_path(
                 fallback_mask,
                 index,
                 None,
+                session_id,
             );
             let note = path.health_note();
             failures += 1;
             schedule_redial(failures, backoff, &mut next_redial);
-            log_warn!(
-                "route {} health check timed out ({failures} in a row){}",
-                index + 1,
-                note.as_deref()
-                    .map(|note| format!(": {note}"))
-                    .unwrap_or_default()
-            );
+            if failures == HEALTH_FAILURE_THRESHOLD - 1 {
+                log_warn!(
+                    "session {session_id} route {} degraded after {failures} consecutive health \
+                     timeouts; still carrying duplicated traffic{}",
+                    index + 1,
+                    note.as_deref()
+                        .map(|note| format!(": {note}"))
+                        .unwrap_or_default()
+                );
+            } else if failures == HEALTH_FAILURE_THRESHOLD {
+                log_warn!(
+                    "session {session_id} route {} unavailable after {failures} consecutive health \
+                     timeouts; dispatcher is using available alternatives{}",
+                    index + 1,
+                    note.as_deref()
+                        .map(|note| format!(": {note}"))
+                        .unwrap_or_default()
+                );
+            }
             // Only a run of unanswered probes takes the path out of service.
             // A single loss has already been recorded against the path's score
             // above, which is the proportionate response to it.
@@ -2270,6 +2627,7 @@ fn drain_send_queue(
     index: usize,
     queue_depth: &[AtomicU64],
     dropped: &[AtomicU64],
+    stale_dropped: &[AtomicU64],
     mut send: impl FnMut(&[u8]) -> (usize, Result<(), String>),
     mut record: impl FnMut(usize, Result<(), String>),
 ) {
@@ -2282,6 +2640,9 @@ fn drain_send_queue(
         }
         if command.queued_at.elapsed() > PATH_QUEUE_MAX_AGE {
             if let Some(dropped) = dropped.get(index) {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(dropped) = stale_dropped.get(index) {
                 dropped.fetch_add(1, Ordering::Relaxed);
             }
             continue;
@@ -2337,12 +2698,23 @@ fn spawn_session_summary(
     statuses: &Arc<Mutex<Vec<PathSessionStatus>>>,
     telemetry: &PathTelemetry,
     decision_mask: &Arc<AtomicU64>,
+    scheduler_metrics: &Arc<Mutex<Vec<PathMetrics>>>,
 ) -> Option<JoinHandle<()>> {
     let (stop, statuses) = (Arc::clone(stop), Arc::clone(statuses));
     let (telemetry, decision_mask) = (telemetry.clone(), Arc::clone(decision_mask));
+    let scheduler_metrics = Arc::clone(scheduler_metrics);
     thread::Builder::new()
         .name("gamepath-session-summary".into())
-        .spawn(move || run_session_summary(session_id, stop, statuses, telemetry, decision_mask))
+        .spawn(move || {
+            run_session_summary(
+                session_id,
+                stop,
+                statuses,
+                telemetry,
+                decision_mask,
+                scheduler_metrics,
+            )
+        })
         .inspect_err(|error| log_warn!("session summary logging is unavailable: {error}"))
         .ok()
 }
@@ -2354,51 +2726,123 @@ const SESSION_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 ///
 /// This is the context a transition on its own does not give: what the other
 /// routes were doing at the time, whether queues were backing up, and how much
-/// had been shed. One line a minute is about 1.5 KB an hour, which the rotation
-/// cap absorbs easily.
+/// had been shed. One line a minute remains small enough for the rotation cap,
+/// while drop bursts are reported promptly and rate-limited above.
 fn run_session_summary(
     session_id: u64,
     stop: Arc<AtomicBool>,
     statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
     telemetry: PathTelemetry,
     decision_mask: Arc<AtomicU64>,
+    scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
 ) {
+    let route_count = statuses.lock().unwrap().len();
+    let mut previous_lost = vec![0_u64; route_count];
+    let mut previous_dropped = vec![0_u64; route_count];
+    let mut previous_sent = vec![0_u64; route_count];
+    let mut previous_received = vec![0_u64; route_count];
+    let mut reported_dropped = vec![0_u64; route_count];
+    let mut reported_full = vec![0_u64; route_count];
+    let mut reported_stale = vec![0_u64; route_count];
+    let mut reported_inbound = vec![0_u64; route_count];
+    let mut last_drop_log: Option<Instant> = None;
     let mut next = Instant::now() + SESSION_SUMMARY_INTERVAL;
     while !stop.load(Ordering::Acquire) {
-        if Instant::now() < next {
+        let observed_at = Instant::now();
+        let current_dropped = telemetry
+            .dropped
+            .iter()
+            .map(|value| value.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        let has_new_drops = current_dropped
+            .iter()
+            .zip(&reported_dropped)
+            .any(|(current, reported)| current > reported);
+        if has_new_drops
+            && last_drop_log
+                .is_none_or(|logged| observed_at.duration_since(logged) >= DROP_LOG_INTERVAL)
+        {
+            let details = (0..route_count)
+                .filter_map(|index| {
+                    let total = current_dropped[index].saturating_sub(reported_dropped[index]);
+                    (total > 0).then(|| {
+                        let full = telemetry.queue_full_dropped[index].load(Ordering::Relaxed);
+                        let stale = telemetry.stale_dropped[index].load(Ordering::Relaxed);
+                        let inbound = telemetry.inbound_dropped[index].load(Ordering::Relaxed);
+                        let detail = format!(
+                            "{}:+{total} (full +{}, stale +{}, inbound +{}, q={}, peak={})",
+                            index + 1,
+                            full.saturating_sub(reported_full[index]),
+                            stale.saturating_sub(reported_stale[index]),
+                            inbound.saturating_sub(reported_inbound[index]),
+                            telemetry.queue_depth[index].load(Ordering::Relaxed),
+                            telemetry.queue_peak[index].load(Ordering::Relaxed),
+                        );
+                        reported_full[index] = full;
+                        reported_stale[index] = stale;
+                        reported_inbound[index] = inbound;
+                        detail
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            log_warn!("session {session_id} packet shedding by route: {details}");
+            reported_dropped.clone_from(&current_dropped);
+            last_drop_log = Some(observed_at);
+        }
+        if observed_at < next {
             thread::sleep(Duration::from_millis(250));
             continue;
         }
-        next = Instant::now() + SESSION_SUMMARY_INTERVAL;
+        next = observed_at + SESSION_SUMMARY_INTERVAL;
         let selected = selected_paths(
             decision_mask.load(Ordering::Acquire),
             telemetry.healthy_mask.load(Ordering::Acquire),
         );
-        let routes = statuses
-            .lock()
-            .unwrap()
+        let paths = statuses.lock().unwrap().clone();
+        let metrics = scheduler_metrics.lock().unwrap().clone();
+        let routes = paths
             .iter()
             .enumerate()
             .map(|(index, path)| {
                 let carrying = selected & 1_u64.checked_shl(index as u32).unwrap_or(0) != 0;
-                let latency = path
+                let relay_rtt = path
                     .latency_ms
                     .map(|value| format!("{value:.0}ms"))
                     .unwrap_or_else(|| "-".into());
+                let (ewma, jitter, loss) = metrics.get(index).map_or((0.0, 0.0, 0.0), |metric| {
+                    (
+                        metric.latency_ms,
+                        metric.jitter_ms,
+                        metric.loss_ratio * 100.0,
+                    )
+                });
+                let dropped = telemetry.dropped[index].load(Ordering::Relaxed);
+                let lost_delta = path.probes_lost.saturating_sub(previous_lost[index]);
+                let dropped_delta = dropped.saturating_sub(previous_dropped[index]);
+                let sent_delta = path.packets_sent.saturating_sub(previous_sent[index]);
+                let received_delta = path
+                    .packets_received
+                    .saturating_sub(previous_received[index]);
+                previous_lost[index] = path.probes_lost;
+                previous_dropped[index] = dropped;
+                previous_sent[index] = path.packets_sent;
+                previous_received[index] = path.packets_received;
                 format!(
-                    "{}:{}{} {latency} lost={} q={} drop={}",
+                    "{}:{}{} relay-rtt={relay_rtt} ewma={ewma:.0}ms jitter={jitter:.0}ms \
+                     loss-ewma={loss:.0}% probes-lost={} (+{lost_delta}) q={}/peak={} \
+                     drop={dropped} (+{dropped_delta}; full={} stale={} inbound={}) \
+                     packets=+{sent_delta}/+{received_delta} worker-gap-peak={}ms",
                     path.route,
                     if path.reachable { "up" } else { "down" },
                     if carrying { "/active" } else { "" },
                     path.probes_lost,
-                    telemetry
-                        .queue_depth
-                        .get(index)
-                        .map_or(0, |depth| depth.load(Ordering::Relaxed)),
-                    telemetry
-                        .dropped
-                        .get(index)
-                        .map_or(0, |dropped| dropped.load(Ordering::Relaxed)),
+                    telemetry.queue_depth[index].load(Ordering::Relaxed),
+                    telemetry.queue_peak[index].load(Ordering::Relaxed),
+                    telemetry.queue_full_dropped[index].load(Ordering::Relaxed),
+                    telemetry.stale_dropped[index].load(Ordering::Relaxed),
+                    telemetry.inbound_dropped[index].load(Ordering::Relaxed),
+                    telemetry.worker_gap_peak_ms[index].load(Ordering::Relaxed),
                 )
             })
             .collect::<Vec<_>>()
@@ -2448,6 +2892,7 @@ fn update_scheduler_probe(
     fallback_mask: u64,
     index: usize,
     latency_ms: Option<f64>,
+    session_id: u64,
 ) {
     let mut metrics = metrics.lock().unwrap();
     let Some(path) = metrics.get_mut(index) else {
@@ -2458,10 +2903,45 @@ fn update_scheduler_probe(
         None => path.record_loss(),
     }
     let decision = choose_paths(&metrics, Strategy::Adaptive);
-    decision_mask.store(
-        mask_for_decision(decision, fallback_mask),
-        Ordering::Release,
-    );
+    let next = mask_for_decision(decision, fallback_mask);
+    let previous = decision_mask.swap(next, Ordering::AcqRel);
+    if previous != next {
+        let reason = latency_ms
+            .map(|latency| format!("route {} probe {latency:.0} ms", index + 1))
+            .unwrap_or_else(|| format!("route {} probe lost", index + 1));
+        let snapshot = metrics
+            .iter()
+            .enumerate()
+            .map(|(route, path)| {
+                format!(
+                    "{}:rtt={:.0}ms jitter={:.0}ms loss-ewma={:.0}% score={:.0}",
+                    route + 1,
+                    path.latency_ms,
+                    path.jitter_ms,
+                    path.loss_ratio * 100.0,
+                    path.score()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        log_info!(
+            "session {session_id} scheduler routes {} -> {} after {reason}; {snapshot}",
+            route_mask(previous),
+            route_mask(next)
+        );
+    }
+}
+
+fn route_mask(mask: u64) -> String {
+    let routes = (0..64)
+        .filter(|index| mask & (1_u64 << index) != 0)
+        .map(|index| (index + 1).to_string())
+        .collect::<Vec<_>>();
+    if routes.is_empty() {
+        "none".to_owned()
+    } else {
+        routes.join("+")
+    }
 }
 
 fn mask_for_decision(decision: Decision, fallback_mask: u64) -> u64 {
@@ -2948,6 +3428,75 @@ fn scheduler_demo() -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_recovery_discards_an_already_running_reconnect() {
+        let (sender, receiver) = mpsc::channel();
+        let mut attempt = ReconnectAttempt::new(receiver);
+        attempt.recovered();
+        sender.send(Ok::<_, String>(42_u8)).unwrap();
+        assert!(matches!(attempt.poll(), ReconnectPoll::Discarded));
+    }
+
+    #[test]
+    fn a_reconnect_result_is_used_when_the_old_path_never_recovers() {
+        let (sender, receiver) = mpsc::channel();
+        let mut attempt = ReconnectAttempt::new(receiver);
+        sender.send(Ok::<_, String>(42_u8)).unwrap();
+        assert!(matches!(attempt.poll(), ReconnectPoll::Finished(Ok(42))));
+    }
+
+    #[test]
+    fn latency_watch_reports_a_sustained_small_step_once_then_recovers_once() {
+        let mut watch = LatencyWatch::default();
+        let started = Instant::now();
+        for offset in 0..LATENCY_BASELINE_SAMPLES {
+            assert_eq!(
+                watch.observe(105.0, started + Duration::from_millis(offset)),
+                None
+            );
+        }
+        assert_eq!(
+            watch.observe(120.0, started + Duration::from_secs(1)),
+            None,
+            "one modest sample is not an incident"
+        );
+        assert!(matches!(
+            watch.observe(121.0, started + Duration::from_secs(2)),
+            Some(LatencyEvent::Degraded { .. })
+        ));
+        assert_eq!(
+            watch.observe(123.0, started + Duration::from_secs(3)),
+            None,
+            "an active incident must not log every sample"
+        );
+        for second in 4..4 + u64::from(LATENCY_RECOVERY_SAMPLES) - 1 {
+            assert_eq!(
+                watch.observe(106.0, started + Duration::from_secs(second)),
+                None
+            );
+        }
+        assert!(matches!(
+            watch.observe(106.0, started + Duration::from_secs(6)),
+            Some(LatencyEvent::Recovered { peak_ms, .. }) if peak_ms == 123.0
+        ));
+    }
+
+    #[test]
+    fn latency_watch_reports_one_severe_spike_immediately() {
+        let mut watch = LatencyWatch::default();
+        let now = Instant::now();
+        for offset in 0..LATENCY_BASELINE_SAMPLES {
+            assert_eq!(
+                watch.observe(50.0, now + Duration::from_millis(offset)),
+                None
+            );
+        }
+        assert!(matches!(
+            watch.observe(120.0, now + Duration::from_secs(1)),
+            Some(LatencyEvent::Degraded { .. })
+        ));
+    }
+
     fn queued(frame: Vec<u8>, age: Duration) -> PathCommand {
         PathCommand {
             frame,
@@ -2960,6 +3509,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
         let depth = vec![AtomicU64::new(0)];
         let dropped = vec![AtomicU64::new(0)];
+        let stale = vec![AtomicU64::new(0)];
         for _ in 0..PATH_SEND_BATCH * 2 {
             sender
                 .try_send(queued(vec![0; 64], Duration::ZERO))
@@ -2972,6 +3522,7 @@ mod tests {
             0,
             &depth,
             &dropped,
+            &stale,
             |frame| (frame.len(), Ok(())),
             |_, _| sent += 1,
         );
@@ -2987,6 +3538,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(4);
         let depth = vec![AtomicU64::new(2)];
         let dropped = vec![AtomicU64::new(0)];
+        let stale = vec![AtomicU64::new(0)];
         sender
             .try_send(queued(vec![1; 64], PATH_QUEUE_MAX_AGE * 2))
             .unwrap();
@@ -2999,11 +3551,13 @@ mod tests {
             0,
             &depth,
             &dropped,
+            &stale,
             |frame| (frame.len(), Ok(())),
             |length, _| sent.push(length),
         );
         assert_eq!(sent, [64]);
         assert_eq!(dropped[0].load(Ordering::Relaxed), 1);
+        assert_eq!(stale[0].load(Ordering::Relaxed), 1);
         assert_eq!(depth[0].load(Ordering::Relaxed), 0);
     }
 
@@ -3493,7 +4047,12 @@ mod tests {
         let telemetry = PathTelemetry {
             iterations: Arc::new(vec![AtomicU64::new(0)]),
             queue_depth: Arc::new(vec![AtomicU64::new(0)]),
+            queue_peak: Arc::new(vec![AtomicU64::new(0)]),
             dropped: Arc::new(vec![AtomicU64::new(0)]),
+            queue_full_dropped: Arc::new(vec![AtomicU64::new(0)]),
+            stale_dropped: Arc::new(vec![AtomicU64::new(0)]),
+            inbound_dropped: Arc::new(vec![AtomicU64::new(0)]),
+            worker_gap_peak_ms: Arc::new(vec![AtomicU64::new(0)]),
             healthy_mask: Arc::new(AtomicU64::new(0)),
             uplink: Arc::new(UplinkMonitor::new()),
         };
@@ -3509,6 +4068,7 @@ mod tests {
                     inbound_tx,
                     Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())])),
                     telemetry,
+                    1,
                 )
             }
         });
@@ -3633,14 +4193,14 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_mask_selects_the_best_healthy_route() {
+    fn scheduler_mask_keeps_two_healthy_routes_ready() {
         let mut slower = PathMetrics::new("0");
         slower.record_probe(70.0);
         let mut faster = PathMetrics::new("1");
         faster.record_probe(35.0);
         assert_eq!(
             mask_for_decision(choose_paths(&[slower, faster], Strategy::Adaptive), 0b11),
-            0b10
+            0b11
         );
     }
 

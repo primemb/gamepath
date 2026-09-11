@@ -309,6 +309,14 @@ const BYPASS_QUEUE_DEPTH: usize = 2048;
 /// over a hundred megabytes. This is the bound that actually holds.
 const BYPASS_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Packet processing above this duration can be felt by the selected game
+/// even when every tunnel probe remains healthy.
+const SLOW_CAPTURE_LOOP: Duration = Duration::from_millis(100);
+
+/// Capture anomalies are combined into one line and never emitted more often
+/// than this, even during a large burst.
+const CAPTURE_ANOMALY_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Soft ceiling for reply routing state.
 ///
 /// Socket close notifications normally remove these entries. The ceiling is a
@@ -494,7 +502,13 @@ struct Registry {
     /// copy and take the lock only when the set has actually changed.
     table_version: AtomicU64,
     handled_connections: Mutex<HashMap<ReturnKey, HandledConnection>>,
+    /// Each selected remote endpoint is logged once per capture session. The
+    /// fixed cap preserves enough game-server context without turning a busy
+    /// application's connection churn into log spam.
+    logged_destinations: Mutex<HashSet<(u8, Ipv4Addr, u16)>>,
     capture_loop_buckets: [AtomicU64; 8],
+    capture_loop_peak_us: AtomicU64,
+    slow_capture_loops: AtomicU64,
     capture_receive_errors: AtomicU64,
     pending_syn_depth: AtomicU64,
     pending_syn_peak: AtomicU64,
@@ -516,6 +530,10 @@ struct Registry {
     captured_bytes: AtomicU64,
     relayed_packets: AtomicU64,
     bypassed_packets: AtomicU64,
+    relay_return_packets: AtomicU64,
+    injected_return_packets: AtomicU64,
+    unmatched_return_packets: AtomicU64,
+    return_injection_errors: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -641,7 +659,10 @@ impl SplitPacketCapture {
             table: RwLock::new(Arc::new(SelectorTable::default())),
             table_version: AtomicU64::new(0),
             handled_connections: Mutex::new(HashMap::new()),
+            logged_destinations: Mutex::new(HashSet::new()),
             capture_loop_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            capture_loop_peak_us: AtomicU64::new(0),
+            slow_capture_loops: AtomicU64::new(0),
             capture_receive_errors: AtomicU64::new(0),
             pending_syn_depth: AtomicU64::new(0),
             pending_syn_peak: AtomicU64::new(0),
@@ -656,6 +677,10 @@ impl SplitPacketCapture {
             captured_bytes: AtomicU64::new(0),
             relayed_packets: AtomicU64::new(0),
             bypassed_packets: AtomicU64::new(0),
+            relay_return_packets: AtomicU64::new(0),
+            injected_return_packets: AtomicU64::new(0),
+            unmatched_return_packets: AtomicU64::new(0),
+            return_injection_errors: AtomicU64::new(0),
             tcp_mss: effective_mtu.tcp_mss(),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -780,6 +805,7 @@ impl SplitPacketCapture {
 
         let inject_stop = Arc::clone(&stop);
         let inject_returns = Arc::clone(&return_paths);
+        let inject_registry = Arc::clone(&registry);
         let worker = thread::Builder::new()
             .name("gamepath-windivert-inject".into())
             .spawn(move || {
@@ -789,9 +815,18 @@ impl SplitPacketCapture {
                     data_receiver,
                     inject_returns,
                     virtual_ipv4,
+                    inject_registry,
                 )
             })
             .map_err(|error| format!("could not start split reply injector: {error}"))?;
+        registry.workers.lock().unwrap().push(worker);
+
+        let diagnostic_stop = Arc::clone(&stop);
+        let diagnostic_registry = Arc::clone(&registry);
+        let worker = thread::Builder::new()
+            .name("gamepath-capture-diagnostics".into())
+            .spawn(move || run_capture_diagnostics(diagnostic_stop, diagnostic_registry))
+            .map_err(|error| format!("could not start capture diagnostics: {error}"))?;
         registry.workers.lock().unwrap().push(worker);
 
         Ok(Self {
@@ -853,10 +888,16 @@ impl SplitPacketCapture {
             "bypassedPackets": self.registry.bypassed_packets.load(Ordering::Relaxed),
             "handledConnections": handled_connections,
             "captureLoopHistogram": capture_loop_histogram,
+            "captureLoopPeakUs": self.registry.capture_loop_peak_us.load(Ordering::Relaxed),
+            "slowCaptureLoops": self.registry.slow_capture_loops.load(Ordering::Relaxed),
             "captureReceiveErrors": self.registry.capture_receive_errors.load(Ordering::Relaxed),
             "pendingSynDepth": self.registry.pending_syn_depth.load(Ordering::Relaxed),
             "pendingSynPeak": self.registry.pending_syn_peak.load(Ordering::Relaxed),
             "pendingSynOverflow": self.registry.pending_syn_overflow.load(Ordering::Relaxed),
+            "relayReturnPackets": self.registry.relay_return_packets.load(Ordering::Relaxed),
+            "injectedReturnPackets": self.registry.injected_return_packets.load(Ordering::Relaxed),
+            "unmatchedReturnPackets": self.registry.unmatched_return_packets.load(Ordering::Relaxed),
+            "returnInjectionErrors": self.registry.return_injection_errors.load(Ordering::Relaxed),
             "driverQueueTimeMs": 100,
         })
     }
@@ -946,6 +987,14 @@ struct CaptureLoopTimer<'a> {
 impl Drop for CaptureLoopTimer<'_> {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed().as_micros() as u64;
+        self.registry
+            .capture_loop_peak_us
+            .fetch_max(elapsed, Ordering::Relaxed);
+        if elapsed >= SLOW_CAPTURE_LOOP.as_micros() as u64 {
+            self.registry
+                .slow_capture_loops
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let bucket = [10_u64, 25, 50, 100, 250, 500, 1000]
             .iter()
             .position(|upper| elapsed <= *upper)
@@ -1807,11 +1856,17 @@ fn run_reply_injector(
     data_receiver: Arc<DataReceiver>,
     return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
     virtual_ipv4: Ipv4Addr,
+    registry: Arc<Registry>,
 ) {
     while !stop.load(Ordering::Acquire) {
         let received = data_receiver.receive(Duration::from_millis(20));
         let mut packet = match received {
-            Ok(Some(packet)) => packet,
+            Ok(Some(packet)) => {
+                registry
+                    .relay_return_packets
+                    .fetch_add(1, Ordering::Relaxed);
+                packet
+            }
             Ok(None) => continue,
             Err(_) => {
                 thread::sleep(Duration::from_millis(1));
@@ -1819,14 +1874,23 @@ fn run_reply_injector(
             }
         };
         let Some(fields) = ipv4_fields(&packet) else {
+            registry
+                .unmatched_return_packets
+                .fetch_add(1, Ordering::Relaxed);
             continue;
         };
         if fields.destination != virtual_ipv4 {
+            registry
+                .unmatched_return_packets
+                .fetch_add(1, Ordering::Relaxed);
             continue;
         }
         let path = {
             let mut paths = return_paths.lock().unwrap();
             let Some(path) = paths.get_mut(&ReturnKey::inbound(fields)) else {
+                registry
+                    .unmatched_return_packets
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             path.last_seen = Instant::now();
@@ -1835,9 +1899,69 @@ fn run_reply_injector(
         packet[16..20].copy_from_slice(&path.local_ip.octets());
         clamp_tcp_mss(&mut packet, 1000);
         let mut address = Address::inbound(path.interface_index, path.subinterface_index);
-        if handle.checksums(&mut packet, &mut address).is_ok() {
-            let _ = handle.send(&packet, &address);
+        if handle.checksums(&mut packet, &mut address).is_ok()
+            && handle.send(&packet, &address).is_ok()
+        {
+            registry
+                .injected_return_packets
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            registry
+                .return_injection_errors
+                .fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Watches counters outside the packet path and writes one combined incident
+/// record. Keeping formatting and logging here ensures a burst never makes a
+/// capture thread do disk I/O or emit one warning per packet.
+fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
+    let read = || {
+        [
+            registry.bypassed_packets.load(Ordering::Relaxed),
+            registry.bypass_queue_full.load(Ordering::Relaxed),
+            registry.capture_receive_errors.load(Ordering::Relaxed),
+            registry.pending_syn_overflow.load(Ordering::Relaxed),
+            registry.slow_capture_loops.load(Ordering::Relaxed),
+            registry.unmatched_return_packets.load(Ordering::Relaxed),
+            registry.return_injection_errors.load(Ordering::Relaxed),
+        ]
+    };
+    let mut reported = read();
+    let mut last_log: Option<Instant> = None;
+    while !stop.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(250));
+        let observed_at = Instant::now();
+        let current = read();
+        let changed = current
+            .iter()
+            .zip(&reported)
+            .any(|(value, previous)| value > previous);
+        if !changed
+            || last_log.is_some_and(|logged| {
+                observed_at.duration_since(logged) < CAPTURE_ANOMALY_LOG_INTERVAL
+            })
+        {
+            continue;
+        }
+        let delta =
+            std::array::from_fn::<_, 7, _>(|index| current[index].saturating_sub(reported[index]));
+        gamepath_engine::log_warn!(
+            "split capture anomaly: selected-fail-open=+{} bypass-queue-full=+{} \
+             receive-errors=+{} pending-syn-overflow=+{} slow-loops=+{} \
+             unmatched-returns=+{} return-injection-errors=+{} peak-loop={}us",
+            delta[0],
+            delta[1],
+            delta[2],
+            delta[3],
+            delta[4],
+            delta[5],
+            delta[6],
+            registry.capture_loop_peak_us.load(Ordering::Relaxed),
+        );
+        reported = current;
+        last_log = Some(observed_at);
     }
 }
 
@@ -2047,6 +2171,25 @@ fn record_handled_connection(
     application: Option<&str>,
     process_id: Option<u32>,
 ) {
+    let protocol = match fields.protocol {
+        6 => "TCP",
+        17 => "UDP",
+        1 => "ICMP",
+        _ => "IP",
+    };
+    let application = application.unwrap_or("Matched destination");
+    let first_seen = {
+        let mut logged = registry.logged_destinations.lock().unwrap();
+        logged.len() < 64
+            && logged.insert((fields.protocol, fields.destination, fields.destination_port))
+    };
+    if first_seen {
+        gamepath_engine::log_info!(
+            "split capture selected {application}: {protocol} {}:{}",
+            fields.destination,
+            fields.destination_port
+        );
+    }
     let mut connections = registry.handled_connections.lock().unwrap();
     if connections.len() >= 64 && !connections.contains_key(&key) {
         let oldest = connections
@@ -2061,18 +2204,10 @@ fn record_handled_connection(
     connections.insert(
         key,
         HandledConnection {
-            application: application
-                .map(str::to_owned)
-                .unwrap_or_else(|| "Matched destination".into()),
+            application: application.to_owned(),
             destination_ip: fields.destination,
             destination_port: fields.destination_port,
-            protocol: match fields.protocol {
-                6 => "TCP",
-                17 => "UDP",
-                1 => "ICMP",
-                _ => "IP",
-            }
-            .into(),
+            protocol: protocol.into(),
             started_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()

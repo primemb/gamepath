@@ -74,6 +74,15 @@ impl std::fmt::Debug for ReplayWindow {
 }
 
 impl ReplayWindow {
+    /// Checks without consuming a sequence. Callers admitting to a bounded
+    /// queue can commit with `accept` only after the enqueue succeeds. Both
+    /// operations must hold the same lock when paths share the window.
+    pub fn would_accept(&self, sequence: u64) -> bool {
+        !self.initialized
+            || sequence > self.highest
+            || (self.highest - sequence < WINDOW && !self.is_set(sequence))
+    }
+
     fn slot(sequence: u64) -> (usize, u64) {
         let position = sequence % WINDOW;
         ((position / 64) as usize, 1_u64 << (position % 64))

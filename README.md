@@ -112,11 +112,23 @@ See `docs/relay-security.md` and `deploy/README.md` for the encrypted overlay an
 ## Connection modes
 
 **Relay mode** keeps eligible enabled nodes connected to a relay you run. The
-adaptive scheduler selects one route or duplicates sealed packets across two
-routes according to measured latency, jitter, and probe loss. When duplicating,
-the first accepted copy is forwarded and later copies are discarded. Multiple
-enabled nodes do not mean every packet always travels through every node. This
-mode needs a VPS.
+adaptive scheduler proactively duplicates sealed packets across the two best
+suitable routes, so backup copies are already travelling when a path fails.
+Latency, jitter, and probe loss affect selection; a severely slower backup or
+substantial degradation on both candidates reduces outbound traffic to one
+route. Other enabled paths keep probing and can replace a failed route.
+The first authenticated copy wins in each direction, without waiting for the
+other paths. Return copies are deduplicated before entering the client queue;
+a reply can still rescue a lost packet even if its path is no longer selected
+for outgoing traffic. Multiple enabled nodes do not mean every outbound packet
+travels through every node. The relay currently sends replies to every recently
+authenticated endpoint, including endpoints kept alive by probes. This mode
+needs a VPS and adds bandwidth overhead for redundancy.
+
+Failover preserves the relay session and public source address. Its quality
+still depends on a usable alternative: a slower backup can increase ping, and
+paths sharing an ISP bottleneck or the same relay cannot bypass failure of that
+shared segment. Direct mode does not provide multipath failover.
 
 **Direct mode** is for people who have no server to run a relay on. Selected
 traffic goes through one WireGuard or OpenVPN node, which routes it onward as a
