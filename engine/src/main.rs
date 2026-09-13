@@ -743,7 +743,7 @@ impl WireGuardSessionManager {
             .map_err(|error| format!("invalid session request: {error}"))?;
         let nodes = input.resolved_nodes();
         if nodes.is_empty() {
-            return Err("at least one WireGuard or SOCKS5 node is required".into());
+            return Err("at least one WireGuard, OpenVPN, or SOCKS5 node is required".into());
         }
         match input.mode {
             SessionMode::Relay => self.start_relay(&input, &nodes)?,
@@ -993,7 +993,7 @@ impl WireGuardSessionManager {
         let [node] = nodes else {
             return Err(format!(
                 "direct mode sends traffic through exactly one node, but {} are enabled. \
-                 Enable a single WireGuard node, or switch to relay mode to combine them.",
+                 Enable a single WireGuard or OpenVPN node, or switch to relay mode to combine them.",
                 nodes.len()
             ));
         };
@@ -4154,7 +4154,10 @@ mod tests {
         let error = manager.start_direct(&[node(), node()]).err().unwrap();
         assert!(error.contains("exactly one node"), "{error}");
         // The message has to name both ways out, since either is reasonable.
-        assert!(error.contains("single WireGuard node"), "{error}");
+        assert!(
+            error.contains("single WireGuard or OpenVPN node"),
+            "{error}"
+        );
         assert!(error.contains("relay mode"), "{error}");
         assert!(manager.active.is_none());
     }

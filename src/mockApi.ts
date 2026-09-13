@@ -197,8 +197,8 @@ export const mockApi: GamePathApi = {
     state.connectionMode = mode
     if (mode === 'direct') {
       const chosen =
-        state.tunnels.find((item) => item.enabled && item.kind === 'wireguard') ??
-        state.tunnels.find((item) => item.kind === 'wireguard')
+        state.tunnels.find((item) => item.enabled && item.kind !== 'socks5') ??
+        state.tunnels.find((item) => item.kind !== 'socks5')
       state.tunnels = state.tunnels.map((item) => ({ ...item, enabled: item.id === chosen?.id }))
     }
     return snapshot()

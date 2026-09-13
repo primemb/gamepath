@@ -641,7 +641,7 @@ mod gamepath_service {
         }
         let nodes = input.resolved_nodes();
         if nodes.is_empty() {
-            return Err("at least one WireGuard or SOCKS5 node is required".into());
+            return Err("at least one WireGuard, OpenVPN, or SOCKS5 node is required".into());
         }
         // A direct session has no relay behind the node, so the node itself has
         // to be able to route. Catch that here, before anything is opened.
@@ -649,13 +649,13 @@ mod gamepath_service {
             if nodes.len() != 1 {
                 return Err(format!(
                     "direct mode sends traffic through exactly one node, but {} are enabled. \
-                     Enable a single WireGuard node, or switch to relay mode to combine them.",
+                     Enable a single WireGuard or OpenVPN node, or switch to relay mode to combine them.",
                     nodes.len()
                 ));
             }
             if !nodes[0].supports_direct() {
                 return Err(format!(
-                    "{} cannot carry a direct session on its own. Use a WireGuard node for \
+                    "{} cannot carry a direct session on its own. Use a WireGuard or OpenVPN node for \
                      direct mode, or set up a relay to reach this proxy through.",
                     nodes[0].describe()
                 ));
@@ -860,6 +860,7 @@ mod gamepath_service {
         }
 
         const WIREGUARD_CONFIG: &str = "[Interface]\nPrivateKey = key\nAddress = 10.88.0.2/32\n\n[Peer]\nPublicKey = peer\nAllowedIPs = 0.0.0.0/0\nEndpoint = vpn.example:51820\n";
+        const OPENVPN_CONFIG: &str = "client\ndev tun\nremote vpn.example 1194 udp\nauth-user-pass\n<ca>\n-----BEGIN CERTIFICATE-----\nMIIBIjCByaADAgECAgEBMAoGCCqGSM49BAMCMBIxEDAOBgNVBAMMB1Rlc3QgQ0Ew\n-----END CERTIFICATE-----\n</ca>\n";
 
         fn validate(traffic_mode: &str, nodes: Value) -> Result<Value, String> {
             validate_runtime(
@@ -941,6 +942,20 @@ mod gamepath_service {
                 .unwrap()["mode"],
                 "relay"
             );
+
+            // OpenVPN is also a tunnelling node: it is valid as the direct
+            // session's only hop and needs neither a relay address nor a
+            // WireGuard runtime inspection.
+            let openvpn = validate_direct(json!([{
+                "kind": "openvpn",
+                "config": OPENVPN_CONFIG,
+                "username": "someone",
+                "password": "secret",
+            }]))
+            .unwrap();
+            assert_eq!(openvpn["mode"], "direct");
+            assert_eq!(openvpn["routeCount"], 1);
+            assert_eq!(openvpn["nodeKinds"][0], "openvpn");
         }
 
         #[test]
@@ -950,7 +965,10 @@ mod gamepath_service {
             )
             .err()
             .unwrap();
-            assert!(error.contains("WireGuard node for direct mode"), "{error}");
+            assert!(
+                error.contains("WireGuard or OpenVPN node for direct mode"),
+                "{error}"
+            );
             assert!(error.contains("relay"), "{error}");
 
             let error = validate_direct(json!([

@@ -25,7 +25,7 @@ pub enum SessionMode {
     /// is what lets the scheduler send one packet down several paths at once.
     #[default]
     Relay,
-    /// One WireGuard node routes the captured traffic itself. Nothing to run on
+    /// One WireGuard or OpenVPN node routes the captured traffic itself. Nothing to run on
     /// a server, and in exchange there is only ever one path.
     Direct,
 }
@@ -212,7 +212,7 @@ impl NodeSpec {
     /// Opens the node as the only hop of a direct session.
     ///
     /// A direct session has no relay to frame traffic for, so the node itself
-    /// has to route plain IPv4 packets onward. WireGuard servers do exactly
+    /// has to route plain IPv4 packets onward. WireGuard and OpenVPN servers do exactly
     /// that; a SOCKS5 proxy speaks in connections and datagrams instead and
     /// has nothing to route with, which is why it is turned away here rather
     /// than failing later with a confusing transport error.

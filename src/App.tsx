@@ -100,8 +100,8 @@ const connectionModes = [
     icon: Waypoints,
     title: 'Direct mode',
     tagline: 'No server needed',
-    body: 'Your selected traffic goes through one WireGuard node and out to the game from there. A plain split tunnel, with nothing else to run.',
-    needs: 'Needs one WireGuard node. SOCKS5 proxies can only be used with a relay.',
+    body: 'Your selected traffic goes through one WireGuard or OpenVPN node and out to the game from there. A plain split tunnel, with nothing else to run.',
+    needs: 'Needs one WireGuard or OpenVPN node. SOCKS5 proxies can only be used with a relay.',
   },
 ]
 
@@ -1766,7 +1766,7 @@ function SetupDrawer({
   const complete = readyCount === steps.length
   const stack = routes.length
     ? routes.map((name) => ({ name, enabled: true }))
-    : [{ name: direct ? 'WireGuard node' : 'WireGuard pool', enabled: false }]
+    : [{ name: direct ? 'WireGuard or OpenVPN node' : 'WireGuard pool', enabled: false }]
   return (
     <section className={`setup-drawer ${open ? 'is-open' : ''} ${complete ? 'is-complete' : ''}`}>
       <button className="drawer-head" onClick={onToggle} aria-expanded={open}>
@@ -1992,7 +1992,7 @@ function App() {
   const setupSteps: SetupItem[] = [
     {
       done: readiness.routes,
-      title: direct ? 'Choose a WireGuard node' : 'Add a WireGuard route',
+      title: direct ? 'Choose a WireGuard or OpenVPN node' : 'Add a WireGuard route',
       detail: direct
         ? directNode
           ? `${directNode.name} will carry your traffic`

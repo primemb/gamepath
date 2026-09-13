@@ -163,11 +163,11 @@ it over one or more node transports to the relay. The relay authenticates the
 frame, writes the inner packet to its TUN, and the kernel there does the
 routing and NAT.
 
-A **direct session** has no relay, so a node has to do that work itself. Only a
-WireGuard node can: its server already routes and NATs whatever comes out of
-the tunnel. The captured packet is rewritten to the tunnel's own address and
+A **direct session** has no relay, so a node has to do that work itself. A
+WireGuard or OpenVPN node can: its server already routes and NATs whatever
+comes out of the tunnel. The captured packet is rewritten to the tunnel's own address and
 sent as it stands, with no GamePath framing, no sequence number and no
-duplication — WireGuard's own crypto is the only wrapping, and replies come
+duplication — the selected VPN protocol's own crypto is the only wrapping, and replies come
 back as plain inner packets addressed to the tunnel. A SOCKS5 node is refused
 before anything is opened, since a proxy has nothing to route with.
 
