@@ -104,6 +104,14 @@ struct SessionRequest {
     wireguard_configs: Vec<String>,
     #[serde(default)]
     route_labels: Vec<String>,
+    /// Smart is the safe default; all-paths is an explicit user choice for
+    /// sending each packet on every healthy enabled route.
+    #[serde(default = "default_relay_strategy")]
+    strategy: Strategy,
+}
+
+fn default_relay_strategy() -> Strategy {
+    Strategy::Adaptive
 }
 
 impl SessionRequest {
@@ -180,6 +188,7 @@ enum SessionOverlay {
 
 struct ActiveWireGuardSession {
     mode: SessionMode,
+    strategy: Strategy,
     overlay: SessionOverlay,
     session_id: u64,
     started_at: u128,
@@ -750,6 +759,7 @@ impl WireGuardSessionManager {
         let (client_id, key) = enrollment.material()?;
         let relay_ip = resolve_ipv4(&input.relay_host, input.relay_port)?;
         let relay = SocketAddrV4::new(relay_ip, input.relay_port);
+        let strategy = input.strategy;
         let mut paths: Vec<(usize, String, NodeSpec, Box<dyn RelayPath>)> = Vec::new();
         let mut skipped_routes = Vec::new();
         for (index, node) in nodes.iter().enumerate() {
@@ -921,6 +931,7 @@ impl WireGuardSessionManager {
                             worker_metrics,
                             worker_decision,
                             initial_mask,
+                            strategy,
                             worker_telemetry,
                             worker_dialer,
                             route_count,
@@ -951,6 +962,7 @@ impl WireGuardSessionManager {
         );
         self.active = Some(ActiveWireGuardSession {
             mode: SessionMode::Relay,
+            strategy,
             overlay: SessionOverlay::Relay { client_id, crypto },
             session_id,
             started_at: unix_time_millis(),
@@ -1053,6 +1065,7 @@ impl WireGuardSessionManager {
         );
         self.active = Some(ActiveWireGuardSession {
             mode: SessionMode::Direct,
+            strategy: Strategy::FastestPath,
             overlay: SessionOverlay::Direct,
             session_id,
             started_at: unix_time_millis(),
@@ -1373,7 +1386,7 @@ impl WireGuardSessionManager {
             "paths": paths,
             "skippedRoutes": session.skipped_routes,
             "strategy": match session.mode {
-                SessionMode::Relay => "adaptive",
+                SessionMode::Relay => session.strategy.as_str(),
                 // One path cannot be scheduled between, so nothing is chosen.
                 SessionMode::Direct => "single-path",
             },
@@ -2227,6 +2240,7 @@ fn run_path(
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     decision_mask: Arc<AtomicU64>,
     fallback_mask: u64,
+    strategy: Strategy,
     telemetry: PathTelemetry,
     dialer: PathDialer,
     route_count: usize,
@@ -2410,6 +2424,7 @@ fn run_path(
                         fallback_mask,
                         index,
                         None,
+                        strategy,
                         session_id,
                     );
                     update_path_status(&statuses, index, Err(error));
@@ -2493,6 +2508,7 @@ fn run_path(
                                     fallback_mask,
                                     index,
                                     Some(latency),
+                                    strategy,
                                     session_id,
                                 );
                                 match latency_watch.observe(latency, Instant::now()) {
@@ -2562,6 +2578,7 @@ fn run_path(
                 fallback_mask,
                 index,
                 None,
+                strategy,
                 session_id,
             );
             let note = path.health_note();
@@ -2895,6 +2912,7 @@ fn update_scheduler_probe(
     fallback_mask: u64,
     index: usize,
     latency_ms: Option<f64>,
+    strategy: Strategy,
     session_id: u64,
 ) {
     let mut metrics = metrics.lock().unwrap();
@@ -2905,7 +2923,7 @@ fn update_scheduler_probe(
         Some(latency) => path.record_probe(latency),
         None => path.record_loss(),
     }
-    let decision = choose_paths(&metrics, Strategy::Adaptive);
+    let decision = choose_paths(&metrics, strategy);
     let next = mask_for_decision(decision, fallback_mask);
     let previous = decision_mask.swap(next, Ordering::AcqRel);
     if previous != next {
@@ -3913,6 +3931,19 @@ mod tests {
             "wireguardConfigs": ["[Interface] one"],
         }));
         assert_eq!(request.mode, SessionMode::Relay);
+        assert_eq!(request.strategy, Strategy::Adaptive);
+    }
+
+    #[test]
+    fn a_manual_request_keeps_all_healthy_paths_enabled() {
+        let request = session_request(json!({
+            "relayHost": "relay.example",
+            "relayPort": 51821,
+            "enrollmentToken": "gpe1_token",
+            "strategy": "all-paths",
+            "wireguardConfigs": ["[Interface] one"],
+        }));
+        assert_eq!(request.strategy, Strategy::AllPaths);
     }
 
     #[test]

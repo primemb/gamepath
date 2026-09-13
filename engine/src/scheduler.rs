@@ -78,6 +78,20 @@ pub enum Strategy {
     FastestPath,
     Duplicate,
     Adaptive,
+    /// Send every packet on every healthy enabled route. This is intentionally
+    /// opt-in: it trades proportional bandwidth for maximum redundancy.
+    AllPaths,
+}
+
+impl Strategy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FastestPath => "fastest-path",
+            Self::Duplicate => "duplicate",
+            Self::Adaptive => "adaptive",
+            Self::AllPaths => "all-paths",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +133,17 @@ pub fn choose_paths(paths: &[PathMetrics], strategy: Strategy) -> Decision {
         }
         return Decision::Drop;
     };
+    if strategy == Strategy::AllPaths {
+        return if healthy.len() == 1 {
+            Decision::Single {
+                path_id: best.id.clone(),
+            }
+        } else {
+            Decision::Duplicate {
+                path_ids: healthy.iter().map(|path| path.id.clone()).collect(),
+            }
+        };
+    }
     if healthy.len() == 1 || strategy == Strategy::FastestPath {
         return Decision::Single {
             path_id: best.id.clone(),
@@ -255,6 +280,23 @@ mod tests {
             ),
             Decision::Duplicate { .. }
         ));
+    }
+
+    #[test]
+    fn all_paths_mode_keeps_every_healthy_enabled_route_active() {
+        assert_eq!(
+            choose_paths(
+                &[
+                    measured("wg", 50.0),
+                    measured("tcp", 65.0),
+                    measured("socks", 95.0)
+                ],
+                Strategy::AllPaths,
+            ),
+            Decision::Duplicate {
+                path_ids: vec!["wg".into(), "tcp".into(), "socks".into()],
+            }
+        );
     }
 
     #[test]

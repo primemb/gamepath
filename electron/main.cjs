@@ -22,6 +22,7 @@ const defaultState = () => ({
   ruleGroups: [],
   trafficMode: 'split',
   connectionMode: 'relay',
+  routingStrategy: 'smart',
   relays: [
     {
       id: 'tr-istanbul-01',
@@ -84,6 +85,7 @@ function loadState() {
     }))
     // Sessions saved before direct mode existed all went through a relay.
     if (state.connectionMode !== 'direct') state.connectionMode = 'relay'
+    if (state.routingStrategy !== 'manual') state.routingStrategy = 'smart'
     // Nodes imported before SOCKS5 support existed are all WireGuard routes.
     state.tunnels = state.tunnels.map((tunnel) => ({ kind: 'wireguard', ...tunnel }))
     state.relays = state.relays.map((relay) => {
@@ -506,6 +508,13 @@ function registerIpc() {
     return publicState()
   })
 
+  ipcMain.handle('routing:set-strategy', (_event, strategy) => {
+    if (strategy !== 'smart' && strategy !== 'manual') throw new Error('Unknown routing strategy')
+    state.routingStrategy = strategy
+    saveState()
+    return publicState()
+  })
+
   ipcMain.handle('tunnel:remove', (_event, id) => {
     state.tunnels = state.tunnels.filter((item) => item.id !== id)
     delete state.encryptedConfigs[id]
@@ -786,6 +795,7 @@ function registerIpc() {
 
   ipcMain.handle('engine:start', async () => {
     const mode = state.connectionMode === 'direct' ? 'direct' : 'relay'
+    const strategy = state.routingStrategy === 'manual' ? 'all-paths' : 'adaptive'
     const enabledTunnels = state.tunnels.filter((tunnel) => tunnel.enabled)
     const enabledRules = enabledRuleSpecs()
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
@@ -841,7 +851,7 @@ function registerIpc() {
         })
         const serviceSession = await serviceBridge.request(
           'start-session',
-          { mode, ...relayCredentials, nodes, trafficMode: state.trafficMode, rules },
+          { mode, strategy, ...relayCredentials, nodes, trafficMode: state.trafficMode, rules },
           30000,
         )
         const paths = serviceSession.paths

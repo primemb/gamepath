@@ -1944,6 +1944,7 @@ function App() {
   const ipv6Exposed = state?.session.capture?.ipv6?.systemHasRoute === true
   const connectionMode = state?.connectionMode ?? 'relay'
   const direct = connectionMode === 'direct'
+  const routingStrategy = state?.routingStrategy ?? 'smart'
   // Both tunnelling kinds route packets themselves, so both can be the single
   // hop of a direct session; a proxy cannot.
   const routingNodes = state?.tunnels.filter((item) => item.kind !== 'socks5').length ?? 0
@@ -2794,15 +2795,40 @@ function App() {
                     <Zap size={18} />
                   </span>
                   <div>
-                    <strong>Adaptive duplication</strong>
+                    <strong>Relay routing mode</strong>
                     <p>
                       {direct
-                        ? 'Needs relay mode: duplicating a packet only helps when a second path can carry the copy.'
-                        : 'Duplicate latency-sensitive packets when route quality becomes unstable.'}
+                        ? 'Available in relay mode. Direct mode always uses its one selected node.'
+                        : 'Smart uses the best two healthy routes. Manual duplicates through every healthy enabled route. Changes apply when you next start a session.'}
                     </p>
                   </div>
                 </div>
-                <Toggle checked={!direct} disabled={direct} onChange={() => undefined} label="Adaptive duplication" />
+                <div className="segmented-control" role="radiogroup" aria-label="Relay routing mode">
+                  <button
+                    className={routingStrategy === 'smart' ? 'active' : ''}
+                    disabled={direct}
+                    onClick={async () => setState(await api.setRoutingStrategy('smart'))}
+                    role="radio"
+                    aria-checked={routingStrategy === 'smart'}
+                  >
+                    <span>
+                      Smart
+                      <small>Best two routes</small>
+                    </span>
+                  </button>
+                  <button
+                    className={routingStrategy === 'manual' ? 'active' : ''}
+                    disabled={direct}
+                    onClick={async () => setState(await api.setRoutingStrategy('manual'))}
+                    role="radio"
+                    aria-checked={routingStrategy === 'manual'}
+                  >
+                    <span>
+                      Manual
+                      <small>Every healthy route</small>
+                    </span>
+                  </button>
+                </div>
               </div>
               <div className="settings-card">
                 <div>

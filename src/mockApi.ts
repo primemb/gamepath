@@ -47,6 +47,7 @@ let state: AppState = {
   ruleGroups: [{ id: 'group-competitive', name: 'Competitive games', enabled: true }],
   trafficMode: 'split',
   connectionMode: 'relay',
+  routingStrategy: 'smart',
   relays: [
     {
       id: 'tr-istanbul-01',
@@ -200,6 +201,10 @@ export const mockApi: GamePathApi = {
         state.tunnels.find((item) => item.kind === 'wireguard')
       state.tunnels = state.tunnels.map((item) => ({ ...item, enabled: item.id === chosen?.id }))
     }
+    return snapshot()
+  },
+  setRoutingStrategy: async (strategy) => {
+    state.routingStrategy = strategy
     return snapshot()
   },
   setRelay: async (id) => {

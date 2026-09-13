@@ -142,6 +142,8 @@ export type AppState = {
   ruleGroups: SplitRuleGroup[]
   trafficMode: 'all' | 'split'
   connectionMode: ConnectionMode
+  /** Smart uses the best two paths; manual duplicates across every healthy path. */
+  routingStrategy: 'smart' | 'manual'
   relays: Relay[]
   activeRelayId: string | null
   session: {
@@ -149,7 +151,7 @@ export type AppState = {
     mode?: ConnectionMode
     message?: string
     routeLatencies?: number[]
-    strategy?: 'adaptive' | 'fastest-path' | 'duplicate' | 'single-path'
+    strategy?: 'adaptive' | 'all-paths' | 'fastest-path' | 'duplicate' | 'single-path'
     selectedRoutes?: number[]
     /** Routes that are enabled but not currently carrying traffic. */
     degradedRoutes?: number[]
@@ -273,6 +275,7 @@ export type GamePathApi = {
   removeRuleGroup: (id: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
   setConnectionMode: (mode: ConnectionMode) => Promise<AppState>
+  setRoutingStrategy: (strategy: 'smart' | 'manual') => Promise<AppState>
   setRelay: (id: string) => Promise<AppState>
   addRelay: (input: { city: string; country: string }) => Promise<{ state: AppState; relayId: string }>
   removeRelayLocal: (id: string) => Promise<AppState>
