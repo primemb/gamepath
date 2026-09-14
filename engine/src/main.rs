@@ -4,7 +4,7 @@ use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU};
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::relay_path::{
-    DirectPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
+    DirectPath, KIND_WIREGUARD, NodeSpec, RelayPath, ReopenEffort, SessionMode, Socks5RelayPath,
 };
 use gamepath_engine::replay::ReplayWindow;
 use gamepath_engine::rtt::RttEstimator;
@@ -301,11 +301,40 @@ struct SkippedRoute {
 struct PathDialer {
     node: NodeSpec,
     relay: SocketAddrV4,
+    /// Whether the next reopen may take the cheap route.
+    ///
+    /// Shared with the worker rather than owned by it, because the dial runs on
+    /// its own thread. Set again every time the path answers a probe, so the
+    /// cheap attempt is offered once per outage: if it does not hold, the next
+    /// attempt is the full rebuild, and a path can never sit in a loop of cheap
+    /// reopens that do not fix it.
+    cheap_reopen: Arc<AtomicBool>,
+}
+
+/// Takes the cheap attempt if one is on offer, and withdraws the offer.
+///
+/// Separated from the dial so the escalation can be tested without a node or a
+/// network: it is the part that has to be right, because getting it wrong in
+/// one direction costs twenty seconds of play and in the other loops for ever
+/// on a rebuild that never helps.
+fn choose_reopen_effort(cheap_allowed: &AtomicBool) -> ReopenEffort {
+    if cheap_allowed.swap(false, Ordering::AcqRel) {
+        ReopenEffort::Cheap
+    } else {
+        ReopenEffort::Full
+    }
 }
 
 impl PathDialer {
     fn open(&self) -> Result<Box<dyn RelayPath>, String> {
-        self.node.reopen(self.relay)
+        self.node
+            .reopen(self.relay, choose_reopen_effort(&self.cheap_reopen))
+    }
+
+    /// Lets the next recovery try the cheap route again. Called when the path
+    /// has proved itself, which is what makes the offer safe to renew.
+    fn allow_cheap_reopen(&self) {
+        self.cheap_reopen.store(true, Ordering::Release);
     }
 }
 
@@ -984,7 +1013,11 @@ impl WireGuardSessionManager {
             let worker_metrics = Arc::clone(&scheduler_metrics);
             let worker_decision = Arc::clone(&decision_mask);
             let worker_telemetry = telemetry.clone();
-            let worker_dialer = PathDialer { node, relay };
+            let worker_dialer = PathDialer {
+                node,
+                relay,
+                cheap_reopen: Arc::new(AtomicBool::new(true)),
+            };
             let worker_kind = path.kind();
             workers.push(
                 thread::Builder::new()
@@ -2392,6 +2425,9 @@ fn run_path(
     let mut failures = 0_u32;
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut next_redial: Option<Instant> = None;
+    // Set once this transport's own verdict has been acted on, so a socket that
+    // stays broken is reported once rather than on every loop iteration.
+    let mut reported_transport_failure = false;
     // When every path in this session was first seen down at the same moment.
     // Cleared as soon as any of them answers, so it measures one episode rather
     // than accumulating across unrelated ones.
@@ -2428,6 +2464,7 @@ fn run_path(
             Some(ReconnectPoll::Finished(Ok(replacement))) => {
                 dialing = None;
                 path = replacement;
+                reported_transport_failure = false;
                 publish_path_health(&telemetry.healthy_mask, index, false);
                 // A redial may fall back from UDP to TCP (or recover to UDP).
                 // Neither the old samples nor its deadline floor apply.
@@ -2536,6 +2573,25 @@ fn run_path(
             |frame| (frame.len(), path.send_frame(frame)),
             |length, result| record_path_send(&statuses, index, length, result),
         );
+        // A transport that has established it is gone will not answer a probe
+        // either, so waiting three of them out only costs the user the traffic
+        // handed to a socket that cannot carry it. The probe machinery still
+        // runs; this only stops the dispatcher choosing this path meanwhile.
+        if path.transport_failed() && !reported_transport_failure {
+            reported_transport_failure = true;
+            failures = failures.max(HEALTH_FAILURE_THRESHOLD);
+            publish_path_health(&telemetry.healthy_mask, index, false);
+            update_path_status(
+                &statuses,
+                index,
+                Err("the transport underneath this route is gone".to_owned()),
+            );
+            schedule_redial(failures, backoff, &mut next_redial);
+            log_warn!(
+                "session {session_id} route {} reported its transport gone; redialling without waiting for probes to time out",
+                index + 1
+            );
+        }
         if Instant::now() >= next_probe && pending_probe.is_none() {
             let sequence = sequences.fetch_add(1, Ordering::Relaxed);
             let result = (|| {
@@ -2650,6 +2706,9 @@ fn run_path(
                                 failures = 0;
                                 backoff = RECONNECT_BACKOFF_MIN;
                                 next_redial = None;
+                                // The path works, so the next outage gets a
+                                // cheap first attempt again.
+                                dialer.allow_cheap_reopen();
                                 if let Some(attempt) = dialing.as_mut() {
                                     attempt.recovered();
                                 }
@@ -4091,6 +4150,37 @@ mod tests {
             (in_flight as usize) < LATE_REPLY_CAPACITY,
             "{in_flight} probes can be outstanding, capacity is {LATE_REPLY_CAPACITY}"
         );
+    }
+
+    /// One cheap attempt per outage, then the real thing. Getting this wrong
+    /// either way is expensive: never escalating leaves a path rebuilding a
+    /// socket that cannot help, and never offering the cheap attempt pays a
+    /// twenty-second RAS redial for a relay that merely went quiet.
+    #[test]
+    fn a_reopen_escalates_after_the_cheap_attempt_is_spent() {
+        let allowed = AtomicBool::new(true);
+        assert_eq!(choose_reopen_effort(&allowed), ReopenEffort::Cheap);
+        // Spent: every further attempt in this outage rebuilds properly.
+        assert_eq!(choose_reopen_effort(&allowed), ReopenEffort::Full);
+        assert_eq!(choose_reopen_effort(&allowed), ReopenEffort::Full);
+    }
+
+    #[test]
+    fn a_recovered_path_is_offered_the_cheap_attempt_again() {
+        let allowed = AtomicBool::new(true);
+        assert_eq!(choose_reopen_effort(&allowed), ReopenEffort::Cheap);
+        assert_eq!(choose_reopen_effort(&allowed), ReopenEffort::Full);
+        // What the worker does once a probe is answered.
+        allowed.store(true, Ordering::Release);
+        assert_eq!(choose_reopen_effort(&allowed), ReopenEffort::Cheap);
+    }
+
+    /// A path that has never come up must not get the cheap attempt, or a
+    /// session whose adapter was never usable would keep reusing it.
+    #[test]
+    fn a_dialer_that_is_not_offered_the_cheap_route_rebuilds() {
+        let allowed = AtomicBool::new(false);
+        assert_eq!(choose_reopen_effort(&allowed), ReopenEffort::Full);
     }
 
     #[test]

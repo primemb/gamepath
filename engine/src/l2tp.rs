@@ -7,7 +7,7 @@
 //! other transports. Direct L2TP is handled by the service through native
 //! Windows routing, outside the packet engine.
 
-use crate::relay_path::{PathIdentity, RelayPath};
+use crate::relay_path::{PathIdentity, RelayPath, ReopenEffort};
 use crate::rtt::MIN_TIMEOUT;
 use crate::transport::{bind_to_interface, socket_read_timeout};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -41,6 +41,9 @@ pub struct L2tpRelayPath {
     server: String,
     runtime: L2tpRuntime,
     receive_buffer: Vec<u8>,
+    /// Set once a send has failed in a way that says the adapter underneath
+    /// this socket is gone. Sticky: nothing short of a new socket clears it.
+    transport_failed: bool,
     #[cfg(windows)]
     _redialed_connection: Option<OwnedRasConnection>,
 }
@@ -53,7 +56,14 @@ impl L2tpRelayPath {
         runtime: &L2tpRuntime,
         relay: SocketAddrV4,
     ) -> Result<Self, String> {
-        Self::open_inner(server, username, password, runtime, relay, false)
+        Self::open_inner(
+            server,
+            username,
+            password,
+            runtime,
+            relay,
+            ReopenEffort::Cheap,
+        )
     }
 
     pub fn reopen(
@@ -62,8 +72,9 @@ impl L2tpRelayPath {
         password: &str,
         runtime: &L2tpRuntime,
         relay: SocketAddrV4,
+        effort: ReopenEffort,
     ) -> Result<Self, String> {
-        Self::open_inner(server, username, password, runtime, relay, true)
+        Self::open_inner(server, username, password, runtime, relay, effort)
     }
 
     fn open_inner(
@@ -72,19 +83,35 @@ impl L2tpRelayPath {
         password: &str,
         runtime: &L2tpRuntime,
         relay: SocketAddrV4,
-        force_redial: bool,
+        effort: ReopenEffort,
     ) -> Result<Self, String> {
         let mut runtime = runtime.clone();
         #[cfg(windows)]
         let mut redialed_connection = None;
 
-        let initial_socket = if !force_redial && runtime_is_active(&runtime) {
+        // A RAS session that is still up is worth keeping. Rebuilding the
+        // socket pinned to it costs microseconds, where redialling costs tens
+        // of seconds of IKE, IPsec, L2TP and PPP - twenty-one of them on a
+        // measured session - and most of what takes this path out is the relay
+        // going quiet rather than the adapter dying. When the adapter has gone
+        // this falls through on its own, so the cheap attempt is never a
+        // detour, only a chance.
+        #[cfg(windows)]
+        if effort == ReopenEffort::Cheap {
+            // Take the session's current coordinates, not the ones handed over
+            // when it was first dialled.
+            if let Some((address, index)) = live_adapter(&runtime.profile_name) {
+                runtime.local_address = address;
+                runtime.interface_index = index;
+            }
+        }
+        let reuse_adapter = effort == ReopenEffort::Cheap && runtime_is_active(&runtime);
+        let initial_socket = if reuse_adapter {
             open_socket(&runtime, relay)
         } else {
-            Err(if force_redial {
-                "the L2TP data plane stopped answering"
-            } else {
-                "the Windows L2TP adapter is no longer active"
+            Err(match effort {
+                ReopenEffort::Cheap => "the Windows L2TP adapter is no longer active",
+                ReopenEffort::Full => "the L2TP data plane stopped answering",
             }
             .into())
         };
@@ -93,9 +120,7 @@ impl L2tpRelayPath {
             Err(original_error) => {
                 #[cfg(windows)]
                 {
-                    if force_redial {
-                        disconnect_profile(&runtime);
-                    }
+                    disconnect_profile(&runtime);
                     let connection = redial_ras(&runtime, username, password, relay).map_err(
                         |redial_error| {
                             format!(
@@ -124,6 +149,7 @@ impl L2tpRelayPath {
             server: server.to_owned(),
             runtime,
             receive_buffer: vec![0; 65_535],
+            transport_failed: false,
             #[cfg(windows)]
             _redialed_connection: redialed_connection,
         })
@@ -132,15 +158,121 @@ impl L2tpRelayPath {
 
 #[cfg(windows)]
 fn disconnect_profile(runtime: &L2tpRuntime) {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    let _ = Command::new("rasdial.exe")
-        .args([&runtime.profile_name, "/disconnect"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(0x0800_0000)
-        .status();
+    use windows_sys::Win32::NetworkManagement::Rras::RasHangUpW;
+    let Some(handle) = find_connection(&runtime.profile_name) else {
+        // Nothing to hang up. This is the ordinary case on a redial - the
+        // adapter going away is usually why we are here - and discovering it
+        // used to cost a process start.
+        return;
+    };
+    unsafe { RasHangUpW(handle) };
+    wait_for_disconnect(handle);
+}
+
+/// Reads a fixed-width RAS wide string up to its terminator.
+#[cfg(windows)]
+fn take_wide(value: &[u16]) -> String {
+    let end = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..end])
+}
+
+/// The live RAS connection for `entry_name`, if there still is one.
+#[cfg(windows)]
+fn find_connection(
+    entry_name: &str,
+) -> Option<windows_sys::Win32::NetworkManagement::Rras::HRASCONN> {
+    use windows_sys::Win32::NetworkManagement::Rras::{RASCONNW, RasEnumConnectionsW};
+    // The first entry carries the struct size so RAS knows the layout it is
+    // filling. Sixteen is far more simultaneous connections than a desktop
+    // has, and a truncated enumeration would only mean falling through to a
+    // full redial, which is what the caller would have done anyway.
+    let mut connections: [RASCONNW; 16] = unsafe { std::mem::zeroed() };
+    connections[0].dwSize = std::mem::size_of::<RASCONNW>() as u32;
+    let mut size = std::mem::size_of_val(&connections) as u32;
+    let mut count = 0_u32;
+    let status = unsafe { RasEnumConnectionsW(connections.as_mut_ptr(), &mut size, &mut count) };
+    if status != 0 {
+        return None;
+    }
+    connections
+        .iter()
+        .take(count as usize)
+        .find(|connection| take_wide(&connection.szEntryName) == entry_name)
+        .map(|connection| connection.hrasconn)
+}
+
+/// The IPv4 address PPP negotiated on a live RAS connection.
+#[cfg(windows)]
+fn projected_ipv4(
+    handle: windows_sys::Win32::NetworkManagement::Rras::HRASCONN,
+) -> Result<Ipv4Addr, String> {
+    use windows_sys::Win32::NetworkManagement::Rras::{
+        RASP_PppIp, RASPPPIPW, RasGetProjectionInfoW,
+    };
+    let mut projection: RASPPPIPW = unsafe { std::mem::zeroed() };
+    projection.dwSize = std::mem::size_of::<RASPPPIPW>() as u32;
+    let mut size = std::mem::size_of::<RASPPPIPW>() as u32;
+    let status = unsafe {
+        RasGetProjectionInfoW(
+            handle,
+            RASP_PppIp,
+            (&mut projection as *mut RASPPPIPW).cast(),
+            &mut size,
+        )
+    };
+    if status != 0 || projection.dwError != 0 {
+        return Err(format!(
+            "IPv4 projection failed (RAS error {})",
+            if status != 0 {
+                status
+            } else {
+                projection.dwError
+            }
+        ));
+    }
+    take_wide(&projection.szIpAddress)
+        .parse()
+        .map_err(|_| "IPv4 projection returned no usable address".to_owned())
+}
+
+/// Where a live RAS session for this profile can be reached right now.
+///
+/// Asked of RAS rather than read from the handover this process was given,
+/// because every redial renegotiates both the address and the adapter, and the
+/// stored pair then describes something that no longer exists. Without this the
+/// cheap reopen would only ever work for the first outage of a session.
+#[cfg(windows)]
+fn live_adapter(profile_name: &str) -> Option<(Ipv4Addr, u32)> {
+    let handle = find_connection(profile_name)?;
+    let address = projected_ipv4(handle).ok()?;
+    let index = crate::netconfig::interface_index_for_address(address)
+        .ok()
+        .flatten()?;
+    Some((address, index))
+}
+
+/// Waits for a hung-up RAS connection to finish tearing down.
+///
+/// `RasHangUpW` returns before the session is gone, and dialling the same entry
+/// while the previous one is still disconnecting is how a redial races itself.
+#[cfg(windows)]
+fn wait_for_disconnect(handle: windows_sys::Win32::NetworkManagement::Rras::HRASCONN) {
+    use windows_sys::Win32::NetworkManagement::Rras::{
+        RASCONNSTATUSW, RASCS_Disconnected, RasGetConnectStatusW,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let mut status: RASCONNSTATUSW = unsafe { std::mem::zeroed() };
+        status.dwSize = std::mem::size_of::<RASCONNSTATUSW>() as u32;
+        let result = unsafe { RasGetConnectStatusW(handle, &mut status) };
+        if result != 0 || status.rasconnstate == RASCS_Disconnected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(windows)]
@@ -175,10 +307,12 @@ fn open_socket(runtime: &L2tpRuntime, relay: SocketAddrV4) -> Result<UdpSocket, 
 
 impl RelayPath for L2tpRelayPath {
     fn send_frame(&mut self, frame: &[u8]) -> Result<(), String> {
-        self.socket
-            .send(frame)
-            .map(|_| ())
-            .map_err(|error| format!("L2TP relay send failed: {error}"))
+        self.socket.send(frame).map(|_| ()).map_err(|error| {
+            if is_fatal_send_error(&error) {
+                self.transport_failed = true;
+            }
+            format!("L2TP relay send failed: {error}")
+        })
     }
 
     fn receive_frames(&mut self, timeout: Duration) -> Result<Vec<Vec<u8>>, String> {
@@ -228,6 +362,50 @@ impl RelayPath for L2tpRelayPath {
     fn probe_deadline_floor(&self) -> Duration {
         MIN_TIMEOUT
     }
+
+    fn transport_failed(&self) -> bool {
+        self.transport_failed
+    }
+}
+
+/// Whether a send error means this socket can never carry anything again.
+///
+/// The relay socket is bound to the RAS adapter's address and pinned to its
+/// interface with `IP_UNICAST_IF`. When Windows tears that adapter down - which
+/// happens on every redial, and on this provider rather often - the socket
+/// outlives it and every send fails from then on. That is a different thing
+/// from a datagram being dropped, and it needs a different answer: no probe
+/// will succeed either, so waiting for three of them to time out only buys the
+/// user three seconds of traffic pushed into a socket that cannot carry it.
+///
+/// Observed live as `WSAEINVAL` (10022), reported to the user as "L2TP relay
+/// send failed: An invalid argument was supplied".
+///
+/// The list is deliberately short. `WSAECONNRESET` and `WSAEHOSTUNREACH` are
+/// left out because Windows raises those from an ICMP message about an earlier
+/// datagram - the socket is fine and the next send may well work, which is the
+/// same reason [`crate::socks5`] swallows them on receive.
+#[cfg(windows)]
+fn is_fatal_send_error(error: &std::io::Error) -> bool {
+    /// The bound local address no longer exists.
+    const WSAEINVAL: i32 = 10022;
+    /// The handle is no longer a socket.
+    const WSAENOTSOCK: i32 = 10038;
+    /// The interface underneath it was removed.
+    const WSAEADDRNOTAVAIL: i32 = 10049;
+    /// The network subsystem or that interface has gone down.
+    const WSAENETDOWN: i32 = 10050;
+    /// The connection was broken by the interface being reset.
+    const WSAENETRESET: i32 = 10052;
+    matches!(
+        error.raw_os_error(),
+        Some(WSAEINVAL | WSAENOTSOCK | WSAEADDRNOTAVAIL | WSAENETDOWN | WSAENETRESET)
+    )
+}
+
+#[cfg(not(windows))]
+fn is_fatal_send_error(_error: &std::io::Error) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -253,19 +431,7 @@ impl Drop for OwnedRasConnection {
         // this handle to finish disconnecting, then remove the route only when
         // no live connection owns that address/index pair; otherwise we would
         // delete the replacement's freshly installed route during the swap.
-        use windows_sys::Win32::NetworkManagement::Rras::{
-            RASCONNSTATUSW, RASCS_Disconnected, RasGetConnectStatusW,
-        };
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            let mut status: RASCONNSTATUSW = unsafe { std::mem::zeroed() };
-            status.dwSize = std::mem::size_of::<RASCONNSTATUSW>() as u32;
-            let result = unsafe { RasGetConnectStatusW(self.handle, &mut status) };
-            if result != 0 || status.rasconnstate == RASCS_Disconnected {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_for_disconnect(self.handle);
         if !adapter_address_is_active(self.interface_index, self.local_address) {
             if let Some(relay) = self.relay {
                 crate::netconfig::remove_route(relay, 32, self.interface_index);
@@ -282,8 +448,7 @@ fn redial_ras(
     relay: SocketAddrV4,
 ) -> Result<OwnedRasConnection, String> {
     use windows_sys::Win32::NetworkManagement::Rras::{
-        HRASCONN, RASDIALPARAMSW, RASP_PppIp, RASPPPIPW, RasDialW, RasGetProjectionInfoW,
-        RasHangUpW,
+        HRASCONN, RASDIALPARAMSW, RasDialW, RasHangUpW,
     };
 
     fn wide(value: &str) -> Vec<u16> {
@@ -296,14 +461,6 @@ fn redial_ras(
         }
         destination[..encoded.len()].copy_from_slice(&encoded);
         Ok(())
-    }
-    fn take(value: &[u16]) -> String {
-        String::from_utf16_lossy(
-            &value[..value
-                .iter()
-                .position(|unit| *unit == 0)
-                .unwrap_or(value.len())],
-        )
     }
 
     let phonebook = wide(&runtime.phonebook_path);
@@ -337,31 +494,8 @@ fn redial_ras(
         interface_index: 0,
         relay: None,
     };
-    let mut projection: RASPPPIPW = unsafe { std::mem::zeroed() };
-    projection.dwSize = std::mem::size_of::<RASPPPIPW>() as u32;
-    let mut size = std::mem::size_of::<RASPPPIPW>() as u32;
-    let projection_status = unsafe {
-        RasGetProjectionInfoW(
-            handle,
-            RASP_PppIp,
-            (&mut projection as *mut RASPPPIPW).cast(),
-            &mut size,
-        )
-    };
-    let local_address = take(&projection.szIpAddress)
-        .parse::<Ipv4Addr>()
-        .map_err(|_| "Windows reconnected L2TP without a valid IPv4 address".to_owned());
-    if projection_status != 0 || projection.dwError != 0 || local_address.is_err() {
-        return Err(format!(
-            "Windows reconnected L2TP but IPv4 projection failed (RAS error {})",
-            if projection_status != 0 {
-                projection_status
-            } else {
-                projection.dwError
-            }
-        ));
-    }
-    let local_address = local_address.unwrap();
+    let local_address =
+        projected_ipv4(handle).map_err(|error| format!("Windows reconnected L2TP but {error}"))?;
     owned.local_address = local_address;
     let interface_index =
         crate::netconfig::wait_for_interface_index(local_address, Duration::from_secs(5))
@@ -390,4 +524,37 @@ fn configure_mtu(interface_index: u32, mtu: u16) -> Result<(), String> {
 fn add_route(relay: Ipv4Addr, interface_index: u32) -> Result<(), String> {
     crate::netconfig::add_route(relay, 32, interface_index)
         .map_err(|error| format!("could not route the relay through reconnected L2TP: {error}"))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::is_fatal_send_error;
+    use std::io::{Error, ErrorKind};
+
+    /// The distinction the whole flag rests on: some send errors mean the
+    /// socket is finished, and most do not.
+    #[test]
+    fn a_vanished_adapter_is_fatal_but_an_icmp_reply_is_not() {
+        // What a user actually saw, reported as "L2TP relay send failed: An
+        // invalid argument was supplied": the RAS adapter went away underneath
+        // a socket still bound to its address.
+        assert!(is_fatal_send_error(&Error::from_raw_os_error(10022)));
+        assert!(is_fatal_send_error(&Error::from_raw_os_error(10038)));
+        assert!(is_fatal_send_error(&Error::from_raw_os_error(10049)));
+        assert!(is_fatal_send_error(&Error::from_raw_os_error(10050)));
+        assert!(is_fatal_send_error(&Error::from_raw_os_error(10052)));
+
+        // Windows raises these from an ICMP message about a datagram already
+        // sent. The socket is fine and the next send may well succeed, so
+        // tearing the path down for one would be the more expensive mistake.
+        assert!(!is_fatal_send_error(&Error::from_raw_os_error(10054)));
+        assert!(!is_fatal_send_error(&Error::from_raw_os_error(10065)));
+        assert!(!is_fatal_send_error(&Error::from_raw_os_error(10051)));
+
+        // An error carrying no OS code cannot be classified, so it is not.
+        assert!(!is_fatal_send_error(&Error::new(
+            ErrorKind::Other,
+            "no code"
+        )));
+    }
 }

@@ -94,6 +94,28 @@ pub enum NodeSpec {
     },
 }
 
+/// How hard a reopen should work to get a transport back.
+///
+/// Recovery is not one price. A transport whose own plumbing has broken can
+/// often be rebuilt in microseconds, while the thing underneath it - a Windows
+/// RAS session negotiating IKE, IPsec, L2TP and PPP - takes tens of seconds and
+/// is measured in lost play. Asking for the expensive one when the cheap one
+/// would have done is the difference between a hitch and a visible outage, so
+/// the caller says which it wants and escalates only when the cheap one did
+/// not hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReopenEffort {
+    /// Reuse whatever is still standing. For L2TP that means keeping the RAS
+    /// session and rebuilding only the socket pinned to it, which is free.
+    /// Falls through to the full path by itself when there is nothing to
+    /// reuse.
+    Cheap,
+    /// Tear the transport down and build it again from the bottom. The only
+    /// way back when the thing underneath has actually gone, and the reason
+    /// `Cheap` is tried first.
+    Full,
+}
+
 impl NodeSpec {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -151,7 +173,11 @@ impl NodeSpec {
     /// Recreates a transport after repeated authenticated-probe failures.
     /// L2TP must also replace the underlying RAS connection; reopening only
     /// its UDP socket cannot repair a connected-but-stalled Windows tunnel.
-    pub fn reopen(&self, relay: SocketAddrV4) -> Result<Box<dyn RelayPath>, String> {
+    pub fn reopen(
+        &self,
+        relay: SocketAddrV4,
+        effort: ReopenEffort,
+    ) -> Result<Box<dyn RelayPath>, String> {
         match self {
             Self::L2tp {
                 server,
@@ -167,6 +193,7 @@ impl NodeSpec {
                     .as_ref()
                     .ok_or("the L2TP node has not been connected by the Windows service")?,
                 relay,
+                effort,
             )?)),
             _ => self.open(relay),
         }
@@ -454,6 +481,28 @@ pub trait RelayPath: Send {
     /// default.
     fn probe_deadline_floor(&self) -> Duration {
         crate::rtt::MIN_TIMEOUT
+    }
+
+    /// Whether this transport has established that it can no longer carry
+    /// anything, so the worker should stop waiting for probes to prove it.
+    ///
+    /// Most failures do not mean this. A lost datagram, a refused send, an
+    /// ICMP unreachable surfacing on the next call - the path may well carry
+    /// the next packet, and a probe deciding it is the proportionate response.
+    ///
+    /// Some do. A socket pinned to a VPN adapter that Windows has torn down
+    /// cannot recover without being rebuilt, and every packet handed to it
+    /// until something notices is a packet the user loses. A transport that
+    /// can tell the difference says so here, and the worker takes the path out
+    /// of the dispatcher immediately rather than spending three probe cycles
+    /// rediscovering it.
+    ///
+    /// Reported by the transport rather than inferred from an error string, so
+    /// each one decides using whatever its own platform gives it. The default
+    /// is that nothing is fatal, which is the behaviour every transport had
+    /// before this existed.
+    fn transport_failed(&self) -> bool {
+        false
     }
 }
 

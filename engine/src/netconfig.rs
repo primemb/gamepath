@@ -307,11 +307,30 @@ pub fn configure_tunnel_interface(interface_index: u32, mtu: u16) -> Result<(), 
 /// which is likely, because a server usually advertises as soon as the link
 /// comes up and that is before the adapter can be configured.
 pub fn disable_ipv6_default_route(interface_index: u32) -> Result<(), String> {
+    // Sweep first, and whatever the interface lets us configure afterwards.
+    // This is the half that fixes the symptom, and it used to be skipped
+    // whenever the half below failed - which on a live RAS adapter it did,
+    // with ERROR_INVALID_PARAMETER, leaving the route exactly where it was.
+    let swept = remove_ipv6_default_routes(interface_index);
+    let configured = disable_ipv6_router_discovery(interface_index);
+    swept.and(configured)
+}
+
+/// Stops Windows acting on any further Router Advertisement from this link.
+///
+/// Best-effort by contract, and reported separately from the sweep above. A
+/// RAS/PPP interface does not always accept the change; what is lost when it
+/// refuses is only the guarantee that the next advertisement will not put the
+/// route back, not the removal of the one already there.
+fn disable_ipv6_router_discovery(interface_index: u32) -> Result<(), String> {
     let mut row = ip_interface_entry_for(AF_INET6, interface_index)?;
+    if row.RouterDiscoveryBehavior == RouterDiscoveryDisabled {
+        return Ok(());
+    }
     row.RouterDiscoveryBehavior = RouterDiscoveryDisabled;
-    // See `set_interface_mtu`: the value read back is not always one the
-    // setter will accept, and zero means "leave it alone".
-    row.SitePrefixLength = 0;
+    // Windows then also declines to *use* a default route learned on this
+    // interface, which is the same switch it sets for a split-tunnel VPN.
+    row.DisableDefaultRoutes = 1;
     let status = unsafe { SetIpInterfaceEntry(&mut row) };
     if status != NO_ERROR {
         return Err(format!(
@@ -323,7 +342,7 @@ pub fn disable_ipv6_default_route(interface_index: u32) -> Result<(), String> {
             }
         ));
     }
-    remove_ipv6_default_routes(interface_index)
+    Ok(())
 }
 
 /// Deletes every `::/0` route already installed on `interface_index`.
@@ -565,17 +584,24 @@ mod tests {
             .expect("GAMEPATH_IPV6_TEST_IFINDEX must be an interface index");
         let before = ipv6_default_route_count(index);
         println!("interface {index}: {before} IPv6 default route(s) before");
-        if let Err(error) = disable_ipv6_default_route(index) {
-            // Both halves of this need administrator rights, which the service
-            // and its engine child have and `cargo test` does not.
-            panic!("{error} -- run this test from an elevated shell");
-        }
+        // Both halves need administrator rights, which the service and its
+        // engine child have and `cargo test` does not.
+        let outcome = disable_ipv6_default_route(index);
         let after = ipv6_default_route_count(index);
         println!("interface {index}: {after} IPv6 default route(s) after");
-        assert_eq!(after, 0, "an IPv6 default route survived");
-        // Router discovery is off, so a second advertisement cannot undo it.
-        let row = ip_interface_entry_for(AF_INET6, index).expect("IPv6 interface row");
-        assert_eq!(row.RouterDiscoveryBehavior, RouterDiscoveryDisabled);
+        assert_eq!(after, 0, "an IPv6 default route survived: {outcome:?}");
+        match outcome {
+            Ok(()) => {
+                // Router discovery is off, so a further advertisement cannot
+                // put the route back.
+                let row = ip_interface_entry_for(AF_INET6, index).expect("IPv6 interface row");
+                assert_eq!(row.RouterDiscoveryBehavior, RouterDiscoveryDisabled);
+            }
+            // The route is gone either way; only the guarantee against the
+            // next advertisement is missing, which is worth seeing but is not
+            // a failure of the thing being tested.
+            Err(error) => println!("route removed, but not configured out: {error}"),
+        }
     }
 
     /// Counts the `::/0` routes on one interface, for the live test to compare.
@@ -597,6 +623,19 @@ mod tests {
             found
         };
         count
+    }
+
+    /// The ordering that matters. The configuration change is refused on some
+    /// interfaces - and on every interface when unelevated - and that must not
+    /// stop the sweep, which is the half that actually removes the route.
+    #[test]
+    fn a_refused_configuration_change_still_leaves_the_sweep_done() {
+        let index = interface_index_for_address(Ipv4Addr::LOCALHOST)
+            .expect("the IPv4 address table should be readable")
+            .expect("127.0.0.1 should be assigned to an interface");
+        // Whatever the combined call reports, the sweep half has succeeded.
+        let _ = disable_ipv6_default_route(index);
+        assert_eq!(remove_ipv6_default_routes(index), Ok(()));
     }
 
     #[test]

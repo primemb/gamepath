@@ -500,6 +500,70 @@ After a redial, the RTT estimator is recreated using the replacement path's
 deadline floor. A UDP-to-TCP fallback must acquire the wider deadline, and a
 return to UDP must restore faster failure detection.
 
+### Recovery is not one price
+
+A redial is not a single cost to be paid whenever a path fails. Measured on a
+live session, an L2TP route took **21 seconds** to come back: `rasdial.exe` to
+hang up, then `RasDialW` negotiating IKE, IPsec, L2TP and PPP from scratch.
+Rebuilding the UDP socket pinned to a RAS session that is still perfectly alive
+takes microseconds. Most of what takes an L2TP path out is the relay going
+quiet, not the adapter dying — so the expensive answer was usually being paid
+for a problem it did not solve.
+
+`ReopenEffort` splits the two. `Cheap` keeps whatever is still standing and
+rebuilds only the socket; `Full` tears the transport down and builds it again.
+A path worker offers `Cheap` once per outage and escalates to `Full` for every
+attempt after it, so a rebuild that does not hold costs one probe cycle rather
+than becoming a loop, and the offer is renewed only when the path answers a
+probe again — proof that the cheap route worked. A transport with nothing cheap
+to reuse ignores the distinction; the L2TP path falls through to `Full` by
+itself when no RAS session is up, so `Cheap` is never a detour.
+
+The live session's coordinates come from RAS at the moment of the reopen rather
+than from the handover the service gave the engine at session start. A redial
+renegotiates both address and adapter, so the stored pair describes something
+that no longer exists; without asking, the cheap route would work for the first
+outage of a session and never again.
+
+Hanging up is native too. `rasdial.exe <profile> /disconnect` cost a process
+start before it could act, and most often had nothing to do — the adapter had
+already gone, which is generally why a redial is happening. `RasEnumConnectionsW`
+answers that without spawning anything, and when there is a session to close,
+`RasHangUpW` plus a wait on `RasGetConnectStatusW` closes it: RAS hangs up
+asynchronously, and dialling the same entry while the last one is still tearing
+down is how a redial races itself.
+
+None of this makes `RasDialW` faster. What it removes is paying for `RasDialW`
+when nothing needed it.
+
+### A transport can report itself gone
+
+A path is normally declared down by its probes, and that is the right default:
+a failed send usually means one datagram was lost, not that the path is
+finished, and reacting to it would take a working route out of service.
+
+An interface-pinned socket breaks that assumption. The L2TP relay socket is
+bound to the RAS adapter's address and pinned to its interface with
+`IP_UNICAST_IF`; when Windows tears that adapter down — on every redial, and
+oftener than that on a flaky provider — the socket outlives it and every send
+fails from then on. Waiting for three probes to time out rediscovers something
+the socket already knew, and each of those seconds is game traffic handed to
+something that cannot carry it. Seen live as `WSAEINVAL`, surfaced to the user
+as "L2TP relay send failed: An invalid argument was supplied".
+
+So `RelayPath::transport_failed` lets a transport say that its own failure is
+terminal, and the worker then takes the path out of the dispatcher and arms the
+redial without waiting. The verdict is the transport's rather than inferred
+from an error string, so each one decides with whatever its platform gives it,
+and the default is that nothing is terminal — the behaviour every transport had
+before.
+
+The classification is deliberately narrow. `WSAECONNRESET`, `WSAEHOSTUNREACH`
+and `WSAENETUNREACH` are excluded because Windows raises them from an ICMP
+message about a datagram already sent: the socket is fine, the next send may
+well succeed, and tearing the path down for one is the more expensive mistake —
+the same reasoning that makes the SOCKS5 transport swallow them on receive.
+
 ## Common-mode failure
 
 Independent providers do not fail in the same second. When every path stops
