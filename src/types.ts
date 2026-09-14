@@ -7,6 +7,19 @@ export type NodeKind = 'wireguard' | 'socks5' | 'openvpn' | 'l2tp'
  */
 export type ConnectionMode = 'relay' | 'direct'
 
+/**
+ * A named collection of nodes with one switch over all of them.
+ *
+ * A node inside a switched-off group stays exactly as the user left it and
+ * simply stops carrying traffic, so turning the group back on restores the
+ * selection rather than re-enabling everything.
+ */
+export type NodeGroup = {
+  id: string
+  name: string
+  enabled: boolean
+}
+
 export type Tunnel = {
   id: string
   kind: NodeKind
@@ -15,6 +28,8 @@ export type Tunnel = {
   address: string
   dns: string
   enabled: boolean
+  /** The group whose switch also gates this node, or null when ungrouped. */
+  groupId: string | null
   importedAt: string
   hasPrivateKey: boolean
   /** SOCKS5 nodes only. */
@@ -161,6 +176,7 @@ export type HandledConnection = {
 export type AppState = {
   clientVersion?: string
   tunnels: Tunnel[]
+  nodeGroups: NodeGroup[]
   rules: SplitRule[]
   ruleGroups: SplitRuleGroup[]
   trafficMode: 'all' | 'split'
@@ -291,7 +307,12 @@ export type GamePathApi = {
   testL2tpNode: (input: L2tpNodeInput) => Promise<L2tpProbeResult>
   testSavedL2tpNode: (id: string) => Promise<L2tpProbeResult>
   setTunnelEnabled: (id: string, enabled: boolean) => Promise<AppState>
+  setTunnelGroup: (id: string, groupId: string | null) => Promise<AppState>
   removeTunnel: (id: string) => Promise<AppState>
+  addNodeGroup: (name: string) => Promise<{ state: AppState; groupId: string }>
+  renameNodeGroup: (id: string, name: string) => Promise<AppState>
+  setNodeGroupEnabled: (id: string, enabled: boolean) => Promise<AppState>
+  removeNodeGroup: (id: string) => Promise<AppState>
   browseRuleTarget: (kind: RuleKind) => Promise<{ canceled: boolean; value?: string; label?: string }>
   addRule: (input: AddRuleInput) => Promise<AppState>
   setRuleEnabled: (id: string, enabled: boolean) => Promise<AppState>

@@ -7,7 +7,12 @@ const { parseWireGuardConfig } = require('./wireguard.cjs')
 const { parseOpenVpnConfig } = require('./openvpn.cjs')
 const { parseSocks5Node } = require('./socks5.cjs')
 const { parseL2tpNode } = require('./l2tp.cjs')
-const { directNodeSelection, directSelectionAfterSwitch } = require('./connection.cjs')
+const {
+  activeTunnels,
+  enforceDirectSelection,
+  directNodeSelection,
+  directSelectionAfterSwitch,
+} = require('./connection.cjs')
 const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
 const { provisionRelay, removeRelay } = require('./vps.cjs')
@@ -17,6 +22,7 @@ const lookupIpCountry = createIpCountryLookup()
 
 const defaultState = () => ({
   tunnels: [],
+  nodeGroups: [],
   encryptedConfigs: {},
   encryptedRelayTokens: {},
   rules: [],
@@ -87,8 +93,15 @@ function loadState() {
     // Sessions saved before direct mode existed all went through a relay.
     if (state.connectionMode !== 'direct') state.connectionMode = 'relay'
     if (state.routingStrategy !== 'manual') state.routingStrategy = 'smart'
-    // Nodes imported before SOCKS5 support existed are all WireGuard routes.
-    state.tunnels = state.tunnels.map((tunnel) => ({ kind: 'wireguard', ...tunnel }))
+    state.nodeGroups = Array.isArray(state.nodeGroups) ? state.nodeGroups : []
+    const nodeGroupIds = new Set(state.nodeGroups.map((group) => group.id))
+    // Nodes imported before SOCKS5 support existed are all WireGuard routes,
+    // and nodes saved before grouping existed belong to no group.
+    state.tunnels = state.tunnels.map((tunnel) => ({
+      kind: 'wireguard',
+      ...tunnel,
+      groupId: nodeGroupIds.has(tunnel.groupId) ? tunnel.groupId : null,
+    }))
     state.relays = state.relays.map((relay) => {
       const hasEnrollmentToken = Boolean(state.encryptedRelayTokens[relay.id])
       const normalized = { port: 51821, ...relay, hasEnrollmentToken }
@@ -380,6 +393,11 @@ function activeRelayWithToken() {
   return { relay, enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedToken, 'base64')) }
 }
 
+/** Every node starts ungrouped; groups are something the user arranges later. */
+function registerTunnel(tunnel) {
+  state.tunnels.push({ groupId: null, ...tunnel })
+}
+
 function registerIpc() {
   ipcMain.handle('app:bootstrap', () => publicState())
   ipcMain.handle('ip-country:lookup', (_event, target) => lookupIpCountry(String(target ?? '').slice(0, 300)))
@@ -389,7 +407,7 @@ function registerIpc() {
     if (state.tunnels.some((item) => item.kind === 'socks5' && item.endpoint === node.endpoint)) {
       throw new Error(`${node.endpoint} is already added. Two associations on one proxy carry no extra path.`)
     }
-    state.tunnels.push(node)
+    registerTunnel(node)
     state.encryptedConfigs[node.id] = encryptConfig(JSON.stringify(credentials))
     saveState()
     return { state: publicState(), nodeId: node.id }
@@ -429,7 +447,7 @@ function registerIpc() {
     if (state.tunnels.some((item) => item.kind === 'l2tp' && item.endpoint === node.endpoint)) {
       throw new Error(`${node.endpoint} is already added as an L2TP/IPsec node.`)
     }
-    state.tunnels.push(node)
+    registerTunnel(node)
     state.encryptedConfigs[node.id] = encryptConfig(JSON.stringify(credentials))
     saveState()
     return { state: publicState(), nodeId: node.id }
@@ -505,7 +523,7 @@ function registerIpc() {
         if (node.wantsCredentials && !credentials.username) {
           throw new Error('This file needs a username and password, and none were entered.')
         }
-        state.tunnels.push({ ...node, hasCredentials: Boolean(credentials.username) })
+        registerTunnel({ ...node, hasCredentials: Boolean(credentials.username) })
         // The file itself can carry a private key, so it is stored the same way
         // a WireGuard configuration is and never leaves the main process.
         state.encryptedConfigs[node.id] = encryptConfig(JSON.stringify({ config: source, ...credentials }))
@@ -532,7 +550,7 @@ function registerIpc() {
       try {
         const source = fs.readFileSync(filePath, 'utf8')
         const tunnel = parseWireGuardConfig(source, filePath, crypto.randomUUID())
-        state.tunnels.push(tunnel)
+        registerTunnel(tunnel)
         state.encryptedConfigs[tunnel.id] = encryptConfig(source)
       } catch (error) {
         errors.push(`${path.basename(filePath)}: ${error.message}`)
@@ -555,14 +573,80 @@ function registerIpc() {
     return publicState()
   })
 
+  ipcMain.handle('tunnel:set-group', (_event, id, groupId) => {
+    const tunnel = state.tunnels.find((item) => item.id === id)
+    if (!tunnel) return publicState()
+    tunnel.groupId = state.nodeGroups.some((group) => group.id === groupId) ? groupId : null
+    // Moving a node into a switched-on group can wake it, which direct mode
+    // has no room for alongside the node already carrying traffic.
+    if (state.connectionMode === 'direct') enforceDirectSelection(state.tunnels, state.nodeGroups, id)
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('node-group:add', (_event, rawName) => {
+    const name = String(rawName ?? '').trim()
+    if (!name) throw new Error('A group name is required')
+    if (state.nodeGroups.some((group) => group.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      throw new Error('A group with that name already exists')
+    }
+    const group = { id: crypto.randomUUID(), name, enabled: true }
+    state.nodeGroups.push(group)
+    saveState()
+    return { state: publicState(), groupId: group.id }
+  })
+
+  ipcMain.handle('node-group:rename', (_event, id, rawName) => {
+    const name = String(rawName ?? '').trim()
+    if (!name) throw new Error('A group name is required')
+    if (
+      state.nodeGroups.some((group) => group.id !== id && group.name.toLocaleLowerCase() === name.toLocaleLowerCase())
+    ) {
+      throw new Error('A group with that name already exists')
+    }
+    const group = state.nodeGroups.find((item) => item.id === id)
+    if (group) group.name = name
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('node-group:set-enabled', (_event, id, enabled) => {
+    const group = state.nodeGroups.find((item) => item.id === id)
+    if (!group) return publicState()
+    group.enabled = Boolean(enabled)
+    // One switch waking every node inside is the point of a group, but direct
+    // mode can still only carry one, so the rest are switched back off.
+    if (state.connectionMode === 'direct' && group.enabled) {
+      enforceDirectSelection(state.tunnels, state.nodeGroups)
+    }
+    saveState()
+    return publicState()
+  })
+
+  ipcMain.handle('node-group:remove', (_event, id) => {
+    state.nodeGroups = state.nodeGroups.filter((group) => group.id !== id)
+    // Removing the group keeps its nodes; they simply become ungrouped, which
+    // also means they answer to their own switch again.
+    for (const tunnel of state.tunnels) if (tunnel.groupId === id) tunnel.groupId = null
+    if (state.connectionMode === 'direct') enforceDirectSelection(state.tunnels, state.nodeGroups)
+    saveState()
+    return publicState()
+  })
+
   // Switching modes changes what a selected node means, so the selection is
   // carried across rather than left in a shape the new mode cannot start with.
   ipcMain.handle('connection:set-mode', (_event, mode) => {
     if (mode !== 'relay' && mode !== 'direct') throw new Error('Unknown connection mode')
     state.connectionMode = mode
     if (mode === 'direct') {
-      const chosen = directSelectionAfterSwitch(state.tunnels)
+      const chosen = directSelectionAfterSwitch(state.tunnels, state.nodeGroups)
       for (const tunnel of state.tunnels) tunnel.enabled = tunnel.id === chosen
+      // Only reached when nothing outside a switched-off group could carry a
+      // direct session. Leaving that group off would hand the user a selection
+      // that cannot start, so the group comes back on with the node.
+      const selected = state.tunnels.find((tunnel) => tunnel.id === chosen)
+      const group = state.nodeGroups.find((item) => item.id === selected?.groupId)
+      if (group) group.enabled = true
     }
     saveState()
     return publicState()
@@ -856,16 +940,27 @@ function registerIpc() {
   ipcMain.handle('engine:start', async () => {
     const mode = state.connectionMode === 'direct' ? 'direct' : 'relay'
     const strategy = state.routingStrategy === 'manual' ? 'all-paths' : 'adaptive'
-    const enabledTunnels = state.tunnels.filter((tunnel) => tunnel.enabled)
+    // A node only joins the session when its own switch and its group's are
+    // both on, so a switched-off group takes every node inside it out.
+    const enabledTunnels = activeTunnels(state.tunnels, state.nodeGroups)
     const enabledRules = enabledRuleSpecs()
     const relay = state.relays.find((item) => item.id === state.activeRelayId)
     const encryptedRelayToken = relay && state.encryptedRelayTokens[relay.id]
     const direct = mode === 'direct'
     const selection = direct ? directNodeSelection(enabledTunnels) : { node: null, error: null }
+    // Nodes switched on but held back by their group: without naming this, the
+    // user sees switches that are on and a message saying to switch one on.
+    const heldByGroup = state.tunnels.some((tunnel) => tunnel.enabled) && enabledTunnels.length < 1
+    const groupBlocker =
+      'Every node you enabled is in a switched-off group. Switch its group back on, or enable an ungrouped node.'
     const blocker = direct
-      ? selection.error
+      ? heldByGroup
+        ? groupBlocker
+        : selection.error
       : enabledTunnels.length < 1
-        ? 'Enable at least one WireGuard, OpenVPN, L2TP/IPsec or SOCKS5 node.'
+        ? heldByGroup
+          ? groupBlocker
+          : 'Enable at least one WireGuard, OpenVPN, L2TP/IPsec or SOCKS5 node.'
         : !relay || relay.status !== 'ready' || !encryptedRelayToken
           ? 'The Istanbul relay needs its address and enrollment token.'
           : null

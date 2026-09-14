@@ -1454,61 +1454,6 @@ select:focus-visible {
   opacity: 0.35;
   cursor: not-allowed;
 }
-.route-list {
-  display: grid;
-  gap: 10px;
-}
-.route-card {
-  min-height: 117px;
-  padding: 18px;
-  border: 1px solid var(--line);
-  border-radius: 13px;
-  display: flex;
-  align-items: flex-start;
-  gap: 14px;
-  background: rgba(255, 255, 255, 0.018);
-  transition:
-    border 0.15s ease,
-    background 0.15s ease;
-}
-.route-card.is-enabled {
-  border-color: rgba(38, 230, 205, 0.14);
-  background: linear-gradient(110deg, rgba(38, 230, 205, 0.035), rgba(255, 255, 255, 0.012) 40%);
-}
-.route-state-icon {
-  width: 36px;
-  height: 36px;
-  flex: 0 0 auto;
-  border-radius: 10px;
-  display: grid;
-  place-items: center;
-  color: #616b7c;
-  background: rgba(255, 255, 255, 0.04);
-}
-.is-enabled .route-state-icon {
-  color: var(--cyan);
-  background: var(--cyan-soft);
-}
-.route-copy {
-  flex: 1;
-  min-width: 0;
-}
-.route-title-row {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-}
-.route-title-row h3 {
-  margin: 1px 0 0;
-  font-size: 13px;
-  font-weight: 620;
-}
-.route-copy > p {
-  margin: 6px 0 13px;
-  color: #6c7789;
-  font-family: 'Cascadia Code', monospace;
-  font-size: 9px;
-}
 .status-pill {
   padding: 3px 6px;
   border-radius: 5px;
@@ -1543,26 +1488,6 @@ select:focus-visible {
   font-weight: 650;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-}
-.route-meta {
-  display: flex;
-  gap: 23px;
-  color: #626d7e;
-  font-size: 8px;
-}
-.route-meta span {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-.route-meta strong {
-  color: #9ba5b5;
-  font-weight: 540;
-}
-.route-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
 }
 .toggle {
   width: 35px;
@@ -2967,48 +2892,440 @@ select:focus-visible {
   color: var(--violet);
 }
 
-/* A node the current mode cannot use keeps its place and says why. */
-.route-card.is-unusable {
-  background: rgba(255, 255, 255, 0.008);
+/* ---------------------------------------------------------------------------
+   Routes and nodes
+   A fleet can run to a dozen nodes, so the screen is built around groups: one
+   switch per group, a header that stays readable collapsed, and cards whose
+   labels are large enough to scan rather than decode.
+   --------------------------------------------------------------------------- */
+
+.node-fleet-bar {
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 20px;
+  background: linear-gradient(120deg, rgba(38, 230, 205, 0.04), rgba(255, 255, 255, 0.014) 45%);
 }
-.route-card.is-unusable .route-state-icon,
-.route-card.is-unusable .route-copy > p,
-.route-card.is-unusable .route-meta {
-  opacity: 0.5;
+.node-fleet-count {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-right: 20px;
+  border-right: 1px solid var(--line);
 }
-.route-note {
+.node-fleet-count strong {
+  color: var(--cyan);
+  font-size: 26px;
+  font-weight: 660;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.node-fleet-count span {
+  color: #aab3c2;
+  font-size: 12px;
+}
+.node-fleet-copy {
+  margin: 0;
+  max-inline-size: 76ch;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.node-fleet-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+/* The group control leads, because it is what organises everything after it. */
+.node-fleet-actions .button:first-child {
+  margin-right: auto;
+  border-color: rgba(138, 124, 255, 0.3);
+  color: #c3bbff;
+}
+
+.node-group-list {
+  display: grid;
+  gap: 12px;
+}
+.node-group {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.012);
+}
+.node-group.is-paused {
+  border-color: rgba(255, 179, 92, 0.18);
+}
+.node-group-head {
+  min-height: 58px;
+  padding: 0 14px 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(255, 255, 255, 0.022);
+}
+.node-group:not(.is-collapsed) .node-group-head {
+  border-bottom: 1px solid var(--line);
+}
+.node-group-disclosure {
+  flex: 1;
+  min-width: 0;
+  min-height: 56px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.node-group-disclosure:hover .node-group-name strong {
+  color: var(--cyan);
+}
+.node-group-disclosure:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+}
+.node-group-chevron {
+  flex: 0 0 auto;
+  color: #7b8598;
+  transition: transform 0.18s ease;
+}
+.node-group.is-collapsed .node-group-chevron {
+  transform: rotate(-90deg);
+}
+.node-group-icon {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: var(--cyan);
+  background: var(--cyan-soft);
+}
+.node-group.is-paused .node-group-icon {
+  color: #ffb35c;
+  background: rgba(255, 179, 92, 0.1);
+}
+/* The ungrouped bucket is a holding area, not a group, so it reads quieter. */
+.node-group.is-ungrouped .node-group-icon {
+  color: #8993a5;
+  background: rgba(255, 255, 255, 0.05);
+}
+.node-group-name {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.node-group-name strong {
+  font-size: 14px;
+  font-weight: 620;
+  transition: color 0.15s ease;
+}
+.node-group-name small {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.node-group-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.node-group-hint {
+  color: #6f7a8c;
+  font-size: 11px;
+}
+.node-group-switch {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding-left: 10px;
+  margin-left: 2px;
+  border-left: 1px solid var(--line);
+}
+.node-group-switch > span {
+  min-width: 22px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.node-group.is-paused .node-group-switch > span {
+  color: #ffb35c;
+}
+.node-group-body {
+  padding: 12px;
+}
+.node-group-empty {
+  padding: 20px 16px;
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: left;
+}
+.node-group-empty p {
+  margin: 0;
+  max-inline-size: 62ch;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.node-group-empty strong {
+  color: #cfd6e2;
+}
+.node-group-note {
+  margin: 12px 4px 2px;
+  max-inline-size: 82ch;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.node-list {
+  display: grid;
+  gap: 10px;
+}
+.node-item {
+  position: relative;
+  padding: 16px 16px 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.016);
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.node-item:hover {
+  border-color: rgba(255, 255, 255, 0.13);
+}
+/* A rail rather than a tinted card: state stays legible at a glance without
+   washing out the text beside it. */
+.node-item-rail {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: #2a3140;
+  transition: background 0.18s ease;
+}
+.node-item.is-carrying {
+  border-color: rgba(38, 230, 205, 0.16);
+  background: linear-gradient(110deg, rgba(38, 230, 205, 0.035), rgba(255, 255, 255, 0.012) 42%);
+}
+.node-item.is-carrying .node-item-rail {
+  background: var(--cyan);
+  box-shadow: 0 0 10px rgba(38, 230, 205, 0.45);
+}
+.node-item.is-unusable {
+  background: rgba(255, 255, 255, 0.006);
+}
+.node-item.is-unusable .node-item-avatar,
+.node-item.is-unusable .node-item-endpoint,
+.node-item.is-unusable .node-item-facts {
+  opacity: 0.55;
+}
+.node-item-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: #6d7789;
+  background: rgba(255, 255, 255, 0.045);
+}
+.node-item.is-carrying .node-item-avatar {
+  color: var(--cyan);
+  background: var(--cyan-soft);
+}
+.node-item-body {
+  min-width: 0;
+}
+.node-item-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.node-item-title h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 620;
+}
+.node-item-endpoint {
+  margin: 7px 0 12px;
+  color: #7e8899;
+  font-family: 'Cascadia Code', monospace;
+  font-size: 11px;
+}
+/* Labelled pairs, so a value is never left to be guessed from its shape. */
+.node-item-facts {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 28px;
+}
+.node-item-facts > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.node-item-facts dt {
+  color: #7d8698;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.node-item-facts dd {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #c2cad7;
+  font-size: 12px;
+}
+.node-item-facts dd svg {
+  flex: 0 0 auto;
+  color: var(--cyan);
+}
+.node-item-note {
   display: flex;
   align-items: flex-start;
   gap: 7px;
-  margin: 8px 0 0;
-  max-inline-size: 74ch;
+  margin: 11px 0 0;
+  max-inline-size: 78ch;
   color: var(--muted);
   font-size: 11.5px;
   line-height: 1.55;
 }
-.route-note svg {
+.node-item-note svg {
   flex: 0 0 auto;
   margin-top: 2px;
   color: var(--violet);
 }
 /* A test result carries its own colour, because the outcome is the point. */
-.route-note.is-good {
+.node-item-note.is-good {
   color: #a7d8bf;
 }
-.route-note.is-good svg {
+.node-item-note.is-good svg {
   color: var(--green);
 }
-.route-note.is-bad {
+.node-item-note.is-bad {
   color: #e7b4b4;
 }
-.route-note.is-bad svg {
+.node-item-note.is-bad svg {
   color: #ef6f6f;
 }
-/* The card's own buttons stay quieter than the page's primary actions. */
-.route-actions .button {
-  min-height: 30px;
-  padding: 0 12px;
+.node-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.node-item-actions .button {
+  min-height: 32px;
+  padding: 0 13px;
   font-size: 11.5px;
+}
+.node-group-field select {
+  height: 32px;
+  max-width: 150px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: #c2cad7;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.node-group-field select:hover {
+  border-color: rgba(38, 230, 205, 0.28);
+}
+
+/* Offered only while no group exists, so the first one is easy to find. */
+.node-group-invite {
+  width: 100%;
+  margin-top: 14px;
+  padding: 15px 18px;
+  border: 1px dashed rgba(138, 124, 255, 0.28);
+  border-radius: 13px;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  background: rgba(138, 124, 255, 0.045);
+  cursor: pointer;
+  text-align: left;
+}
+.node-group-invite:hover {
+  border-color: rgba(138, 124, 255, 0.5);
+}
+.node-group-invite:focus-visible {
+  outline: 2px solid var(--violet);
+  outline-offset: 2px;
+}
+.node-group-invite > span:first-child {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: var(--violet);
+  background: rgba(138, 124, 255, 0.12);
+}
+.node-group-invite > span:last-child {
+  display: grid;
+  gap: 3px;
+}
+.node-group-invite strong {
+  font-size: 13px;
+  font-weight: 620;
+}
+.node-group-invite small {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* On for the node, off for its group: a third state neither pill covered. */
+.status-pill.paused {
+  color: #ffc684;
+  background: rgba(255, 179, 92, 0.1);
+}
+.status-pill.paused i {
+  background: #ffb35c;
+}
+
+@media (max-width: 1180px) {
+  .node-item {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .node-item-actions {
+    grid-column: 2;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    padding-top: 4px;
+  }
 }
 
 @media (max-width: 1100px) {

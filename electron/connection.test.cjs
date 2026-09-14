@@ -1,10 +1,34 @@
 const assert = require('node:assert/strict')
 const test = require('node:test')
-const { directNodeSelection, directSelectionAfterSwitch } = require('./connection.cjs')
+const {
+  activeTunnels,
+  enforceDirectSelection,
+  directNodeSelection,
+  directSelectionAfterSwitch,
+} = require('./connection.cjs')
 
-const wireguard = (id, enabled = true) => ({ id, kind: 'wireguard', name: `WG ${id}`, enabled })
-const openvpn = (id, enabled = true) => ({ id, kind: 'openvpn', name: `OVPN ${id}`, enabled })
-const proxy = (id, enabled = true) => ({ id, kind: 'socks5', name: `Proxy ${id}`, enabled })
+const wireguard = (id, enabled = true, groupId = null) => ({
+  id,
+  kind: 'wireguard',
+  name: `WG ${id}`,
+  enabled,
+  groupId,
+})
+const openvpn = (id, enabled = true, groupId = null) => ({
+  id,
+  kind: 'openvpn',
+  name: `OVPN ${id}`,
+  enabled,
+  groupId,
+})
+const proxy = (id, enabled = true, groupId = null) => ({
+  id,
+  kind: 'socks5',
+  name: `Proxy ${id}`,
+  enabled,
+  groupId,
+})
+const group = (id, enabled = true) => ({ id, name: `Group ${id}`, enabled })
 
 test('a single tunnelling node is what direct mode wants', () => {
   const { node, error } = directNodeSelection([wireguard('a')])
@@ -54,4 +78,64 @@ test('switching offers the first usable node when none was enabled', () => {
 test('switching with nothing usable leaves the selection empty', () => {
   assert.equal(directSelectionAfterSwitch([proxy('p', true)]), null)
   assert.equal(directSelectionAfterSwitch([]), null)
+})
+
+test('a node carries traffic only when its own switch and its group are both on', () => {
+  const tunnels = [wireguard('a', true, 'g1'), wireguard('b', false, 'g1'), wireguard('c', true, 'g2'), wireguard('d')]
+  const groups = [group('g1', true), group('g2', false)]
+  assert.deepEqual(
+    activeTunnels(tunnels, groups).map((tunnel) => tunnel.id),
+    ['a', 'd'],
+  )
+})
+
+test('an ungrouped node answers to its own switch alone', () => {
+  assert.deepEqual(
+    activeTunnels([wireguard('a'), wireguard('b', false)], []).map((tunnel) => tunnel.id),
+    ['a'],
+  )
+})
+
+test('switching a group on in direct mode leaves exactly one node carrying', () => {
+  const tunnels = [wireguard('a', true, 'g1'), wireguard('b', true, 'g1'), wireguard('c', true)]
+  enforceDirectSelection(tunnels, [group('g1', true)])
+  assert.deepEqual(
+    activeTunnels(tunnels, [group('g1', true)]).map((tunnel) => tunnel.id),
+    ['a'],
+  )
+  // The nodes that lost the contest are switched off, not silently hidden.
+  assert.deepEqual(
+    tunnels.filter((tunnel) => tunnel.enabled).map((tunnel) => tunnel.id),
+    ['a'],
+  )
+})
+
+test('a node the user just chose is the one direct mode keeps', () => {
+  const tunnels = [wireguard('a', true, 'g1'), wireguard('b', true, 'g1')]
+  enforceDirectSelection(tunnels, [group('g1', true)], 'b')
+  assert.deepEqual(
+    tunnels.filter((tunnel) => tunnel.enabled).map((tunnel) => tunnel.id),
+    ['b'],
+  )
+})
+
+test('direct mode is left alone when only one node was carrying', () => {
+  const tunnels = [wireguard('a', true, 'g1'), wireguard('b', true, 'g2')]
+  const groups = [group('g1', true), group('g2', false)]
+  enforceDirectSelection(tunnels, groups)
+  // 'b' stays switched on so switching its group back on restores the choice.
+  assert.deepEqual(
+    tunnels.filter((tunnel) => tunnel.enabled).map((tunnel) => tunnel.id),
+    ['a', 'b'],
+  )
+})
+
+test('switching to direct mode passes over a node in a switched-off group', () => {
+  const tunnels = [wireguard('a', true, 'g1'), wireguard('b', false, 'g2')]
+  assert.equal(directSelectionAfterSwitch(tunnels, [group('g1', false), group('g2', true)]), 'b')
+})
+
+test('switching falls back to a grouped node when nothing else can carry', () => {
+  const tunnels = [proxy('p'), wireguard('a', true, 'g1')]
+  assert.equal(directSelectionAfterSwitch(tunnels, [group('g1', false)]), 'a')
 })

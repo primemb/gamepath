@@ -11,6 +11,7 @@ let state: AppState = {
       address: '10.44.0.2/32',
       dns: '1.1.1.1',
       enabled: true,
+      groupId: 'node-group-istanbul',
       importedAt: new Date().toISOString(),
       hasPrivateKey: true,
     },
@@ -22,10 +23,12 @@ let state: AppState = {
       address: '10.71.0.8/32',
       dns: 'System default',
       enabled: true,
+      groupId: 'node-group-istanbul',
       importedAt: new Date().toISOString(),
       hasPrivateKey: true,
     },
   ],
+  nodeGroups: [{ id: 'node-group-istanbul', name: 'Istanbul fleet', enabled: true }],
   rules: [
     {
       id: 'rule-1',
@@ -119,6 +122,7 @@ export const mockApi: GamePathApi = {
       address: 'SOCKS5 proxy',
       dns: 'System default',
       enabled: true,
+      groupId: null,
       importedAt: new Date().toISOString(),
       hasPrivateKey: false,
       hasCredentials: Boolean(input.username),
@@ -153,6 +157,7 @@ export const mockApi: GamePathApi = {
       address: 'Assigned when connected',
       dns: 'Provider assigned',
       enabled: true,
+      groupId: null,
       importedAt: new Date().toISOString(),
       hasPrivateKey: true,
       hasCredentials: true,
@@ -184,8 +189,30 @@ export const mockApi: GamePathApi = {
     )
     return snapshot()
   },
+  setTunnelGroup: async (id, groupId) => {
+    state.tunnels = state.tunnels.map((item) => (item.id === id ? { ...item, groupId } : item))
+    return snapshot()
+  },
   removeTunnel: async (id) => {
     state.tunnels = state.tunnels.filter((item) => item.id !== id)
+    return snapshot()
+  },
+  addNodeGroup: async (name) => {
+    const group = { id: crypto.randomUUID(), name: name.trim(), enabled: true }
+    state.nodeGroups.push(group)
+    return { state: snapshot(), groupId: group.id }
+  },
+  renameNodeGroup: async (id, name) => {
+    state.nodeGroups = state.nodeGroups.map((group) => (group.id === id ? { ...group, name: name.trim() } : group))
+    return snapshot()
+  },
+  setNodeGroupEnabled: async (id, enabled) => {
+    state.nodeGroups = state.nodeGroups.map((group) => (group.id === id ? { ...group, enabled } : group))
+    return snapshot()
+  },
+  removeNodeGroup: async (id) => {
+    state.nodeGroups = state.nodeGroups.filter((group) => group.id !== id)
+    state.tunnels = state.tunnels.map((item) => (item.groupId === id ? { ...item, groupId: null } : item))
     return snapshot()
   },
   browseRuleTarget: async () => ({ canceled: true }),
