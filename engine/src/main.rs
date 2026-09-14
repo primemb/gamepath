@@ -437,6 +437,56 @@ fn another_path_is_up(healthy_mask: &AtomicU64, index: usize) -> bool {
     healthy_mask.load(Ordering::Acquire) & !own != 0
 }
 
+/// How long every path being down at once is treated as evidence of a shared
+/// cause while the uplink monitor still reports `Up`.
+///
+/// Sized from how long the monitor needs to change its mind: up to one
+/// `uplink::PROBE_INTERVAL` before it probes again, then
+/// `uplink::FAILURES_BEFORE_DOWN` probes that have to fail. A path declares
+/// itself dead after three probes of its own, inside a second.
+///
+/// That gap was the bug. A real uplink stall shorter than the monitor's window
+/// - a Wi-Fi hiccup, a router pause, a congestion burst, which is the common
+/// case - killed every path at once while the monitor still said `Up`, so the
+/// guard below never engaged and all of them redialled simultaneously into a
+/// link that could not carry the dials. Observed live: three routes across two
+/// unrelated providers went unavailable inside 1.2 s and all three redialled,
+/// one of them an L2TP/IPsec RAS redial, with the monitor reporting `Up`
+/// throughout.
+const COMMON_MODE_CONFIRM_WINDOW: Duration = Duration::from_secs(
+    uplink::PROBE_INTERVAL.as_secs() * (uplink::FAILURES_BEFORE_DOWN as u64 + 1),
+);
+
+/// Whether a failed path should hold its redial because the evidence points at
+/// something shared rather than at the path itself.
+///
+/// `common_mode_for` is how long every path in the session has been down at
+/// once, having previously carried traffic. It is `None` when at least one path
+/// is up, when none has ever been up - a session still starting has not
+/// collapsed, it has simply not arrived - and when the session has a single
+/// path, which has nothing to compare itself against and so always redials.
+fn hold_redial_for_common_mode(uplink: UplinkState, common_mode_for: Option<Duration>) -> bool {
+    match uplink {
+        // Measured down. Nothing a dial could accomplish.
+        UplinkState::Down => true,
+        // Measured up - but that measurement can be a probe interval old, and
+        // promoting it to `Down` takes several more probes. Inside that window
+        // the health mask is the fresher evidence, because it moves the moment
+        // a path fails, so simultaneous failure outranks a stale `Up`. Past the
+        // window the monitor has had every chance to agree and has not, so
+        // these paths are down for their own reasons and must be allowed to
+        // redial rather than wait for a verdict that is not coming.
+        UplinkState::Up => {
+            common_mode_for.is_some_and(|elapsed| elapsed < COMMON_MODE_CONFIRM_WINDOW)
+        }
+        // No measurement to weigh against, which is where a router filtering
+        // ICMP leaves us, so the inference is all there is and gets no
+        // deadline: an uplink that is genuinely down would look exactly like
+        // this for as long as it stayed down.
+        UplinkState::Unknown => common_mode_for.is_some(),
+    }
+}
+
 struct PathCommand {
     frame: Vec<u8>,
     /// When the scheduler handed this packet over. A packet that waited longer
@@ -2339,6 +2389,13 @@ fn run_path(
     let mut failures = 0_u32;
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut next_redial: Option<Instant> = None;
+    // When every path in this session was first seen down at the same moment.
+    // Cleared as soon as any of them answers, so it measures one episode rather
+    // than accumulating across unrelated ones.
+    let mut common_mode_since: Option<Instant> = None;
+    // Whether any path in this session has ever been healthy. Distinguishes a
+    // session that collapsed from one that has not come up yet.
+    let mut carried_traffic = false;
     // A dial can take seconds - a SOCKS5 connect allows eight, an OpenVPN
     // handshake its own - so it runs on its own thread and the result is
     // collected here. The worker keeps probing and keeps checking `stop` while
@@ -2415,21 +2472,32 @@ fn run_path(
             Some(ReconnectPoll::Pending) | None => {}
         }
         // A redial is only worth making when something proves the uplink is
-        // there. The monitor answers that directly when it can; when it cannot
-        // - a router that filters ICMP - fall back to inferring it from whether
-        // any other path is up, which is all that was available before.
-        let uplink_down = match telemetry.uplink.state() {
-            UplinkState::Down => true,
-            UplinkState::Up => false,
-            UplinkState::Unknown => {
-                route_count > 1 && !another_path_is_up(&telemetry.healthy_mask, index)
-            }
+        // there. The monitor answers that directly when it can, but it is slow
+        // to change its mind, so every path being down at once is tracked here
+        // as evidence in its own right - fresher than the monitor, and the only
+        // thing that catches a stall too short for the monitor to see.
+        //
+        // Only a collapse counts, though. Until some path has carried traffic,
+        // "nothing is up" is a session that has not finished starting, and
+        // holding its redials would only slow it down.
+        carried_traffic |= telemetry.healthy_mask.load(Ordering::Acquire) != 0;
+        let common_mode_for = if route_count > 1
+            && carried_traffic
+            && !another_path_is_up(&telemetry.healthy_mask, index)
+        {
+            Some(common_mode_since.get_or_insert_with(Instant::now).elapsed())
+        } else {
+            // One path answering ends it: whatever happened was not shared.
+            common_mode_since = None;
+            None
         };
+        let uplink_down = hold_redial_for_common_mode(telemetry.uplink.state(), common_mode_for);
         if dialing.is_none() && uplink_down && next_redial.is_some_and(|at| Instant::now() >= at) {
             next_redial = Some(Instant::now() + UPLINK_DOWN_BACKOFF);
             log_warn!(
-                "route {} is not redialling: no path is up, so the uplink is the likely cause",
-                index + 1
+                "route {} is not redialling: every route is down at once, so the uplink is the likely cause (monitor reports {:?})",
+                index + 1,
+                telemetry.uplink.state()
             );
         }
         if dialing.is_none() && !uplink_down && next_redial.is_some_and(|at| Instant::now() >= at) {
@@ -3748,26 +3816,79 @@ mod tests {
         );
     }
 
-    /// The monitor answers directly where it can, and the old inference is
-    /// kept only for where it cannot.
+    /// The monitor answers directly where it can, and the inference covers
+    /// where it cannot.
     #[test]
     fn a_measured_uplink_overrides_the_inference_in_both_directions() {
-        let decide = |state: UplinkState, route_count: usize, others_up: bool| match state {
-            UplinkState::Down => true,
-            UplinkState::Up => false,
-            UplinkState::Unknown => route_count > 1 && !others_up,
-        };
+        let recent = Some(Duration::ZERO);
+        let none = None;
         // Measured down: no redial, even though another path looks up.
-        assert!(decide(UplinkState::Down, 2, true));
-        // Measured up: redial, even though nothing else is up. This is the case
-        // the inference could never get right, and the only case for a
-        // single-path session.
-        assert!(!decide(UplinkState::Up, 1, false));
-        assert!(!decide(UplinkState::Up, 2, false));
-        // No opinion: exactly the previous behaviour.
-        assert!(decide(UplinkState::Unknown, 2, false));
-        assert!(!decide(UplinkState::Unknown, 2, true));
-        assert!(!decide(UplinkState::Unknown, 1, false));
+        assert!(hold_redial_for_common_mode(UplinkState::Down, none));
+        // Something else is carrying traffic, so this path is on its own and
+        // redials whatever the monitor thinks.
+        assert!(!hold_redial_for_common_mode(UplinkState::Up, none));
+        assert!(!hold_redial_for_common_mode(UplinkState::Unknown, none));
+        // No measurement and nothing up: the inference is all there is.
+        assert!(hold_redial_for_common_mode(UplinkState::Unknown, recent));
+    }
+
+    /// The bug this guard was missing. The monitor needs several seconds to
+    /// turn `Up` into `Down`, and a path gives up in about one, so a short
+    /// uplink stall used to leave every path redialling at once while the
+    /// monitor still said `Up`.
+    #[test]
+    fn a_stale_up_does_not_override_every_path_failing_at_once() {
+        assert!(hold_redial_for_common_mode(
+            UplinkState::Up,
+            Some(Duration::ZERO)
+        ));
+        assert!(hold_redial_for_common_mode(
+            UplinkState::Up,
+            Some(COMMON_MODE_CONFIRM_WINDOW - Duration::from_millis(1))
+        ));
+    }
+
+    /// But it is a window, not a veto: once the monitor has had time to agree
+    /// and has not, the paths are down for their own reasons and have to be
+    /// allowed to recover. Without this the session could hold every redial
+    /// indefinitely on transports that cannot come back without one.
+    #[test]
+    fn a_monitor_that_keeps_reporting_up_eventually_wins() {
+        assert!(!hold_redial_for_common_mode(
+            UplinkState::Up,
+            Some(COMMON_MODE_CONFIRM_WINDOW)
+        ));
+        assert!(!hold_redial_for_common_mode(
+            UplinkState::Up,
+            Some(COMMON_MODE_CONFIRM_WINDOW * 10)
+        ));
+    }
+
+    /// The window has to outlast the monitor's own verdict, or it would expire
+    /// while a real outage was still being confirmed - which is exactly the
+    /// case it exists to cover.
+    #[test]
+    fn the_confirmation_window_outlasts_the_monitors_decision() {
+        let worst_case_to_declare_down =
+            uplink::PROBE_INTERVAL * (uplink::FAILURES_BEFORE_DOWN + 1) - uplink::PROBE_INTERVAL;
+        assert!(
+            COMMON_MODE_CONFIRM_WINDOW >= worst_case_to_declare_down,
+            "{COMMON_MODE_CONFIRM_WINDOW:?} is shorter than the {worst_case_to_declare_down:?} the monitor needs"
+        );
+        // And it is not so long that a path is stranded: the guard re-arms in
+        // UPLINK_DOWN_BACKOFF steps, so this bounds one episode, not recovery.
+        assert!(COMMON_MODE_CONFIRM_WINDOW <= Duration::from_secs(15));
+    }
+
+    /// A single-path session has nothing to compare against, so it is never
+    /// held back - the caller passes `None` for it. The same goes for a session
+    /// still starting up, where no path has carried traffic yet: that is not a
+    /// collapse and its retries must not be slowed down.
+    #[test]
+    fn a_single_path_session_or_one_still_starting_always_redials() {
+        for state in [UplinkState::Up, UplinkState::Unknown] {
+            assert!(!hold_redial_for_common_mode(state, None));
+        }
     }
 
     #[test]

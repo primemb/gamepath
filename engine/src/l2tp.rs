@@ -367,6 +367,12 @@ fn redial_ras(
         crate::netconfig::wait_for_interface_index(local_address, Duration::from_secs(5))
             .map_err(|_| "the reconnected L2TP adapter did not become ready".to_owned())?;
     configure_mtu(interface_index, runtime.mtu)?;
+    // A redial gets a fresh adapter, so the IPv6 default route the link
+    // advertises has to be taken off this one too. Relay paths are always the
+    // IPv4-only, relay-scoped case; see the matching call in the service.
+    if let Err(error) = crate::netconfig::disable_ipv6_default_route(interface_index) {
+        crate::log_warn!("{error}; the reconnected L2TP adapter may keep an IPv6 default route");
+    }
     add_route(*relay.ip(), interface_index)?;
     owned.interface_index = interface_index;
     owned.relay = Some(*relay.ip());

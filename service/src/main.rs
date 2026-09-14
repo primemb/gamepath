@@ -621,6 +621,24 @@ mod gamepath_service {
                 session
                     .add_route(&format!("{relay}/32"))
                     .map_err(|error| format!("route {}: {error}", index + 1))?;
+                // In relay mode this adapter exists only to carry GamePath's
+                // IPv4 frames to the relay, so an IPv6 default route picked up
+                // from the link's Router Advertisements is never wanted.
+                //
+                // A direct session is deliberately left alone. There Windows
+                // routes the user's own traffic through this adapter natively,
+                // and taking IPv6 off it would push that traffic onto the
+                // physical interface instead - turning a tunnelled protocol
+                // into a leak rather than fixing anything.
+                //
+                // Non-fatal either way: a session that carries traffic is worth
+                // more than this, and IPv6 exposure is reported separately.
+                if let Err(error) = netconfig::disable_ipv6_default_route(session.interface_index) {
+                    log_event(&format!(
+                        "route {}: {error}; the L2TP adapter may keep an IPv6 default route",
+                        index + 1
+                    ));
+                }
             }
             *runtime = Some(session.runtime(index + 1));
             // Relay workers keep the login only inside the privileged engine

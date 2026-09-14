@@ -280,6 +280,23 @@ credentials held inside the privileged engine child, reapplies its MTU and
 relay route, and rejoins after an authenticated probe. Other relay paths remain
 up during that recovery.
 
+That adapter is also stripped of IPv6. Providers advertise a router on the PPP
+link, and Windows acts on it, so the temporary adapter acquires a `::/0` route —
+on one observed session it was the machine's only IPv6 default route. Nothing
+breaks while the link hands out no global address, because Windows cannot select
+an IPv6 source and falls back to IPv4, but a server that did advertise a prefix
+would have IPv6 routed into a tunnel this client carries no IPv6 through.
+`netconfig::disable_ipv6_default_route` turns off router discovery and sweeps any
+route that already arrived — both halves, because a server usually advertises as
+soon as the link comes up, which is before the adapter can be configured. It is
+best-effort: a session that carries traffic is worth more than this.
+
+A **direct** L2TP session is deliberately left alone. There Windows routes the
+user's own traffic through the adapter natively, so removing IPv6 from it would
+push that traffic onto the physical interface instead — turning a tunnelled
+protocol into a leak rather than fixing one. The relay case is the one where the
+adapter exists solely to carry GamePath's IPv4 frames.
+
 In direct all-traffic mode RAS owns the default route. In direct split mode the
 service installs native IPv4 routes for CIDRs and the current A records of exact
 hostnames. Windows routes alone cannot express application/folder ownership or
@@ -471,7 +488,40 @@ outage worse:
   handshake over a link that cannot carry it. Instead the path waits
   `UPLINK_DOWN_BACKOFF` and keeps probing, because paths recover on their own the
   moment the uplink does. A single-path session has nothing to compare against
-  and redials as normal.
+  and redials as normal, and so does one that has not come up yet: until some
+  path has carried traffic, "nothing is up" is a session still starting rather
+  than one that collapsed.
+
+### The monitor is too slow to be the only witness
+
+That guard is gated on the uplink verdict, and the verdict is deliberately
+unhurried: `uplink::PROBE_INTERVAL` is 2 s and `uplink::FAILURES_BEFORE_DOWN` is
+3, so turning `Up` into `Down` takes around eight seconds. A path gives up after
+three probes of its own — about one second.
+
+Those two numbers disagreeing is a hole rather than a rounding error. Any shared
+stall shorter than the monitor's window — a Wi-Fi hiccup, a router pause, a
+congestion burst, which is the ordinary case — kills every path while the
+monitor still reports `Up`, and a plain `Up` used to mean "redial". Observed
+live: three routes across two unrelated providers went unavailable inside 1.2 s
+and all three redialled, one of them an L2TP/IPsec RAS redial, with the monitor
+reporting `Up` throughout and recovering every path 2 s later at 500 ms RTT
+decaying back to 48.
+
+So the health mask is treated as evidence in its own right. Every path being
+down at once, after at least one of them had carried traffic, is the
+common-mode signal, and inside `COMMON_MODE_CONFIRM_WINDOW` it outranks a
+stale `Up`: the mask moves the moment a path fails, while `Up` can be a probe
+interval old.
+
+It is a window and not a veto, which is the other half of the design. Past it
+the monitor has had every chance to agree and has not, so the paths are down for
+their own reasons and are allowed to redial. Without that expiry a session whose
+transports cannot recover without a dial — OpenVPN, SOCKS5, L2TP, none of which
+rehandshake on their own — could hold every redial indefinitely on the strength
+of an inference the monitor kept contradicting. The window is derived from the
+monitor's own constants rather than written down separately, so the two cannot
+drift apart.
 
 This is a game client, so recovery is timed to be fast rather than merely safe.
 A path that misses a probe switches to `PROBE_INTERVAL_DEGRADED`, so a route

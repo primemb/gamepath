@@ -17,14 +17,16 @@ use std::net::Ipv4Addr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIpInterfaceEntry,
-    GetUnicastIpAddressTable, IP_ADDRESS_PREFIX, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
-    MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_TABLE, SetIpInterfaceEntry,
+    CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIpForwardTable2,
+    GetIpInterfaceEntry, GetUnicastIpAddressTable, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
+    MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_TABLE,
+    SetIpInterfaceEntry,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_INET,
+    ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, RouterDiscoveryDisabled, SOCKADDR_IN,
+    SOCKADDR_INET,
 };
 
 /// Wraps an IPv4 address in the `SOCKADDR_INET` the IP Helper API takes.
@@ -120,10 +122,13 @@ pub fn wait_for_interface_index(address: Ipv4Addr, timeout: Duration) -> Result<
     }
 }
 
-/// Fills in the identifying fields and reads one IPv4 interface row.
-fn ip_interface_entry(interface_index: u32) -> Result<MIB_IPINTERFACE_ROW, String> {
+/// Fills in the identifying fields and reads one interface row.
+fn ip_interface_entry_for(
+    family: ADDRESS_FAMILY,
+    interface_index: u32,
+) -> Result<MIB_IPINTERFACE_ROW, String> {
     let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
-    row.Family = AF_INET;
+    row.Family = family;
     row.InterfaceIndex = interface_index;
     let status = unsafe { GetIpInterfaceEntry(&mut row) };
     if status != NO_ERROR {
@@ -132,6 +137,11 @@ fn ip_interface_entry(interface_index: u32) -> Result<MIB_IPINTERFACE_ROW, Strin
         ));
     }
     Ok(row)
+}
+
+/// Reads one IPv4 interface row.
+fn ip_interface_entry(interface_index: u32) -> Result<MIB_IPINTERFACE_ROW, String> {
+    ip_interface_entry_for(AF_INET, interface_index)
 }
 
 /// The IPv4 link MTU of `interface_index`. Replaces `Get-NetIPInterface`.
@@ -276,6 +286,86 @@ pub fn configure_tunnel_interface(interface_index: u32, mtu: u16) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+/// Stops a tunnel adapter from acquiring an IPv6 default route.
+///
+/// GamePath carries IPv4 only. A provider's L2TP/IPsec server nonetheless
+/// sends Router Advertisements on the PPP link, and Windows acts on them: the
+/// temporary RAS adapter ends up holding a `::/0` route. Observed on a live
+/// session, that was the machine's *only* IPv6 default route.
+///
+/// Nothing breaks while the link hands out no global IPv6 address, because
+/// Windows cannot then select an IPv6 source and everything falls back to
+/// IPv4. It is still wrong in two ways worth closing: the interface reports
+/// itself as having a default route that reaches nothing, and a server that
+/// later does advertise a prefix would have IPv6 traffic routed into a tunnel
+/// this client does not carry IPv6 through.
+///
+/// Both halves are needed. Disabling router discovery stops the next
+/// advertisement being acted on; the sweep removes one that already arrived,
+/// which is likely, because a server usually advertises as soon as the link
+/// comes up and that is before the adapter can be configured.
+pub fn disable_ipv6_default_route(interface_index: u32) -> Result<(), String> {
+    let mut row = ip_interface_entry_for(AF_INET6, interface_index)?;
+    row.RouterDiscoveryBehavior = RouterDiscoveryDisabled;
+    // See `set_interface_mtu`: the value read back is not always one the
+    // setter will accept, and zero means "leave it alone".
+    row.SitePrefixLength = 0;
+    let status = unsafe { SetIpInterfaceEntry(&mut row) };
+    if status != NO_ERROR {
+        return Err(format!(
+            "could not disable IPv6 router discovery on interface {interface_index} (error {status}){}",
+            if status == ERROR_ACCESS_DENIED {
+                "; this needs administrator rights"
+            } else {
+                ""
+            }
+        ));
+    }
+    remove_ipv6_default_routes(interface_index)
+}
+
+/// Deletes every `::/0` route already installed on `interface_index`.
+///
+/// The next hop of an advertised route is a link-local address this process
+/// never sees, so the rows are found by walking the table rather than
+/// reconstructed and deleted by name.
+fn remove_ipv6_default_routes(interface_index: u32) -> Result<(), String> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let status = unsafe { GetIpForwardTable2(AF_INET6, &mut table) };
+    if status != NO_ERROR {
+        return Err(format!(
+            "could not read the IPv6 route table (error {status})"
+        ));
+    }
+    if table.is_null() {
+        return Ok(());
+    }
+    // SAFETY: the call succeeded with a non-null table, so `NumEntries` and
+    // that many `Table` rows are initialised; the trailing array is declared
+    // with one element. The rows are a snapshot, so deleting as we go cannot
+    // disturb the walk.
+    let mut failures = 0_u32;
+    unsafe {
+        let count = (*table).NumEntries as usize;
+        for row in std::slice::from_raw_parts((*table).Table.as_ptr(), count) {
+            if row.InterfaceIndex != interface_index || row.DestinationPrefix.PrefixLength != 0 {
+                continue;
+            }
+            if DeleteIpForwardEntry2(row) != NO_ERROR {
+                failures += 1;
+            }
+        }
+        FreeMibTable(table.cast());
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not remove {failures} IPv6 default route(s) from interface {interface_index}"
+        ))
+    }
 }
 
 /// Builds an on-link route row for `destination/prefix_length` out of
@@ -440,6 +530,73 @@ mod tests {
             elapsed < INTERFACE_READY_TIMEOUT * 2,
             "took {elapsed:?}, far past the deadline"
         );
+    }
+
+    /// The IPv6 sweep has to be safe to run against an interface that has no
+    /// IPv6 default route, which is every interface most of the time.
+    #[test]
+    fn removing_ipv6_default_routes_is_a_no_op_when_there_are_none() {
+        let index = interface_index_for_address(Ipv4Addr::LOCALHOST)
+            .expect("the IPv4 address table should be readable")
+            .expect("127.0.0.1 should be assigned to an interface");
+        assert_eq!(remove_ipv6_default_routes(index), Ok(()));
+    }
+
+    /// And the whole operation has to fail cleanly, not panic, on an interface
+    /// index that does not exist - a RAS adapter can disappear mid-setup.
+    #[test]
+    fn disabling_the_ipv6_default_route_on_a_missing_interface_is_an_error() {
+        assert!(disable_ipv6_default_route(u32::MAX).is_err());
+    }
+
+    /// End to end against a real RAS adapter, which is the only place the
+    /// interesting half runs: a loopback or Ethernet interface never has an
+    /// advertised IPv6 default route to remove. Ignored by default because it
+    /// needs a live L2TP session and changes that adapter's configuration.
+    ///
+    /// `GAMEPATH_IPV6_TEST_IFINDEX=<index> cargo test -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a live L2TP adapter; set GAMEPATH_IPV6_TEST_IFINDEX"]
+    fn a_live_adapter_loses_its_ipv6_default_route() {
+        let index: u32 = std::env::var("GAMEPATH_IPV6_TEST_IFINDEX")
+            .expect("set GAMEPATH_IPV6_TEST_IFINDEX to a connected L2TP adapter")
+            .trim()
+            .parse()
+            .expect("GAMEPATH_IPV6_TEST_IFINDEX must be an interface index");
+        let before = ipv6_default_route_count(index);
+        println!("interface {index}: {before} IPv6 default route(s) before");
+        if let Err(error) = disable_ipv6_default_route(index) {
+            // Both halves of this need administrator rights, which the service
+            // and its engine child have and `cargo test` does not.
+            panic!("{error} -- run this test from an elevated shell");
+        }
+        let after = ipv6_default_route_count(index);
+        println!("interface {index}: {after} IPv6 default route(s) after");
+        assert_eq!(after, 0, "an IPv6 default route survived");
+        // Router discovery is off, so a second advertisement cannot undo it.
+        let row = ip_interface_entry_for(AF_INET6, index).expect("IPv6 interface row");
+        assert_eq!(row.RouterDiscoveryBehavior, RouterDiscoveryDisabled);
+    }
+
+    /// Counts the `::/0` routes on one interface, for the live test to compare.
+    #[cfg(test)]
+    fn ipv6_default_route_count(interface_index: u32) -> usize {
+        let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        if unsafe { GetIpForwardTable2(AF_INET6, &mut table) } != NO_ERROR || table.is_null() {
+            return 0;
+        }
+        let count = unsafe {
+            let entries = (*table).NumEntries as usize;
+            let found = std::slice::from_raw_parts((*table).Table.as_ptr(), entries)
+                .iter()
+                .filter(|row| {
+                    row.InterfaceIndex == interface_index && row.DestinationPrefix.PrefixLength == 0
+                })
+                .count();
+            FreeMibTable(table.cast());
+            found
+        };
+        count
     }
 
     #[test]
