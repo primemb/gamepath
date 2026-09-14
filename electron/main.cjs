@@ -223,6 +223,27 @@ let sessionPollInFlight = false
 let lastRuntimeState = null
 let sessionPollFailures = 0
 
+/**
+ * Loss the session is experiencing right now, from the engine's smoothed
+ * per-path estimate rather than from counters accumulated since it started.
+ *
+ * The dispatcher sends each packet down every selected route at once, so a
+ * packet survives as long as the best of them delivers it. Taking the minimum
+ * rather than multiplying the routes' loss together states that without also
+ * assuming the routes fail independently, which they do not when they share a
+ * last mile.
+ */
+function sessionLossPercent(paths, selectedRoutes) {
+  const live = (path) => (typeof path.lossPercent === 'number' ? path.lossPercent : null)
+  const carrying = paths.filter((path) => selectedRoutes.includes(path.route))
+  // Before the first probe resolves nothing is selected yet; the reachable
+  // routes are still the honest basis for an answer.
+  const considered = (carrying.length ? carrying : paths.filter((path) => path.reachable))
+    .map(live)
+    .filter((value) => value !== null)
+  return considered.length ? Math.min(...considered) : 0
+}
+
 function updateSessionMetrics(runtime, dataPlane) {
   const paths = runtime.paths ?? []
   const fastest = paths
@@ -230,9 +251,6 @@ function updateSessionMetrics(runtime, dataPlane) {
     .sort((left, right) => (left.latencyMs ?? Infinity) - (right.latencyMs ?? Infinity))[0]
   const sent = paths.reduce((total, path) => total + path.packetsSent, 0)
   const received = paths.reduce((total, path) => total + path.packetsReceived, 0)
-  const probesReceived = paths.reduce((total, path) => total + (path.probesReceived ?? 0), 0)
-  const probesLost = paths.reduce((total, path) => total + (path.probesLost ?? 0), 0)
-  const completedProbes = probesReceived + probesLost
   const journey = deriveJourney({
     paths,
     selectedRoutes: runtime.selectedRoutes ?? [],
@@ -272,7 +290,7 @@ function updateSessionMetrics(runtime, dataPlane) {
     bytesReceived: paths.reduce((total, path) => total + path.bytesReceived, 0),
     packetsSent: sent,
     packetsReceived: received,
-    packetLossPercent: completedProbes ? (probesLost / completedProbes) * 100 : 0,
+    packetLossPercent: sessionLossPercent(paths, runtime.selectedRoutes ?? []),
   }
 }
 

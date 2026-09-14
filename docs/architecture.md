@@ -150,6 +150,54 @@ the first leaves several retries of headroom inside the second.
 
 A captured packet is not what leaves the machine, so the tunnel MTU is derived from what the selected transports actually add rather than fixed at a constant. `EffectiveMtu::for_session` costs the outer IPv4/UDP header, the transport's own framing, and — for a relay session — the inner IPv4/UDP datagram, the 40-byte GamePath header and its 16-byte AEAD tag. Relay over WireGuard therefore costs 144 bytes and yields a 1356-byte MTU on a 1500-byte link; direct WireGuard costs 60 and yields 1440. A mixed route set takes the smallest, because the scheduler may move a packet onto any of them. The Wintun adapter is sized from this, and split mode clamps the TCP MSS to `mtu - 40` rather than to a fixed conservative value.
 
+The link MTU is read per endpoint from the route Windows would actually take, because a laptop can have Ethernet, Wi-Fi and a mobile interface up at once.
+
+`MIN_TUNNEL_MTU` (1280) is a hard floor, not a preference: no session is configured below it whatever the link and encapsulation leave room for. 1280 is the minimum every IPv6-capable link must carry, and the size games, engines and middleboxes assume they can send without discovering a path MTU first, so a tunnel advertised under it tends to surface as connection failures rather than as the slower path it ought to be. On a link too narrow to hold the floor plus its encapsulation — a 1280-byte uplink carrying a relay session over L2TP/IPsec, where 200 bytes of encapsulation leave 1080 — the remainder fragments instead. That is the deliberate trade, and it is the less obvious failure of the two, so `EffectiveMtu::below_link_budget` records it and both session-start paths log it rather than letting it appear as unexplained loss.
+
+## Windows network configuration
+
+Interface MTUs, route installation and adapter lookups go through the IP Helper
+API in `engine/src/netconfig.rs`, not through the `Net*` PowerShell cmdlets.
+
+The cmdlets are the obvious way to do this and were the original
+implementation. Each call starts a PowerShell engine plus the CIM/WMI machinery
+the NetTCPIP module sits on, which measures at 850-1000 ms on an ordinary
+desktop — per call, and bringing a session up made several in a row. Dialling
+one L2TP/IPsec node cost five, and the engine looked up a route MTU once per
+tunnel endpoint on top of that. On a three-route session most of the wait to
+connect was process startup rather than anything to do with the network.
+`GetBestRoute2`, `GetUnicastIpAddressTable`, `Get`/`SetIpInterfaceEntry` and
+`Create`/`DeleteIpForwardEntry2` answer the same questions from the same tables
+in microseconds, so this is a substitution rather than a change of behaviour.
+Creating the Windows VPN profile is the one thing still done through PowerShell,
+because `Add-VpnConnection` has no public API.
+
+**One of those delays was load-bearing.** A Wintun adapter is configured
+immediately after it is created, and the `Set-NetIPInterface` call that did it
+was slow enough to cover the gap before Windows finished binding the new adapter
+to TCP/IP. Reading the interface row directly can now arrive first and fail,
+which would break session start — most visibly on the first session after an
+install or a reboot, when the adapter is genuinely new. So
+`configure_tunnel_interface` waits for the row with a stated deadline. Removing
+an accidental delay means restoring it deliberately wherever something quietly
+depended on it.
+
+Route MTU lookups are cached for `ROUTE_MTU_TTL`. The cache is not there to save
+time any more — a lookup is effectively free — but to bound how long a stale
+answer can survive, and the TTL is chosen from that direction. A cached MTU that
+is too _large_ is the harmful case, fragmenting or dropping every full-size
+packet, and moving from Ethernet to Wi-Fi or onto a phone hotspot produces
+exactly that. So the window is long enough to cover one session start's lookups
+and a quick restart, and no longer. `invalidate_route_mtu_cache` drops it
+outright for anything that knows the uplink changed.
+
+Dialling L2TP/IPsec and starting the privileged engine child do not depend on
+each other, so the service runs them concurrently: RAS negotiation is the long
+pole in bringing a session up, and the child only has to exist before it is
+asked to start the session. A failed dial still joins the thread, because
+`EngineProcess` kills its child when dropped and an orphaned engine would
+outlive the session that failed.
+
 ## Relay and direct sessions
 
 A session runs in one of two modes, chosen by the client and carried through
@@ -180,7 +228,8 @@ Health is judged differently because the evidence differs. A relay session
 exchanges authenticated control frames with a relay it owns, so a silent path
 is a broken path. A userspace direct session's node belongs to a provider and
 answers nothing at the application layer, so the engine sends an ICMP echo
-through the tunnel to `1.1.1.1` every 500 ms and works from two signals:
+through the tunnel to `BENCHMARK_TARGET` every second and works from two
+signals:
 
 - The **WireGuard handshake** says the node is there at all. It is what the
   session waits for at startup, and a peer that has not answered within three
@@ -193,6 +242,13 @@ through the tunnel to `1.1.1.1` every 500 ms and works from two signals:
 A completed handshake is deliberately not treated as lasting proof. It never
 expires on its own, so a node that dies mid-session would otherwise keep
 reporting itself healthy for as long as the process ran.
+
+The echo target is one constant, `gamepath_engine::BENCHMARK_TARGET`, shared by
+this probe, the data-plane benchmark and the L2TP direct-mode DNS probe. The
+only requirement of it is that it answers from wherever a user connects, and
+that is a stricter requirement than it sounds: it was `1.1.1.1`, which several
+national filters blackhole or hijack outright, so a perfectly healthy tunnel
+measured as silent for the users behind them. It is `8.8.8.8`.
 
 Some providers filter ICMP while routing everything else perfectly. If no echo
 is ever answered, the engine stops asking after three attempts and stops
@@ -231,9 +287,11 @@ keep wildcard DNS sets correlated with processes, so those selectors are
 rejected with an actionable error; users can choose all-traffic mode or a
 WireGuard/OpenVPN direct node for them. Exact hostname routes are refreshed
 when the live target set is applied again. The service sets the RAS interface to
-a 1384-byte MTU, then probes a public DNS endpoint with an interface-pinned UDP
-socket. This measures startup and live data-plane latency without installing a
-hidden route; three consecutive failures mark the route degraded. IPv6 exposure
+the MTU derived from the uplink route it measured before dialling — 1384 bytes
+on an ordinary 1500-byte link, and never below the 1280-byte floor — then probes
+`BENCHMARK_TARGET` on port 53 with an interface-pinned UDP socket. This measures
+startup and live data-plane latency without installing a hidden route; three
+consecutive failures mark the route degraded. IPv6 exposure
 is derived from the interface selected for a public IPv6 destination, so the
 result distinguishes traffic carried by RAS from traffic bypassing it. The RAS
 connection remains protected by the same service lease.
@@ -278,6 +336,21 @@ The scheduler still sees the first loss immediately through `record_loss`, so a
 path that begins dropping packets is de-prioritised by its score straight away.
 The threshold governs only the harder decision to stop using the path at all,
 and two in a row is reached inside four seconds.
+
+### Reported loss is current, not cumulative
+
+The loss figure a route publishes is `PathMetrics::loss_ratio` — the smoothed
+estimate the scheduler scores with — exposed per path as `lossPercent`.
+
+The client used to compute it instead from the session's lifetime
+`probesLost`/`probesReceived` counters, which answer a different question. Those
+counters never forget, so one bad minute keeps reading as steady-state loss for
+as long as the session runs, decaying only as the session ages around it. A
+route that lost 45 probes during a 40-second stall at startup and nothing since
+was still reporting about 20% loss several minutes later, while the scheduler's
+own view of that route — the number deciding whether it carried traffic — was
+0%. Those two should not be able to disagree, so both now read the same
+estimate. The raw counters are still reported, as counters.
 
 ### The deadline floor depends on the transport
 
@@ -402,7 +475,7 @@ outage worse:
 
 This is a game client, so recovery is timed to be fast rather than merely safe.
 A path that misses a probe switches to `PROBE_INTERVAL_DEGRADED`, so a route
-that comes back is noticed in milliseconds instead of at the healthy half-second
+that comes back is noticed in milliseconds instead of at the healthy one-second
 cadence. The first redial of a path judged dead waits for nothing at all — by
 then it has missed several probes in a row _and_ another path is up, so the
 uplink is known good and there is nothing to gain by pausing. Only subsequent

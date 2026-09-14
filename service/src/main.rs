@@ -13,6 +13,7 @@ fn main() -> windows_service::Result<()> {
 mod gamepath_service {
     use gamepath_engine::l2tp::L2tpRuntime;
     use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU};
+    use gamepath_engine::netconfig;
     use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
     use gamepath_engine::relay_path::{NodeSpec, SessionMode};
     use gamepath_engine::transport::bind_to_interface;
@@ -326,53 +327,15 @@ mod gamepath_service {
     }
 
     fn l2tp_interface_index(local_address: Ipv4Addr) -> Result<u32, String> {
-        let script = format!(
-            "$a=Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop|Where-Object {{$_.IPAddress -eq '{local_address}'}}|Select-Object -First 1 -ExpandProperty InterfaceIndex;if($null -eq $a){{exit 2}};[Console]::Out.Write($a)"
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let output = Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                .stdin(Stdio::null())
-                .output()
-                .map_err(|error| format!("could not inspect the L2TP adapter: {error}"))?;
-            if output.status.success() {
-                return String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .parse()
-                    .map_err(|_| "Windows returned an invalid L2TP adapter index".into());
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        Err(format!(
-            "Windows connected L2TP and assigned {local_address}, but its network adapter did not become ready"
-        ))
+        netconfig::wait_for_interface_index(local_address, Duration::from_secs(5))
+            .map_err(|error| format!("could not inspect the L2TP adapter: {error}"))
     }
 
     fn configure_l2tp_mtu(interface_index: u32, desired: u16) -> Result<u16, String> {
-        let script = format!(
-            "$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -ErrorAction Stop;if($i.NlMtu-ne {desired}){{Set-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -NlMtuBytes {desired} -ErrorAction Stop;$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -ErrorAction Stop}};[Console]::Out.Write($i.NlMtu)"
-        );
-        let output = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .stdin(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .output()
+        let actual = netconfig::set_interface_mtu(interface_index, desired)
             .map_err(|error| format!("could not configure the L2TP MTU: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "Windows could not configure a safe L2TP MTU: {}",
-                String::from_utf8_lossy(&output.stderr)
-                    .lines()
-                    .next()
-                    .unwrap_or("MTU configuration failed")
-                    .trim()
-            ));
-        }
-        let actual = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u16>()
-            .map_err(|_| "Windows returned an invalid L2TP MTU".to_owned())?;
+        let actual =
+            u16::try_from(actual).map_err(|_| "Windows returned an invalid L2TP MTU".to_owned())?;
         if actual != desired {
             return Err(format!(
                 "Windows kept the L2TP MTU at {actual}; GamePath needs {desired} to prevent nested-tunnel fragmentation"
@@ -386,26 +349,8 @@ mod gamepath_service {
     /// lookup is intentionally non-fatal; callers retain the 1500-byte safe
     /// fallback so users on older Windows builds can still connect.
     fn route_link_mtu(destination: Ipv4Addr) -> Result<u16, String> {
-        let script = format!(
-            "$r=Find-NetRoute -RemoteIPAddress '{destination}' -ErrorAction Stop|Select-Object -First 1;if($null-eq $r){{throw 'no route'}};$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $r.InterfaceIndex -ErrorAction Stop;[Console]::Out.Write($i.NlMtu)"
-        );
-        let output = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .stdin(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .output()
-            .map_err(|error| format!("could not inspect route MTU for {destination}: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "could not inspect route MTU for {destination}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let reported = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u16>()
-            .map_err(|_| format!("Windows returned an invalid route MTU for {destination}"))?;
-        Ok(gamepath_engine::mtu::normalize_link_mtu(reported))
+        netconfig::route_link_mtu(destination)
+            .map_err(|error| format!("could not inspect route MTU for {destination}: {error}"))
     }
 
     fn l2tp_server_ipv4(server: &str) -> Result<Ipv4Addr, String> {
@@ -585,25 +530,9 @@ mod gamepath_service {
                 // Non-elevated live-test fallback owns the default route.
                 return Ok(());
             }
-            let script = format!(
-                "Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceIndex {} -ErrorAction SilentlyContinue|Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;New-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceIndex {} -NextHop '0.0.0.0' -RouteMetric 1 -ErrorAction Stop|Out-Null",
-                self.interface_index, self.interface_index
-            );
-            let output = Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                .stdin(Stdio::null())
-                .output()
+            let (destination, length) = split_ipv4_prefix(prefix)?;
+            netconfig::add_route(destination, length, self.interface_index)
                 .map_err(|error| format!("could not add the L2TP route: {error}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "Windows could not route traffic through L2TP: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                        .lines()
-                        .next()
-                        .unwrap_or("route creation failed")
-                        .trim()
-                ));
-            }
             if !self.routes.iter().any(|route| route == prefix) {
                 self.routes.push(prefix.to_owned());
             }
@@ -612,17 +541,11 @@ mod gamepath_service {
 
         fn remove_routes(&mut self) {
             for prefix in self.routes.drain(..) {
-                let script = format!(
-                    "Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceIndex {} -ErrorAction SilentlyContinue|Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue",
-                    self.interface_index
-                );
-                let _ = Command::new("powershell.exe")
-                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .creation_flags(0x0800_0000)
-                    .status();
+                // The prefix was parsed before it was ever installed, so a
+                // failure here would mean it was never a route to begin with.
+                if let Ok((destination, length)) = split_ipv4_prefix(&prefix) {
+                    netconfig::remove_route(destination, length, self.interface_index);
+                }
             }
         }
 
@@ -708,6 +631,23 @@ mod gamepath_service {
             sessions.push(session);
         }
         Ok(sessions)
+    }
+
+    /// Splits an `a.b.c.d/len` prefix into the pair the routing API takes.
+    fn split_ipv4_prefix(value: &str) -> Result<(Ipv4Addr, u8), String> {
+        let (address, length) = value
+            .split_once('/')
+            .ok_or_else(|| format!("invalid IPv4 route: {value}"))?;
+        let address: Ipv4Addr = address
+            .parse()
+            .map_err(|_| format!("invalid IPv4 route: {value}"))?;
+        let length: u8 = length
+            .parse()
+            .map_err(|_| format!("invalid IPv4 route: {value}"))?;
+        if length > 32 {
+            return Err(format!("invalid IPv4 route: {value}"));
+        }
+        Ok((address, length))
     }
 
     fn canonical_ipv4_prefix(value: &str) -> Result<String, String> {
@@ -815,7 +755,7 @@ mod gamepath_service {
                 .set_write_timeout(Some(timeout))
                 .map_err(|error| error.to_string())?;
             socket
-                .connect(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53))
+                .connect(SocketAddrV4::new(gamepath_engine::BENCHMARK_TARGET, 53))
                 .map_err(|error| error.to_string())?;
             // A standard recursive A query for the DNS root. The fixed ID is
             // checked in the response; no name or user data leaves the host.
@@ -912,6 +852,10 @@ mod gamepath_service {
                 "probesSent": 1,
                 "probesReceived": if reachable { 1 } else { 0 },
                 "probesLost": if reachable { 0 } else { 1 },
+                // Native L2TP routing is polled one probe at a time rather
+                // than by a worker keeping an EWMA, so the latest probe is the
+                // whole of what is currently known about loss.
+                "lossPercent": if reachable { 0.0 } else { 100.0 },
                 "lastError": Value::Null,
             }],
             "skippedRoutes": [],
@@ -927,7 +871,7 @@ mod gamepath_service {
         let data_plane = json!({
             "reachable": reachable,
             "latencyMs": latency_ms,
-            "benchmarkServer": "1.1.1.1",
+            "benchmarkServer": gamepath_engine::BENCHMARK_TARGET.to_string(),
             "relayToServerMs": Value::Null,
         });
         let ipv6 = l2tp_ipv6_exposure(session);
@@ -1472,10 +1416,30 @@ mod gamepath_service {
             log_event("native Windows L2TP direct routing started");
             return Ok(json!({ "paths": paths, "dataPlane": data_plane, "capture": capture }));
         }
-        let l2tp_sessions = connect_l2tp_nodes(&mut nodes, relay_address, true)?;
+        // Starting the engine child and dialling L2TP do not depend on each
+        // other, and the dial is the long pole in bringing a session up: IKE
+        // negotiation plus waiting for the RAS adapter to appear takes seconds
+        // during which the engine would not even have been spawned yet. The
+        // child only has to exist before it is asked to start the session, so
+        // the two run together and the session begins roughly one of them
+        // sooner.
+        let engine_start = thread::spawn(EngineProcess::start);
+        let l2tp_sessions = match connect_l2tp_nodes(&mut nodes, relay_address, true) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                // `EngineProcess` kills its child when dropped, so collecting
+                // the thread here is what stops a failed dial from leaving an
+                // orphaned engine behind.
+                drop(engine_start.join());
+                return Err(error);
+            }
+        };
         payload["nodes"] = serde_json::to_value(&nodes)
             .map_err(|error| format!("could not prepare L2TP runtime: {error}"))?;
-        let mut engine = EngineProcess::start().inspect_err(|error| log_event(error))?;
+        let mut engine = engine_start
+            .join()
+            .map_err(|_| "the native engine panicked while starting".to_owned())?
+            .inspect_err(|error| log_event(error))?;
         log_event("native engine child ready");
         let paths = engine
             .request("start-wireguard-session", payload)

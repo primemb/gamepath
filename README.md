@@ -117,7 +117,9 @@ adaptive scheduler proactively duplicates sealed packets across the two best
 suitable routes, so backup copies are already travelling when a path fails.
 Latency, jitter, and probe loss affect selection; a severely slower backup or
 substantial degradation on both candidates reduces outbound traffic to one
-route. Other enabled paths keep probing and can replace a failed route.
+route. The latency and loss shown for a route are current smoothed measures
+rather than session averages, so a route that had a bad minute and recovered
+reads as recovered. Other enabled paths keep probing and can replace a failed route.
 The first authenticated copy wins in each direction, without waiting for the
 other paths. Return copies are deduplicated before entering the client queue;
 a reply can still rescue a lost packet even if its path is no longer selected
@@ -158,7 +160,8 @@ wildcard-hostname and IPv6 split targets are not supported. Use all-traffic mode
 or a WireGuard/OpenVPN node for the application, folder and wildcard-hostname
 selectors.
 
-The service sets the L2TP interface MTU to 1384 bytes before traffic starts and
+The service derives the L2TP interface MTU from the uplink route before traffic
+starts — 1384 bytes on an ordinary 1500-byte link, and never below 1280 — and
 uses an interface-pinned DNS probe for live latency and loss. The probe requires
 no permanent route of its own, so direct split mode carries only the targets the
 user selected. IPv6 diagnostics follow the machine's preferred public IPv6

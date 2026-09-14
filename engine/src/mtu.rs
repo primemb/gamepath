@@ -15,9 +15,16 @@ use crate::relay_path::SessionMode;
 /// the Windows route that actually reaches the selected tunnel endpoint.
 pub const LINK_MTU: u16 = 1500;
 
-/// Preferred lower bound for a game tunnel. If an unusually constrained link
-/// cannot accommodate this after encapsulation, preserving a fitting packet is
-/// safer than advertising a larger MTU and forcing fragmentation.
+/// Hard lower bound for a game tunnel. No session is configured below this,
+/// whatever the link and encapsulation leave room for.
+///
+/// 1280 is the minimum every IPv6-capable link must carry, and the figure
+/// games, engines and middleboxes assume they can send without discovering a
+/// path MTU first. A tunnel advertised under it fits its own link but breaks
+/// that assumption, which surfaces as connection failures rather than as the
+/// slow path it ought to be. On a link too narrow to hold the floor plus its
+/// encapsulation the remainder fragments, and
+/// [`EffectiveMtu::below_link_budget`] records that so it can be logged.
 pub const MIN_TUNNEL_MTU: u16 = 1280;
 
 /// Makes an OS-reported link MTU safe to use as an Internet packet budget.
@@ -102,6 +109,15 @@ pub fn relay_tun_mtu(link_mtu: u16) -> u16 {
 pub struct EffectiveMtu {
     pub mtu: u16,
     pub overhead: u16,
+    /// Set when [`MIN_TUNNEL_MTU`] had to be held above what the link and the
+    /// encapsulation actually leave room for.
+    ///
+    /// The tunnel is still configured at the floor, because that is the
+    /// contract, but on such a link a full-size packet has to fragment to get
+    /// out. That is worth saying out loud in a log rather than discovering as
+    /// unexplained loss, so the decision is recorded here instead of being
+    /// silently absorbed by the clamp.
+    pub below_link_budget: bool,
 }
 
 impl EffectiveMtu {
@@ -118,19 +134,31 @@ impl EffectiveMtu {
             .map(|kind| path_overhead_bytes(mode, kind))
             .max()
             .unwrap_or_else(|| path_overhead_bytes(mode, ""));
-        // A path below the preferred 1280-byte tunnel floor is rare, but it
-        // exists on nested/mobile links. Its real budget is still better than
-        // a nominal 1280 that fragments every large game packet.
-        let mtu = link_mtu.saturating_sub(overhead);
-        Self { mtu, overhead }
+        let budget = link_mtu.saturating_sub(overhead);
+        // [`MIN_TUNNEL_MTU`] is a floor, not a preference: no session is ever
+        // configured below it. Nested and mobile links can leave less than
+        // that after encapsulation, and the alternative - advertising the
+        // smaller real budget - hands games an MTU under the 1280 bytes IPv6
+        // requires every link to carry, which breaks more than the
+        // fragmentation this costs.
+        let mtu = budget.max(MIN_TUNNEL_MTU);
+        Self {
+            mtu,
+            overhead,
+            below_link_budget: mtu > budget,
+        }
     }
 
     /// Applies the lower inner-MTU requested by a provider configuration.
     /// The transport overhead is deliberately retained: it describes the
     /// selected transport, while this cap describes the provider's tunnel.
     pub fn with_tunnel_limit(self, configured: Option<u16>) -> Self {
+        // `configured_tunnel_mtu` already rejects anything under the floor;
+        // the clamp restates it so the invariant holds at the one place that
+        // can otherwise lower `mtu` after construction.
         let mtu = configured_tunnel_mtu(configured.unwrap_or(LINK_MTU))
-            .map_or(self.mtu, |limit| self.mtu.min(limit));
+            .map_or(self.mtu, |limit| self.mtu.min(limit))
+            .max(MIN_TUNNEL_MTU);
         Self { mtu, ..self }
     }
 
@@ -208,11 +236,52 @@ mod tests {
         assert!(relay < 1380);
     }
 
+    /// The floor wins on a link that cannot hold it, and says so rather than
+    /// quietly handing back a tunnel under 1280.
     #[test]
-    fn a_small_link_keeps_packets_within_the_real_budget() {
+    fn a_small_link_is_held_at_the_floor_and_flagged() {
         let mtu = EffectiveMtu::for_session(SessionMode::Relay, ["openvpn"], 1280);
-        assert_eq!(mtu.mtu, 1108);
-        assert_eq!(u32::from(mtu.mtu) + u32::from(mtu.overhead), 1280);
+        assert_eq!(mtu.mtu, MIN_TUNNEL_MTU);
+        assert!(mtu.below_link_budget);
+        // The cost of the floor, which is what the flag exists to let a caller
+        // report: this much of every full-size packet has to fragment.
+        assert!(u32::from(mtu.mtu) + u32::from(mtu.overhead) > 1280);
+    }
+
+    /// A link with room to spare is untouched by the floor, and is not
+    /// flagged as if it were constrained.
+    #[test]
+    fn a_roomy_link_keeps_its_real_budget_and_is_not_flagged() {
+        let mtu = EffectiveMtu::for_session(SessionMode::Relay, ["openvpn"], LINK_MTU);
+        assert!(mtu.mtu > MIN_TUNNEL_MTU);
+        assert!(!mtu.below_link_budget);
+        assert_eq!(
+            u32::from(mtu.mtu) + u32::from(mtu.overhead),
+            u32::from(LINK_MTU)
+        );
+    }
+
+    /// The invariant the whole change is for, across every transport, every
+    /// mode, and every link MTU the normaliser can produce.
+    #[test]
+    fn no_session_is_ever_configured_below_the_floor() {
+        for link in [0_u16, 576, 1000, 1280, 1400, 1492, 1500, 9000, u16::MAX] {
+            for mode in [SessionMode::Relay, SessionMode::Direct] {
+                for kind in ["wireguard", "openvpn", "socks5", "l2tp", "something-new"] {
+                    let mtu = EffectiveMtu::for_session(mode, [kind], link);
+                    assert!(
+                        mtu.mtu >= MIN_TUNNEL_MTU,
+                        "{kind} on a {link}-byte link produced {}",
+                        mtu.mtu
+                    );
+                    // A provider cap must not be able to duck under it either.
+                    for configured in [None, Some(0), Some(1279), Some(1280), Some(1400)] {
+                        assert!(mtu.with_tunnel_limit(configured).mtu >= MIN_TUNNEL_MTU);
+                    }
+                }
+            }
+        }
+        assert!(relay_tun_mtu(1280) >= MIN_TUNNEL_MTU);
     }
 
     #[test]

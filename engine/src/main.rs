@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use gamepath_engine::adapter::inspect_library;
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
-use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU, normalize_link_mtu};
+use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU};
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::relay_path::{
     DirectPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
@@ -168,6 +168,16 @@ struct PathSessionStatus {
     probes_sent: u64,
     probes_received: u64,
     probes_lost: u64,
+    /// Current probe loss, as the smoothed ratio the scheduler actually acts
+    /// on, in percent.
+    ///
+    /// The lifetime `probes_lost`/`probes_received` counters above cannot
+    /// answer "is this path lossy *now*": they never forget, so a single bad
+    /// minute at startup keeps showing as steady-state loss for as long as the
+    /// session runs, decaying only as the session ages. This is the same EWMA
+    /// that feeds [`PathMetrics::score`], so what the user sees and what the
+    /// scheduler believes cannot drift apart.
+    loss_percent: f64,
     last_error: Option<String>,
 }
 
@@ -974,6 +984,7 @@ impl WireGuardSessionManager {
             effective_mtu.overhead,
             skipped_routes.len()
         );
+        warn_if_below_link_budget(effective_mtu, link_mtu);
         self.active = Some(ActiveWireGuardSession {
             mode: SessionMode::Relay,
             strategy,
@@ -1065,6 +1076,7 @@ impl WireGuardSessionManager {
             })
             .map_err(|error| format!("could not start path worker: {error}"))?;
         let mut workers = vec![worker];
+        warn_if_below_link_budget(effective_mtu, link_mtu);
         workers.extend(spawn_uplink_monitor(&stop, &telemetry));
         workers.extend(spawn_session_summary(
             session_id,
@@ -1159,7 +1171,7 @@ impl WireGuardSessionManager {
             .as_ref()
             .ok_or("start the WireGuard session before probing its data plane")?;
         let (virtual_ipv4, mode) = (session.virtual_ipv4, session.mode);
-        let benchmark_server = std::net::Ipv4Addr::new(1, 1, 1, 1);
+        let benchmark_server = gamepath_engine::BENCHMARK_TARGET;
         let identifier = rand::random::<u16>();
         let request = icmp_echo_packet(virtual_ipv4, benchmark_server, identifier, 1, false);
         let started = Instant::now();
@@ -1365,7 +1377,14 @@ impl WireGuardSessionManager {
         let Some(session) = &self.active else {
             return json!({ "state": "idle", "paths": [] });
         };
-        let paths = session.paths.lock().unwrap().clone();
+        let mut paths = session.paths.lock().unwrap().clone();
+        let scheduler_metrics = session.scheduler_metrics.lock().unwrap().clone();
+        // The workers own these two structures separately, so the live loss
+        // estimate is joined onto the path status here rather than written on
+        // the hot path under a second lock.
+        for (path, metric) in paths.iter_mut().zip(scheduler_metrics.iter()) {
+            path.loss_percent = metric.loss_ratio * 100.0;
+        }
         let decision = session.decision_mask.load(Ordering::Acquire);
         let healthy = session.telemetry.healthy_mask.load(Ordering::Acquire);
         // What the dispatcher will actually use. Reporting the raw pick would
@@ -1382,7 +1401,6 @@ impl WireGuardSessionManager {
             .filter(|path| !path.reachable)
             .map(|path| path.route)
             .collect::<Vec<_>>();
-        let scheduler_metrics = session.scheduler_metrics.lock().unwrap().clone();
         let path_worker_iterations = session
             .telemetry
             .iterations
@@ -1799,21 +1817,7 @@ fn run_wintun_downlink(
 
 #[cfg(windows)]
 fn configure_tunnel_interface(interface_index: u32, mtu: u16) -> Result<(), String> {
-    let script = format!(
-        "Set-NetIPInterface -InterfaceIndex {interface_index} -AddressFamily IPv4 -DadTransmits 0 -AutomaticMetric Disabled -InterfaceMetric 5 -NlMtuBytes {mtu} -ErrorAction Stop"
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|error| format!("could not configure GamePath interface: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "could not configure GamePath interface: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+    gamepath_engine::netconfig::configure_tunnel_interface(interface_index, mtu)
 }
 
 /// Returns the physical-interface MTU Windows selected for an already
@@ -1821,24 +1825,25 @@ fn configure_tunnel_interface(interface_index: u32, mtu: u16) -> Result<(), Stri
 /// can have Ethernet, Wi-Fi and a mobile interface active at the same time.
 #[cfg(windows)]
 fn route_link_mtu(destination: std::net::Ipv4Addr) -> Result<u16, String> {
-    let script = format!(
-        "$r=Find-NetRoute -RemoteIPAddress '{destination}' -ErrorAction Stop|Select-Object -First 1;if($null-eq $r){{throw 'no route'}};$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $r.InterfaceIndex -ErrorAction Stop;[Console]::Out.Write($i.NlMtu)"
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|error| format!("could not inspect route MTU for {destination}: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "could not inspect route MTU for {destination}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    gamepath_engine::netconfig::route_link_mtu(destination)
+        .map_err(|error| format!("could not inspect route MTU for {destination}: {error}"))
+}
+
+/// Says so when the 1280-byte tunnel floor had to be held above what the link
+/// leaves after encapsulation.
+///
+/// The session still runs, because the floor is not negotiable, but on such a
+/// link full-size packets fragment, and that would otherwise surface as
+/// latency and loss with nothing in the log to explain it.
+fn warn_if_below_link_budget(effective_mtu: EffectiveMtu, link_mtu: u16) {
+    if effective_mtu.below_link_budget {
+        log_warn!(
+            "a {link_mtu}-byte uplink leaves {} bytes after {} bytes of encapsulation, under the {}-byte tunnel floor; holding the floor, so full-size packets fragment on this link",
+            link_mtu.saturating_sub(effective_mtu.overhead),
+            effective_mtu.overhead,
+            effective_mtu.mtu,
+        );
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u16>()
-        .map(normalize_link_mtu)
-        .map_err(|_| format!("Windows returned an invalid route MTU for {destination}"))
 }
 
 /// Uses the tightest successfully inspected endpoint route. Discovery is an
@@ -1976,6 +1981,7 @@ fn initial_status(
         probes_sent: 0,
         probes_received: 0,
         probes_lost: 0,
+        loss_percent: 0.0,
         last_error: None,
     }
 }
@@ -2038,7 +2044,7 @@ fn ipv6_exposure() -> Value {
 
 /// Where a direct session's latency probe is aimed. A public resolver that
 /// answers echo requests, reached through the node like any game server.
-const DIRECT_PROBE_TARGET: std::net::Ipv4Addr = std::net::Ipv4Addr::new(1, 1, 1, 1);
+const DIRECT_PROBE_TARGET: std::net::Ipv4Addr = gamepath_engine::BENCHMARK_TARGET;
 
 /// Carries a direct session's traffic through its single node.
 ///

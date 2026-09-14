@@ -141,6 +141,12 @@ export type PathMetric = {
   probesSent?: number
   probesReceived?: number
   probesLost?: number
+  /**
+   * Current probe loss as a percentage, smoothed by the engine. Unlike the
+   * lifetime `probesLost`/`probesReceived` counters it decays, so a path that
+   * has recovered stops reporting the loss it once had.
+   */
+  lossPercent?: number
   lastError: string | null
 }
 

@@ -432,10 +432,9 @@ const jitter = (samples: PathSample[]) =>
     ? 0
     : samples.slice(1).reduce((total, sample, index) => total + Math.abs(sample.latency - samples[index].latency), 0) /
       (samples.length - 1)
-const pathLoss = (path: PathMetric) => {
-  const completed = (path.probesReceived ?? 0) + (path.probesLost ?? 0)
-  return completed ? ((path.probesLost ?? 0) / completed) * 100 : 0
-}
+// The engine's smoothed estimate, not a lifetime average: a route that lost
+// probes at startup and has been clean since should read clean.
+const pathLoss = (path: PathMetric) => path.lossPercent ?? 0
 const formatRate = (bytesPerSecond: number | undefined) => `${formatBytes(bytesPerSecond)}/s`
 const histogramPercentile = (
   buckets: Array<{ upperBoundUs: number | null; count: number }> | undefined,

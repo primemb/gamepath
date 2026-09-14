@@ -346,6 +346,7 @@ export const mockApi: GamePathApi = {
                 probesSent: 12,
                 probesReceived: 12,
                 probesLost: 0,
+                lossPercent: 0,
                 lastError: null,
               },
               {
@@ -364,6 +365,7 @@ export const mockApi: GamePathApi = {
                 probesSent: 12,
                 probesReceived: 11,
                 probesLost: 1,
+                lossPercent: 1.8,
                 lastError: null,
               },
             ],
@@ -416,12 +418,12 @@ export const mockApi: GamePathApi = {
               nodeToRelayMs: 17,
               relayToServerMs: 9,
               endToEndMs: 48,
-              benchmarkServer: '1.1.1.1',
+              benchmarkServer: '8.8.8.8',
               bytesSent: 296640,
               bytesReceived: 464820,
               packetsSent: 256,
               packetsReceived: 253,
-              packetLossPercent: 1.17,
+              packetLossPercent: 0,
             },
           }
         : { status: 'error', message: 'The Istanbul relay needs its server component and address.' }

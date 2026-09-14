@@ -150,20 +150,7 @@ fn runtime_is_active(runtime: &L2tpRuntime) -> bool {
 
 #[cfg(windows)]
 fn adapter_address_is_active(interface_index: u32, local_address: Ipv4Addr) -> bool {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    let script = format!(
-        "if(Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex {} -IPAddress '{}' -ErrorAction SilentlyContinue){{exit 0}}else{{exit 1}}",
-        interface_index, local_address
-    );
-    Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(0x0800_0000)
-        .status()
-        .is_ok_and(|status| status.success())
+    crate::netconfig::address_is_active(interface_index, local_address)
 }
 
 #[cfg(not(windows))]
@@ -248,7 +235,9 @@ struct OwnedRasConnection {
     handle: windows_sys::Win32::NetworkManagement::Rras::HRASCONN,
     local_address: Ipv4Addr,
     interface_index: u32,
-    relay_prefix: Option<String>,
+    /// The relay this connection installed a host route for, so the route can
+    /// be withdrawn again when the connection goes away.
+    relay: Option<Ipv4Addr>,
 }
 
 #[cfg(windows)]
@@ -278,8 +267,8 @@ impl Drop for OwnedRasConnection {
             std::thread::sleep(Duration::from_millis(50));
         }
         if !adapter_address_is_active(self.interface_index, self.local_address) {
-            if let Some(prefix) = &self.relay_prefix {
-                remove_route(prefix, self.interface_index);
+            if let Some(relay) = self.relay {
+                crate::netconfig::remove_route(relay, 32, self.interface_index);
             }
         }
     }
@@ -292,9 +281,6 @@ fn redial_ras(
     password: &str,
     relay: SocketAddrV4,
 ) -> Result<OwnedRasConnection, String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
     use windows_sys::Win32::NetworkManagement::Rras::{
         HRASCONN, RASDIALPARAMSW, RASP_PppIp, RASPPPIPW, RasDialW, RasGetProjectionInfoW,
         RasHangUpW,
@@ -349,7 +335,7 @@ fn redial_ras(
         handle,
         local_address: Ipv4Addr::UNSPECIFIED,
         interface_index: 0,
-        relay_prefix: None,
+        relay: None,
     };
     let mut projection: RASPPPIPW = unsafe { std::mem::zeroed() };
     projection.dwSize = std::mem::size_of::<RASPPPIPW>() as u32;
@@ -377,86 +363,25 @@ fn redial_ras(
     }
     let local_address = local_address.unwrap();
     owned.local_address = local_address;
-    let script = format!(
-        "$d=(Get-Date).AddSeconds(5);do{{$i=Get-NetIPAddress -AddressFamily IPv4 -IPAddress '{local_address}' -ErrorAction SilentlyContinue|Select-Object -First 1 -ExpandProperty InterfaceIndex;if($null-ne $i){{[Console]::Out.Write($i);exit 0}};Start-Sleep -Milliseconds 100}}while((Get-Date)-lt$d);exit 2"
-    );
-    let started = Instant::now();
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .stdin(Stdio::null())
-        .creation_flags(0x0800_0000)
-        .output()
-        .map_err(|error| format!("could not inspect the reconnected L2TP adapter: {error}"))?;
-    if !output.status.success() || started.elapsed() > Duration::from_secs(6) {
-        return Err("the reconnected L2TP adapter did not become ready".into());
-    }
-    let interface_index = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| "Windows returned an invalid L2TP adapter index".to_owned())?;
+    let interface_index =
+        crate::netconfig::wait_for_interface_index(local_address, Duration::from_secs(5))
+            .map_err(|_| "the reconnected L2TP adapter did not become ready".to_owned())?;
     configure_mtu(interface_index, runtime.mtu)?;
-    let relay_prefix = format!("{}/32", relay.ip());
-    add_route(&relay_prefix, interface_index)?;
+    add_route(*relay.ip(), interface_index)?;
     owned.interface_index = interface_index;
-    owned.relay_prefix = Some(relay_prefix);
+    owned.relay = Some(*relay.ip());
     Ok(owned)
 }
 
 #[cfg(windows)]
 fn configure_mtu(interface_index: u32, mtu: u16) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    let script = format!(
-        "Set-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -NlMtuBytes {mtu} -ErrorAction Stop"
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .stdin(Stdio::null())
-        .creation_flags(0x0800_0000)
-        .output()
-        .map_err(|error| format!("could not restore the L2TP MTU after reconnect: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Windows could not restore the L2TP MTU after reconnect: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+    crate::netconfig::set_interface_mtu(interface_index, mtu)
+        .map(|_| ())
+        .map_err(|error| format!("could not restore the L2TP MTU after reconnect: {error}"))
 }
 
 #[cfg(windows)]
-fn add_route(prefix: &str, interface_index: u32) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    let script = format!(
-        "Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceIndex {interface_index} -ErrorAction SilentlyContinue|Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;New-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceIndex {interface_index} -NextHop '0.0.0.0' -RouteMetric 1 -ErrorAction Stop|Out-Null"
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .stdin(Stdio::null())
-        .creation_flags(0x0800_0000)
-        .output()
-        .map_err(|error| format!("could not route the relay through reconnected L2TP: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-    }
-}
-
-#[cfg(windows)]
-fn remove_route(prefix: &str, interface_index: u32) {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    let script = format!(
-        "Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceIndex {interface_index} -ErrorAction SilentlyContinue|Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue"
-    );
-    let _ = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(0x0800_0000)
-        .status();
+fn add_route(relay: Ipv4Addr, interface_index: u32) -> Result<(), String> {
+    crate::netconfig::add_route(relay, 32, interface_index)
+        .map_err(|error| format!("could not route the relay through reconnected L2TP: {error}"))
 }
