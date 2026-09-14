@@ -143,6 +143,39 @@ export const mockApi: GamePathApi = {
       latencyMs: 41,
     }
   },
+  addL2tpNode: async (input) => {
+    const node = {
+      id: crypto.randomUUID(),
+      kind: 'l2tp' as const,
+      name: input.label?.trim() || input.server,
+      endpoint: input.server,
+      host: input.server,
+      address: 'Assigned when connected',
+      dns: 'Provider assigned',
+      enabled: true,
+      importedAt: new Date().toISOString(),
+      hasPrivateKey: true,
+      hasCredentials: true,
+    }
+    state.tunnels.push(node)
+    return { state: snapshot(), nodeId: node.id }
+  },
+  testL2tpNode: async (input) => ({
+    reachable: true,
+    server: input.server,
+    assignedIpv4: '10.10.10.2',
+    interfaceIndex: 42,
+    setupLatencyMs: 240,
+    dataLatencyMs: 48,
+  }),
+  testSavedL2tpNode: async (id) => ({
+    reachable: true,
+    server: state.tunnels.find((item) => item.id === id)?.endpoint ?? '',
+    assignedIpv4: '10.10.10.2',
+    interfaceIndex: 42,
+    setupLatencyMs: 240,
+    dataLatencyMs: 48,
+  }),
   setTunnelEnabled: async (id, enabled) => {
     // Direct mode picks one node rather than pooling several.
     const exclusive = state.connectionMode === 'direct' && enabled

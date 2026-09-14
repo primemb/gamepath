@@ -3,8 +3,8 @@
 **Bring your own VPN configs. Choose your apps. Keep your routes working together.**
 
 GamePath is an early-stage Windows gaming tunnel client built with Electron, React,
-and Rust. Import WireGuard, OpenVPN (TCP or UDP), or UDP-capable SOCKS5 nodes and
-choose which apps use them. Use a single WireGuard or OpenVPN node directly, or
+and Rust. Import WireGuard, OpenVPN (TCP or UDP), L2TP/IPsec, or UDP-capable SOCKS5 nodes and
+choose which apps use them. Use one VPN node directly, or
 combine paths through an authenticated relay on your own Debian or Ubuntu VPS.
 
 [Download releases](https://github.com/primemb/gamepath/releases) |
@@ -14,7 +14,7 @@ combine paths through an authenticated relay on your own Debian or Ubuntu VPS.
 ## Get started
 
 1. Install the Windows x64 installer from Releases, when available.
-2. Import a WireGuard or OpenVPN config. For SOCKS5, use a proxy with working
+2. Import a WireGuard or OpenVPN config, or add an L2TP/IPsec login. For SOCKS5, use a proxy with working
    `UDP ASSOCIATE` support and select relay mode.
 3. Choose **Direct** for one tunnelling node without a VPS, or **Relay** to use
    multiple nodes with a VPS you control.
@@ -57,7 +57,7 @@ administrator access at launch. Its uninstaller removes the Windows service,
 privileged runtime, control token, routes, and local app data. Settings includes
 a manual service reinstall action for repair.
 
-Imported WireGuard configuration bodies and SOCKS5 proxy passwords are encrypted with Electron `safeStorage`, backed by Windows cryptography. Only non-secret metadata is sent to the renderer.
+Imported VPN configurations, L2TP/IPsec pre-shared keys and login passwords, and SOCKS5 proxy passwords are encrypted with Electron `safeStorage`, backed by Windows cryptography. Only non-secret metadata is sent to the renderer.
 
 To copy the privileged runtime without starting packet capture, use `deploy\install-windows-service.ps1 -LeaveStopped`. Running the installer from Settings installs and starts the service normally.
 
@@ -74,11 +74,12 @@ cargo test --locked --manifest-path relay/Cargo.toml
 
 - Import any number of WireGuard `.conf` files.
 - Import any number of OpenVPN `.ovpn` files, over UDP or TCP, and run several at once without an adapter or a driver.
+- Add L2TP/IPsec nodes backed by the native Windows RAS client, and test the real connection before saving.
 - Add any number of SOCKS5 proxy nodes, alone or beside WireGuard routes, and test each one for real UDP support before saving it.
 - Enable, disable, and remove individual routes.
 - Choose all-system traffic or split-tunnel rules.
 - Add split rules for executables, folders, hostnames, and IP ranges.
-- Choose relay mode, which adaptively selects paths through a relay you own, or direct mode, which needs no VPS and routes through a single WireGuard or OpenVPN node.
+- Choose relay mode, which adaptively selects paths through a relay you own, or direct mode, which needs no VPS and routes through one WireGuard, OpenVPN or L2TP/IPsec node.
 - Configure and test an authenticated relay in a location you choose.
 - Add any number of relay locations and enable zero or one at a time.
 - Provision or remove a Debian 13+ or Ubuntu 22.04+ VPS over password-authenticated SSH from the client; SSH passwords remain transient and host fingerprints are pinned after first use.
@@ -88,7 +89,7 @@ cargo test --locked --manifest-path relay/Cargo.toml
 - Compile application, folder, hostname, and IP targets into a process-aware WFP interception plan.
 - Compute adaptive route decisions in the Rust engine.
 - Load and verify the WinDivert WFP capture runtime before activation.
-- Encrypt and send sequenced frames through WireGuard, OpenVPN TCP/UDP, and UDP-capable SOCKS5 paths.
+- Encrypt and send sequenced frames through WireGuard, OpenVPN TCP/UDP, Windows L2TP/IPsec, and UDP-capable SOCKS5 paths.
 - Monitor provider routes with authenticated probes and check the local uplink separately.
 - Duplicate authenticated IP frames across the live paths and verify the complete Windows-to-relay-TUN return loop.
 - Detect configs that resolve to the same WireGuard endpoint and reuse the same client identity, then hold overlaps as standby instead of allowing their handshakes to replace each other.
@@ -131,19 +132,37 @@ paths sharing an ISP bottleneck or the same relay cannot bypass failure of that
 shared segment. Direct mode does not provide multipath failover.
 
 **Direct mode** is for people who have no server to run a relay on. Selected
-traffic goes through one WireGuard or OpenVPN node, which routes it onward as a
-normal VPN would — GamePath still decides which applications, folders,
-hostnames and addresses enter the tunnel, but nothing is duplicated and there
-is no second path to fall back on.
+traffic goes through one WireGuard, OpenVPN or L2TP/IPsec node, which routes it
+onward as a normal VPN would. Nothing is duplicated and there is no second path
+to fall back on. WireGuard and OpenVPN accept every split selector; native L2TP
+split routing accepts IPv4 ranges and exact hostnames, while its all-traffic
+mode accepts everything.
 
-Direct mode takes a tunnelling node: WireGuard or OpenVPN. A SOCKS5 proxy
+Direct mode takes a tunnelling node: WireGuard, OpenVPN or L2TP/IPsec. A SOCKS5 proxy
 forwards connections and datagrams; it cannot route the raw packets GamePath
 captures, so it needs a relay on the other side to do that. Exactly one node is
 used, because combining nodes is the relay's job.
 
-Nothing else changes between the modes. Split-tunnel rules, all-traffic mode,
-the capture layer and the privileged service work the same either way, and
-switching modes needs no reconfiguration beyond choosing the node.
+Switching modes needs no provider-side reconfiguration beyond choosing the node.
+
+## L2TP/IPsec nodes
+
+L2TP/IPsec uses the Windows RAS client. GamePath creates a temporary VPN profile,
+dials it from the privileged network service, and removes the connection,
+profile and routes on disconnect or lease expiry. In relay mode only the relay
+host is routed through that adapter. If RAS drops, the privileged engine redials
+that profile without restarting the other relay paths. In direct all-traffic
+mode Windows owns the VPN default route. Direct split mode installs IPv4 routes
+for CIDRs and the current A records of exact hostnames; application, folder,
+wildcard-hostname and IPv6 split targets are not supported. Use all-traffic mode
+or a WireGuard/OpenVPN node for the application, folder and wildcard-hostname
+selectors.
+
+The service sets the L2TP interface MTU to 1384 bytes before traffic starts and
+uses an interface-pinned DNS probe for live latency and loss. The probe requires
+no permanent route of its own, so direct split mode carries only the targets the
+user selected. IPv6 diagnostics follow the machine's preferred public IPv6
+route and distinguish traffic carried by the VPN from traffic bypassing it.
 
 ## OpenVPN nodes
 
@@ -198,7 +217,7 @@ decrypted only in the privileged process, at the moment the engine needs them.
 
 ## SOCKS5 nodes
 
-A relay session can mix WireGuard, OpenVPN, and SOCKS5 nodes. GamePath carries game TCP _and_ UDP inside its own authenticated UDP
+A relay session can mix WireGuard, OpenVPN, L2TP/IPsec, and SOCKS5 nodes. GamePath carries game TCP _and_ UDP inside its own authenticated UDP
 frames, so a SOCKS5 node only has to move datagrams: the proxy must support
 `UDP ASSOCIATE`. Proxies that speak only `CONNECT`, including SSH dynamic
 forwarding, cannot be used. Accepting the association is not sufficient either,

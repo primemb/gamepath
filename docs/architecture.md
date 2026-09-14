@@ -164,23 +164,23 @@ frame, writes the inner packet to its TUN, and the kernel there does the
 routing and NAT.
 
 A **direct session** has no relay, so a node has to do that work itself. A
-WireGuard or OpenVPN node can: its server already routes and NATs whatever
-comes out of the tunnel. The captured packet is rewritten to the tunnel's own address and
-sent as it stands, with no GamePath framing, no sequence number and no
-duplication — the selected VPN protocol's own crypto is the only wrapping, and replies come
-back as plain inner packets addressed to the tunnel. A SOCKS5 node is refused
-before anything is opened, since a proxy has nothing to route with.
+WireGuard, OpenVPN or L2TP/IPsec server already routes and NATs traffic that
+comes out of its tunnel. WireGuard and OpenVPN run through the userspace packet
+engine: captured packets are rewritten to the tunnel address and sent without
+GamePath framing, sequence numbers or duplication. L2TP/IPsec is different:
+Windows RAS owns the tunnel and Windows routes the selected traffic natively.
+A SOCKS5 node is refused before anything is opened, since a proxy has nothing
+to route with.
 
-The two modes meet at `enqueue_data_packet` and `DataReceiver::receive`, so the
-capture layer above them is identical: split-tunnel filters, the Wintun
-all-traffic path, the reply injector and the privileged service are unchanged
-by the choice.
+The userspace WireGuard/OpenVPN modes meet at `enqueue_data_packet` and
+`DataReceiver::receive`, so their capture layer is identical. Native L2TP direct
+mode intentionally bypasses that layer.
 
 Health is judged differently because the evidence differs. A relay session
 exchanges authenticated control frames with a relay it owns, so a silent path
-is a broken path. A direct session's node belongs to a provider and answers
-nothing at the application layer, so the engine sends an ICMP echo through the
-tunnel to `1.1.1.1` every 500 ms and works from two signals:
+is a broken path. A userspace direct session's node belongs to a provider and
+answers nothing at the application layer, so the engine sends an ICMP echo
+through the tunnel to `1.1.1.1` every 500 ms and works from two signals:
 
 - The **WireGuard handshake** says the node is there at all. It is what the
   session waits for at startup, and a peer that has not answered within three
@@ -207,9 +207,40 @@ rather than a fixed one. A relay hands out `10.203.0.x` and gets `10.203.0.1`
 as before; a direct session's address comes from the provider and gets the
 first host of its own `/24`.
 
+### L2TP/IPsec through Windows RAS
+
+The privileged service creates a temporary Windows VPN profile, passes the
+pre-shared key to PowerShell over anonymous stdin, and dials with `RasDialW`.
+The password is cleared from the RAS parameter buffer after the call. The
+profile, connection and any explicit routes are removed when the user stops,
+the client disappears and its lease expires, or setup fails.
+
+In relay mode the RAS profile is split-tunnel and has only a host route to the
+relay. The engine binds its relay UDP socket to the assigned PPP address and
+pins it to the RAS interface with `IP_UNICAST_IF`; encrypted GamePath frames
+therefore traverse L2TP/IPsec without changing the machine's default route. A
+worker whose RAS adapter disappears redials the same temporary profile with the
+credentials held inside the privileged engine child, reapplies its MTU and
+relay route, and rejoins after an authenticated probe. Other relay paths remain
+up during that recovery.
+
+In direct all-traffic mode RAS owns the default route. In direct split mode the
+service installs native IPv4 routes for CIDRs and the current A records of exact
+hostnames. Windows routes alone cannot express application/folder ownership or
+keep wildcard DNS sets correlated with processes, so those selectors are
+rejected with an actionable error; users can choose all-traffic mode or a
+WireGuard/OpenVPN direct node for them. Exact hostname routes are refreshed
+when the live target set is applied again. The service sets the RAS interface to
+a 1384-byte MTU, then probes a public DNS endpoint with an interface-pinned UDP
+socket. This measures startup and live data-plane latency without installing a
+hidden route; three consecutive failures mark the route degraded. IPv6 exposure
+is derived from the interface selected for a public IPv6 destination, so the
+result distinguishes traffic carried by RAS from traffic bypassing it. The RAS
+connection remains protected by the same service lease.
+
 ## Multipath transport
 
-Every node becomes one path behind a common `RelayPath` transport interface, so the scheduler, the sequence allocator, and the session's authenticated framing work the same whichever transport a route uses. Two transports exist today: a user-space WireGuard tunnel and a SOCKS5 UDP association. A session may mix them freely.
+Every relay node becomes one path behind a common `RelayPath` transport interface, so the scheduler, the sequence allocator, and the session's authenticated framing work the same whichever transport a route uses. The relay transports are user-space WireGuard, user-space OpenVPN, SOCKS5 UDP association, and an interface-pinned L2TP/IPsec RAS path. A session may mix them when their endpoint identities do not conflict.
 
 Each distinct imported configuration creates an independent user-space WireGuard protocol instance. This allows different provider endpoints to run simultaneously even when their tunnel addresses overlap, a combination Windows rejects as duplicate adapters. The implementation uses BoringTun's portable WireGuard protocol core and ordinary Winsock UDP sockets for the outer provider connections.
 

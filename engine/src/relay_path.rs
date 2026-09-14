@@ -1,14 +1,16 @@
+use crate::l2tp::{L2tpRelayPath, L2tpRuntime};
 #[cfg(feature = "openvpn")]
 use crate::openvpn::{Credentials, Protocol, UserSpaceOpenVpnPath};
 use crate::socks5::{Socks5NodeConfig, Socks5UdpPath};
 use crate::userspace_wireguard::{UserSpaceWireGuardPath, ipv4_udp_packet, ipv4_udp_payload};
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 pub const KIND_WIREGUARD: &str = "wireguard";
 pub const KIND_SOCKS5: &str = "socks5";
+pub const KIND_L2TP: &str = "l2tp";
 /// Only the client speaks OpenVPN. The relay links this crate for its frame and
 /// session types and is built without the feature, so the kind is gated with it.
 #[cfg(feature = "openvpn")]
@@ -25,8 +27,8 @@ pub enum SessionMode {
     /// is what lets the scheduler send one packet down several paths at once.
     #[default]
     Relay,
-    /// One WireGuard or OpenVPN node routes the captured traffic itself. Nothing to run on
-    /// a server, and in exchange there is only ever one path.
+    /// One WireGuard, OpenVPN or Windows RAS L2TP node routes the selected
+    /// traffic itself. Nothing to run on a relay, and there is one path.
     Direct,
 }
 
@@ -43,7 +45,7 @@ impl SessionMode {
 ///
 /// Both the engine and the privileged service read this shape, so a node is
 /// described the same way wherever it is validated or opened.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum NodeSpec {
     #[serde(rename = "wireguard")]
@@ -75,6 +77,21 @@ pub enum NodeSpec {
         #[serde(default)]
         label: Option<String>,
     },
+    /// L2TP/IPsec credentials are consumed by the privileged service. It then
+    /// attaches the temporary profile and coordinates of the connected Windows
+    /// RAS adapter so a relay worker can recover it after a drop.
+    #[serde(rename = "l2tp")]
+    L2tp {
+        server: String,
+        username: String,
+        password: String,
+        #[serde(rename = "preSharedKey")]
+        pre_shared_key: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        runtime: Option<L2tpRuntime>,
+    },
 }
 
 impl NodeSpec {
@@ -82,6 +99,7 @@ impl NodeSpec {
         match self {
             Self::WireGuard { .. } => KIND_WIREGUARD,
             Self::Socks5 { .. } => KIND_SOCKS5,
+            Self::L2tp { .. } => KIND_L2TP,
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => KIND_OPENVPN,
         }
@@ -96,6 +114,21 @@ impl NodeSpec {
             }
             Self::Socks5 { .. } => Ok(Box::new(Socks5RelayPath::open(
                 &self.socks5_config().ok_or("node is not a SOCKS5 node")?,
+                relay,
+            )?)),
+            Self::L2tp {
+                server,
+                username,
+                password,
+                runtime,
+                ..
+            } => Ok(Box::new(L2tpRelayPath::open(
+                server,
+                username,
+                password,
+                runtime
+                    .as_ref()
+                    .ok_or("the L2TP node has not been connected by the Windows service")?,
                 relay,
             )?)),
             #[cfg(feature = "openvpn")]
@@ -115,6 +148,30 @@ impl NodeSpec {
         }
     }
 
+    /// Recreates a transport after repeated authenticated-probe failures.
+    /// L2TP must also replace the underlying RAS connection; reopening only
+    /// its UDP socket cannot repair a connected-but-stalled Windows tunnel.
+    pub fn reopen(&self, relay: SocketAddrV4) -> Result<Box<dyn RelayPath>, String> {
+        match self {
+            Self::L2tp {
+                server,
+                username,
+                password,
+                runtime,
+                ..
+            } => Ok(Box::new(L2tpRelayPath::reopen(
+                server,
+                username,
+                password,
+                runtime
+                    .as_ref()
+                    .ok_or("the L2TP node has not been connected by the Windows service")?,
+                relay,
+            )?)),
+            _ => self.open(relay),
+        }
+    }
+
     /// Checks the node's shape without touching the network.
     pub fn validate(&self) -> Result<(), String> {
         match self {
@@ -129,6 +186,25 @@ impl NodeSpec {
                 .socks5_config()
                 .ok_or("node is not a SOCKS5 node")?
                 .validate(),
+            Self::L2tp {
+                server,
+                username,
+                password,
+                pre_shared_key,
+                runtime,
+                ..
+            } => {
+                if server.trim().is_empty() {
+                    return Err("L2TP node is missing its server".into());
+                }
+                if username.trim().is_empty() || password.is_empty() {
+                    return Err("L2TP node needs a username and password".into());
+                }
+                if pre_shared_key.is_empty() && runtime.is_none() {
+                    return Err("L2TP/IPsec node needs a pre-shared key".into());
+                }
+                Ok(())
+            }
             #[cfg(feature = "openvpn")]
             Self::OpenVpn {
                 config,
@@ -157,6 +233,7 @@ impl NodeSpec {
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => None,
             Self::WireGuard { .. } => None,
+            Self::L2tp { .. } => None,
             Self::Socks5 {
                 host,
                 port,
@@ -177,6 +254,7 @@ impl NodeSpec {
     pub fn is_loopback_proxy(&self) -> bool {
         match self {
             Self::WireGuard { .. } => false,
+            Self::L2tp { .. } => false,
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => false,
             Self::Socks5 { host, .. } => {
@@ -192,6 +270,7 @@ impl NodeSpec {
     pub fn label(&self) -> Option<String> {
         let label = match self {
             Self::WireGuard { label, .. } | Self::Socks5 { label, .. } => label.as_deref()?,
+            Self::L2tp { label, .. } => label.as_deref()?,
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { label, .. } => label.as_deref()?,
         };
@@ -204,6 +283,7 @@ impl NodeSpec {
         match self {
             Self::WireGuard { .. } => format!("WireGuard route {route}"),
             Self::Socks5 { .. } => format!("SOCKS5 route {route}"),
+            Self::L2tp { .. } => format!("L2TP route {route}"),
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => format!("OpenVPN route {route}"),
         }
@@ -212,8 +292,9 @@ impl NodeSpec {
     /// Opens the node as the only hop of a direct session.
     ///
     /// A direct session has no relay to frame traffic for, so the node itself
-    /// has to route plain IPv4 packets onward. WireGuard and OpenVPN servers do exactly
-    /// that; a SOCKS5 proxy speaks in connections and datagrams instead and
+    /// has to route plain IPv4 packets onward. WireGuard and OpenVPN servers do
+    /// exactly that; Windows RAS handles L2TP outside this userspace interface.
+    /// A SOCKS5 proxy speaks in connections and datagrams instead and
     /// has nothing to route with, which is why it is turned away here rather
     /// than failing later with a confusing transport error.
     pub fn open_direct(&self) -> Result<DirectPath, String> {
@@ -237,8 +318,12 @@ impl NodeSpec {
                 )?,
             ))),
             Self::Socks5 { .. } => Err(
-                "a SOCKS5 proxy cannot carry a direct session on its own. Use a WireGuard or \
-                 OpenVPN node for direct mode, or set up a relay to reach this proxy through."
+                "a SOCKS5 proxy cannot carry a direct session on its own. Use a WireGuard, \
+                 OpenVPN or L2TP/IPsec node for direct mode, or set up a relay to reach this proxy through."
+                    .into(),
+            ),
+            Self::L2tp { .. } => Err(
+                "L2TP/IPsec direct mode is owned by the Windows routing service, not the userspace packet engine"
                     .into(),
             ),
         }
@@ -246,12 +331,13 @@ impl NodeSpec {
 
     /// Whether this node can be the single hop of a direct session.
     ///
-    /// Both tunnelling nodes can: their servers route whatever is put into
-    /// them. A proxy cannot, because it speaks in connections and datagrams and
-    /// has nothing to route with.
+    /// Tunnelling nodes can: their servers route whatever is put into them. A
+    /// proxy cannot, because it speaks in connections and datagrams and has
+    /// nothing to route with.
     pub fn supports_direct(&self) -> bool {
         match self {
             Self::WireGuard { .. } => true,
+            Self::L2tp { .. } => true,
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => true,
             Self::Socks5 { .. } => false,
@@ -262,6 +348,7 @@ impl NodeSpec {
         match self {
             Self::WireGuard { .. } => "WireGuard configuration".to_owned(),
             Self::Socks5 { host, port, .. } => format!("SOCKS5 proxy {host}:{port}"),
+            Self::L2tp { server, .. } => format!("L2TP/IPsec server {server}"),
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => "OpenVPN configuration".to_owned(),
         }
@@ -280,6 +367,9 @@ pub enum PathIdentity {
     },
     /// A second association on one proxy works, but carries no path diversity.
     Socks5 { proxy: SocketAddr },
+    /// Two tunnels to the same L2TP server share the same provider path and do
+    /// not add useful redundancy, even when Windows assigns distinct adapters.
+    L2tp { server: Ipv4Addr },
     /// The same provider account reached at the same server: the second session
     /// commonly displaces the first.
     #[cfg(feature = "openvpn")]
@@ -904,10 +994,47 @@ mod tests {
         // perfectly usable in the other mode.
         let error = proxy.open_direct().err().unwrap();
         assert!(
-            error.contains("WireGuard or OpenVPN node for direct mode"),
+            error.contains("OpenVPN or L2TP/IPsec node for direct mode"),
             "{error}"
         );
         assert!(error.contains("relay"), "{error}");
+
+        let l2tp = NodeSpec::L2tp {
+            server: "vpn.example".into(),
+            username: "player".into(),
+            password: "secret".into(),
+            pre_shared_key: "shared-secret".into(),
+            label: None,
+            runtime: None,
+        };
+        assert!(l2tp.supports_direct());
+        assert_eq!(l2tp.kind(), KIND_L2TP);
+        assert!(l2tp.validate().is_ok());
+        let mut prepared = l2tp.clone();
+        if let NodeSpec::L2tp {
+            pre_shared_key,
+            runtime,
+            ..
+        } = &mut prepared
+        {
+            pre_shared_key.clear();
+            *runtime = Some(L2tpRuntime {
+                local_address: "10.0.0.2".parse().unwrap(),
+                virtual_address: "10.203.201.2".parse().unwrap(),
+                server_address: "203.0.113.8".parse().unwrap(),
+                interface_index: 42,
+                setup_latency_ms: 125.0,
+                profile_name: "GamePath-L2TP-test".into(),
+                phonebook_path: r"C:\ProgramData\rasphone.pbk".into(),
+            });
+        }
+        assert!(prepared.validate().is_ok());
+
+        let mut missing_psk = l2tp.clone();
+        if let NodeSpec::L2tp { pre_shared_key, .. } = &mut missing_psk {
+            pre_shared_key.clear();
+        }
+        assert!(missing_psk.validate().is_err());
 
         // An OpenVPN node routes IP packets just as a WireGuard one does, so it
         // is offered for direct mode too. Opening it would dial a server, which
@@ -1062,5 +1189,20 @@ mod tests {
             proxy: "127.0.0.1:51820".parse().unwrap(),
         };
         assert_ne!(wireguard.identity(), proxy);
+    }
+
+    #[test]
+    fn l2tp_routes_to_the_same_server_are_one_failure_domain() {
+        let first = PathIdentity::L2tp {
+            server: "203.0.113.8".parse().unwrap(),
+        };
+        let second = PathIdentity::L2tp {
+            server: "203.0.113.8".parse().unwrap(),
+        };
+        let distinct = PathIdentity::L2tp {
+            server: "203.0.113.9".parse().unwrap(),
+        };
+        assert_eq!(first, second);
+        assert_ne!(first, distinct);
     }
 }

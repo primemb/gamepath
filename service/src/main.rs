@@ -11,7 +11,11 @@ fn main() -> windows_service::Result<()> {
 
 #[cfg(windows)]
 mod gamepath_service {
+    use gamepath_engine::l2tp::L2tpRuntime;
+    use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU};
+    use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
     use gamepath_engine::relay_path::{NodeSpec, SessionMode};
+    use gamepath_engine::transport::bind_to_interface;
     use gamepath_engine::wireguard_runtime::{inspect, narrow_to_relay};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
@@ -19,7 +23,9 @@ mod gamepath_service {
     use std::ffi::OsString;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::{IpAddr, TcpListener, TcpStream};
+    use std::net::{
+        IpAddr, Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+    };
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -38,6 +44,11 @@ mod gamepath_service {
         service_dispatcher,
     };
     use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::NetworkManagement::Rras::{
+        HRASCONN, RASCONNSTATUSW, RASCS_Disconnected, RASDIALPARAMSW, RASP_PppIp, RASPPPIPW,
+        RasDeleteEntryW, RasDialW, RasGetConnectStatusW, RasGetErrorStringW, RasGetProjectionInfoW,
+        RasHangUpW,
+    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -68,6 +79,7 @@ mod gamepath_service {
     /// tear down a working session, and still short enough that routes do not
     /// outlive a client that has actually died.
     const SESSION_LEASE: Duration = Duration::from_secs(30);
+    static L2TP_PROFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -96,6 +108,12 @@ mod gamepath_service {
         traffic_mode: String,
         session_rules: Value,
         engine: Option<EngineProcess>,
+        l2tp_sessions: Vec<L2tpSession>,
+        native_l2tp_direct: bool,
+        native_l2tp_status: Value,
+        native_l2tp_capture: Value,
+        native_l2tp_probe_supported: bool,
+        native_l2tp_probe_failures: u32,
         lease_deadline: Option<Instant>,
     }
 
@@ -124,6 +142,31 @@ mod gamepath_service {
         wireguard_configs: Vec<String>,
     }
 
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct L2tpProbeRequest {
+        server: String,
+        username: String,
+        password: String,
+        pre_shared_key: String,
+    }
+
+    struct L2tpSession {
+        connection: HRASCONN,
+        profile_name: String,
+        phonebook: Vec<u16>,
+        server: String,
+        server_address: Ipv4Addr,
+        local_address: Ipv4Addr,
+        interface_index: u32,
+        setup_latency_ms: f64,
+        split_tunneling: bool,
+        mtu: u16,
+        routes: Vec<String>,
+    }
+
+    unsafe impl Send for L2tpSession {}
+
     impl ValidateRequest {
         /// Callers may send the tagged node list or, for WireGuard-only
         /// sessions, the original flat configuration list.
@@ -141,6 +184,727 @@ mod gamepath_service {
         }
     }
 
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn put_wide(destination: &mut [u16], value: &str, name: &str) -> Result<(), String> {
+        let encoded = value.encode_utf16().collect::<Vec<_>>();
+        if encoded.len() >= destination.len() {
+            return Err(format!("the L2TP {name} is too long"));
+        }
+        destination[..encoded.len()].copy_from_slice(&encoded);
+        destination[encoded.len()] = 0;
+        Ok(())
+    }
+
+    fn take_wide(value: &[u16]) -> String {
+        String::from_utf16_lossy(
+            &value[..value
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(value.len())],
+        )
+    }
+
+    fn ras_error(code: u32) -> String {
+        let mut message = [0_u16; 512];
+        let result =
+            unsafe { RasGetErrorStringW(code, message.as_mut_ptr(), message.len() as u32) };
+        if result == 0 {
+            format!("{} (RAS error {code})", take_wide(&message).trim())
+        } else {
+            format!("RAS error {code}")
+        }
+    }
+
+    fn all_users_phonebook() -> PathBuf {
+        let root = env::var_os("PROGRAMDATA").unwrap_or_else(|| OsString::from(r"C:\ProgramData"));
+        PathBuf::from(root)
+            .join("Microsoft")
+            .join("Network")
+            .join("Connections")
+            .join("Pbk")
+            .join("rasphone.pbk")
+    }
+
+    fn current_user_phonebook() -> PathBuf {
+        let root = env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(
+                    env::var_os("USERPROFILE")
+                        .unwrap_or_else(|| OsString::from(r"C:\Users\Default")),
+                )
+                .join("AppData")
+                .join("Roaming")
+            });
+        root.join("Microsoft")
+            .join("Network")
+            .join("Connections")
+            .join("Pbk")
+            .join("rasphone.pbk")
+    }
+
+    fn run_l2tp_profile_script(
+        name: &str,
+        server: &str,
+        pre_shared_key: &str,
+        all_users: bool,
+        split_tunneling: bool,
+    ) -> Result<(), String> {
+        // The PSK travels over the child's anonymous stdin, never its command
+        // line. PowerShell owns the supported all-users VPN profile format;
+        // dialing and credentials stay in the native RAS API below.
+        const SCRIPT: &str = "$ErrorActionPreference='Stop';$p=[Console]::In.ReadToEnd()|ConvertFrom-Json;$a=@{Name=$p.name;ServerAddress=$p.server;TunnelType='L2tp';L2tpPsk=$p.psk;AuthenticationMethod='MSChapv2';EncryptionLevel='Optional';SplitTunneling=$p.splitTunneling;RememberCredential=$false;Force=$true};if($p.allUsers){Get-VpnConnection -Name $p.name -AllUserConnection -ErrorAction SilentlyContinue|Remove-VpnConnection -AllUserConnection -Force -ErrorAction SilentlyContinue;Add-VpnConnection @a -AllUserConnection|Out-Null}else{Get-VpnConnection -Name $p.name -ErrorAction SilentlyContinue|Remove-VpnConnection -Force -ErrorAction SilentlyContinue;Add-VpnConnection @a|Out-Null}";
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|error| format!("could not configure the Windows L2TP profile: {error}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            serde_json::to_writer(
+                &mut stdin,
+                &json!({
+                    "name": name,
+                    "server": server,
+                    "psk": pre_shared_key,
+                    "allUsers": all_users,
+                    // The non-elevated branch exists only for local live tests;
+                    // it needs a default route because it cannot add a /32.
+                    "splitTunneling": split_tunneling,
+                }),
+            )
+            .map_err(|error| format!("could not configure the Windows L2TP profile: {error}"))?;
+            stdin.flush().map_err(|error| {
+                format!("could not configure the Windows L2TP profile: {error}")
+            })?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("could not configure the Windows L2TP profile: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "Windows could not create the L2TP/IPsec profile: {}",
+                detail.lines().next().unwrap_or("PowerShell failed").trim()
+            ))
+        }
+    }
+
+    fn create_l2tp_profile(
+        name: &str,
+        server: &str,
+        pre_shared_key: &str,
+        split_tunneling: bool,
+        allow_user_fallback: bool,
+    ) -> Result<(PathBuf, bool), String> {
+        match run_l2tp_profile_script(name, server, pre_shared_key, true, split_tunneling) {
+            Ok(()) => Ok((all_users_phonebook(), split_tunneling)),
+            Err(all_users_error) => {
+                // A developer console is intentionally not elevated. The real
+                // service runs as LocalSystem, but a per-user fallback keeps
+                // connection tests useful without weakening the release path.
+                if !allow_user_fallback || !env::args().any(|argument| argument == "--console") {
+                    return Err(all_users_error);
+                }
+                run_l2tp_profile_script(name, server, pre_shared_key, false, false)
+                    .map(|_| (current_user_phonebook(), false))
+                    .map_err(|user_error| {
+                        format!("{all_users_error}; per-user fallback also failed: {user_error}")
+                    })
+            }
+        }
+    }
+
+    fn l2tp_interface_index(local_address: Ipv4Addr) -> Result<u32, String> {
+        let script = format!(
+            "$a=Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop|Where-Object {{$_.IPAddress -eq '{local_address}'}}|Select-Object -First 1 -ExpandProperty InterfaceIndex;if($null -eq $a){{exit 2}};[Console]::Out.Write($a)"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let output = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|error| format!("could not inspect the L2TP adapter: {error}"))?;
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse()
+                    .map_err(|_| "Windows returned an invalid L2TP adapter index".into());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!(
+            "Windows connected L2TP and assigned {local_address}, but its network adapter did not become ready"
+        ))
+    }
+
+    fn configure_l2tp_mtu(interface_index: u32, desired: u16) -> Result<u16, String> {
+        let script = format!(
+            "$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -ErrorAction Stop;if($i.NlMtuBytes-ne {desired}){{Set-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -NlMtuBytes {desired} -ErrorAction Stop;$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -ErrorAction Stop}};[Console]::Out.Write($i.NlMtuBytes)"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .output()
+            .map_err(|error| format!("could not configure the L2TP MTU: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Windows could not configure a safe L2TP MTU: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("MTU configuration failed")
+                    .trim()
+            ));
+        }
+        let actual = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| "Windows returned an invalid L2TP MTU".to_owned())?;
+        if actual != desired {
+            return Err(format!(
+                "Windows kept the L2TP MTU at {actual}; GamePath needs {desired} to prevent nested-tunnel fragmentation"
+            ));
+        }
+        Ok(actual)
+    }
+
+    fn close_l2tp(connection: HRASCONN, phonebook: &[u16], profile_name: &str) {
+        if connection != 0 {
+            unsafe {
+                RasHangUpW(connection);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let mut status: RASCONNSTATUSW = unsafe { std::mem::zeroed() };
+                status.dwSize = std::mem::size_of::<RASCONNSTATUSW>() as u32;
+                let result = unsafe { RasGetConnectStatusW(connection, &mut status) };
+                if result != 0 || status.rasconnstate == RASCS_Disconnected {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let profile = wide(profile_name);
+        unsafe {
+            RasDeleteEntryW(phonebook.as_ptr(), profile.as_ptr());
+        }
+    }
+
+    impl L2tpSession {
+        fn dial(
+            profile_name: String,
+            server: &str,
+            username: &str,
+            password: &str,
+            pre_shared_key: &str,
+            split_tunneling: bool,
+            allow_user_fallback: bool,
+        ) -> Result<Self, String> {
+            if server.trim().is_empty()
+                || username.trim().is_empty()
+                || password.is_empty()
+                || pre_shared_key.is_empty()
+            {
+                return Err(
+                    "L2TP/IPsec needs a server, pre-shared key, username and password".into(),
+                );
+            }
+            let (phonebook_path, actual_split_tunneling) = create_l2tp_profile(
+                &profile_name,
+                server,
+                pre_shared_key,
+                split_tunneling,
+                allow_user_fallback,
+            )?;
+            let phonebook = wide(&phonebook_path.to_string_lossy());
+            let mut params: RASDIALPARAMSW = unsafe { std::mem::zeroed() };
+            params.dwSize = std::mem::size_of::<RASDIALPARAMSW>() as u32;
+            if let Err(error) = put_wide(&mut params.szEntryName, &profile_name, "profile name")
+                .and_then(|_| put_wide(&mut params.szUserName, username, "username"))
+                .and_then(|_| put_wide(&mut params.szPassword, password, "password"))
+            {
+                close_l2tp(0, &phonebook, &profile_name);
+                return Err(error);
+            }
+            let started = Instant::now();
+            let mut connection: HRASCONN = 0;
+            let status = unsafe {
+                RasDialW(
+                    std::ptr::null(),
+                    phonebook.as_ptr(),
+                    &params,
+                    0,
+                    std::ptr::null(),
+                    &mut connection,
+                )
+            };
+            params.szUserName.fill(0);
+            params.szPassword.fill(0);
+            if status != 0 {
+                close_l2tp(connection, &phonebook, &profile_name);
+                return Err(format!(
+                    "L2TP/IPsec connection failed: {}",
+                    ras_error(status)
+                ));
+            }
+            let mut projection: RASPPPIPW = unsafe { std::mem::zeroed() };
+            projection.dwSize = std::mem::size_of::<RASPPPIPW>() as u32;
+            let mut projection_size = std::mem::size_of::<RASPPPIPW>() as u32;
+            let projection_status = unsafe {
+                RasGetProjectionInfoW(
+                    connection,
+                    RASP_PppIp,
+                    (&mut projection as *mut RASPPPIPW).cast(),
+                    &mut projection_size,
+                )
+            };
+            if projection_status != 0 || projection.dwError != 0 {
+                close_l2tp(connection, &phonebook, &profile_name);
+                return Err(format!(
+                    "L2TP connected but did not receive an IPv4 address: {}",
+                    ras_error(if projection_status != 0 {
+                        projection_status
+                    } else {
+                        projection.dwError
+                    })
+                ));
+            }
+            let local_address: Ipv4Addr = match take_wide(&projection.szIpAddress).parse() {
+                Ok(address) => address,
+                Err(_) => {
+                    close_l2tp(connection, &phonebook, &profile_name);
+                    return Err("L2TP connected but returned an invalid IPv4 address".into());
+                }
+            };
+            let interface_index = match l2tp_interface_index(local_address) {
+                Ok(index) => index,
+                Err(error) => {
+                    close_l2tp(connection, &phonebook, &profile_name);
+                    return Err(error);
+                }
+            };
+            let mtu = if allow_user_fallback && !actual_split_tunneling {
+                // A non-elevated console probe cannot tune interfaces. It does
+                // not carry a session, so the production MTU invariant is not
+                // weakened by leaving this short-lived fallback alone.
+                1384
+            } else {
+                match configure_l2tp_mtu(interface_index, 1384) {
+                    Ok(mtu) => mtu,
+                    Err(error) => {
+                        close_l2tp(connection, &phonebook, &profile_name);
+                        return Err(error);
+                    }
+                }
+            };
+            let server_address = match (server, 1701).to_socket_addrs() {
+                Ok(mut addresses) => match addresses.find_map(|address| match address.ip() {
+                    IpAddr::V4(ip) => Some(ip),
+                    IpAddr::V6(_) => None,
+                }) {
+                    Some(address) => address,
+                    None => {
+                        close_l2tp(connection, &phonebook, &profile_name);
+                        return Err("the L2TP server did not resolve to IPv4".into());
+                    }
+                },
+                Err(error) => {
+                    close_l2tp(connection, &phonebook, &profile_name);
+                    return Err(format!("could not resolve the L2TP server: {error}"));
+                }
+            };
+            Ok(Self {
+                connection,
+                profile_name,
+                phonebook,
+                server: server.to_owned(),
+                server_address,
+                local_address,
+                interface_index,
+                setup_latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                split_tunneling: actual_split_tunneling,
+                mtu,
+                routes: Vec::new(),
+            })
+        }
+
+        fn add_route(&mut self, prefix: &str) -> Result<(), String> {
+            if !self.split_tunneling {
+                // Non-elevated live-test fallback owns the default route.
+                return Ok(());
+            }
+            let script = format!(
+                "Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceIndex {} -ErrorAction SilentlyContinue|Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;New-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceIndex {} -NextHop '0.0.0.0' -RouteMetric 1 -ErrorAction Stop|Out-Null",
+                self.interface_index, self.interface_index
+            );
+            let output = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|error| format!("could not add the L2TP route: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Windows could not route traffic through L2TP: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .next()
+                        .unwrap_or("route creation failed")
+                        .trim()
+                ));
+            }
+            if !self.routes.iter().any(|route| route == prefix) {
+                self.routes.push(prefix.to_owned());
+            }
+            Ok(())
+        }
+
+        fn remove_routes(&mut self) {
+            for prefix in self.routes.drain(..) {
+                let script = format!(
+                    "Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceIndex {} -ErrorAction SilentlyContinue|Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue",
+                    self.interface_index
+                );
+                let _ = Command::new("powershell.exe")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .creation_flags(0x0800_0000)
+                    .status();
+            }
+        }
+
+        fn runtime(&self, route: usize) -> L2tpRuntime {
+            let third = 200_u8.saturating_add((route % 50) as u8);
+            L2tpRuntime {
+                local_address: self.local_address,
+                virtual_address: Ipv4Addr::new(10, 203, third, 2),
+                server_address: self.server_address,
+                interface_index: self.interface_index,
+                setup_latency_ms: self.setup_latency_ms,
+                profile_name: self.profile_name.clone(),
+                phonebook_path: String::from_utf16_lossy(
+                    &self.phonebook[..self.phonebook.len().saturating_sub(1)],
+                ),
+            }
+        }
+
+        fn is_connected(&self) -> bool {
+            if self.connection == 0 {
+                return false;
+            }
+            let mut status: RASCONNSTATUSW = unsafe { std::mem::zeroed() };
+            status.dwSize = std::mem::size_of::<RASCONNSTATUSW>() as u32;
+            let result = unsafe { RasGetConnectStatusW(self.connection, &mut status) };
+            result == 0 && status.rasconnstate != RASCS_Disconnected
+        }
+    }
+
+    impl Drop for L2tpSession {
+        fn drop(&mut self) {
+            self.remove_routes();
+            close_l2tp(self.connection, &self.phonebook, &self.profile_name);
+        }
+    }
+
+    fn connect_l2tp_nodes(
+        nodes: &mut [NodeSpec],
+        relay: Option<Ipv4Addr>,
+        split_tunneling: bool,
+    ) -> Result<Vec<L2tpSession>, String> {
+        let mut sessions = Vec::new();
+        for (index, node) in nodes.iter_mut().enumerate() {
+            let NodeSpec::L2tp {
+                server,
+                username,
+                password,
+                pre_shared_key,
+                runtime,
+                ..
+            } = node
+            else {
+                continue;
+            };
+            let profile_name = format!(
+                "GamePath-L2TP-{}-{}-{}",
+                std::process::id(),
+                index + 1,
+                L2TP_PROFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            );
+            let mut session = L2tpSession::dial(
+                profile_name,
+                server,
+                username,
+                password,
+                pre_shared_key,
+                split_tunneling,
+                false,
+            )
+            .map_err(|error| format!("route {}: {error}", index + 1))?;
+            if let Some(relay) = relay {
+                session
+                    .add_route(&format!("{relay}/32"))
+                    .map_err(|error| format!("route {}: {error}", index + 1))?;
+            }
+            *runtime = Some(session.runtime(index + 1));
+            // Relay workers keep the login only inside the privileged engine
+            // child so they can redial a RAS connection after a real drop. The
+            // PSK is already sealed in the temporary Windows profile and does
+            // not cross the child-process boundary.
+            pre_shared_key.clear();
+            sessions.push(session);
+        }
+        Ok(sessions)
+    }
+
+    fn canonical_ipv4_prefix(value: &str) -> Result<String, String> {
+        let (address, prefix) = value
+            .split_once('/')
+            .ok_or_else(|| format!("invalid IPv4 route: {value}"))?;
+        let address: Ipv4Addr = address
+            .parse()
+            .map_err(|_| format!("L2TP direct split mode cannot route IPv6 target {value}"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| format!("invalid IPv4 route: {value}"))?;
+        if prefix > 32 {
+            return Err(format!("invalid IPv4 route: {value}"));
+        }
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - u32::from(prefix))
+        };
+        Ok(format!(
+            "{}/{}",
+            Ipv4Addr::from(u32::from(address) & mask),
+            prefix
+        ))
+    }
+
+    /// Windows RAS split tunnelling is route based. IP and exact-hostname
+    /// targets map cleanly to routes; process/folder ownership and wildcard
+    /// DNS matching require a WFP callout and are deliberately rejected.
+    fn direct_l2tp_prefixes(rules: &Value) -> Result<Vec<String>, String> {
+        let rules: Vec<RuleSpec> = serde_json::from_value(rules.clone())
+            .map_err(|error| format!("invalid split targets: {error}"))?;
+        if rules.is_empty() {
+            return Ok(Vec::new());
+        }
+        let plan = compile_policy("split", &rules)?;
+        if !plan.application_paths.is_empty() || !plan.folder_prefixes.is_empty() {
+            return Err(
+                "L2TP direct split mode supports IP and exact hostname targets. Application and folder targets need all-traffic mode or a WireGuard/OpenVPN direct node."
+                    .into(),
+            );
+        }
+        let mut prefixes = std::collections::BTreeSet::new();
+        for network in plan.ip_networks {
+            prefixes.insert(canonical_ipv4_prefix(&network)?);
+        }
+        for hostname in plan.hostnames {
+            if hostname.starts_with("*.") {
+                return Err(
+                    "L2TP direct split mode cannot keep wildcard hostnames updated. Use an exact hostname, an IP range, or all-traffic mode."
+                        .into(),
+                );
+            }
+            let addresses = (hostname.as_str(), 0)
+                .to_socket_addrs()
+                .map_err(|error| format!("could not resolve split target {hostname}: {error}"))?;
+            let mut resolved = 0;
+            for address in addresses {
+                if let IpAddr::V4(address) = address.ip() {
+                    prefixes.insert(format!("{address}/32"));
+                    resolved += 1;
+                }
+            }
+            if resolved == 0 {
+                return Err(format!(
+                    "split target {hostname} did not resolve to an IPv4 address"
+                ));
+            }
+        }
+        Ok(prefixes.into_iter().collect())
+    }
+
+    fn apply_direct_l2tp_prefixes(
+        session: &mut L2tpSession,
+        prefixes: &[String],
+    ) -> Result<(), String> {
+        session.remove_routes();
+        for prefix in prefixes {
+            session.add_route(prefix)?;
+        }
+        Ok(())
+    }
+
+    fn apply_direct_l2tp_routes(session: &mut L2tpSession, rules: &Value) -> Result<(), String> {
+        let prefixes = direct_l2tp_prefixes(rules)?;
+        apply_direct_l2tp_prefixes(session, &prefixes)
+    }
+
+    fn probe_direct_l2tp(session: &L2tpSession, timeout: Duration) -> (bool, f64) {
+        let started = Instant::now();
+        let reachable = (|| -> Result<(), String> {
+            let socket = UdpSocket::bind(SocketAddrV4::new(session.local_address, 0))
+                .map_err(|error| error.to_string())?;
+            bind_to_interface(
+                &socket,
+                IpAddr::V4(session.local_address),
+                session.interface_index,
+            )
+            .map_err(|error| error.to_string())?;
+            socket
+                .set_read_timeout(Some(timeout))
+                .map_err(|error| error.to_string())?;
+            socket
+                .set_write_timeout(Some(timeout))
+                .map_err(|error| error.to_string())?;
+            socket
+                .connect(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53))
+                .map_err(|error| error.to_string())?;
+            // A standard recursive A query for the DNS root. The fixed ID is
+            // checked in the response; no name or user data leaves the host.
+            let query = [
+                0x47, 0x50, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x01, 0x00, 0x01,
+            ];
+            socket.send(&query).map_err(|error| error.to_string())?;
+            let mut response = [0_u8; 512];
+            let length = socket
+                .recv(&mut response)
+                .map_err(|error| error.to_string())?;
+            if length < 12 || response[..2] != query[..2] || response[2] & 0x80 == 0 {
+                return Err("invalid DNS probe response".into());
+            }
+            Ok(())
+        })()
+        .is_ok();
+        (reachable, started.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    fn is_globally_routable_ipv6(address: std::net::Ipv6Addr) -> bool {
+        let first = address.segments()[0];
+        !address.is_loopback()
+            && !address.is_unspecified()
+            && first & 0xffc0 != 0xfe80
+            && first & 0xfe00 != 0xfc00
+    }
+
+    fn ipv6_route_interface() -> Option<u32> {
+        let source = UdpSocket::bind("[::]:0")
+            .and_then(|socket| {
+                socket.connect("[2606:4700:4700::1111]:53")?;
+                socket.local_addr()
+            })
+            .ok()
+            .and_then(|address| match address.ip() {
+                IpAddr::V6(address) if is_globally_routable_ipv6(address) => Some(address),
+                _ => None,
+            })?;
+        let script = format!(
+            "$i=Get-NetIPAddress -AddressFamily IPv6 -IPAddress '{source}' -ErrorAction SilentlyContinue|Select-Object -First 1 -ExpandProperty InterfaceIndex;if($null-eq $i){{exit 2}};[Console]::Out.Write($i)"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+            .flatten()
+    }
+
+    fn l2tp_ipv6_exposure(session: &L2tpSession) -> Value {
+        classify_l2tp_ipv6(ipv6_route_interface(), session.interface_index)
+    }
+
+    fn classify_l2tp_ipv6(route_interface: Option<u32>, l2tp_interface: u32) -> Value {
+        let carried = route_interface == Some(l2tp_interface);
+        json!({
+            "carried": carried,
+            "systemHasRoute": route_interface.is_some() && !carried,
+        })
+    }
+
+    fn native_l2tp_result(
+        session: &L2tpSession,
+        label: &str,
+        traffic_mode: &str,
+        target_count: usize,
+    ) -> (Value, Value, Value) {
+        let (reachable, latency_ms) = probe_direct_l2tp(session, Duration::from_secs(2));
+        let mtu = EffectiveMtu {
+            mtu: session.mtu,
+            overhead: LINK_MTU.saturating_sub(session.mtu),
+        };
+        let paths = json!({
+            "state": "connected",
+            "mode": "direct",
+            "paths": [{
+                "route": 1,
+                "pathKind": "l2tp",
+                "label": label,
+                "endpoint": session.server,
+                "reachable": reachable,
+                "latencyMs": if reachable { Some(latency_ms) } else { None },
+                "handshakeMs": session.setup_latency_ms,
+                "handshakeRoundTrips": Value::Null,
+                "packetsSent": 0,
+                "packetsReceived": 0,
+                "bytesSent": 0,
+                "bytesReceived": 0,
+                "probesSent": 1,
+                "probesReceived": if reachable { 1 } else { 0 },
+                "probesLost": if reachable { 0 } else { 1 },
+                "lastError": Value::Null,
+            }],
+            "skippedRoutes": [],
+            "strategy": "single-path",
+            "selectedRoutes": [1],
+            "degradedRoutes": [],
+            "queueDepth": [0],
+            "droppedPackets": [0],
+            "queueCapacity": Value::Null,
+            "effectiveMtu": mtu.mtu,
+            "transportOverhead": mtu.overhead,
+        });
+        let data_plane = json!({
+            "reachable": reachable,
+            "latencyMs": latency_ms,
+            "benchmarkServer": "1.1.1.1",
+            "relayToServerMs": Value::Null,
+        });
+        let ipv6 = l2tp_ipv6_exposure(session);
+        let capture = json!({
+            "state": "routing",
+            "backend": "windows-ras",
+            "adapterIndex": session.interface_index,
+            "splitTunneling": session.split_tunneling,
+            "trafficMode": traffic_mode,
+            "targetCount": target_count,
+            "effectiveMtu": mtu.mtu,
+            "tcpMss": mtu.tcp_mss(),
+            "transportOverhead": mtu.overhead,
+            "ipv6": ipv6,
+        });
+        (paths, data_plane, capture)
+    }
+
     pub fn run() -> ServiceResult<()> {
         // A service has no console to print to, so the file is the only record
         // of what it did. Mirrored to stderr as well for `--console` runs.
@@ -149,10 +913,7 @@ mod gamepath_service {
             Some(gamepath_engine::log::log_path("service")),
             true,
         );
-        gamepath_engine::log_info!(
-            "gamepath-service {} starting",
-            env!("CARGO_PKG_VERSION")
-        );
+        gamepath_engine::log_info!("gamepath-service {} starting", env!("CARGO_PKG_VERSION"));
         if env::args().any(|argument| argument == "--console") {
             let token_file = argument("--token-file")
                 .map(PathBuf::from)
@@ -218,7 +979,7 @@ mod gamepath_service {
     }
 
     fn cleanup_stale_routes() {
-        let script = "$i=@(Get-NetAdapter -Name 'GamePath*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ifIndex); if($i.Count){Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.InterfaceIndex -in $i -and $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1')} | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue}";
+        let script = "$i=@(Get-NetAdapter -Name 'GamePath*' -ErrorAction SilentlyContinue|Select-Object -ExpandProperty ifIndex);if($i.Count){Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue|Where-Object {$_.InterfaceIndex -in $i -and $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1')}|Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue};Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue|Where-Object {$_.Name -like 'GamePath-L2TP-*'}|ForEach-Object {& rasdial.exe $_.Name /disconnect 2>$null|Out-Null;Remove-VpnConnection -Name $_.Name -AllUserConnection -Force -ErrorAction SilentlyContinue}";
         let _ = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .stdin(Stdio::null())
@@ -246,7 +1007,7 @@ mod gamepath_service {
         let watchdog_stop = Arc::clone(&stop);
         let watchdog = thread::spawn(move || {
             while !watchdog_stop.load(Ordering::Acquire) {
-                let expired_engine = {
+                let expired_session = {
                     let mut runtime = watchdog_state.lock().unwrap();
                     if runtime
                         .lease_deadline
@@ -258,12 +1019,25 @@ mod gamepath_service {
                         runtime.route_count = 0;
                         runtime.traffic_mode.clear();
                         runtime.session_rules = Value::Null;
-                        runtime.engine.take()
+                        runtime.native_l2tp_direct = false;
+                        runtime.native_l2tp_status = Value::Null;
+                        runtime.native_l2tp_capture = Value::Null;
+                        runtime.native_l2tp_probe_supported = false;
+                        runtime.native_l2tp_probe_failures = 0;
+                        Some((
+                            runtime.engine.take(),
+                            std::mem::take(&mut runtime.l2tp_sessions),
+                        ))
                     } else {
                         None
                     }
                 };
-                drop(expired_engine);
+                if let Some((engine, sessions)) = expired_session {
+                    if let Some(mut engine) = engine {
+                        let _ = engine.request("stop-wireguard-session", json!({}));
+                    }
+                    drop(sessions);
+                }
                 thread::sleep(Duration::from_millis(250));
             }
         });
@@ -293,6 +1067,17 @@ mod gamepath_service {
             }
         }
         let _ = watchdog.join();
+        let (engine, sessions) = {
+            let mut runtime = state.lock().unwrap();
+            (
+                runtime.engine.take(),
+                std::mem::take(&mut runtime.l2tp_sessions),
+            )
+        };
+        if let Some(mut engine) = engine {
+            let _ = engine.request("stop-wireguard-session", json!({}));
+        }
+        drop(sessions);
         Ok(())
     }
 
@@ -367,6 +1152,7 @@ mod gamepath_service {
                 }))
             }
             "validate-runtime" => validate_runtime(request.payload, state),
+            "probe-l2tp-node" => probe_l2tp_node(request.payload),
             "start-session" => start_session(request.payload, state),
             "update-session-rules" => update_session_rules(request.payload, state),
             "session-status" => session_status(state),
@@ -377,10 +1163,16 @@ mod gamepath_service {
                     let _ = engine.child.kill();
                     let _ = engine.child.wait();
                 }
+                state.l2tp_sessions.clear();
                 state.session_status = "idle".into();
                 state.route_count = 0;
                 state.traffic_mode.clear();
                 state.session_rules = Value::Null;
+                state.native_l2tp_direct = false;
+                state.native_l2tp_status = Value::Null;
+                state.native_l2tp_capture = Value::Null;
+                state.native_l2tp_probe_supported = false;
+                state.native_l2tp_probe_failures = 0;
                 state.lease_deadline = None;
                 Ok(json!({ "sessionStatus": "idle" }))
             }
@@ -519,17 +1311,131 @@ mod gamepath_service {
         }
     }
 
-    fn start_session(payload: Value, state: &Mutex<RuntimeState>) -> Result<Value, String> {
-        log_event("starting privileged engine session");
+    fn probe_l2tp_node(payload: Value) -> Result<Value, String> {
+        let input: L2tpProbeRequest = serde_json::from_value(payload)
+            .map_err(|error| format!("invalid L2TP test request: {error}"))?;
+        let profile = format!(
+            "GamePath-L2TP-Probe-{}-{}",
+            std::process::id(),
+            L2TP_PROFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let session = L2tpSession::dial(
+            profile,
+            &input.server,
+            &input.username,
+            &input.password,
+            &input.pre_shared_key,
+            true,
+            true,
+        )?;
+        let (reachable, data_latency_ms) = probe_direct_l2tp(&session, Duration::from_secs(2));
+        if !reachable {
+            return Err(
+                "Windows authenticated L2TP/IPsec, but no data returned through the VPN adapter"
+                    .into(),
+            );
+        }
+        Ok(json!({
+            "reachable": reachable,
+            "server": session.server.clone(),
+            "assignedIpv4": session.local_address,
+            "interfaceIndex": session.interface_index,
+            "setupLatencyMs": session.setup_latency_ms,
+            "dataLatencyMs": data_latency_ms,
+        }))
+    }
+
+    fn start_session(mut payload: Value, state: &Mutex<RuntimeState>) -> Result<Value, String> {
+        log_event("starting privileged network session");
         let mut runtime = state.lock().unwrap();
         if let Some(mut current) = runtime.engine.take() {
             let _ = current.child.kill();
             let _ = current.child.wait();
         }
+        runtime.l2tp_sessions.clear();
+        runtime.native_l2tp_direct = false;
+        runtime.native_l2tp_status = Value::Null;
+        runtime.native_l2tp_capture = Value::Null;
+        runtime.native_l2tp_probe_supported = false;
+        runtime.native_l2tp_probe_failures = 0;
+        let request: ValidateRequest = serde_json::from_value(payload.clone())
+            .map_err(|error| format!("invalid session request: {error}"))?;
+        let mut nodes = request.resolved_nodes();
+        for (index, node) in nodes.iter().enumerate() {
+            node.validate()
+                .map_err(|error| format!("route {}: {error}", index + 1))?;
+        }
+        let relay_address = if request.mode == SessionMode::Relay {
+            let host = payload["relayHost"]
+                .as_str()
+                .ok_or("a relay session needs the relay address")?;
+            let port = payload["relayPort"].as_u64().unwrap_or(0) as u16;
+            Some(
+                (host, port)
+                    .to_socket_addrs()
+                    .map_err(|error| format!("could not resolve the relay: {error}"))?
+                    .find_map(|address| match address.ip() {
+                        IpAddr::V4(ip) => Some(ip),
+                        IpAddr::V6(_) => None,
+                    })
+                    .ok_or("the relay did not resolve to IPv4")?,
+            )
+        } else {
+            None
+        };
+        let traffic_mode = payload["trafficMode"].as_str().unwrap_or("all").to_owned();
+        if traffic_mode != "all" && traffic_mode != "split" {
+            return Err("traffic mode must be all or split".into());
+        }
+        let rules = payload["rules"].clone();
+        if request.mode == SessionMode::Direct
+            && matches!(nodes.as_slice(), [NodeSpec::L2tp { .. }])
+        {
+            let label = nodes[0]
+                .label()
+                .unwrap_or_else(|| nodes[0].default_label(1));
+            // Reject selectors Windows routes cannot express before creating a
+            // VPN profile or changing any route.
+            let direct_prefixes = if traffic_mode == "split" {
+                direct_l2tp_prefixes(&rules)?
+            } else {
+                Vec::new()
+            };
+            let mut l2tp_sessions = connect_l2tp_nodes(&mut nodes, None, traffic_mode == "split")?;
+            let session = l2tp_sessions
+                .first_mut()
+                .ok_or("the L2TP direct session did not create a Windows connection")?;
+            if traffic_mode == "split" {
+                apply_direct_l2tp_prefixes(session, &direct_prefixes)?;
+            }
+            let target_count = rules.as_array().map_or(0, Vec::len);
+            let (paths, data_plane, capture) =
+                native_l2tp_result(session, &label, &traffic_mode, target_count);
+            if data_plane["reachable"] != json!(true) {
+                return Err(
+                    "Windows connected L2TP/IPsec, but no data returned through the VPN adapter"
+                        .into(),
+                );
+            }
+            runtime.session_status = "connected".into();
+            runtime.route_count = 1;
+            runtime.traffic_mode = traffic_mode;
+            runtime.session_rules = rules;
+            runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
+            runtime.native_l2tp_direct = true;
+            runtime.native_l2tp_status = paths.clone();
+            runtime.native_l2tp_capture = capture.clone();
+            runtime.native_l2tp_probe_supported = true;
+            runtime.native_l2tp_probe_failures = 0;
+            runtime.l2tp_sessions = l2tp_sessions;
+            log_event("native Windows L2TP direct routing started");
+            return Ok(json!({ "paths": paths, "dataPlane": data_plane, "capture": capture }));
+        }
+        let l2tp_sessions = connect_l2tp_nodes(&mut nodes, relay_address, true)?;
+        payload["nodes"] = serde_json::to_value(&nodes)
+            .map_err(|error| format!("could not prepare L2TP runtime: {error}"))?;
         let mut engine = EngineProcess::start().inspect_err(|error| log_event(error))?;
         log_event("native engine child ready");
-        let traffic_mode = payload["trafficMode"].as_str().unwrap_or("all").to_owned();
-        let rules = payload["rules"].clone();
         let paths = engine
             .request("start-wireguard-session", payload)
             .inspect_err(|error| log_event(error))?;
@@ -551,6 +1457,7 @@ mod gamepath_service {
         runtime.session_rules = rules;
         runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
         runtime.engine = Some(engine);
+        runtime.l2tp_sessions = l2tp_sessions;
         Ok(json!({ "paths": paths, "dataPlane": data_plane, "capture": capture }))
     }
 
@@ -565,6 +1472,29 @@ mod gamepath_service {
             return Err("live target updates require a connected split session".into());
         }
         let previous_rules = runtime.session_rules.clone();
+        if runtime.native_l2tp_direct {
+            let session = runtime
+                .l2tp_sessions
+                .first_mut()
+                .ok_or("no active L2TP direct session")?;
+            if let Err(error) = apply_direct_l2tp_routes(session, &rules) {
+                let rollback = apply_direct_l2tp_routes(session, &previous_rules);
+                return match rollback {
+                    Ok(()) => Err(format!("could not apply live L2TP targets: {error}")),
+                    Err(rollback_error) => Err(format!(
+                        "could not apply live L2TP targets: {error}; restoring the previous routes also failed: {rollback_error}"
+                    )),
+                };
+            }
+            let target_count = rules.as_array().map_or(0, Vec::len);
+            runtime.session_rules = rules;
+            runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
+            runtime.native_l2tp_capture["state"] =
+                json!(if target_count == 0 { "idle" } else { "routing" });
+            runtime.native_l2tp_capture["targetCount"] = json!(target_count);
+            log_event("native L2TP split routes updated without reconnecting");
+            return Ok(runtime.native_l2tp_capture.clone());
+        }
         let rules_are_empty = rules.as_array().is_some_and(Vec::is_empty);
         let previous_rules_are_empty = previous_rules.as_array().is_some_and(Vec::is_empty);
         if rules_are_empty {
@@ -623,6 +1553,68 @@ mod gamepath_service {
 
     fn session_status(state: &Mutex<RuntimeState>) -> Result<Value, String> {
         let mut runtime = state.lock().unwrap();
+        if runtime.native_l2tp_direct {
+            let mut result = runtime.native_l2tp_status.clone();
+            let ras_connected = runtime
+                .l2tp_sessions
+                .first()
+                .is_some_and(L2tpSession::is_connected);
+            let probe = if ras_connected && runtime.native_l2tp_probe_supported {
+                runtime
+                    .l2tp_sessions
+                    .first()
+                    .map(|session| probe_direct_l2tp(session, Duration::from_secs(1)))
+            } else {
+                None
+            };
+            if let Some((true, latency_ms)) = probe {
+                runtime.native_l2tp_probe_failures = 0;
+                result["paths"][0]["latencyMs"] = json!(latency_ms);
+                let received = result["paths"][0]["probesReceived"].as_u64().unwrap_or(0) + 1;
+                result["paths"][0]["probesReceived"] = json!(received);
+            } else if probe.is_some() {
+                runtime.native_l2tp_probe_failures =
+                    runtime.native_l2tp_probe_failures.saturating_add(1);
+                let lost = result["paths"][0]["probesLost"].as_u64().unwrap_or(0) + 1;
+                result["paths"][0]["probesLost"] = json!(lost);
+            }
+            if probe.is_some() {
+                let sent = result["paths"][0]["probesSent"].as_u64().unwrap_or(0) + 1;
+                result["paths"][0]["probesSent"] = json!(sent);
+            }
+            let data_reachable = runtime.native_l2tp_probe_failures < 3;
+            let connected = ras_connected && data_reachable;
+            result["state"] = json!(if connected { "connected" } else { "degraded" });
+            result["selectedRoutes"] = if connected { json!([1]) } else { json!([]) };
+            result["degradedRoutes"] = if connected { json!([]) } else { json!([1]) };
+            result["paths"][0]["reachable"] = json!(connected);
+            result["paths"][0]["lastError"] = if connected {
+                Value::Null
+            } else if !ras_connected {
+                json!("the Windows L2TP connection is no longer active")
+            } else {
+                json!("the L2TP connection is active but its data plane stopped answering")
+            };
+            runtime.native_l2tp_status = result.clone();
+            let mut capture = runtime.native_l2tp_capture.clone();
+            capture["state"] = if connected {
+                if capture["trafficMode"] == json!("split")
+                    && capture["targetCount"].as_u64() == Some(0)
+                {
+                    json!("idle")
+                } else {
+                    json!("routing")
+                }
+            } else {
+                json!("degraded")
+            };
+            runtime.native_l2tp_capture = capture.clone();
+            if let Some(object) = result.as_object_mut() {
+                object.insert("capture".into(), capture);
+            }
+            runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
+            return Ok(result);
+        }
         let engine = runtime.engine.as_mut().ok_or("no active network session")?;
         let mut result = engine.request("wireguard-session-status", json!({}))?;
         let capture = engine.request("packet-capture-status", json!({}))?;
@@ -641,7 +1633,9 @@ mod gamepath_service {
         }
         let nodes = input.resolved_nodes();
         if nodes.is_empty() {
-            return Err("at least one WireGuard, OpenVPN, or SOCKS5 node is required".into());
+            return Err(
+                "at least one WireGuard, OpenVPN, L2TP/IPsec, or SOCKS5 node is required".into(),
+            );
         }
         // A direct session has no relay behind the node, so the node itself has
         // to be able to route. Catch that here, before anything is opened.
@@ -649,13 +1643,13 @@ mod gamepath_service {
             if nodes.len() != 1 {
                 return Err(format!(
                     "direct mode sends traffic through exactly one node, but {} are enabled. \
-                     Enable a single WireGuard or OpenVPN node, or switch to relay mode to combine them.",
+                     Enable a single WireGuard, OpenVPN, or L2TP/IPsec node, or switch to relay mode to combine them.",
                     nodes.len()
                 ));
             }
             if !nodes[0].supports_direct() {
                 return Err(format!(
-                    "{} cannot carry a direct session on its own. Use a WireGuard or OpenVPN node for \
+                    "{} cannot carry a direct session on its own. Use a WireGuard, OpenVPN, or L2TP/IPsec node for \
                      direct mode, or set up a relay to reach this proxy through.",
                     nodes[0].describe()
                 ));
@@ -771,8 +1765,10 @@ mod gamepath_service {
                 // reading, which on loopback is a matter of scheduling luck.
                 thread::sleep(Duration::from_millis(300));
                 socket
-                    .write_all(b"{\"id\":7,\"command\":\"status\",\"token\":\"token\"}
-")
+                    .write_all(
+                        b"{\"id\":7,\"command\":\"status\",\"token\":\"token\"}
+",
+                    )
                     .unwrap();
                 let mut response = String::new();
                 BufReader::new(&socket).read_line(&mut response).unwrap();
@@ -956,6 +1952,18 @@ mod gamepath_service {
             assert_eq!(openvpn["mode"], "direct");
             assert_eq!(openvpn["routeCount"], 1);
             assert_eq!(openvpn["nodeKinds"][0], "openvpn");
+
+            let l2tp = validate_direct(json!([{
+                "kind": "l2tp",
+                "server": "vpn.example",
+                "username": "someone",
+                "password": "secret",
+                "preSharedKey": "shared-secret",
+            }]))
+            .unwrap();
+            assert_eq!(l2tp["mode"], "direct");
+            assert_eq!(l2tp["routeCount"], 1);
+            assert_eq!(l2tp["nodeKinds"][0], "l2tp");
         }
 
         #[test]
@@ -966,7 +1974,7 @@ mod gamepath_service {
             .err()
             .unwrap();
             assert!(
-                error.contains("WireGuard or OpenVPN node for direct mode"),
+                error.contains("WireGuard, OpenVPN, or L2TP/IPsec node for direct mode"),
                 "{error}"
             );
             assert!(error.contains("relay"), "{error}");
@@ -983,6 +1991,59 @@ mod gamepath_service {
             assert!(
                 validate_direct(json!([{ "kind": "wireguard", "config": "[Interface]" }])).is_err()
             );
+        }
+
+        #[test]
+        fn l2tp_direct_routes_canonicalize_ipv4_targets() {
+            let prefixes = direct_l2tp_prefixes(&json!([
+                { "kind": "ip", "value": "203.0.113.42/24" },
+                { "kind": "ip", "value": "198.51.100.9" },
+                { "kind": "ip", "value": "198.51.100.9/32" },
+            ]))
+            .unwrap();
+            assert_eq!(prefixes, ["198.51.100.9/32", "203.0.113.0/24"]);
+        }
+
+        #[test]
+        fn l2tp_direct_split_rejects_selectors_windows_routes_cannot_express() {
+            let application = direct_l2tp_prefixes(&json!([{
+                "kind": "application",
+                "value": r"C:\Games\Demo\game.exe",
+            }]))
+            .unwrap_err();
+            assert!(
+                application.contains("Application and folder"),
+                "{application}"
+            );
+
+            let wildcard = direct_l2tp_prefixes(&json!([{
+                "kind": "hostname",
+                "value": "*.game.example.com",
+            }]))
+            .unwrap_err();
+            assert!(wildcard.contains("wildcard"), "{wildcard}");
+
+            let ipv6 = direct_l2tp_prefixes(&json!([{
+                "kind": "ip",
+                "value": "2001:db8::1",
+            }]))
+            .unwrap_err();
+            assert!(ipv6.contains("IPv6"), "{ipv6}");
+        }
+
+        #[test]
+        fn l2tp_ipv6_reports_whether_the_preferred_route_bypasses_the_vpn() {
+            let bypass = classify_l2tp_ipv6(Some(7), 12);
+            assert_eq!(bypass["carried"], json!(false));
+            assert_eq!(bypass["systemHasRoute"], json!(true));
+
+            let carried = classify_l2tp_ipv6(Some(12), 12);
+            assert_eq!(carried["carried"], json!(true));
+            assert_eq!(carried["systemHasRoute"], json!(false));
+
+            let unavailable = classify_l2tp_ipv6(None, 12);
+            assert_eq!(unavailable["carried"], json!(false));
+            assert_eq!(unavailable["systemHasRoute"], json!(false));
         }
 
         #[test]

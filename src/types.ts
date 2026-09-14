@@ -1,4 +1,4 @@
-export type NodeKind = 'wireguard' | 'socks5' | 'openvpn'
+export type NodeKind = 'wireguard' | 'socks5' | 'openvpn' | 'l2tp'
 
 /**
  * How traffic reaches the Internet. `relay` combines every enabled node at a
@@ -74,6 +74,23 @@ export type Socks5ProbeResult = {
   proxy: string
   setupLatencyMs: number
   latencyMs: number
+}
+
+export type L2tpNodeInput = {
+  server: string
+  label?: string
+  preSharedKey: string
+  username: string
+  password: string
+}
+
+export type L2tpProbeResult = {
+  reachable: boolean
+  server: string
+  assignedIpv4: string
+  interfaceIndex: number
+  setupLatencyMs: number
+  dataLatencyMs: number
 }
 
 export type RuleKind = 'application' | 'folder' | 'hostname' | 'ip'
@@ -177,6 +194,8 @@ export type AppState = {
     capture?: {
       state: string
       backend: string
+      adapterIndex?: number
+      splitTunneling?: boolean
       trafficMode?: string
       targetCount?: number
       effectiveMtu?: number
@@ -262,6 +281,9 @@ export type GamePathApi = {
   addSocks5Node: (input: Socks5NodeInput) => Promise<{ state: AppState; nodeId: string }>
   testSocks5Node: (input: Socks5NodeInput) => Promise<Socks5ProbeResult>
   testSavedSocks5Node: (id: string) => Promise<Socks5ProbeResult>
+  addL2tpNode: (input: L2tpNodeInput) => Promise<{ state: AppState; nodeId: string }>
+  testL2tpNode: (input: L2tpNodeInput) => Promise<L2tpProbeResult>
+  testSavedL2tpNode: (id: string) => Promise<L2tpProbeResult>
   setTunnelEnabled: (id: string, enabled: boolean) => Promise<AppState>
   removeTunnel: (id: string) => Promise<AppState>
   browseRuleTarget: (kind: RuleKind) => Promise<{ canceled: boolean; value?: string; label?: string }>

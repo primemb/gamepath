@@ -295,7 +295,7 @@ struct PathDialer {
 
 impl PathDialer {
     fn open(&self) -> Result<Box<dyn RelayPath>, String> {
-        self.node.open(self.relay)
+        self.node.reopen(self.relay)
     }
 }
 
@@ -743,7 +743,9 @@ impl WireGuardSessionManager {
             .map_err(|error| format!("invalid session request: {error}"))?;
         let nodes = input.resolved_nodes();
         if nodes.is_empty() {
-            return Err("at least one WireGuard, OpenVPN, or SOCKS5 node is required".into());
+            return Err(
+                "at least one WireGuard, OpenVPN, L2TP/IPsec, or SOCKS5 node is required".into(),
+            );
         }
         match input.mode {
             SessionMode::Relay => self.start_relay(&input, &nodes)?,
@@ -993,7 +995,7 @@ impl WireGuardSessionManager {
         let [node] = nodes else {
             return Err(format!(
                 "direct mode sends traffic through exactly one node, but {} are enabled. \
-                 Enable a single WireGuard or OpenVPN node, or switch to relay mode to combine them.",
+                 Enable a single WireGuard, OpenVPN or L2TP/IPsec node, or switch to relay mode to combine them.",
                 nodes.len()
             ));
         };
@@ -4155,7 +4157,7 @@ mod tests {
         assert!(error.contains("exactly one node"), "{error}");
         // The message has to name both ways out, since either is reasonable.
         assert!(
-            error.contains("single WireGuard or OpenVPN node"),
+            error.contains("single WireGuard, OpenVPN or L2TP/IPsec node"),
             "{error}"
         );
         assert!(error.contains("relay mode"), "{error}");

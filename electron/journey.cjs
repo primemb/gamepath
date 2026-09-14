@@ -5,7 +5,7 @@
  *
  * `latencyMs` is an RTT measured by a GamePath probe that travels through the
  * selected VPN/proxy path and reaches our relay. A transport setup time is
- * deliberately not used here: WireGuard, OpenVPN, and SOCKS negotiation can
+ * deliberately not used here: WireGuard, OpenVPN, L2TP/IPsec, and SOCKS negotiation can
  * take seconds because of retries and server work, and is not a live latency
  * measurement. We also cannot honestly split this RTT into user-to-node and
  * node-to-relay without an agent running on the user's VPN node.

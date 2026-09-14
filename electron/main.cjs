@@ -6,6 +6,7 @@ const crypto = require('node:crypto')
 const { parseWireGuardConfig } = require('./wireguard.cjs')
 const { parseOpenVpnConfig } = require('./openvpn.cjs')
 const { parseSocks5Node } = require('./socks5.cjs')
+const { parseL2tpNode } = require('./l2tp.cjs')
 const { directNodeSelection, directSelectionAfterSwitch } = require('./connection.cjs')
 const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
@@ -309,6 +310,17 @@ function sessionNodes(enabledTunnels) {
         label: tunnel.name,
       }
     }
+    if (tunnel.kind === 'l2tp') {
+      const { server, username, password, preSharedKey } = JSON.parse(secret)
+      return {
+        kind: 'l2tp',
+        server,
+        username,
+        password,
+        preSharedKey,
+        label: tunnel.name,
+      }
+    }
     return { kind: 'wireguard', config: secret, label: tunnel.name }
   })
 }
@@ -386,6 +398,36 @@ function registerIpc() {
       tunnel.port,
       JSON.parse(safeStorage.decryptString(Buffer.from(stored, 'base64'))),
     )
+  })
+
+  const probeL2tp = (credentials) => {
+    if (serviceBridge?.status.status !== 'ready')
+      throw new Error('Install and start the GamePath Network Service first')
+    return serviceBridge.request('probe-l2tp-node', credentials, 60000)
+  }
+
+  ipcMain.handle('node:add-l2tp', (_event, input) => {
+    const { node, credentials } = parseL2tpNode(input ?? {}, crypto.randomUUID())
+    if (state.tunnels.some((item) => item.kind === 'l2tp' && item.endpoint === node.endpoint)) {
+      throw new Error(`${node.endpoint} is already added as an L2TP/IPsec node.`)
+    }
+    state.tunnels.push(node)
+    state.encryptedConfigs[node.id] = encryptConfig(JSON.stringify(credentials))
+    saveState()
+    return { state: publicState(), nodeId: node.id }
+  })
+
+  ipcMain.handle('node:test-l2tp', async (_event, input) => {
+    const { credentials } = parseL2tpNode(input ?? {}, 'probe')
+    return probeL2tp(credentials)
+  })
+
+  ipcMain.handle('node:test-saved-l2tp', async (_event, id) => {
+    const tunnel = state.tunnels.find((item) => item.id === id)
+    if (tunnel?.kind !== 'l2tp') throw new Error('That node is not an L2TP/IPsec node')
+    const stored = state.encryptedConfigs[tunnel.id]
+    if (!stored) throw new Error(`${tunnel.name} is missing its stored secret. Remove the node and add it again.`)
+    return probeL2tp(JSON.parse(safeStorage.decryptString(Buffer.from(stored, 'base64'))))
   })
 
   // Choosing the files comes first, because only the files can say whether a
@@ -805,7 +847,7 @@ function registerIpc() {
     const blocker = direct
       ? selection.error
       : enabledTunnels.length < 1
-        ? 'Enable at least one WireGuard or SOCKS5 node.'
+        ? 'Enable at least one WireGuard, OpenVPN, L2TP/IPsec or SOCKS5 node.'
         : !relay || relay.status !== 'ready' || !encryptedRelayToken
           ? 'The Istanbul relay needs its address and enrollment token.'
           : null
@@ -852,7 +894,7 @@ function registerIpc() {
         const serviceSession = await serviceBridge.request(
           'start-session',
           { mode, strategy, ...relayCredentials, nodes, trafficMode: state.trafficMode, rules },
-          30000,
+          nodes.some((node) => node.kind === 'l2tp') ? 60000 : 30000,
         )
         const paths = serviceSession.paths
         const dataPlane = serviceSession.dataPlane

@@ -15,6 +15,7 @@
     "relay:configure": "electron scripts/configure-relay.cjs",
     "relay:test": "electron scripts/test-relay.cjs",
     "socks5:test": "electron scripts/test-socks5-relay.cjs",
+    "l2tp:test": "electron scripts/test-l2tp-session.cjs",
     "wireguard:import": "electron scripts/import-wireguard.cjs",
     "runtime:test": "electron scripts/test-runtime.cjs",
     "wireguard:probe": "electron scripts/probe-wireguard-routes.cjs",

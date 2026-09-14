@@ -60,6 +60,8 @@ import type {
   SplitRuleGroup,
   OpenVpnCandidate,
   OpenVpnRejection,
+  L2tpNodeInput,
+  L2tpProbeResult,
   Socks5NodeInput,
   Socks5ProbeResult,
   Tunnel,
@@ -100,8 +102,8 @@ const connectionModes = [
     icon: Waypoints,
     title: 'Direct mode',
     tagline: 'No server needed',
-    body: 'Your selected traffic goes through one WireGuard or OpenVPN node and out to the game from there. A plain split tunnel, with nothing else to run.',
-    needs: 'Needs one WireGuard or OpenVPN node. SOCKS5 proxies can only be used with a relay.',
+    body: 'Your selected traffic goes through one WireGuard, OpenVPN or L2TP/IPsec node and out to the game from there. A plain split tunnel, with nothing else to run.',
+    needs: 'Needs one tunnelling node. SOCKS5 proxies can only be used with a relay.',
   },
 ]
 
@@ -205,15 +207,16 @@ function Endpoint({
   direct: boolean
   onToggle: (enabled: boolean) => void
   onRemove: () => void
-  onTest: () => Promise<Socks5ProbeResult>
+  onTest: () => Promise<Socks5ProbeResult | L2tpProbeResult>
 }) {
   const [testing, setTesting] = useState(false)
   const [outcome, setOutcome] = useState<{ ok: boolean; message: ReactNode } | null>(null)
   const isProxy = tunnel.kind === 'socks5'
   const isOpenVpn = tunnel.kind === 'openvpn'
+  const isL2tp = tunnel.kind === 'l2tp'
   // A proxy has no way to route on its own, so in direct mode it stays in the
   // list with the reason attached rather than quietly refusing to switch on.
-  // Both tunnelling kinds route, so both are usable in either mode.
+  // Every tunnelling kind routes, so all three are usable in either mode.
   const unusable = direct && isProxy
   const stateLabel = tunnel.enabled ? (direct ? 'Carrying traffic' : 'Enabled') : 'Disabled'
   return (
@@ -222,7 +225,9 @@ function Endpoint({
       <div className="route-copy">
         <div className="route-title-row">
           <h3>{tunnel.name}</h3>
-          <span className="kind-pill">{isProxy ? 'SOCKS5' : isOpenVpn ? 'OpenVPN' : 'WireGuard'}</span>
+          <span className="kind-pill">
+            {isProxy ? 'SOCKS5' : isOpenVpn ? 'OpenVPN' : isL2tp ? 'L2TP/IPsec' : 'WireGuard'}
+          </span>
           {unusable ? (
             <span className="status-pill">
               <i /> Needs a relay
@@ -247,6 +252,18 @@ function Endpoint({
               </span>
               <span title="Frames are encrypted by GamePath, but the proxy hop itself is not">
                 <Info size={13} /> No outer encryption
+              </span>
+            </>
+          ) : isL2tp ? (
+            <>
+              <span>
+                Transport <strong>Windows RAS</strong>
+              </span>
+              <span>
+                Auth <strong>PSK + username</strong>
+              </span>
+              <span title="The pre-shared key and password are protected by Windows secure storage">
+                <ShieldCheck size={13} /> Secrets protected
               </span>
             </>
           ) : isOpenVpn ? (
@@ -293,6 +310,12 @@ function Endpoint({
             the ones behind it.
           </p>
         )}
+        {isL2tp && direct && (
+          <p className="route-note">
+            <Info size={13} /> L2TP direct split routing supports IP ranges and exact hostnames. Use all-traffic mode
+            for application, folder or wildcard-hostname targets; IPv6 split targets are unavailable.
+          </p>
+        )}
         {unusable && (
           <p className="route-note">
             <Info size={13} /> A SOCKS5 proxy forwards connections, it does not route packets, so it needs a relay on
@@ -303,7 +326,7 @@ function Endpoint({
       <div className="route-actions">
         {/* A proxy is the one node whose reachability the app cannot infer, so
             it gets a check of its own. Direct mode has no relay to answer it. */}
-        {isProxy && !direct && (
+        {((isProxy && !direct) || isL2tp) && (
           <button
             className="button secondary"
             disabled={testing}
@@ -312,15 +335,25 @@ function Endpoint({
               setOutcome(null)
               try {
                 const probe = await onTest()
-                setOutcome({
-                  ok: true,
-                  message: (
-                    <>
-                      Relay answered through <AddressWithCountry value={probe.proxy} /> in {Math.round(probe.latencyMs)}{' '}
-                      ms ({Math.round(probe.setupLatencyMs)} ms to open the association).
-                    </>
-                  ),
-                })
+                if (isL2tp) {
+                  const l2tp = probe as L2tpProbeResult
+                  setOutcome({
+                    ok: true,
+                    message: `Windows connected and received ${l2tp.assignedIpv4} in ${Math.round(l2tp.setupLatencyMs)} ms; data returned in ${Math.round(l2tp.dataLatencyMs)} ms.`,
+                  })
+                } else {
+                  const proxy = probe as Socks5ProbeResult
+                  setOutcome({
+                    ok: true,
+                    message: (
+                      <>
+                        Relay answered through <AddressWithCountry value={proxy.proxy} /> in{' '}
+                        {Math.round(proxy.latencyMs)} ms ({Math.round(proxy.setupLatencyMs)} ms to open the
+                        association).
+                      </>
+                    ),
+                  })
+                }
               } catch (error) {
                 setOutcome({ ok: false, message: (error as Error).message })
               } finally {
@@ -328,7 +361,7 @@ function Endpoint({
               }
             }}
           >
-            {testing ? 'Testing…' : 'Test'}
+            {testing ? 'Testing…' : isL2tp ? 'Test connection' : 'Test'}
           </button>
         )}
         <Toggle
@@ -1516,6 +1549,155 @@ function Socks5Modal({
   )
 }
 
+function L2tpModal({
+  onClose,
+  onAdd,
+  onTest,
+}: {
+  onClose: () => void
+  onAdd: (input: L2tpNodeInput) => Promise<void>
+  onTest: (input: L2tpNodeInput) => Promise<L2tpProbeResult>
+}) {
+  const [server, setServer] = useState('')
+  const [label, setLabel] = useState('')
+  const [preSharedKey, setPreSharedKey] = useState('')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState<'idle' | 'testing' | 'saving'>('idle')
+  const [result, setResult] = useState<string | null>(null)
+  const [failure, setFailure] = useState<string | null>(null)
+
+  const input = (): L2tpNodeInput => ({
+    server: server.trim(),
+    label: label.trim() || undefined,
+    preSharedKey,
+    username: username.trim(),
+    password,
+  })
+  const complete = Boolean(server.trim() && preSharedKey && username.trim() && password)
+
+  const testConnection = async () => {
+    setBusy('testing')
+    setResult(null)
+    setFailure(null)
+    try {
+      const probe = await onTest(input())
+      setResult(
+        `Windows completed L2TP/IPsec in ${Math.round(probe.setupLatencyMs)} ms, received ${probe.assignedIpv4}, and returned data in ${Math.round(probe.dataLatencyMs)} ms.`,
+      )
+    } catch (error) {
+      setFailure((error as Error).message)
+    } finally {
+      setBusy('idle')
+    }
+  }
+
+  const save = async () => {
+    setBusy('saving')
+    setFailure(null)
+    try {
+      await onAdd(input())
+    } catch (error) {
+      setFailure((error as Error).message)
+      setBusy('idle')
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section
+        className="modal relay-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Add an L2TP/IPsec node"
+      >
+        <div className="modal-head">
+          <div>
+            <span className="eyebrow">Windows VPN</span>
+            <h2>Add an L2TP/IPsec node</h2>
+          </div>
+          <button className="icon-button" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <p className="modal-intro">
+          This uses the Windows L2TP/IPsec client in both relay and direct mode. The temporary Windows profile is
+          removed whenever GamePath disconnects. Direct split routing supports IPv4 ranges and exact hostnames.
+        </p>
+        <label className="field-label">
+          Server hostname or IPv4 address
+          <input
+            autoFocus
+            value={server}
+            onChange={(event) => setServer(event.target.value)}
+            placeholder="vpn.example.com"
+          />
+        </label>
+        <label className="field-label">
+          Name (optional)
+          <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Provider L2TP" />
+        </label>
+        <label className="field-label">
+          IPsec pre-shared key
+          <input
+            type="password"
+            value={preSharedKey}
+            onChange={(event) => setPreSharedKey(event.target.value)}
+            placeholder="Required"
+          />
+        </label>
+        <div className="relay-fields">
+          <label className="field-label">
+            Username
+            <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" />
+          </label>
+          <label className="field-label">
+            Password
+            <input
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              autoComplete="current-password"
+            />
+          </label>
+        </div>
+        {result && (
+          <div className="info-banner">
+            <Check size={18} />
+            <div>
+              <strong>The L2TP connection works</strong>
+              <p>{result}</p>
+            </div>
+          </div>
+        )}
+        {failure && (
+          <div className="info-banner">
+            <Info size={18} />
+            <div>
+              <strong>Windows could not connect</strong>
+              <p>{failure}</p>
+            </div>
+          </div>
+        )}
+        <div className="modal-actions">
+          <button className="button secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="button secondary" disabled={!complete || busy !== 'idle'} onClick={testConnection}>
+            <Zap size={16} />
+            {busy === 'testing' ? 'Testing…' : 'Test connection'}
+          </button>
+          <button className="button primary" disabled={!complete || busy !== 'idle'} onClick={save}>
+            <Check size={16} />
+            {busy === 'saving' ? 'Saving…' : 'Add node'}
+          </button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 function AddRelayModal({
   onClose,
   onAdd,
@@ -1766,7 +1948,7 @@ function SetupDrawer({
   const complete = readyCount === steps.length
   const stack = routes.length
     ? routes.map((name) => ({ name, enabled: true }))
-    : [{ name: direct ? 'WireGuard or OpenVPN node' : 'WireGuard pool', enabled: false }]
+    : [{ name: direct ? 'WireGuard, OpenVPN or L2TP/IPsec node' : 'VPN or proxy node', enabled: false }]
   return (
     <section className={`setup-drawer ${open ? 'is-open' : ''} ${complete ? 'is-complete' : ''}`}>
       <button className="drawer-head" onClick={onToggle} aria-expanded={open}>
@@ -1860,6 +2042,7 @@ function App() {
   const [showRelayModal, setShowRelayModal] = useState(false)
   const [showAddRelay, setShowAddRelay] = useState(false)
   const [showSocks5Modal, setShowSocks5Modal] = useState(false)
+  const [showL2tpModal, setShowL2tpModal] = useState(false)
   // Set once files have been chosen and found to need a login, which is the
   // only reason a dialog is shown at all.
   const [openVpnLogin, setOpenVpnLogin] = useState<{
@@ -1945,7 +2128,7 @@ function App() {
   const connectionMode = state?.connectionMode ?? 'relay'
   const direct = connectionMode === 'direct'
   const routingStrategy = state?.routingStrategy ?? 'smart'
-  // Both tunnelling kinds route packets themselves, so both can be the single
+  // Every tunnelling kind routes packets itself, so each can be the single
   // hop of a direct session; a proxy cannot.
   const routingNodes = state?.tunnels.filter((item) => item.kind !== 'socks5').length ?? 0
   // Direct mode is ready when exactly one node is chosen and that node can
@@ -1992,7 +2175,7 @@ function App() {
   const setupSteps: SetupItem[] = [
     {
       done: readiness.routes,
-      title: direct ? 'Choose a WireGuard or OpenVPN node' : 'Add a WireGuard route',
+      title: direct ? 'Choose a tunnelling node' : 'Add a VPN route',
       detail: direct
         ? directNode
           ? `${directNode.name} will carry your traffic`
@@ -2074,6 +2257,12 @@ function App() {
     setShowSocks5Modal(false)
   }
 
+  const addL2tpNode = async (input: L2tpNodeInput) => {
+    const result = await api.addL2tpNode(input)
+    setState(result.state)
+    setShowL2tpModal(false)
+  }
+
   const toggleSession = async () => {
     if (state.session.status !== 'connected') {
       setState({ ...state, session: { status: 'starting' } })
@@ -2089,7 +2278,7 @@ function App() {
 
   const title: Record<View, [string, string]> = {
     dashboard: ['Overview', 'Session control and live route telemetry.'],
-    routes: ['Routes and nodes', 'Import WireGuard or OpenVPN configurations and add SOCKS5 proxies GamePath can use.'],
+    routes: ['Routes and nodes', 'Add WireGuard, OpenVPN, L2TP/IPsec or SOCKS5 nodes GamePath can use.'],
     split: ['Split tunnel', 'Choose exactly which traffic should enter the multipath tunnel.'],
     relays: ['Connection', 'Choose how your traffic leaves this PC.'],
     settings: ['Settings', 'Control startup, diagnostics, and client behavior.'],
@@ -2273,8 +2462,8 @@ function App() {
                   </span>
                   <span className="muted">
                     {direct
-                      ? 'Direct mode sends your traffic through one WireGuard or OpenVPN node, which routes it onward. SOCKS5 proxies need a relay on the other side.'
-                      : 'Each active node carries relay traffic through its own hop: a WireGuard tunnel, an OpenVPN tunnel or a SOCKS5 proxy. Direct ISP relay access is disabled.'}
+                      ? 'Direct mode sends your traffic through one WireGuard, OpenVPN or L2TP/IPsec node. SOCKS5 proxies need a relay.'
+                      : 'Each active node carries relay traffic through its own VPN or proxy hop. Direct ISP relay access is disabled.'}
                   </span>
                 </div>
                 <div className="toolbar-actions">
@@ -2286,6 +2475,10 @@ function App() {
                       Add SOCKS5
                     </button>
                   )}
+                  <button className="button secondary" onClick={() => setShowL2tpModal(true)}>
+                    <ShieldCheck size={16} />
+                    Add L2TP
+                  </button>
                   <button className="button secondary" onClick={chooseAndAddOpenVpn}>
                     <Import size={16} />
                     Add OpenVPN
@@ -2303,7 +2496,9 @@ function App() {
                       key={tunnel.id}
                       tunnel={tunnel}
                       direct={direct}
-                      onTest={() => api.testSavedSocks5Node(tunnel.id)}
+                      onTest={() =>
+                        tunnel.kind === 'l2tp' ? api.testSavedL2tpNode(tunnel.id) : api.testSavedSocks5Node(tunnel.id)
+                      }
                       onToggle={async (enabled) => setState(await api.setTunnelEnabled(tunnel.id, enabled))}
                       onRemove={async () => setState(await api.removeTunnel(tunnel.id))}
                     />
@@ -2317,8 +2512,8 @@ function App() {
                   <h2>No nodes yet</h2>
                   <p>
                     {direct
-                      ? 'Import the WireGuard or OpenVPN configuration file from your VPN provider. Direct mode routes through it, so it is all you need. Private keys are encrypted using Windows secure storage.'
-                      : 'Import your purchased WireGuard or OpenVPN configuration files, or add a SOCKS5 proxy that supports UDP. Private keys and passwords are encrypted using Windows secure storage.'}
+                      ? 'Add a WireGuard, OpenVPN or L2TP/IPsec node from your VPN provider. Direct mode routes through it, so it is all you need. Secrets are protected with Windows secure storage.'
+                      : 'Add a WireGuard, OpenVPN, L2TP/IPsec or SOCKS5 node. Private keys and passwords are protected with Windows secure storage.'}
                   </p>
                   <div className="empty-actions">
                     <button className="button primary" onClick={importTunnels}>
@@ -2328,6 +2523,10 @@ function App() {
                     <button className="button secondary" onClick={chooseAndAddOpenVpn}>
                       <Import size={16} />
                       Add an OpenVPN node
+                    </button>
+                    <button className="button secondary" onClick={() => setShowL2tpModal(true)}>
+                      <ShieldCheck size={16} />
+                      Add an L2TP/IPsec node
                     </button>
                     {/* A proxy cannot carry a direct session, so offering one
                         here would only lead to a node that will not start. */}
@@ -2343,8 +2542,8 @@ function App() {
               <div className="info-banner">
                 <ShieldCheck size={18} />
                 <div>
-                  <strong>Your private keys stay on this PC</strong>
-                  <p>GamePath only decrypts a configuration when the local routing engine needs it.</p>
+                  <strong>Your VPN secrets stay on this PC</strong>
+                  <p>GamePath only decrypts a configuration or login when the local network service needs it.</p>
                 </div>
               </div>
             </section>
@@ -3003,6 +3202,13 @@ function App() {
           onClose={() => setShowSocks5Modal(false)}
           onAdd={addSocks5Node}
           onTest={(input) => api.testSocks5Node(input)}
+        />
+      )}
+      {showL2tpModal && (
+        <L2tpModal
+          onClose={() => setShowL2tpModal(false)}
+          onAdd={addL2tpNode}
+          onTest={(input) => api.testL2tpNode(input)}
         />
       )}
       {showRelayModal && relay && (

@@ -135,7 +135,11 @@ impl MultipathSender {
 }
 
 #[cfg(windows)]
-fn bind_to_interface(socket: &UdpSocket, address: IpAddr, interface_index: u32) -> io::Result<()> {
+pub fn bind_to_interface(
+    socket: &UdpSocket,
+    address: IpAddr,
+    interface_index: u32,
+) -> io::Result<()> {
     use std::mem::size_of;
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
@@ -166,7 +170,7 @@ fn bind_to_interface(socket: &UdpSocket, address: IpAddr, interface_index: u32) 
 }
 
 #[cfg(not(windows))]
-fn bind_to_interface(
+pub fn bind_to_interface(
     _socket: &UdpSocket,
     _address: IpAddr,
     _interface_index: u32,

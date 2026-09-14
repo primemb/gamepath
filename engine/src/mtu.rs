@@ -32,6 +32,10 @@ const OPENVPN_DATA: u16 = 4 + 16 + 8 + 32;
 /// SOCKS5 UDP request header in front of an IPv4 target.
 const SOCKS5_UDP_REQUEST: u16 = 10;
 
+/// Conservative L2TP/IPsec NAT-T allowance: outer IPv4/UDP, non-ESP marker,
+/// ESP IV/auth/padding, the L2TP UDP header and PPP framing.
+const L2TP_IPSEC_DATA: u16 = 116;
+
 /// A relay frame is an IPv4/UDP datagram carrying the GamePath header and the
 /// AEAD tag that seals it.
 const RELAY_OVERLAY: u16 = 20 + 8 + HEADER_LEN as u16 + 16;
@@ -43,13 +47,14 @@ pub const AEAD_TAG: u16 = 16;
 pub fn path_overhead_bytes(mode: SessionMode, kind: &str) -> u16 {
     // Matched as literals rather than the `KIND_*` constants: the relay links
     // this crate without the `openvpn` feature, which gates that constant.
-    let transport = match kind {
-        "wireguard" => WIREGUARD_DATA,
-        "socks5" => SOCKS5_UDP_REQUEST,
-        "openvpn" => OPENVPN_DATA,
+    let (transport, outer) = match kind {
+        "wireguard" => (WIREGUARD_DATA, OUTER_IPV4_UDP),
+        "socks5" => (SOCKS5_UDP_REQUEST, OUTER_IPV4_UDP),
+        "openvpn" => (OPENVPN_DATA, OUTER_IPV4_UDP),
+        "l2tp" => (L2TP_IPSEC_DATA, 0),
         // An unrecognised transport is assumed to cost as much as the most
         // expensive one this build knows about.
-        _ => OPENVPN_DATA,
+        _ => (L2TP_IPSEC_DATA, 0),
     };
     let overlay = match mode {
         SessionMode::Relay => RELAY_OVERLAY,
@@ -57,7 +62,8 @@ pub fn path_overhead_bytes(mode: SessionMode, kind: &str) -> u16 {
         // stands, so only its own transport wraps it.
         SessionMode::Direct => 0,
     };
-    OUTER_IPV4_UDP + transport + overlay
+    // The L2TP/IPsec allowance already includes its outer IP/UDP headers.
+    outer + transport + overlay
 }
 
 /// MTU for the relay's own TUN interface.
@@ -67,7 +73,12 @@ pub fn path_overhead_bytes(mode: SessionMode, kind: &str) -> u16 {
 /// does not know which transports a given client opened, so this is the worst
 /// case across all of them.
 pub fn relay_tun_mtu(link_mtu: u16) -> u16 {
-    EffectiveMtu::for_session(SessionMode::Relay, ["openvpn", "wireguard", "socks5"], link_mtu).mtu
+    EffectiveMtu::for_session(
+        SessionMode::Relay,
+        ["openvpn", "wireguard", "socks5", "l2tp"],
+        link_mtu,
+    )
+    .mtu
 }
 
 /// The MTU a session can carry, and the TCP MSS that fits inside it.
@@ -126,6 +137,17 @@ mod tests {
     }
 
     #[test]
+    fn l2tp_counts_its_outer_headers_only_once() {
+        let direct = EffectiveMtu::for_session(SessionMode::Direct, ["l2tp"], LINK_MTU);
+        assert_eq!(direct.overhead, 116);
+        assert_eq!(direct.mtu, 1384);
+
+        let relay = EffectiveMtu::for_session(SessionMode::Relay, ["l2tp"], LINK_MTU);
+        assert_eq!(relay.overhead, 200);
+        assert_eq!(relay.mtu, 1300);
+    }
+
+    #[test]
     fn the_most_expensive_path_sets_the_session_mtu() {
         let mixed =
             EffectiveMtu::for_session(SessionMode::Relay, ["wireguard", "openvpn"], LINK_MTU);
@@ -145,7 +167,7 @@ mod tests {
     #[test]
     fn the_relay_tun_fits_inside_every_client_transport() {
         let relay = relay_tun_mtu(LINK_MTU);
-        for kind in ["wireguard", "socks5", "openvpn"] {
+        for kind in ["wireguard", "socks5", "openvpn", "l2tp"] {
             let client = EffectiveMtu::for_session(SessionMode::Relay, [kind], LINK_MTU);
             assert!(
                 relay <= client.mtu,
@@ -167,6 +189,7 @@ mod tests {
     fn the_kind_literals_match_the_transport_constants() {
         assert_eq!(crate::relay_path::KIND_WIREGUARD, "wireguard");
         assert_eq!(crate::relay_path::KIND_SOCKS5, "socks5");
+        assert_eq!(crate::relay_path::KIND_L2TP, "l2tp");
         #[cfg(feature = "openvpn")]
         assert_eq!(crate::relay_path::KIND_OPENVPN, "openvpn");
     }
@@ -175,7 +198,7 @@ mod tests {
     fn an_unknown_transport_is_costed_as_the_most_expensive_one() {
         assert_eq!(
             path_overhead_bytes(SessionMode::Relay, "something-new"),
-            path_overhead_bytes(SessionMode::Relay, "openvpn"),
+            path_overhead_bytes(SessionMode::Relay, "l2tp"),
         );
     }
 }

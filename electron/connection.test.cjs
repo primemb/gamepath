@@ -19,14 +19,14 @@ test('a single tunnelling node is what direct mode wants', () => {
 test('an empty selection asks for a node rather than reporting a fault', () => {
   const { node, error } = directNodeSelection([])
   assert.equal(node, null)
-  assert.match(error, /Choose the WireGuard or OpenVPN node/)
+  assert.match(error, /Choose the WireGuard, OpenVPN or L2TP node/)
 })
 
 test('several selected nodes name both ways out', () => {
   const { node, error } = directNodeSelection([wireguard('a'), wireguard('b'), wireguard('c')])
   assert.equal(node, null)
   assert.match(error, /3 are selected/)
-  assert.match(error, /single WireGuard or OpenVPN node/)
+  assert.match(error, /single tunnelling node/)
   assert.match(error, /relay mode/)
 })
 
@@ -36,7 +36,7 @@ test('a proxy is refused with the reason and the alternative', () => {
   // Naming the node matters when several are added and only one is selected.
   assert.match(error, /^Proxy p is a SOCKS5 proxy/)
   assert.match(error, /needs a relay/)
-  assert.match(error, /Choose a WireGuard or OpenVPN node/)
+  assert.match(error, /Choose a WireGuard, OpenVPN or L2TP node/)
 })
 
 test('switching to direct mode keeps an already enabled tunnelling node', () => {
