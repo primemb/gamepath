@@ -1,16 +1,18 @@
 //! Native Windows IP configuration.
 //!
-//! Every function here replaces a `powershell.exe -NoProfile -Command …`
-//! invocation of the matching `Net*` cmdlet. Those cmdlets are convenient but
-//! they are not cheap: each call pays for a fresh PowerShell engine plus the
-//! CIM/WMI machinery the NetTCPIP module sits on, which measures at roughly
-//! 850-1000 ms on an ordinary desktop. The L2TP dial made five such calls in a
-//! row before a session could start, so most of the wait for a session was
-//! process startup rather than anything to do with the network.
+//! Every function here replaces a child process: a `powershell.exe -NoProfile
+//! -Command …` invocation of the matching `Net*` cmdlet, or a `route.exe`. Those
+//! are convenient but they are not cheap. A cmdlet call pays for a fresh
+//! PowerShell engine plus the CIM/WMI machinery the NetTCPIP module sits on,
+//! measured here at 450-1000 ms; `route.exe` is lighter but still 135-175 ms a
+//! call, and all-traffic capture made one per route. The L2TP dial made five
+//! cmdlet calls in a row before a session could start, so most of the wait for
+//! a session was process startup rather than anything to do with the network.
 //!
-//! The IP Helper API underneath those cmdlets answers the same questions in
+//! The IP Helper API underneath all of them answers the same questions in
 //! microseconds, from the same tables, so this is a straight substitution
-//! rather than a change of behaviour.
+//! rather than a change of behaviour — with one deliberate exception, noted on
+//! [`default_ipv4_route`], where the cmdlet pipeline's own ranking was wrong.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -19,15 +21,17 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIpForwardTable2,
+    CreateIpForwardEntry2, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+    DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIpForwardTable2,
     GetIpInterfaceEntry, GetUnicastIpAddressTable, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
     MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_TABLE,
-    SetIpInterfaceEntry,
+    SetInterfaceDnsSettings, SetIpInterfaceEntry,
 };
 use windows_sys::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, RouterDiscoveryDisabled, SOCKADDR_IN,
     SOCKADDR_INET,
 };
+use windows_sys::core::GUID;
 
 /// Wraps an IPv4 address in the `SOCKADDR_INET` the IP Helper API takes.
 ///
@@ -387,12 +391,107 @@ fn remove_ipv6_default_routes(interface_index: u32) -> Result<(), String> {
     }
 }
 
-/// Builds an on-link route row for `destination/prefix_length` out of
+/// The gateway and interface Windows would currently leave this machine by.
+///
+/// Replaces `Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object
+/// RouteMetric | Select-Object -First 1`, which cost a whole PowerShell engine
+/// plus the CIM machinery — measured at 450-830 ms — on the connect path.
+///
+/// The ranking is not quite that cmdlet pipeline's, deliberately. Windows
+/// chooses between default routes on the route metric *plus* the metric of the
+/// interface it leaves by, and sorting on the route metric alone cannot see the
+/// second half: on a laptop with Ethernet and Wi-Fi both up, both default
+/// routes commonly carry route metric 0, so the old sort was a tie broken by
+/// whatever order the table came back in. Picking the wrong one there pins the
+/// relay and node bypass routes to an interface whose gateway cannot reach
+/// them, which strands the session with no route out. This ranks them the way
+/// the stack itself does.
+///
+/// Only `0.0.0.0/0` counts, so the two halves of a GamePath split default
+/// (`0.0.0.0/1` and `128.0.0.0/1`) are never mistaken for the physical route,
+/// and an on-link default — one with no gateway to send bypass traffic to — is
+/// skipped as it was before.
+pub fn default_ipv4_route() -> Result<(Ipv4Addr, u32), String> {
+    let candidates = default_ipv4_route_candidates()?;
+    rank_default_routes(candidates, |interface_index| {
+        ip_interface_entry(interface_index)
+            .ok()
+            .map(|row| row.Metric)
+    })
+    .ok_or_else(|| "no usable default IPv4 route was found".to_owned())
+}
+
+/// Every `0.0.0.0/0` route that has a gateway, as
+/// `(gateway, interface index, route metric)`.
+fn default_ipv4_route_candidates() -> Result<Vec<(Ipv4Addr, u32, u32)>, String> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let status = unsafe { GetIpForwardTable2(AF_INET, &mut table) };
+    if status != NO_ERROR {
+        return Err(format!(
+            "could not read the IPv4 route table (error {status})"
+        ));
+    }
+    if table.is_null() {
+        return Ok(Vec::new());
+    }
+    let mut candidates = Vec::new();
+    // SAFETY: the call succeeded with a non-null table, so `NumEntries` and
+    // that many `Table` rows are initialised; the trailing array is declared
+    // with one element. Nothing borrowed from a row outlives the free below.
+    unsafe {
+        let count = (*table).NumEntries as usize;
+        for row in std::slice::from_raw_parts((*table).Table.as_ptr(), count) {
+            if row.DestinationPrefix.PrefixLength != 0 {
+                continue;
+            }
+            let Some(gateway) = ipv4_from(&row.NextHop) else {
+                continue;
+            };
+            if gateway.is_unspecified() {
+                continue;
+            }
+            candidates.push((gateway, row.InterfaceIndex, row.Metric));
+        }
+        FreeMibTable(table.cast());
+    }
+    Ok(candidates)
+}
+
+/// Picks the default route Windows itself would, given each interface's
+/// metric. Separated from the table walk so the ranking — the part that used
+/// to be wrong — can be tested without a particular machine's network.
+fn rank_default_routes(
+    candidates: Vec<(Ipv4Addr, u32, u32)>,
+    interface_metric: impl Fn(u32) -> Option<u32>,
+) -> Option<(Ipv4Addr, u32)> {
+    let mut best: Option<(u64, Ipv4Addr, u32)> = None;
+    for (gateway, interface_index, route_metric) in candidates {
+        let metric = interface_metric(interface_index)
+            .map(u64::from)
+            // A route whose interface will not answer is still a route. Rank it
+            // last rather than dropping it, so an unreadable row cannot leave a
+            // machine that does have a way out looking like it has none.
+            .unwrap_or(u64::from(u32::MAX));
+        let rank = u64::from(route_metric) + metric;
+        if best.is_none_or(|(current, _, _)| rank < current) {
+            best = Some((rank, gateway, interface_index));
+        }
+    }
+    best.map(|(_, gateway, interface_index)| (gateway, interface_index))
+}
+
+/// Builds a route row for `destination/prefix_length` out of
 /// `interface_index`.
+///
+/// An unspecified `next_hop` is how the API spells "on-link", which is what
+/// `New-NetRoute -NextHop 0.0.0.0` produces; anything else is a gateway the
+/// packet is handed to, as `route ADD … <gateway>` does.
 fn forward_row(
     destination: Ipv4Addr,
     prefix_length: u8,
+    next_hop: Ipv4Addr,
     interface_index: u32,
+    metric: u32,
 ) -> MIB_IPFORWARD_ROW2 {
     let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
     // Fills the defaults Windows expects for the fields this does not set.
@@ -402,24 +501,49 @@ fn forward_row(
         Prefix: sockaddr_v4(destination),
         PrefixLength: prefix_length,
     };
-    // An unspecified next hop is how the API spells "on-link", which is what
-    // `New-NetRoute -NextHop 0.0.0.0` produces.
-    row.NextHop = sockaddr_v4(Ipv4Addr::UNSPECIFIED);
-    row.Metric = 1;
+    row.NextHop = sockaddr_v4(next_hop);
+    row.Metric = metric;
     row
 }
 
-/// Pins `destination/prefix_length` to `interface_index`.
-///
-/// Replaces `Remove-NetRoute` followed by `New-NetRoute`, including the
-/// removal: an existing route for the same prefix may point somewhere else, so
-/// it is deleted rather than left to win.
+/// Pins `destination/prefix_length` on-link to `interface_index`.
 pub fn add_route(
     destination: Ipv4Addr,
     prefix_length: u8,
     interface_index: u32,
 ) -> Result<(), String> {
-    let row = forward_row(destination, prefix_length, interface_index);
+    add_route_via(
+        destination,
+        prefix_length,
+        Ipv4Addr::UNSPECIFIED,
+        interface_index,
+        1,
+    )
+}
+
+/// Routes `destination/prefix_length` through `next_hop` on
+/// `interface_index`.
+///
+/// Replaces `Remove-NetRoute` followed by `New-NetRoute` — and `route.exe ADD`,
+/// which cost a process launch each — including the removal: an existing route
+/// for the same prefix may point somewhere else, so it is deleted rather than
+/// left to win. That also makes this idempotent, which `route ADD` is not: a
+/// leftover bypass route from a session that did not get to clean up used to
+/// fail the next capture start outright instead of being replaced.
+pub fn add_route_via(
+    destination: Ipv4Addr,
+    prefix_length: u8,
+    next_hop: Ipv4Addr,
+    interface_index: u32,
+    metric: u32,
+) -> Result<(), String> {
+    let row = forward_row(
+        destination,
+        prefix_length,
+        next_hop,
+        interface_index,
+        metric,
+    );
     let status = unsafe { CreateIpForwardEntry2(&row) };
     if status == NO_ERROR {
         return Ok(());
@@ -427,7 +551,12 @@ pub fn add_route(
     if status != ERROR_OBJECT_ALREADY_EXISTS {
         return Err(format!(
             "Windows could not route {destination}/{prefix_length} through interface \
-             {interface_index} (error {status})"
+             {interface_index} (error {status}){}",
+            if status == ERROR_ACCESS_DENIED {
+                "; this needs administrator rights"
+            } else {
+                ""
+            }
         ));
     }
     unsafe { DeleteIpForwardEntry2(&row) };
@@ -445,13 +574,80 @@ pub fn add_route(
 /// Removes a route this process added. A route that is already gone is the
 /// intended end state, so it is not an error.
 ///
-/// Deliberately infallible and silent. Both callers run inside `Drop`, while
+/// Deliberately infallible and silent. Every caller runs inside `Drop`, while
 /// a connection is being torn down, and there is nothing useful a failure
 /// could change there: panicking would abort the process mid-teardown and an
 /// error return would only be discarded.
 pub fn remove_route(destination: Ipv4Addr, prefix_length: u8, interface_index: u32) {
-    let row = forward_row(destination, prefix_length, interface_index);
+    remove_route_via(
+        destination,
+        prefix_length,
+        Ipv4Addr::UNSPECIFIED,
+        interface_index,
+    );
+}
+
+/// Removes a route installed through a gateway. The next hop is part of what
+/// identifies a row, so it has to match the one it was created with.
+pub fn remove_route_via(
+    destination: Ipv4Addr,
+    prefix_length: u8,
+    next_hop: Ipv4Addr,
+    interface_index: u32,
+) {
+    let row = forward_row(destination, prefix_length, next_hop, interface_index, 1);
     unsafe { DeleteIpForwardEntry2(&row) };
+}
+
+/// Points an adapter at `servers`, in order, for IPv4 name resolution.
+/// Replaces `netsh interface ipv4 set dnsservers`.
+///
+/// An empty list clears the adapter's servers, which is what teardown wants:
+/// the adapter keeps existing between sessions, and a stale nameserver on a
+/// disconnected tunnel is a resolver pointing into nothing.
+///
+/// `adapter` is the interface GUID rather than its index, because that is what
+/// `SetInterfaceDnsSettings` takes.
+pub fn set_interface_dns(adapter: u128, servers: &[Ipv4Addr]) -> Result<(), String> {
+    // The API takes one space-separated, NUL-terminated wide string. A null
+    // pointer with the flag set is how "no servers" is spelled.
+    let mut encoded: Vec<u16> = servers
+        .iter()
+        .map(Ipv4Addr::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+        .encode_utf16()
+        .collect();
+    encoded.push(0);
+    let mut settings: DNS_INTERFACE_SETTINGS = unsafe { std::mem::zeroed() };
+    settings.Version = DNS_INTERFACE_SETTINGS_VERSION1;
+    // Only the nameserver field is being set. Every other field stays zero and
+    // unflagged, so Windows leaves the adapter's domain, search list and
+    // registration behaviour exactly as it found them.
+    settings.Flags = u64::from(DNS_SETTING_NAMESERVER);
+    settings.NameServer = if servers.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        encoded.as_mut_ptr()
+    };
+    // SAFETY: `settings` is fully initialised and its only pointer either is
+    // null or borrows `encoded`, which outlives the call. The callee copies
+    // what it needs and retains nothing.
+    // Wintun identifies its adapter by the same `u128` it was created with, and
+    // `GUID::from_u128` is the conversion it uses itself, so the two cannot
+    // disagree about which adapter is being configured.
+    let status = unsafe { SetInterfaceDnsSettings(GUID::from_u128(adapter), &settings) };
+    if status == NO_ERROR {
+        return Ok(());
+    }
+    Err(format!(
+        "Windows refused the DNS servers for the tunnel adapter (error {status}){}",
+        if status == ERROR_ACCESS_DENIED {
+            "; this needs administrator rights"
+        } else {
+            ""
+        }
+    ))
 }
 
 #[cfg(test)]
@@ -651,5 +847,128 @@ mod tests {
         let mtu = route_link_mtu(crate::BENCHMARK_TARGET)
             .expect("a machine running these tests has a route to the Internet");
         assert!((crate::mtu::MIN_TUNNEL_MTU..=crate::mtu::LINK_MTU).contains(&mtu));
+    }
+
+    const ETHERNET: (Ipv4Addr, u32) = (Ipv4Addr::new(192, 168, 1, 1), 6);
+    const WIFI: (Ipv4Addr, u32) = (Ipv4Addr::new(192, 168, 50, 1), 14);
+
+    /// The case the old `Sort-Object RouteMetric` could not see. Both default
+    /// routes carry route metric 0 — which is ordinary — so the whole decision
+    /// rests on the interface metric, and sorting on the route metric alone
+    /// left it to the order the table happened to come back in.
+    #[test]
+    fn a_tie_on_route_metric_is_broken_by_the_interface_metric() {
+        let metric = |index| match index {
+            6 => Some(25),  // Ethernet
+            14 => Some(45), // Wi-Fi
+            _ => None,
+        };
+        let wired_first = vec![(ETHERNET.0, ETHERNET.1, 0), (WIFI.0, WIFI.1, 0)];
+        let wireless_first = vec![(WIFI.0, WIFI.1, 0), (ETHERNET.0, ETHERNET.1, 0)];
+        // Whichever order the rows arrive in, the cheaper interface wins.
+        assert_eq!(rank_default_routes(wired_first, metric), Some(ETHERNET));
+        assert_eq!(rank_default_routes(wireless_first, metric), Some(ETHERNET));
+    }
+
+    /// And the route metric still counts: a VPN adapter that asks to be
+    /// avoided by carrying a large route metric must not be chosen over the
+    /// physical link just because its interface metric is low.
+    #[test]
+    fn a_high_route_metric_loses_to_a_cheaper_total() {
+        let metric = |index| match index {
+            6 => Some(25),
+            14 => Some(4), // a VPN interface, cheap on its own
+            _ => None,
+        };
+        let candidates = vec![(WIFI.0, WIFI.1, 328), (ETHERNET.0, ETHERNET.1, 25)];
+        assert_eq!(rank_default_routes(candidates, metric), Some(ETHERNET));
+    }
+
+    /// An interface row that cannot be read is ranked last rather than
+    /// dropped, so it is still chosen when it is the only way out.
+    #[test]
+    fn an_unreadable_interface_is_a_last_resort_not_a_lost_route() {
+        let only = vec![(WIFI.0, WIFI.1, 0)];
+        assert_eq!(rank_default_routes(only, |_| None), Some(WIFI));
+        let both = vec![(WIFI.0, WIFI.1, 0), (ETHERNET.0, ETHERNET.1, 9999)];
+        assert_eq!(
+            rank_default_routes(both, |index| (index == 6).then_some(50)),
+            Some(ETHERNET)
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_gateway_has_no_default_route() {
+        assert_eq!(rank_default_routes(Vec::new(), |_| Some(1)), None);
+    }
+
+    /// The L2TP dial and the service both pin a relay address on-link with
+    /// [`add_route`], and a row that stopped meaning "on-link" would send that
+    /// traffic to a gateway instead of out of the tunnel adapter.
+    #[test]
+    fn an_on_link_route_row_still_has_no_gateway() {
+        let row = forward_row(
+            Ipv4Addr::new(203, 0, 113, 9),
+            32,
+            Ipv4Addr::UNSPECIFIED,
+            12,
+            1,
+        );
+        assert_eq!(ipv4_from(&row.NextHop), Some(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(
+            ipv4_from(&row.DestinationPrefix.Prefix),
+            Some(Ipv4Addr::new(203, 0, 113, 9))
+        );
+        assert_eq!(row.DestinationPrefix.PrefixLength, 32);
+        assert_eq!(row.InterfaceIndex, 12);
+        assert_eq!(row.Metric, 1);
+    }
+
+    /// And a gateway route carries the gateway, which is also what identifies
+    /// the row when it is deleted again.
+    #[test]
+    fn a_gateway_route_row_carries_its_next_hop_and_metric() {
+        let gateway = Ipv4Addr::new(192, 168, 1, 1);
+        let row = forward_row(Ipv4Addr::UNSPECIFIED, 1, gateway, 6, 5);
+        assert_eq!(ipv4_from(&row.NextHop), Some(gateway));
+        assert_eq!(row.DestinationPrefix.PrefixLength, 1);
+        assert_eq!(row.Metric, 5);
+    }
+
+    /// Removing a route that is not there is the intended end state, not an
+    /// error, and teardown runs inside `Drop` where it could not report one.
+    #[test]
+    fn removing_a_route_that_was_never_added_is_silent() {
+        remove_route_via(
+            Ipv4Addr::new(192, 0, 2, 200),
+            32,
+            Ipv4Addr::new(192, 0, 2, 1),
+            1,
+        );
+    }
+
+    /// The live table, read the way the session start path reads it. A machine
+    /// running these tests has a way out, and both halves of the answer have to
+    /// be usable: a gateway that can be sent to, on an interface that exists.
+    #[test]
+    fn the_default_route_names_a_real_gateway_and_interface() {
+        let (gateway, interface_index) =
+            default_ipv4_route().expect("a machine running these tests has a default route");
+        assert!(!gateway.is_unspecified());
+        assert!(interface_index != 0);
+        assert!(
+            interface_mtu(interface_index).is_ok(),
+            "interface {interface_index} does not exist"
+        );
+        // Every candidate came from a `0.0.0.0/0` row, so the winner is one of
+        // them rather than something this invented.
+        let candidates =
+            default_ipv4_route_candidates().expect("the route table should be readable");
+        assert!(
+            candidates
+                .iter()
+                .any(|(address, index, _)| *address == gateway && *index == interface_index),
+            "{gateway} via {interface_index} is not in {candidates:?}"
+        );
     }
 }

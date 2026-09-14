@@ -134,6 +134,11 @@ table inet gamepath_filter {
   chain input {
     type filter hook input priority -10; policy accept;
     udp dport ${PORT} accept
+    # The tunnel resolver below answers on 10.203.0.1 only. An open resolver on
+    # a public address is a DNS amplification reflector, so the uplink is
+    # refused explicitly rather than left to dnsmasq's own binding.
+    iifname "${UPLINK_INTERFACE}" udp dport 53 drop
+    iifname "${UPLINK_INTERFACE}" tcp dport 53 drop
   }
   chain forward {
     type filter hook forward priority -10; policy accept;
@@ -156,6 +161,50 @@ nft list table inet gamepath_filter >/dev/null 2>&1 && nft delete table inet gam
 nft list table ip gamepath_nat >/dev/null 2>&1 && nft delete table ip gamepath_nat || true
 nft -f /etc/nftables.d/gamepath.nft
 systemctl enable nftables.service >/dev/null
+
+# A resolver inside the tunnel.
+#
+# Without one, Windows has no nameserver on its tunnel adapter and falls back to
+# the physical adapter's — the user's home router — so every name lookup leaves
+# outside the tunnel no matter how much traffic goes through it. That is a
+# privacy leak, and on a filtered connection it is worse than that: a poisoned
+# answer sends a game to a dead or wrong address while the tunnel itself is
+# perfectly healthy. Resolving here also means names resolve from the relay's
+# location, so a CDN or game service hands back a node near the exit rather than
+# one near the user's ISP.
+#
+# The client probes this before using it and falls back to a public resolver
+# through the tunnel, so a relay without dnsmasq still works — it just resolves
+# further away.
+if apt-get install -y --no-install-recommends dnsmasq; then
+  # Debian's package starts a system-wide resolver on 0.0.0.0:53. Everything
+  # below narrows it to the tunnel: `bind-dynamic` because gptun0 does not
+  # exist until the relay runs and must be picked up when it appears, and
+  # `no-resolv` because /etc/resolv.conf on a systemd-resolved host points at a
+  # stub this would then forward to in a circle.
+  cat >/etc/dnsmasq.d/gamepath.conf <<'EOF'
+interface=gptun0
+listen-address=10.203.0.1
+bind-dynamic
+no-dhcp-interface=gptun0
+no-resolv
+no-hosts
+domain-needed
+bogus-priv
+cache-size=1000
+server=8.8.8.8
+server=1.1.1.1
+EOF
+  systemctl enable dnsmasq.service >/dev/null 2>&1 || true
+  systemctl restart dnsmasq.service || true
+  if systemctl is-active --quiet dnsmasq.service; then
+    echo "Tunnel resolver active on 10.203.0.1"
+  else
+    echo "WARNING: dnsmasq did not start; clients will resolve through a public resolver." >&2
+  fi
+else
+  echo "WARNING: dnsmasq could not be installed; clients will resolve through a public resolver." >&2
+fi
 
 # Docker installs a later FORWARD base chain whose policy is drop. An accept in
 # our earlier base chain therefore is not enough: Docker evaluates afterwards

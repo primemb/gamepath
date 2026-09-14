@@ -15,6 +15,13 @@ nft list table inet gamepath_filter >/dev/null 2>&1 && nft delete table inet gam
 nft list table ip gamepath_nat >/dev/null 2>&1 && nft delete table ip gamepath_nat || true
 rm -f /etc/nftables.d/gamepath.nft
 
+# Only GamePath's own dnsmasq configuration. The package is left installed
+# because the host may have been using it before this relay existed.
+if [[ -f /etc/dnsmasq.d/gamepath.conf ]]; then
+  rm -f /etc/dnsmasq.d/gamepath.conf
+  systemctl restart dnsmasq.service 2>/dev/null || true
+fi
+
 ip link delete gptun0 2>/dev/null || true
 rm -f /usr/local/bin/gamepath-relay
 rm -f /usr/local/lib/gamepath-relay-allow-docker-forward

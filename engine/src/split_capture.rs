@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use crate::{DataReceiver, WireGuardSessionManager};
+use crate::session::{DataReceiver, WireGuardSessionManager};
 use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::policy::{InterceptionPlan, RuleSpec, compile};
 use std::borrow::Cow;

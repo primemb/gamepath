@@ -1,8 +1,14 @@
 //! Fault injection for the scheduler, sealed overlay and production ingress.
 //! These tests use simulated transport arrival times, not provider networks.
 
-use super::*;
+use super::health::{mask_for_decision, selected_paths};
+use super::state::RelayIngress;
+use gamepath_engine::auth::SessionCrypto;
 use gamepath_engine::protocol::{FLAG_SERVER_TO_CLIENT, FrameHeader};
+use gamepath_engine::replay::ReplayWindow;
+use gamepath_engine::scheduler::{PathMetrics, Strategy, choose_paths};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 
 fn ingress() -> RelayIngress {
     RelayIngress {

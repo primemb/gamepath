@@ -12,6 +12,7 @@ pub const BENCHMARK_TARGET: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 
 pub mod adapter;
 pub mod auth;
+pub mod dns;
 pub mod l2tp;
 pub mod log;
 pub mod mtu;
