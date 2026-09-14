@@ -536,6 +536,10 @@ struct Registry {
     /// to, and a zero here on a machine that is resolving names means the
     /// queries are going out some other way.
     tunnelled_dns: AtomicU64,
+    /// Packets a rule selected whose destination the relay cannot reach, so
+    /// they were left on the local network instead. A steadily climbing count
+    /// means a selected application is talking to something on the LAN.
+    local_destinations: AtomicU64,
     injected_return_packets: AtomicU64,
     unmatched_return_packets: AtomicU64,
     return_injection_errors: AtomicU64,
@@ -690,6 +694,7 @@ impl SplitPacketCapture {
             bypassed_packets: AtomicU64::new(0),
             relay_return_packets: AtomicU64::new(0),
             tunnelled_dns: AtomicU64::new(0),
+            local_destinations: AtomicU64::new(0),
             injected_return_packets: AtomicU64::new(0),
             unmatched_return_packets: AtomicU64::new(0),
             return_injection_errors: AtomicU64::new(0),
@@ -910,6 +915,7 @@ impl SplitPacketCapture {
             "injectedReturnPackets": self.registry.injected_return_packets.load(Ordering::Relaxed),
             "unmatchedReturnPackets": self.registry.unmatched_return_packets.load(Ordering::Relaxed),
             "tunnelledDnsQueries": self.registry.tunnelled_dns.load(Ordering::Relaxed),
+            "localDestinationsLeftUntunnelled": self.registry.local_destinations.load(Ordering::Relaxed),
             "returnInjectionErrors": self.registry.return_injection_errors.load(Ordering::Relaxed),
             "driverQueueTimeMs": 100,
         })
@@ -1142,6 +1148,22 @@ fn run_selected_capture(
                 }
                 continue;
             }
+        }
+        // A rule says which traffic the user wants carried; it cannot say the
+        // relay is able to carry it. A private, link-local or multicast
+        // destination means something different at the far end of the tunnel -
+        // the relay resolving `192.168.1.10` would find its own LAN or nothing
+        // at all - so selecting one does not redirect the packet, it discards
+        // it. Observed live: an application rule sent the launcher's mDNS
+        // discovery to `224.0.0.251:5353` down the tunnel.
+        //
+        // This is the general form of the check `is_name_resolution` makes for
+        // itself. It applies to every way a packet can be selected, because a
+        // rule naming an application selects a LAN game server, a printer or a
+        // NAS exactly as readily as it selects the game's own servers.
+        if selected && !crate::netutil::is_globally_routable_ipv4(fields.destination) {
+            selected = false;
+            registry.local_destinations.fetch_add(1, Ordering::Relaxed);
         }
         if !selected {
             reinject(&handle, &bypass, &registry, packet, address);

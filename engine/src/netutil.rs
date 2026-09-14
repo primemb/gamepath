@@ -135,6 +135,51 @@ pub(crate) fn ipv6_exposure() -> Value {
 mod tests {
     use super::*;
 
+    /// Every address family the relay cannot resolve to the same machine this
+    /// one meant. Each of these has been seen selected by a split-mode rule:
+    /// `192.168.1.1:53` from the DNS rule, `224.0.0.251:5353` from an
+    /// application rule naming a game launcher.
+    #[test]
+    fn an_address_the_relay_cannot_reach_is_not_globally_routable() {
+        use std::net::Ipv4Addr;
+        for address in [
+            "192.168.1.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "224.0.0.251",
+            "255.255.255.255",
+            "0.0.0.0",
+            "192.0.2.1",
+            // 100.64.0.0/10, the ISP's own interior.
+            "100.64.0.1",
+            "100.127.255.254",
+        ] {
+            assert!(
+                !is_globally_routable_ipv4(address.parse::<Ipv4Addr>().unwrap()),
+                "{address} was treated as reachable through the tunnel"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_address_is_globally_routable() {
+        use std::net::Ipv4Addr;
+        for address in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "153.52.92.254",
+            "100.63.255.255",
+            "100.128.0.1",
+        ] {
+            assert!(
+                is_globally_routable_ipv4(address.parse::<Ipv4Addr>().unwrap()),
+                "{address} was withheld from the tunnel"
+            );
+        }
+    }
+
     #[test]
     fn only_a_globally_routable_address_counts_as_ipv6_exposure() {
         use std::net::Ipv6Addr;
