@@ -40,12 +40,34 @@ $serviceBinary = Join-Path $installDirectory 'gamepath-service.exe'
 $tokenFile = Join-Path $dataDirectory 'service-token'
 New-Item -ItemType Directory -Force -Path $installDirectory, $dataDirectory | Out-Null
 
-$existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-$gamePathInterfaceIndexes = @(Get-NetAdapter -Name 'GamePath*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ifIndex)
-if ($existing -and $existing.Status -ne 'Stopped') {
-    Stop-Service -Name $serviceName -Force
-    $existing.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+# Whether Service Control Manager will actually let us operate on the service.
+#
+# `Get-Service` is not that question. A service that has been deleted while
+# someone still holds a handle open stays enumerable, and reports a cached
+# status, while every attempt to open it fails - the "marked for deletion"
+# state. Reinstalling over a just-uninstalled copy lands in it routinely, and
+# because this script runs with `ErrorActionPreference = Stop`, a single
+# `Stop-Service` against such a service aborted the whole installation with
+# "Cannot open GamePathService service on computer '.'". `sc.exe query` opens
+# the service to answer, so its exit code reports what Get-Service cannot.
+function Test-ServiceUsable {
+    & sc.exe query $serviceName | Out-Null
+    return $LASTEXITCODE -eq 0
 }
+
+$gamePathInterfaceIndexes = @(Get-NetAdapter -Name 'GamePath*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ifIndex)
+
+# Every failure here is tolerated. The service is about to be recreated or
+# repointed either way, so "it would not stop" and "it was already gone" lead to
+# the same place, and neither is a reason to refuse to install.
+if (Test-ServiceUsable) {
+    try { Stop-Service -Name $serviceName -Force -ErrorAction Stop } catch {
+        Write-Host "Could not stop ${serviceName}: $($_.Exception.Message)"
+    }
+}
+# The service process holds the handle that keeps a deleted service tombstoned,
+# so a parent Service Control Manager gave up on must not be left behind.
+Get-Process -Name 'gamepath-service' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 # A service upgrade must never leave its separately spawned capture engine
 # intercepting traffic if Service Control Manager terminates the parent early.
 Get-Process -Name 'gamepath-engine' -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -86,7 +108,23 @@ $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 & icacls.exe $dataDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*$currentUserSid`:(OI)(CI)RX" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Failed to protect the GamePath service data directory.' }
 
-if (-not $existing) {
+# Settle before deciding whether to create or repoint. A tombstoned service can
+# be neither: `sc create` fails with "marked for deletion" and `sc config`
+# cannot open it. The handle holding it is released by a process that is already
+# exiting, so this is a wait, not a fix - the same shape as the WinDivert wait
+# above, and with the same ceiling.
+$serviceUsable = $false
+for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    $serviceUsable = Test-ServiceUsable
+    if ($serviceUsable) { break }
+    if (-not (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 250
+}
+if (-not $serviceUsable -and (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+    throw "The previous $serviceName installation is still being removed by Windows. Wait a moment or restart Windows, then run setup again."
+}
+
+if (-not $serviceUsable) {
     & sc.exe create $serviceName binPath= ('"{0}"' -f $serviceBinary) start= auto DisplayName= 'GamePath Network Service' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to create the GamePath Windows service.' }
 }

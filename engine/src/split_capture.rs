@@ -531,6 +531,11 @@ struct Registry {
     relayed_packets: AtomicU64,
     bypassed_packets: AtomicU64,
     relay_return_packets: AtomicU64,
+    /// Name lookups sent through the tunnel that no rule selected. Visible
+    /// because it is the one thing split mode captures without being asked
+    /// to, and a zero here on a machine that is resolving names means the
+    /// queries are going out some other way.
+    tunnelled_dns: AtomicU64,
     injected_return_packets: AtomicU64,
     unmatched_return_packets: AtomicU64,
     return_injection_errors: AtomicU64,
@@ -593,6 +598,9 @@ pub struct CaptureScope {
     reason: &'static str,
 }
 
+/// The kernel-filter half of [`is_name_resolution`].
+const DNS_CLAUSE: &str = "(udp.DstPort == 53 or tcp.DstPort == 53)";
+
 /// Ranges beyond which a destination filter stops being worth building. Each
 /// range costs two comparisons in the kernel's filter program, and past this
 /// the scan is no cheaper than classifying in user space.
@@ -634,7 +642,10 @@ fn capture_scope(plan: &InterceptionPlan, destinations: &[(u32, u32)]) -> Captur
         .collect::<Vec<_>>()
         .join(" or ");
     CaptureScope {
-        clause: format!("({clause})"),
+        // Name resolution is added to every narrow filter, because the
+        // classifier behind it selects DNS whoever asked for it and a packet
+        // the kernel never hands up cannot be selected at all.
+        clause: format!("(({clause}) or {DNS_CLAUSE})"),
         broad: false,
         reason: "destination rules are matched in the kernel",
     }
@@ -678,6 +689,7 @@ impl SplitPacketCapture {
             relayed_packets: AtomicU64::new(0),
             bypassed_packets: AtomicU64::new(0),
             relay_return_packets: AtomicU64::new(0),
+            tunnelled_dns: AtomicU64::new(0),
             injected_return_packets: AtomicU64::new(0),
             unmatched_return_packets: AtomicU64::new(0),
             return_injection_errors: AtomicU64::new(0),
@@ -897,6 +909,7 @@ impl SplitPacketCapture {
             "relayReturnPackets": self.registry.relay_return_packets.load(Ordering::Relaxed),
             "injectedReturnPackets": self.registry.injected_return_packets.load(Ordering::Relaxed),
             "unmatchedReturnPackets": self.registry.unmatched_return_packets.load(Ordering::Relaxed),
+            "tunnelledDnsQueries": self.registry.tunnelled_dns.load(Ordering::Relaxed),
             "returnInjectionErrors": self.registry.return_injection_errors.load(Ordering::Relaxed),
             "driverQueueTimeMs": 100,
         })
@@ -1055,6 +1068,31 @@ fn run_selected_capture(
             None => (false, None, None),
         };
         let mut application = application;
+        // Name resolution goes through the tunnel no matter which process asked
+        // for it, and this is the only place it can be caught.
+        //
+        // An application rule cannot do it. Windows applications do not send
+        // DNS themselves: they call the resolver, and the DNS Client service
+        // inside svchost.exe sends the query. So a rule naming a game selects
+        // every packet that game sends and still leaves its name lookups going
+        // out untunnelled, owned by a process the user never selected. On a
+        // connection that filters DNS by name, the game then resolves its own
+        // servers to a blackhole address while the tunnel beside it is
+        // perfectly healthy - which looks like the tunnel failing and is not.
+        // Measured on such a connection: `steamcommunity.com` and
+        // `discord.com` resolved to 10.10.34.36, while unlisted names resolved
+        // correctly.
+        //
+        // TCP as well as UDP: a truncated answer is retried over TCP, so
+        // selecting only UDP would leak exactly the largest replies.
+        //
+        // If the session cannot carry it, `route_selected_packet` fails open
+        // and the query takes the normal route, so this can cost lookups
+        // latency but never the ability to resolve.
+        if !selected && is_name_resolution(fields) {
+            selected = true;
+            registry.tunnelled_dns.fetch_add(1, Ordering::Relaxed);
+        }
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
         if !selected && is_tcp_syn(packet) {
@@ -2013,6 +2051,27 @@ struct Ipv4Fields {
     destination_port: u16,
 }
 
+/// Whether this is a name lookup the tunnel can actually carry.
+///
+/// Port 53 is not enough on its own. A home machine's resolver is usually its
+/// own router, and `192.168.1.1` means the relay's LAN — or nothing — once the
+/// packet arrives there, so tunnelling such a query does not redirect it, it
+/// drops it. Observed live: a split session selected `UDP 192.168.1.1:53` and
+/// sent it to a relay that could never answer it.
+///
+/// So only a query already addressed to a public resolver is taken. That is
+/// the case this can improve — the same public resolver, reached from the
+/// relay instead of through a filter that rewrites the answer on the way. A
+/// query to a LAN resolver is left alone, because the honest alternatives are
+/// to break it or to change which resolver the machine uses, and silently
+/// doing the second from inside a packet filter is not something split mode
+/// should do.
+fn is_name_resolution(fields: Ipv4Fields) -> bool {
+    matches!(fields.protocol, 6 | 17)
+        && fields.destination_port == 53
+        && crate::netutil::is_globally_routable_ipv4(fields.destination)
+}
+
 impl ReturnKey {
     fn outbound(fields: Ipv4Fields) -> Self {
         Self {
@@ -2649,6 +2708,13 @@ mod tests {
         assert!(scope.clause.contains("ip.DstAddr >= 203.0.113.0"));
         assert!(scope.clause.contains("ip.DstAddr <= 203.0.113.255"));
         assert!(scope.clause.contains("ip.DstAddr == 198.51.100.7"));
+        // A narrow filter still has to hand up name lookups, or the classifier
+        // behind it never gets the chance to select them.
+        assert!(
+            scope.clause.contains("udp.DstPort == 53"),
+            "a narrow filter would never see DNS: {}",
+            scope.clause
+        );
     }
 
     #[test]
@@ -2748,5 +2814,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A query to a public resolver, which is the case split mode carries.
+    fn dns_fields(protocol: u8, destination_port: u16) -> Ipv4Fields {
+        Ipv4Fields {
+            source: Ipv4Addr::new(192, 168, 1, 10),
+            destination: Ipv4Addr::new(8, 8, 8, 8),
+            protocol,
+            source_port: 51_000,
+            destination_port,
+        }
+    }
+
+    /// Both transports, because a truncated answer is retried over TCP and
+    /// selecting only UDP would leak the largest replies.
+    #[test]
+    fn name_resolution_is_selected_on_either_transport() {
+        assert!(is_name_resolution(dns_fields(17, 53)), "UDP/53");
+        assert!(is_name_resolution(dns_fields(6, 53)), "TCP/53");
+    }
+
+    /// It must not swallow ordinary traffic. A game talking to port 53 of
+    /// something that is not a resolver is not what this is for, but the cost
+    /// of that is one tunnelled flow; the cost of matching on source port
+    /// would be capturing every reply a local resolver sends.
+    #[test]
+    fn ordinary_traffic_is_not_mistaken_for_name_resolution() {
+        assert!(!is_name_resolution(dns_fields(17, 443)));
+        assert!(!is_name_resolution(dns_fields(6, 80)));
+        // ICMP has no ports; the field is meaningless rather than zero.
+        assert!(!is_name_resolution(dns_fields(1, 53)));
+    }
+
+    /// The live regression. A home machine resolves through its own router, and
+    /// that address means the relay's own LAN once the packet gets there, so
+    /// tunnelling the query destroys it instead of redirecting it.
+    #[test]
+    fn a_lan_resolver_is_left_on_the_local_network() {
+        for resolver in [
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(169, 254, 1, 1),
+            // Carrier-grade NAT: the ISP's interior, no more reachable from
+            // the relay than a home LAN is.
+            Ipv4Addr::new(100, 100, 0, 1),
+        ] {
+            let mut fields = dns_fields(17, 53);
+            fields.destination = resolver;
+            assert!(
+                !is_name_resolution(fields),
+                "{resolver} would have been sent to a relay that cannot reach it"
+            );
+        }
+    }
+
+    /// And a public resolver is still taken, which is the case this improves.
+    #[test]
+    fn a_public_resolver_is_still_carried() {
+        for resolver in [
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(9, 9, 9, 9),
+        ] {
+            let mut fields = dns_fields(17, 53);
+            fields.destination = resolver;
+            assert!(is_name_resolution(fields), "{resolver} should be carried");
+        }
+    }
+
+    /// The kernel clause and the user-space predicate have to agree, or a
+    /// narrow filter would drop exactly what the classifier wants to select.
+    #[test]
+    fn the_kernel_clause_and_the_classifier_agree() {
+        assert!(DNS_CLAUSE.contains("udp.DstPort == 53"));
+        assert!(DNS_CLAUSE.contains("tcp.DstPort == 53"));
     }
 }

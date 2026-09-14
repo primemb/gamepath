@@ -198,6 +198,92 @@ asked to start the session. A failed dial still joins the thread, because
 `EngineProcess` kills its child when dropped and an orphaned engine would
 outlive the session that failed.
 
+### Picking the default route
+
+All-traffic capture needs the gateway and interface the machine currently
+leaves by, so it can pin the relay and node endpoints outside the tunnel it is
+about to install. This was a `Get-NetRoute` pipeline ending in `Sort-Object
+RouteMetric | Select-Object -First 1`, measured at 450-830 ms, with a
+`route.exe` launch per installed route on top at 135-175 ms each — six routes on
+a three-node session, so well over a second of process startup before a packet
+could move.
+
+`default_ipv4_route` walks `GetIpForwardTable2` instead, and does not reproduce
+that pipeline's ranking. Windows chooses between default routes on the route
+metric _plus_ the metric of the interface they leave by, and sorting on the
+route metric alone cannot see the second half: with Ethernet and Wi-Fi both up,
+both default routes commonly carry route metric 0, so the old sort was a tie
+broken by whatever order the table came back in. Losing that coin flip pins the
+bypass routes to an interface whose gateway cannot reach the relay, which
+strands the session with no route out. Only `0.0.0.0/0` rows are considered, so
+the two halves of GamePath's own split default (`0.0.0.0/1` and `128.0.0.0/1`)
+can never be mistaken for the physical route.
+
+Installing routes through `CreateIpForwardEntry2` also made them idempotent,
+which `route ADD` is not: it fails on a duplicate, so a bypass route left behind
+by a session that did not get to clean up used to fail the next capture start
+outright instead of being replaced.
+
+### Name resolution goes through the tunnel
+
+Windows picks a resolver per interface. The tunnel adapter had none, so lookups
+fell back to the physical adapter's — typically the home router, which sits on
+an on-link `/24` far more specific than the `0.0.0.0/1` capture installs. Every
+lookup therefore left outside the tunnel no matter how much traffic went
+through it.
+
+The reason this is worth doing on the connect path is not privacy. Where DNS
+answers are filtered by name, the filtered answer is a blackhole address, so a
+game resolves its own servers to somewhere dead while the tunnel beside it is
+healthy and carrying traffic. Measured on such a connection: `steamcommunity.com`
+and `discord.com` resolved to `10.10.34.36` from every resolver asked, while
+`github.com` and `example.com` resolved correctly — a name blocklist applied in
+transit, not blanket interception, which is exactly the case a tunnel fixes and
+an untunnelled lookup does not.
+
+All-traffic mode sets the adapter's servers with `SetInterfaceDnsSettings`
+(`netconfig::set_interface_dns`) once the routes exist — before them, there
+would be no path to the resolver it just named. It prefers the relay's own
+resolver at the tunnel gateway, whose address exists only inside the tunnel and
+therefore cannot leak by any route, and proves it first: `tunnel_resolver_answers`
+sends a real query over the live data plane and waits
+`RESOLVER_PROBE_TIMEOUT`. A DNS round trip is normally weak evidence — a proxy
+or a filter can answer one without forwarding anything, which is why
+`answers_dns_without_forwarding` exists — but it is strong evidence here
+precisely because nothing between the client and the relay can see that address,
+let alone reply from it. A public resolver always follows the relay in the list,
+because the relay's resolver can die while a session is up and the machine
+should not stop resolving until someone notices. Teardown clears the servers
+before removing the routes, so there is never a moment pointing at a resolver
+the tunnel can no longer reach.
+
+Split mode has no tunnel adapter to configure, so it selects name resolution in
+the classifier instead — but only queries already addressed to a public
+resolver. A home machine usually resolves through its own router, and
+`192.168.1.1` means the relay's own LAN once the packet arrives there, so
+tunnelling such a query does not redirect it, it destroys it. Observed live: a
+split session selected `UDP 192.168.1.1:53` and sent it to a relay that could
+never answer. What split mode can improve is the other case — the same public
+resolver, reached from the relay instead of through a filter that rewrites the
+answer in transit. Where the machine's resolver is on its own LAN the query is
+left alone, because the alternatives are to break it or to silently change
+which resolver the machine uses, and a packet filter should not do the second.
+Selection is over UDP and TCP — TCP because a truncated answer is
+retried there and selecting only UDP would leak the largest replies. Narrow
+kernel filters carry `DNS_CLAUSE` for the same reason: a packet the kernel never
+hands up cannot be selected. **An application rule cannot do this on its own.**
+Windows applications do not send DNS themselves; they call the resolver, and the
+DNS Client service inside `svchost.exe` sends the query. A rule naming a game
+therefore selects every packet that game sends and still leaves its name lookups
+going out untunnelled, owned by a process the user never selected. Queries the
+session cannot carry fail open to the normal route, so this costs a lookup
+latency at worst, never the ability to resolve.
+
+The probe asks for `example.com`, which is IANA-reserved and belongs to nobody
+whose service could disappear. The first version asked for `dns.google`, which
+turned out to be on the blocklist of the very networks this feature exists to
+work around.
+
 ## Relay and direct sessions
 
 A session runs in one of two modes, chosen by the client and carried through
@@ -368,6 +454,56 @@ was still reporting about 20% loss several minutes later, while the scheduler's
 own view of that route — the number deciding whether it carried traffic — was
 0%. Those two should not be able to disagree, so both now read the same
 estimate. The raw counters are still reported, as counters.
+
+That estimate is smoothed at `LOSS_SMOOTHING`, deliberately a quarter of the
+`SMOOTHING` used for latency and jitter. Being an EWMA over a per-probe 0/1
+indicator, its expectation is the path's true loss rate whatever the constant
+is; what the constant sets is how far one probe can move it. The original 0.2
+moved it the whole way to 20% on a single lost probe, so the published figure
+swung between 20% just after a loss and under 1% just before the next one — on
+a link whose real loss was about 3%, whoever looked saw whichever extreme they
+happened to catch. It was not only cosmetic: at 200 points per unit of loss in
+`score`, one lost probe added 40 points, more than the entire 39-point spread
+between a 47 ms route and an 86 ms one, so a single lost packet outranked every
+latency difference in the route set. A live three-route session changed its
+selection 50 times in six minutes because of it.
+
+Slowing the estimate costs nothing in failure detection, because detection is
+not its job: a path that has actually died is removed by `consecutive_losses`
+reaching `LOSSES_BEFORE_INACTIVE`, an immediate and separate signal. What
+`loss_ratio` ranks is paths that are degraded but still working, and for that a
+rate measured over roughly twenty probes is the honest input.
+
+### The pick has to resist a tie
+
+Fixing the loss estimate removed the loss-driven half of the flapping above and
+exposed the other half. Ranking is memoryless: every probe reply re-sorts the
+whole route set and takes the best two, with no notion of which routes are
+already carrying traffic. Two routes within measurement noise of each other
+therefore trade places on whichever was measured most recently. On a live
+three-route session that produced three different selections inside 2.1
+seconds — `1+3`, then `1+2`, then `2+3` — with every route at about 52 ms and
+no loss, the whole decision turning on one point of score.
+
+`choose_paths_with_incumbent` ranks the routes already carrying traffic
+`INCUMBENCY_MARGIN` points better than they score, so a challenger has to be
+meaningfully better rather than merely different. The margin is sized from the
+gap the decision actually turns on, the second-best route against the third:
+across 261 recorded selection changes its median was 1 point and its 90th
+percentile 6, while the smallest gap separating genuinely different routes in
+the same log was 39 — two 47 ms WireGuard paths against an 86 ms L2TP one. At 8
+points the margin sits inside the noise and nowhere near real signal, and
+replaying the recorded score sequences it suppresses about 88% of the changes.
+
+It cannot delay a failover, which is the property that makes it affordable. A
+path that stops answering scores `f64::INFINITY` through
+`LOSSES_BEFORE_INACTIVE`, and no finite margin reaches infinity; a path that
+genuinely degrades moves its score by far more than 8. The discount also applies
+only to ranking — whether to duplicate at all still reads the paths' true
+latency, jitter and loss, because that is a question about the routes and not
+about which of them was picked last time. The same margin holds the armed
+fallback steady during a total outage, where two equally dead routes could
+otherwise alternate on every timeout.
 
 ### The deadline floor depends on the transport
 

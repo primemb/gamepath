@@ -26,7 +26,7 @@
     "service:routing-test": "electron scripts/test-split-routing.cjs",
     "service:latency-benchmark": "electron scripts/test-split-routing.cjs --latency-benchmark",
     "native:release": "node scripts/build-release.cjs",
-    "package:windows": "npm run check && npm run native:release && node scripts/package-windows.cjs",
+    "package:windows": "npm run format && npm run check && npm run native:release && node scripts/package-windows.cjs",
     "build": "tsc -b && vite build",
     "start": "electron .",
     "typecheck": "tsc -b --pretty false",

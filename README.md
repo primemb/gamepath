@@ -101,6 +101,16 @@ All-traffic mode captures and reinjects IPv4 through Wintun. IPv6 is not carried
 
 Split mode compiles IP and CIDR targets straight into the WinDivert kernel filter, so unrelated traffic never leaves the kernel. Executable, folder and hostname targets cannot be expressed in a filter that is fixed when the handle opens, so those plans admit all outbound IPv4 and classify in user space, reinjecting what was not selected — a compatibility backend with a measurable cost, reported as `captureScope` in capture diagnostics. Exact hostnames resolve at activation; a copy-only DNS observer learns later addresses and wildcard subdomains.
 
+### Name resolution
+
+Both modes send DNS through the tunnel. This is not only about privacy: where DNS answers are filtered by name, a game resolves its own servers to a dead address while the tunnel beside it is perfectly healthy, which looks like the tunnel failing and is not.
+
+All-traffic mode points the tunnel adapter at a resolver reachable through the session. It prefers the relay's own resolver, whose address exists only inside the tunnel and so cannot leak by any route, and falls back to a public resolver reached through the tunnel when the relay has none — a relay installed before this existed keeps working, it just resolves further away. The chosen servers are logged and reported as `dnsServers`. They are cleared when capture stops.
+
+Split mode selects DNS whoever asked for it, over UDP and TCP, counted as `tunnelledDnsQueries` — but only queries already aimed at a public resolver, since a query to your own router means the relay's LAN once it arrives there and tunnelling it would destroy rather than redirect it. If your machine resolves through its router, all-traffic mode is the mode that protects lookups. A rule naming an application cannot do this on its own: Windows applications do not send DNS themselves, they call the resolver, and the DNS Client service inside `svchost.exe` sends the query — so an application rule selects every packet the game sends and still leaves its name lookups going out untunnelled, owned by a process nobody selected. If the session cannot carry a query it takes the normal route, so this can cost a lookup latency but never the ability to resolve.
+
+To resolve inside the relay rather than through a public resolver, reinstall the relay with `deploy/install-relay.sh`; it configures a resolver bound to the tunnel address only, and refuses port 53 on the public interface so the relay never becomes an open resolver.
+
 Targets and rule-group changes made during a connected split session take effect immediately. GamePath replaces only the capture policy and keeps the encrypted relay paths and session keys alive; newly selected TCP applications use the tunnel for new connections, while UDP sockets already open when the rule is added are discovered automatically.
 
 The repository includes the official signed Wintun 0.14.1 AMD64 DLL and its redistribution license under `vendor/wintun`. The downloaded archive is verified against the SHA-256 published by the Wintun project before the binary is copied into the project.

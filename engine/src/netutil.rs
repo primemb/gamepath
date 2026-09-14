@@ -66,6 +66,30 @@ pub(crate) fn link_mtu_for_endpoints(
     }
 }
 
+/// Whether an address means the same thing at the far end of the tunnel as it
+/// does here.
+///
+/// A private, loopback or link-local destination is defined relative to the
+/// machine holding it: `192.168.1.1` is the user's own router, and the relay
+/// resolving that address would find its own LAN or nothing at all. Anything
+/// aimed at one of these has to stay on the local network, because sending it
+/// through the tunnel does not move it somewhere useful — it drops it.
+///
+/// Carrier-grade NAT space is excluded for the same reason: it is the ISP's
+/// interior, unreachable from anywhere else.
+pub(crate) fn is_globally_routable_ipv4(address: std::net::Ipv4Addr) -> bool {
+    let [first, second, ..] = address.octets();
+    !address.is_private()
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !address.is_broadcast()
+        && !address.is_multicast()
+        && !address.is_unspecified()
+        && !address.is_documentation()
+        // 100.64.0.0/10, carrier-grade NAT.
+        && !(first == 100 && (64..128).contains(&second))
+}
+
 /// Whether `address` is one this machine could reach the Internet from.
 ///
 /// Loopback, link-local and unique-local addresses exist on machines with no

@@ -89,12 +89,24 @@ pub fn verdict(response: &[u8], id: u16) -> ResolverVerdict {
     }
 }
 
-/// The name the probe asks for.
+/// The name the probe asks for. Never connected to — only resolved.
 ///
-/// A name that certainly exists and is certainly not in any cache the relay
-/// was shipped with, so the answer proves a live lookup rather than a canned
-/// reply. It is never connected to — only resolved.
-pub const PROBE_HOSTNAME: &str = "dns.google";
+/// `example.com` is reserved by IANA for exactly this kind of use, so it is
+/// guaranteed to exist, guaranteed to stay uninteresting, and belongs to
+/// nobody whose service could disappear or start refusing lookups.
+///
+/// That last property is the one that matters. The first version of this
+/// probe asked for `dns.google`, which turned out to be on the national DNS
+/// blocklist of the very networks this feature exists to work around: asked
+/// from such a connection it returns a blackhole address rather than an
+/// answer. The probe would still have worked, because it is sent through the
+/// tunnel where that blocklist cannot reach it — but picking a name that is
+/// filtered in the target environment leaves no margin for the day some other
+/// code path resolves it outside the tunnel. Measured on a live connection:
+/// `dns.google`, `discord.com` and `steamcommunity.com` all resolved to
+/// `10.10.34.36`, while `example.com`, `github.com` and `cloudflare.com`
+/// resolved correctly.
+pub const PROBE_HOSTNAME: &str = "example.com";
 
 /// Public resolvers to fall back on when the relay has none of its own.
 ///

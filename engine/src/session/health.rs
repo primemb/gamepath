@@ -6,7 +6,7 @@
 
 use super::state::PathSessionStatus;
 use gamepath_engine::log_info;
-use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths};
+use gamepath_engine::scheduler::{Decision, PathMetrics, Strategy, choose_paths_with_incumbent};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -99,9 +99,19 @@ pub(crate) fn update_scheduler_probe(
         Some(latency) => path.record_probe(latency),
         None => path.record_loss(),
     }
-    let decision = choose_paths(&metrics, strategy);
+    // The routes already carrying traffic, so the scheduler can keep them
+    // through a tie instead of re-deciding the whole set on every probe. This
+    // is the only writer of `decision_mask`, and it holds `metrics`, so the
+    // value read here is still the one the store below replaces.
+    let previous = decision_mask.load(Ordering::Acquire);
+    let incumbent: Vec<&str> = metrics
+        .iter()
+        .filter(|path| previous & bit_for_path(&path.id) != 0)
+        .map(|path| path.id.as_str())
+        .collect();
+    let decision = choose_paths_with_incumbent(&metrics, strategy, &incumbent);
     let next = mask_for_decision(decision, fallback_mask);
-    let previous = decision_mask.swap(next, Ordering::AcqRel);
+    decision_mask.store(next, Ordering::Release);
     if previous != next {
         let reason = latency_ms
             .map(|latency| format!("route {} probe {latency:.0} ms", index + 1))
@@ -141,21 +151,23 @@ fn route_mask(mask: u64) -> String {
     }
 }
 
+/// A path id is its route index, which is also its bit in every mask the data
+/// plane reads. One conversion so the masks and the incumbent set cannot drift.
+fn bit_for_path(path_id: &str) -> u64 {
+    path_id
+        .parse::<u32>()
+        .ok()
+        .and_then(|index| 1_u64.checked_shl(index))
+        .unwrap_or(0)
+}
+
 pub(crate) fn mask_for_decision(decision: Decision, fallback_mask: u64) -> u64 {
     let mask = match decision {
         Decision::Drop => 0,
-        Decision::Single { path_id } => path_id
-            .parse::<u32>()
-            .ok()
-            .and_then(|index| 1_u64.checked_shl(index))
-            .unwrap_or(0),
-        Decision::Duplicate { path_ids } => path_ids.into_iter().fold(0, |mask, path_id| {
-            mask | path_id
-                .parse::<u32>()
-                .ok()
-                .and_then(|index| 1_u64.checked_shl(index))
-                .unwrap_or(0)
-        }),
+        Decision::Single { path_id } => bit_for_path(&path_id),
+        Decision::Duplicate { path_ids } => path_ids
+            .into_iter()
+            .fold(0, |mask, path_id| mask | bit_for_path(&path_id)),
     };
     if mask == 0 { fallback_mask } else { mask }
 }
@@ -267,6 +279,7 @@ pub(crate) fn take_late_probe_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gamepath_engine::scheduler::choose_paths;
 
     /// A redial is worth making only when something proves the uplink works.
     /// Two independent providers do not fail in the same second, so when no
