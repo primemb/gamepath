@@ -10,14 +10,30 @@
 use crate::protocol::HEADER_LEN;
 use crate::relay_path::SessionMode;
 
-/// Physical MTU assumed for the uplink. Ethernet and most consumer links use
-/// this; PPPoE and some mobile carriers are lower, which is what
-/// [`EffectiveMtu::probe_floor`] exists to cope with.
+/// Conservative fallback and upper bound for an Internet uplink. Ethernet and
+/// most consumer links use this. Session setup replaces it with the MTU of
+/// the Windows route that actually reaches the selected tunnel endpoint.
 pub const LINK_MTU: u16 = 1500;
 
-/// The smallest MTU IPv4 hosts are required to accept without fragmentation
-/// help. Nothing derived here is allowed below it.
+/// Preferred lower bound for a game tunnel. If an unusually constrained link
+/// cannot accommodate this after encapsulation, preserving a fitting packet is
+/// safer than advertising a larger MTU and forcing fragmentation.
 pub const MIN_TUNNEL_MTU: u16 = 1280;
+
+/// Makes an OS-reported link MTU safe to use as an Internet packet budget.
+/// Jumbo frames do not help the Internet path, and a missing or implausibly
+/// small report must never make connection startup fail.
+pub fn normalize_link_mtu(reported: u16) -> u16 {
+    reported.clamp(MIN_TUNNEL_MTU, LINK_MTU)
+}
+
+/// A provider-supplied tunnel MTU is an inner-packet limit, not an outer-link
+/// budget. Ignore values outside the range GamePath can safely configure.
+pub fn configured_tunnel_mtu(reported: u16) -> Option<u16> {
+    (MIN_TUNNEL_MTU..=LINK_MTU)
+        .contains(&reported)
+        .then_some(reported)
+}
 
 /// IPv4 header plus UDP header for the datagram that leaves this machine.
 const OUTER_IPV4_UDP: u16 = 20 + 8;
@@ -96,13 +112,26 @@ impl EffectiveMtu {
         kinds: impl IntoIterator<Item = &'a str>,
         link_mtu: u16,
     ) -> Self {
+        let link_mtu = normalize_link_mtu(link_mtu);
         let overhead = kinds
             .into_iter()
             .map(|kind| path_overhead_bytes(mode, kind))
             .max()
             .unwrap_or_else(|| path_overhead_bytes(mode, ""));
-        let mtu = link_mtu.saturating_sub(overhead).max(MIN_TUNNEL_MTU);
+        // A path below the preferred 1280-byte tunnel floor is rare, but it
+        // exists on nested/mobile links. Its real budget is still better than
+        // a nominal 1280 that fragments every large game packet.
+        let mtu = link_mtu.saturating_sub(overhead);
         Self { mtu, overhead }
+    }
+
+    /// Applies the lower inner-MTU requested by a provider configuration.
+    /// The transport overhead is deliberately retained: it describes the
+    /// selected transport, while this cap describes the provider's tunnel.
+    pub fn with_tunnel_limit(self, configured: Option<u16>) -> Self {
+        let mtu = configured_tunnel_mtu(configured.unwrap_or(LINK_MTU))
+            .map_or(self.mtu, |limit| self.mtu.min(limit));
+        Self { mtu, ..self }
     }
 
     /// MSS for a clamped TCP handshake: the tunnel MTU less the IPv4 and TCP
@@ -180,9 +209,20 @@ mod tests {
     }
 
     #[test]
-    fn a_small_link_never_produces_an_mtu_below_the_ipv4_minimum() {
+    fn a_small_link_keeps_packets_within_the_real_budget() {
         let mtu = EffectiveMtu::for_session(SessionMode::Relay, ["openvpn"], 1280);
-        assert_eq!(mtu.mtu, MIN_TUNNEL_MTU);
+        assert_eq!(mtu.mtu, 1108);
+        assert_eq!(u32::from(mtu.mtu) + u32::from(mtu.overhead), 1280);
+    }
+
+    #[test]
+    fn a_provider_limit_can_only_reduce_the_safe_result() {
+        let mtu = EffectiveMtu::for_session(SessionMode::Direct, ["wireguard"], LINK_MTU)
+            .with_tunnel_limit(Some(1280));
+        assert_eq!(mtu.mtu, 1280);
+        assert_eq!(mtu.overhead, 60);
+        assert_eq!(configured_tunnel_mtu(1279), None);
+        assert_eq!(configured_tunnel_mtu(1501), None);
     }
 
     #[test]

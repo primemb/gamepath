@@ -20,9 +20,20 @@ pub struct L2tpRuntime {
     pub virtual_address: Ipv4Addr,
     pub server_address: Ipv4Addr,
     pub interface_index: u32,
+    /// Inner MTU the privileged service derived from the route to this L2TP
+    /// server. A RAS redial receives a new adapter and must restore the same
+    /// budget before relay traffic is pinned to it.
+    #[serde(default = "default_l2tp_mtu")]
+    pub mtu: u16,
     pub setup_latency_ms: f64,
     pub profile_name: String,
     pub phonebook_path: String,
+}
+
+// Older privileged-service builds did not include this field in their handoff
+// JSON. Keeping their established safe value makes an in-place update benign.
+fn default_l2tp_mtu() -> u16 {
+    1384
 }
 
 pub struct L2tpRelayPath {
@@ -383,7 +394,7 @@ fn redial_ras(
         .trim()
         .parse::<u32>()
         .map_err(|_| "Windows returned an invalid L2TP adapter index".to_owned())?;
-    configure_mtu(interface_index, 1384)?;
+    configure_mtu(interface_index, runtime.mtu)?;
     let relay_prefix = format!("{}/32", relay.ip());
     add_route(&relay_prefix, interface_index)?;
     owned.interface_index = interface_index;

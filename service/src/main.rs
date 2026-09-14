@@ -161,6 +161,9 @@ mod gamepath_service {
         interface_index: u32,
         setup_latency_ms: f64,
         split_tunneling: bool,
+        /// MTU of the physical route that carried the L2TP/IPsec session into
+        /// Windows RAS. Kept for truthful capture/MSS telemetry.
+        uplink_mtu: u16,
         mtu: u16,
         routes: Vec<String>,
     }
@@ -348,7 +351,7 @@ mod gamepath_service {
 
     fn configure_l2tp_mtu(interface_index: u32, desired: u16) -> Result<u16, String> {
         let script = format!(
-            "$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -ErrorAction Stop;if($i.NlMtuBytes-ne {desired}){{Set-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -NlMtuBytes {desired} -ErrorAction Stop;$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -ErrorAction Stop}};[Console]::Out.Write($i.NlMtuBytes)"
+            "$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -ErrorAction Stop;if($i.NlMtu-ne {desired}){{Set-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -NlMtuBytes {desired} -ErrorAction Stop;$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {interface_index} -ErrorAction Stop}};[Console]::Out.Write($i.NlMtu)"
         );
         let output = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -376,6 +379,45 @@ mod gamepath_service {
             ));
         }
         Ok(actual)
+    }
+
+    /// Looks up the NIC MTU for the route Windows would use to reach the VPN
+    /// server before the RAS connection changes any default routes. A failed
+    /// lookup is intentionally non-fatal; callers retain the 1500-byte safe
+    /// fallback so users on older Windows builds can still connect.
+    fn route_link_mtu(destination: Ipv4Addr) -> Result<u16, String> {
+        let script = format!(
+            "$r=Find-NetRoute -RemoteIPAddress '{destination}' -ErrorAction Stop|Select-Object -First 1;if($null-eq $r){{throw 'no route'}};$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $r.InterfaceIndex -ErrorAction Stop;[Console]::Out.Write($i.NlMtu)"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .output()
+            .map_err(|error| format!("could not inspect route MTU for {destination}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not inspect route MTU for {destination}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let reported = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| format!("Windows returned an invalid route MTU for {destination}"))?;
+        Ok(gamepath_engine::mtu::normalize_link_mtu(reported))
+    }
+
+    fn l2tp_server_ipv4(server: &str) -> Result<Ipv4Addr, String> {
+        let mut addresses = (server, 1701)
+            .to_socket_addrs()
+            .map_err(|error| format!("could not resolve the L2TP server: {error}"))?;
+        addresses
+            .find_map(|address| match address.ip() {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            })
+            .ok_or("the L2TP server did not resolve to IPv4".into())
     }
 
     fn close_l2tp(connection: HRASCONN, phonebook: &[u16], profile_name: &str) {
@@ -419,6 +461,21 @@ mod gamepath_service {
                     "L2TP/IPsec needs a server, pre-shared key, username and password".into(),
                 );
             }
+            // Resolve and inspect the physical route before RAS adds any VPN
+            // routes. The RAS adapter must leave room for L2TP/IPsec inside
+            // that real uplink, not inside a presumed 1500-byte Ethernet link.
+            let server_address = l2tp_server_ipv4(server)?;
+            let uplink_mtu = match route_link_mtu(server_address) {
+                Ok(mtu) => mtu,
+                Err(error) => {
+                    log_event(&format!(
+                        "{error}; L2TP will use the safe 1500-byte fallback"
+                    ));
+                    LINK_MTU
+                }
+            };
+            let desired_mtu =
+                EffectiveMtu::for_session(SessionMode::Direct, ["l2tp"], uplink_mtu).mtu;
             let (phonebook_path, actual_split_tunneling) = create_l2tp_profile(
                 &profile_name,
                 server,
@@ -497,30 +554,14 @@ mod gamepath_service {
                 // A non-elevated console probe cannot tune interfaces. It does
                 // not carry a session, so the production MTU invariant is not
                 // weakened by leaving this short-lived fallback alone.
-                1384
+                desired_mtu
             } else {
-                match configure_l2tp_mtu(interface_index, 1384) {
+                match configure_l2tp_mtu(interface_index, desired_mtu) {
                     Ok(mtu) => mtu,
                     Err(error) => {
                         close_l2tp(connection, &phonebook, &profile_name);
                         return Err(error);
                     }
-                }
-            };
-            let server_address = match (server, 1701).to_socket_addrs() {
-                Ok(mut addresses) => match addresses.find_map(|address| match address.ip() {
-                    IpAddr::V4(ip) => Some(ip),
-                    IpAddr::V6(_) => None,
-                }) {
-                    Some(address) => address,
-                    None => {
-                        close_l2tp(connection, &phonebook, &profile_name);
-                        return Err("the L2TP server did not resolve to IPv4".into());
-                    }
-                },
-                Err(error) => {
-                    close_l2tp(connection, &phonebook, &profile_name);
-                    return Err(format!("could not resolve the L2TP server: {error}"));
                 }
             };
             Ok(Self {
@@ -533,6 +574,7 @@ mod gamepath_service {
                 interface_index,
                 setup_latency_ms: started.elapsed().as_secs_f64() * 1000.0,
                 split_tunneling: actual_split_tunneling,
+                uplink_mtu,
                 mtu,
                 routes: Vec::new(),
             })
@@ -591,6 +633,7 @@ mod gamepath_service {
                 virtual_address: Ipv4Addr::new(10, 203, third, 2),
                 server_address: self.server_address,
                 interface_index: self.interface_index,
+                mtu: self.mtu,
                 setup_latency_ms: self.setup_latency_ms,
                 profile_name: self.profile_name.clone(),
                 phonebook_path: String::from_utf16_lossy(
@@ -848,10 +891,8 @@ mod gamepath_service {
         target_count: usize,
     ) -> (Value, Value, Value) {
         let (reachable, latency_ms) = probe_direct_l2tp(session, Duration::from_secs(2));
-        let mtu = EffectiveMtu {
-            mtu: session.mtu,
-            overhead: LINK_MTU.saturating_sub(session.mtu),
-        };
+        let mtu = EffectiveMtu::for_session(SessionMode::Direct, ["l2tp"], session.uplink_mtu);
+        debug_assert_eq!(mtu.mtu, session.mtu);
         let paths = json!({
             "state": "connected",
             "mode": "direct",

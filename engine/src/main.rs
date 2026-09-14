@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use gamepath_engine::adapter::inspect_library;
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
-use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU};
+use gamepath_engine::mtu::{EffectiveMtu, LINK_MTU, normalize_link_mtu};
 use gamepath_engine::policy::{RuleSpec, compile as compile_policy};
 use gamepath_engine::relay_path::{
     DirectPath, KIND_WIREGUARD, NodeSpec, RelayPath, SessionMode, Socks5RelayPath,
@@ -829,11 +829,23 @@ impl WireGuardSessionManager {
                     .join("; ")
             ));
         }
+        // One capture adapter serves every selected path. Its MTU must fit the
+        // smallest actual outer route and the strictest provider tunnel cap.
+        let link_mtu = link_mtu_for_endpoints(
+            paths
+                .iter()
+                .filter_map(|(_, _, _, path)| path.bypass_ipv4()),
+        );
+        let provider_mtu = paths
+            .iter()
+            .filter_map(|(_, _, node, _)| node.configured_tunnel_mtu())
+            .min();
         let effective_mtu = EffectiveMtu::for_session(
             SessionMode::Relay,
             paths.iter().map(|(_, _, _, path)| path.kind()),
-            LINK_MTU,
-        );
+            link_mtu,
+        )
+        .with_tunnel_limit(provider_mtu);
         let route_summary = paths
             .iter()
             .map(|(route, label, _, path)| format!("{route}:{label}/{}", path.kind()))
@@ -957,7 +969,7 @@ impl WireGuardSessionManager {
         workers.extend(summary);
         log_info!(
             "relay session {session_id} up: {route_count} route(s) [{route_summary}], \
-             mtu {} overhead {}, {} skipped",
+             uplink mtu {link_mtu}, tunnel mtu {} overhead {}, {} skipped",
             effective_mtu.mtu,
             effective_mtu.overhead,
             skipped_routes.len()
@@ -1012,7 +1024,9 @@ impl WireGuardSessionManager {
         let stop = Arc::new(AtomicBool::new(false));
         let kind = path.kind();
         let label_for_log = label.clone();
-        let effective_mtu = EffectiveMtu::for_session(SessionMode::Direct, [kind], LINK_MTU);
+        let link_mtu = link_mtu_for_endpoints(path.bypass_ipv4());
+        let effective_mtu = EffectiveMtu::for_session(SessionMode::Direct, [kind], link_mtu)
+            .with_tunnel_limit(node.configured_tunnel_mtu());
         let statuses = Arc::new(Mutex::new(vec![initial_status(1, kind, label, endpoint)]));
         let scheduler_metrics = Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())]));
         let (command_tx, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
@@ -1061,7 +1075,7 @@ impl WireGuardSessionManager {
             &scheduler_metrics,
         ));
         log_info!(
-            "direct session up: {label_for_log} ({kind}), mtu {} overhead {}",
+            "direct session up: {label_for_log} ({kind}), uplink mtu {link_mtu}, tunnel mtu {} overhead {}",
             effective_mtu.mtu,
             effective_mtu.overhead
         );
@@ -1571,7 +1585,7 @@ impl PacketCaptureManager {
         let adapter_index = adapter
             .get_adapter_index()
             .map_err(|error| format!("could not read GamePath adapter index: {error}"))?;
-        configure_tunnel_interface(adapter_index)?;
+        configure_tunnel_interface(adapter_index, effective_mtu.mtu)?;
         adapter
             .set_network_addresses_tuple(
                 virtual_ipv4.into(),
@@ -1784,9 +1798,9 @@ fn run_wintun_downlink(
 }
 
 #[cfg(windows)]
-fn configure_tunnel_interface(interface_index: u32) -> Result<(), String> {
+fn configure_tunnel_interface(interface_index: u32, mtu: u16) -> Result<(), String> {
     let script = format!(
-        "Set-NetIPInterface -InterfaceIndex {interface_index} -AddressFamily IPv4 -DadTransmits 0 -AutomaticMetric Disabled -InterfaceMetric 5 -NlMtuBytes 1380 -ErrorAction Stop"
+        "Set-NetIPInterface -InterfaceIndex {interface_index} -AddressFamily IPv4 -DadTransmits 0 -AutomaticMetric Disabled -InterfaceMetric 5 -NlMtuBytes {mtu} -ErrorAction Stop"
     );
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -1799,6 +1813,53 @@ fn configure_tunnel_interface(interface_index: u32) -> Result<(), String> {
             "could not configure GamePath interface: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
+    }
+}
+
+/// Returns the physical-interface MTU Windows selected for an already
+/// resolved tunnel endpoint. This is deliberately route-specific: a laptop
+/// can have Ethernet, Wi-Fi and a mobile interface active at the same time.
+#[cfg(windows)]
+fn route_link_mtu(destination: std::net::Ipv4Addr) -> Result<u16, String> {
+    let script = format!(
+        "$r=Find-NetRoute -RemoteIPAddress '{destination}' -ErrorAction Stop|Select-Object -First 1;if($null-eq $r){{throw 'no route'}};$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $r.InterfaceIndex -ErrorAction Stop;[Console]::Out.Write($i.NlMtu)"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|error| format!("could not inspect route MTU for {destination}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not inspect route MTU for {destination}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u16>()
+        .map(normalize_link_mtu)
+        .map_err(|_| format!("Windows returned an invalid route MTU for {destination}"))
+}
+
+/// Uses the tightest successfully inspected endpoint route. Discovery is an
+/// optimisation, never a connection requirement: a filtered query falls back
+/// to the proven 1500-byte budget for only that path.
+fn link_mtu_for_endpoints(endpoints: impl IntoIterator<Item = std::net::Ipv4Addr>) -> u16 {
+    #[cfg(windows)]
+    {
+        let mut smallest = None;
+        for endpoint in endpoints {
+            match route_link_mtu(endpoint) {
+                Ok(mtu) => smallest = Some(smallest.map_or(mtu, |current: u16| current.min(mtu))),
+                Err(error) => log_warn!("{error}; using the safe MTU fallback for this path"),
+            }
+        }
+        smallest.unwrap_or(LINK_MTU)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = endpoints;
+        LINK_MTU
     }
 }
 

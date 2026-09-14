@@ -249,6 +249,21 @@ impl NodeSpec {
         }
     }
 
+    /// A lower cap advertised by the provider for packets inside this
+    /// tunnel. It is applied after outer-path overhead has been accounted for;
+    /// a provider's `MTU`/`tun-mtu` is not itself an Internet-link MTU.
+    pub fn configured_tunnel_mtu(&self) -> Option<u16> {
+        let value = match self {
+            Self::WireGuard { config, .. } => crate::wireguard_runtime::interface_mtu(config),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn { config, .. } => crate::openvpn::OpenVpnConfig::parse(config)
+                .ok()
+                .map(|parsed| parsed.tun_mtu),
+            Self::Socks5 { .. } | Self::L2tp { .. } => None,
+        }?;
+        crate::mtu::configured_tunnel_mtu(value)
+    }
+
     /// True for a proxy running on this machine. Such a proxy is reached over
     /// loopback and never enters the tunnel, but whatever it forwards to does.
     pub fn is_loopback_proxy(&self) -> bool {
@@ -1023,6 +1038,7 @@ mod tests {
                 virtual_address: "10.203.201.2".parse().unwrap(),
                 server_address: "203.0.113.8".parse().unwrap(),
                 interface_index: 42,
+                mtu: 1384,
                 setup_latency_ms: 125.0,
                 profile_name: "GamePath-L2TP-test".into(),
                 phonebook_path: r"C:\ProgramData\rasphone.pbk".into(),

@@ -7,6 +7,31 @@ pub struct RuntimeWireGuardConfig {
     pub endpoint: String,
 }
 
+/// Returns the inner MTU explicitly requested by a provider configuration.
+/// GamePath owns the runtime adapter, so `parse` intentionally removes this
+/// line before bringing the tunnel up; the value is still a useful lower cap
+/// when calculating the adapter's safe MTU.
+pub fn interface_mtu(input: &str) -> Option<u16> {
+    let mut in_interface = false;
+    for original_line in input.lines() {
+        let line = original_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_interface = line.eq_ignore_ascii_case("[interface]");
+            continue;
+        }
+        if !in_interface {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        if raw_key.trim().eq_ignore_ascii_case("mtu") {
+            return raw_value.trim().parse().ok();
+        }
+    }
+    None
+}
+
 /// Rewrites a configuration so the tunnel carries nothing but relay traffic.
 pub fn narrow_to_relay(input: &str, relay: IpAddr) -> Result<RuntimeWireGuardConfig, String> {
     parse(input, Some(relay))
@@ -192,6 +217,13 @@ PersistentKeepalive = 25
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn reads_an_optional_interface_mtu_without_preserving_it_at_runtime() {
+        assert_eq!(interface_mtu(CONFIG), Some(1280));
+        assert_eq!(interface_mtu("[Peer]\nMTU = 1400"), None);
+        assert_eq!(interface_mtu("[Interface]\nMTU = not-a-number"), None);
     }
 
     #[test]
