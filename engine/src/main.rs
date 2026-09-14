@@ -2372,6 +2372,9 @@ fn run_path(
     };
     let mut next_probe = Instant::now();
     let mut pending_probe: Option<(u64, Instant)> = None;
+    // Probes already written off, kept briefly so a reply that arrives after
+    // the deadline can still tell the estimator how slow this path really is.
+    let mut expired_probes: Vec<(u64, Instant)> = Vec::new();
     let mut correlated_probes = false;
     let mut warned_legacy_probes = false;
     let mut published_setup_latency = None;
@@ -2603,6 +2606,17 @@ fn run_path(
                                         !correlated_probes,
                                     )
                                 {
+                                    // Not the outstanding probe's reply, but it
+                                    // may answer one already written off, and
+                                    // that measurement is the one the deadline
+                                    // most needs.
+                                    if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
+                                        if let Some(elapsed) =
+                                            take_late_probe_reply(&mut expired_probes, &plaintext)
+                                        {
+                                            rtt.record(elapsed);
+                                        }
+                                    }
                                     continue;
                                 }
                                 if plaintext.len() == 12 {
@@ -2674,6 +2688,15 @@ fn run_path(
                                     None => {}
                                 }
                                 next_probe = Instant::now() + PROBE_INTERVAL;
+                            } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
+                                // Nothing outstanding: a control frame now can
+                                // only be answering a probe already given up
+                                // on, in the gap before the next one goes out.
+                                if let Some(elapsed) =
+                                    take_late_probe_reply(&mut expired_probes, &plaintext)
+                                {
+                                    rtt.record(elapsed);
+                                }
                             }
                         } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
                             record_path_receive(&statuses, index, frame.len());
@@ -2706,8 +2729,11 @@ fn run_path(
             current[index].handshake_round_trips = path.setup_round_trips();
             published_setup_latency = setup_latency;
         }
-        if pending_probe.is_some_and(|(_, started)| started.elapsed() > rtt.timeout()) {
+        if let Some((sequence, started)) =
+            pending_probe.filter(|(_, started)| started.elapsed() > rtt.timeout())
+        {
             pending_probe = None;
+            remember_expired_probe(&mut expired_probes, sequence, started);
             statuses.lock().unwrap()[index].probes_lost += 1;
             update_scheduler_probe(
                 &scheduler_metrics,
@@ -3019,6 +3045,56 @@ fn next_backoff(current: Duration) -> Duration {
     } else {
         (current * 2).min(RECONNECT_BACKOFF_MAX)
     }
+}
+
+/// How long a timed-out probe is remembered so a reply arriving late can still
+/// correct the deadline estimate.
+///
+/// Twice [`gamepath_engine::rtt::MAX_TIMEOUT`]. Past that the path has already
+/// been taken out of service and a redial matters more than another sample, and
+/// a reply that late produces the ceiling deadline either way.
+const LATE_REPLY_WINDOW: Duration = Duration::from_secs(3);
+
+/// Most written-off probes held at once. A degraded path probes every
+/// [`PROBE_INTERVAL_DEGRADED`], which fits comfortably inside this, so
+/// [`LATE_REPLY_WINDOW`] is what actually expires an entry and this only bounds
+/// the memory.
+const LATE_REPLY_CAPACITY: usize = 32;
+
+/// Remembers a probe that missed its deadline, so its reply is still
+/// recognisable if it turns up.
+fn remember_expired_probe(expired: &mut Vec<(u64, Instant)>, sequence: u64, started: Instant) {
+    expired.retain(|(_, sent)| sent.elapsed() < LATE_REPLY_WINDOW);
+    if expired.len() >= LATE_REPLY_CAPACITY {
+        expired.remove(0);
+    }
+    expired.push((sequence, started));
+}
+
+/// Matches a control frame against probes already written off, returning how
+/// long that probe really took and forgetting it.
+///
+/// The probe stays lost. It missed its deadline, the scheduler has scored it
+/// that way, and none of the health accounting is revisited. What this recovers
+/// is the *measurement*.
+///
+/// Without it the estimator only ever sees replies that beat the current
+/// deadline, which holds its smoothed round trip and variation below the truth
+/// and keeps the deadline pinned near its floor - on exactly the paths whose
+/// replies are slow enough to need it widened, so the next probe times out for
+/// the same reason. Measured on a live L2TP/IPsec route whose round trip
+/// doubled under congestion while two WireGuard routes on the same uplink did
+/// not move at all.
+///
+/// A legacy untagged `pong` is deliberately not matched: it cannot say which
+/// probe it answers, so crediting it to one would invent a round trip rather
+/// than measure one.
+fn take_late_probe_reply(expired: &mut Vec<(u64, Instant)>, reply: &[u8]) -> Option<Duration> {
+    let position = expired.iter().position(|(sequence, _)| {
+        gamepath_engine::protocol::probe_reply_matches(reply, *sequence, false)
+    })?;
+    let (_, started) = expired.remove(position);
+    Some(started.elapsed())
 }
 
 /// Arms the next redial once a path has failed [`RECONNECT_AFTER_FAILURES`]
@@ -3906,6 +3982,115 @@ mod tests {
         publish_path_health(&mask, 1, true);
         assert!(another_path_is_up(&mask, 0));
         assert!(another_path_is_up(&mask, 1));
+    }
+
+    fn probe_reply(sequence: u64) -> Vec<u8> {
+        gamepath_engine::protocol::probe_response(&gamepath_engine::protocol::probe_request(
+            sequence,
+        ))
+        .expect("a tagged request has a tagged response")
+    }
+
+    fn ago(duration: Duration) -> Instant {
+        Instant::now()
+            .checked_sub(duration)
+            .expect("the test machine has been up longer than this")
+    }
+
+    /// What the whole mechanism is for. A path whose replies keep arriving
+    /// just past the deadline has to be able to widen it; otherwise every
+    /// probe times out for the same reason and the estimator never hears the
+    /// sample that would fix it.
+    #[test]
+    fn late_replies_let_the_deadline_catch_up_with_a_slowing_path() {
+        use gamepath_engine::rtt::{MAX_TIMEOUT, MIN_TIMEOUT, RttEstimator};
+        let mut settled = RttEstimator::default();
+        for _ in 0..40 {
+            settled.record(Duration::from_millis(50));
+        }
+        assert_eq!(settled.timeout(), MIN_TIMEOUT);
+
+        // Congestion doubles the path. These replies land past the deadline,
+        // so they are exactly the ones that used to be discarded.
+        let slow = Duration::from_millis(260);
+        assert!(slow > settled.timeout());
+
+        let mut learning = settled;
+        for _ in 0..20 {
+            learning.record(slow);
+        }
+        assert!(
+            learning.timeout() > slow,
+            "a path answering in {slow:?} still gets a {:?} deadline",
+            learning.timeout()
+        );
+        assert!(learning.timeout() <= MAX_TIMEOUT);
+    }
+
+    #[test]
+    fn a_late_reply_is_matched_to_the_probe_it_answers() {
+        let mut expired = Vec::new();
+        remember_expired_probe(&mut expired, 7, ago(Duration::from_millis(300)));
+        remember_expired_probe(&mut expired, 8, Instant::now());
+        let elapsed =
+            take_late_probe_reply(&mut expired, &probe_reply(7)).expect("the reply names probe 7");
+        assert!(elapsed >= Duration::from_millis(300), "got {elapsed:?}");
+        // Taken rather than left to be counted twice.
+        assert_eq!(take_late_probe_reply(&mut expired, &probe_reply(7)), None);
+        // And the unrelated probe is untouched.
+        assert!(take_late_probe_reply(&mut expired, &probe_reply(8)).is_some());
+    }
+
+    /// A legacy relay's bare `pong` cannot say which probe it answers, so
+    /// crediting it to one would invent a round trip instead of measuring one.
+    #[test]
+    fn an_untagged_reply_is_never_credited_to_a_probe() {
+        let mut expired = Vec::new();
+        remember_expired_probe(&mut expired, 3, ago(Duration::from_millis(250)));
+        assert_eq!(take_late_probe_reply(&mut expired, b"pong"), None);
+        assert_eq!(take_late_probe_reply(&mut expired, &probe_reply(4)), None);
+        assert!(take_late_probe_reply(&mut expired, &probe_reply(3)).is_some());
+    }
+
+    #[test]
+    fn written_off_probes_cannot_grow_without_bound() {
+        let mut expired = Vec::new();
+        let last = LATE_REPLY_CAPACITY as u64 * 3;
+        for sequence in 0..=last {
+            remember_expired_probe(&mut expired, sequence, Instant::now());
+        }
+        assert!(expired.len() <= LATE_REPLY_CAPACITY, "{}", expired.len());
+        // The newest are the ones still worth answering.
+        assert!(take_late_probe_reply(&mut expired, &probe_reply(last)).is_some());
+        assert_eq!(take_late_probe_reply(&mut expired, &probe_reply(0)), None);
+    }
+
+    #[test]
+    fn a_probe_older_than_the_window_is_forgotten() {
+        let mut expired = Vec::new();
+        remember_expired_probe(
+            &mut expired,
+            1,
+            ago(LATE_REPLY_WINDOW + Duration::from_millis(1)),
+        );
+        // Pruning happens as the next one is remembered.
+        remember_expired_probe(&mut expired, 2, Instant::now());
+        assert_eq!(take_late_probe_reply(&mut expired, &probe_reply(1)), None);
+        assert!(take_late_probe_reply(&mut expired, &probe_reply(2)).is_some());
+    }
+
+    /// The window has to outlast the widest deadline a probe can be given, or
+    /// the reply to the slowest probe would be forgotten before it arrived.
+    #[test]
+    fn the_late_reply_window_outlasts_the_widest_deadline() {
+        assert!(LATE_REPLY_WINDOW >= gamepath_engine::rtt::MAX_TIMEOUT * 2);
+        // And the window, not the capacity, is what expires an entry even when
+        // a degraded path is probing as fast as it ever does.
+        let in_flight = LATE_REPLY_WINDOW.as_millis() / PROBE_INTERVAL_DEGRADED.as_millis();
+        assert!(
+            (in_flight as usize) < LATE_REPLY_CAPACITY,
+            "{in_flight} probes can be outstanding, capacity is {LATE_REPLY_CAPACITY}"
+        );
     }
 
     #[test]

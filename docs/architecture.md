@@ -403,6 +403,36 @@ bounds that at four seconds. That is the correct trade: on a transport that
 retransmits underneath us, "stalled" and "dead" genuinely take longer to tell
 apart, and reporting the first as the second is the more expensive mistake.
 
+### A probe that times out still measures the path
+
+The deadline is only as good as what the estimator is allowed to see, and it
+used to see a biased sample. A reply arriving after its probe had been written
+off was discarded: the worker matched replies against the one outstanding
+probe, and that slot had already been cleared.
+
+So the estimator learned only from replies that beat the current deadline.
+That holds its smoothed round trip and its variation below the truth, which
+keeps the deadline near its floor — on exactly the paths whose replies are slow
+enough to need it widened, so the next probe times out for the same reason.
+Measured on a live L2TP/IPsec route whose round trip doubled under congestion
+while two WireGuard routes on the same uplink did not move at all: at a 100 ms
+round trip with 24 ms of variation the estimator asks for 196 ms and is given
+the 200 ms floor, about two times headroom, where a 48 ms WireGuard path has
+four.
+
+A timed-out probe is now remembered for `LATE_REPLY_WINDOW`, and a reply that
+turns up inside it feeds its round trip to the estimator. The relay already
+echoes the probe's sequence number in its `pong` for precisely this — the engine
+warns when a relay is too old to do so, naming "accurate RTT matching after
+timeouts" — so the match is exact. An untagged legacy `pong` is refused rather
+than guessed at, because it cannot say which probe it answers.
+
+**The probe stays lost.** It missed its deadline; `probes_lost`, the consecutive
+failure count and the scheduler's loss score are all untouched, and none of the
+health or failover accounting is revisited. What this recovers is the
+measurement, not the verdict — so a path cannot talk its way out of being
+declared dead by answering late.
+
 ### The stream transport keeps its own send queue
 
 The other half of carrying datagrams over TCP is what happens on the way out.
