@@ -49,6 +49,7 @@ let state: AppState = {
   ],
   ruleGroups: [{ id: 'group-competitive', name: 'Competitive games', enabled: true }],
   trafficMode: 'split',
+  remoteDns: true,
   connectionMode: 'relay',
   routingStrategy: 'smart',
   relays: [
@@ -251,6 +252,10 @@ export const mockApi: GamePathApi = {
   },
   setTrafficMode: async (mode) => {
     state.trafficMode = mode
+    return snapshot()
+  },
+  setRemoteDns: async (enabled) => {
+    state.remoteDns = enabled
     return snapshot()
   },
   setConnectionMode: async (mode) => {

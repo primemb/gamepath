@@ -180,6 +180,7 @@ export type AppState = {
   rules: SplitRule[]
   ruleGroups: SplitRuleGroup[]
   trafficMode: 'all' | 'split'
+  remoteDns: boolean
   connectionMode: ConnectionMode
   /** Smart uses the best two paths; manual duplicates across every healthy path. */
   routingStrategy: 'smart' | 'manual'
@@ -323,6 +324,7 @@ export type GamePathApi = {
   setRuleGroupEnabled: (id: string, enabled: boolean) => Promise<AppState>
   removeRuleGroup: (id: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
+  setRemoteDns: (enabled: boolean) => Promise<AppState>
   setConnectionMode: (mode: ConnectionMode) => Promise<AppState>
   setRoutingStrategy: (strategy: 'smart' | 'manual') => Promise<AppState>
   setRelay: (id: string) => Promise<AppState>

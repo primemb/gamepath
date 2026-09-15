@@ -131,6 +131,19 @@ pub(crate) struct PacketCaptureRequest {
     pub(crate) traffic_mode: String,
     #[serde(default)]
     pub(crate) rules: Vec<RuleSpec>,
+    /// Whether name resolution should follow the tunnel.
+    ///
+    /// Defaults on, and defaults on for a caller that predates the setting:
+    /// leaving lookups with the local resolver is what leaks them to the ISP,
+    /// and on a filtered connection hands back poisoned answers while the
+    /// tunnel beside them is healthy. Someone who wants the old behaviour is
+    /// choosing it; someone who never heard of the setting should be protected.
+    #[serde(default = "enabled")]
+    pub(crate) remote_dns: bool,
+}
+
+const fn enabled() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -141,6 +154,27 @@ mod tests {
 
     fn session_request(payload: Value) -> SessionRequest {
         serde_json::from_value(payload).unwrap()
+    }
+
+    /// A caller that predates the setting means the protective behaviour. The
+    /// opposite default would quietly leak every lookup to the local resolver
+    /// after an upgrade, which on a filtered connection is also how a healthy
+    /// tunnel comes to look broken.
+    #[test]
+    fn a_capture_request_without_the_setting_resolves_through_the_tunnel() {
+        let request: PacketCaptureRequest =
+            serde_json::from_value(json!({ "trafficMode": "split" })).unwrap();
+        assert!(request.remote_dns);
+    }
+
+    #[test]
+    fn the_setting_is_carried_through_when_it_is_given() {
+        for asked in [true, false] {
+            let request: PacketCaptureRequest =
+                serde_json::from_value(json!({ "trafficMode": "all", "remoteDns": asked }))
+                    .unwrap();
+            assert_eq!(request.remote_dns, asked);
+        }
     }
 
     #[test]

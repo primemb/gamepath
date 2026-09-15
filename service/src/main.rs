@@ -107,6 +107,9 @@ mod gamepath_service {
         session_status: String,
         route_count: usize,
         traffic_mode: String,
+        /// Remembered so a live rule edit reapplies the session's DNS choice
+        /// rather than silently reverting it to the default.
+        remote_dns: bool,
         session_rules: Value,
         engine: Option<EngineProcess>,
         l2tp_sessions: Vec<L2tpSession>,
@@ -1170,6 +1173,7 @@ mod gamepath_service {
                 state.session_status = "idle".into();
                 state.route_count = 0;
                 state.traffic_mode.clear();
+                state.remote_dns = false;
                 state.session_rules = Value::Null;
                 state.native_l2tp_direct = false;
                 state.native_l2tp_status = Value::Null;
@@ -1363,6 +1367,9 @@ mod gamepath_service {
         runtime.native_l2tp_probe_failures = 0;
         let request: ValidateRequest = serde_json::from_value(payload.clone())
             .map_err(|error| format!("invalid session request: {error}"))?;
+        // Absent means on, matching the engine: a caller that predates the
+        // setting gets the protective behaviour rather than a silent leak.
+        let remote_dns = payload["remoteDns"].as_bool().unwrap_or(true);
         let mut nodes = request.resolved_nodes();
         for (index, node) in nodes.iter().enumerate() {
             node.validate()
@@ -1423,6 +1430,7 @@ mod gamepath_service {
             runtime.session_status = "connected".into();
             runtime.route_count = 1;
             runtime.traffic_mode = traffic_mode;
+            runtime.remote_dns = remote_dns;
             runtime.session_rules = rules;
             runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
             runtime.native_l2tp_direct = true;
@@ -1470,13 +1478,14 @@ mod gamepath_service {
         let capture = engine
             .request(
                 "start-packet-capture",
-                json!({ "trafficMode": traffic_mode, "rules": rules }),
+                json!({ "trafficMode": traffic_mode, "rules": rules, "remoteDns": remote_dns }),
             )
             .inspect_err(|error| log_event(error))?;
         log_event("Windows packet capture started");
         runtime.session_status = "connected".into();
         runtime.route_count = paths["paths"].as_array().map_or(0, Vec::len);
         runtime.traffic_mode = traffic_mode;
+        runtime.remote_dns = remote_dns;
         runtime.session_rules = rules;
         runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
         runtime.engine = Some(engine);
@@ -1535,7 +1544,8 @@ mod gamepath_service {
                 "targetCount": 0,
             }));
         }
-        let update = json!({ "trafficMode": "split", "rules": rules });
+        let remote_dns = runtime.remote_dns;
+        let update = json!({ "trafficMode": "split", "rules": rules, "remoteDns": remote_dns });
         let engine = runtime.engine.as_mut().ok_or("no active network session")?;
         let command = if previous_rules_are_empty {
             "start-packet-capture"
@@ -1553,7 +1563,7 @@ mod gamepath_service {
                 } else {
                     engine.request(
                         "start-packet-capture",
-                        json!({ "trafficMode": "split", "rules": previous_rules }),
+                        json!({ "trafficMode": "split", "rules": previous_rules, "remoteDns": remote_dns }),
                     )
                 };
                 return match rollback {

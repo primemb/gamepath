@@ -28,6 +28,10 @@ const defaultState = () => ({
   rules: [],
   ruleGroups: [],
   trafficMode: 'split',
+  // Name resolution follows the tunnel unless the user turns it off. On a
+  // filtered connection the local resolver hands back poisoned answers while
+  // the tunnel beside it is healthy, which reads as the tunnel failing.
+  remoteDns: true,
   connectionMode: 'relay',
   routingStrategy: 'smart',
   relays: [
@@ -759,6 +763,12 @@ function registerIpc() {
     return publicState()
   })
 
+  ipcMain.handle('traffic:set-remote-dns', (_event, enabled) => {
+    state.remoteDns = Boolean(enabled)
+    saveState()
+    return publicState()
+  })
+
   ipcMain.handle('relay:set', (_event, id) => {
     if (state.relays.some((relay) => relay.id === id)) state.activeRelayId = state.activeRelayId === id ? null : id
     saveState()
@@ -1006,7 +1016,15 @@ function registerIpc() {
         })
         const serviceSession = await serviceBridge.request(
           'start-session',
-          { mode, strategy, ...relayCredentials, nodes, trafficMode: state.trafficMode, rules },
+          {
+            mode,
+            strategy,
+            ...relayCredentials,
+            nodes,
+            trafficMode: state.trafficMode,
+            remoteDns: state.remoteDns !== false,
+            rules,
+          },
           nodes.some((node) => node.kind === 'l2tp') ? 60000 : 30000,
         )
         const paths = serviceSession.paths
@@ -1023,6 +1041,7 @@ function registerIpc() {
         startSessionKeepAlive()
         logger.info(
           `session started: mode=${mode} traffic=${state.trafficMode} ` +
+            `dns=${state.remoteDns !== false ? 'remote' : 'local'} ` +
             `routes=${paths.paths.length} skipped=${(paths.skippedRoutes ?? []).length} ` +
             `mtu=${serviceSession.capture?.effectiveMtu ?? 'unknown'}`,
         )

@@ -1978,7 +1978,35 @@ select:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* The resolver row below takes a full line of its own rather than
+     competing with the mode buttons for the same row. */
+  flex-wrap: wrap;
+  gap: 14px;
   background: rgba(255, 255, 255, 0.015);
+}
+.remote-dns-row {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.remote-dns-row strong {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 13px;
+}
+.remote-dns-row p {
+  max-width: 62ch;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.remote-dns-row .node-group-switch {
+  flex: 0 0 auto;
 }
 .traffic-mode-card h2 {
   margin: 5px 0 4px;

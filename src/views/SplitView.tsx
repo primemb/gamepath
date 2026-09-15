@@ -83,7 +83,15 @@ function RuleRow({
   )
 }
 
-function TrafficModeCard({ state, onChange }: { state: AppState; onChange: (mode: 'all' | 'split') => void }) {
+function TrafficModeCard({
+  state,
+  onChange,
+  onChangeRemoteDns,
+}: {
+  state: AppState
+  onChange: (mode: 'all' | 'split') => void
+  onChangeRemoteDns: (enabled: boolean) => void
+}) {
   return (
     <div className="traffic-mode-card">
       <div>
@@ -104,6 +112,24 @@ function TrafficModeCard({ state, onChange }: { state: AppState; onChange: (mode
             All IPv4 traffic<small>Whole system</small>
           </span>
         </button>
+      </div>
+      <div className="remote-dns-row">
+        <div>
+          <strong>Resolve names through the tunnel</strong>
+          <p>
+            {state.remoteDns
+              ? 'Websites and game servers are looked up at the far end of the tunnel, so a filtered or poisoned local resolver cannot send you to the wrong address. Applies to every app on this PC, not only the ones you select.'
+              : 'Lookups use whatever resolver this PC normally uses. Turn this on if a game or site fails to connect while the tunnel itself is healthy.'}
+          </p>
+        </div>
+        <span className="node-group-switch">
+          <span>{state.remoteDns ? 'On' : 'Off'}</span>
+          <Toggle
+            checked={state.remoteDns}
+            onChange={onChangeRemoteDns}
+            label={`${state.remoteDns ? 'Stop resolving' : 'Resolve'} names through the tunnel`}
+          />
+        </span>
       </div>
     </div>
   )
@@ -158,7 +184,11 @@ export function SplitView({
 
   return (
     <section className="page-section">
-      <TrafficModeCard state={state} onChange={(mode) => guard(async () => setState(await api.setTrafficMode(mode)))} />
+      <TrafficModeCard
+        state={state}
+        onChange={(mode) => guard(async () => setState(await api.setTrafficMode(mode)))}
+        onChangeRemoteDns={(enabled) => guard(async () => setState(await api.setRemoteDns(enabled)))}
+      />
 
       {state.trafficMode === 'all' && (
         <>

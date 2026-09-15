@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('gamepath', {
   setRuleGroupEnabled: (id, enabled) => ipcRenderer.invoke('rule-group:set-enabled', id, enabled),
   removeRuleGroup: (id) => ipcRenderer.invoke('rule-group:remove', id),
   setTrafficMode: (mode) => ipcRenderer.invoke('traffic:set-mode', mode),
+  setRemoteDns: (enabled) => ipcRenderer.invoke('traffic:set-remote-dns', enabled),
   setConnectionMode: (mode) => ipcRenderer.invoke('connection:set-mode', mode),
   setRoutingStrategy: (strategy) => ipcRenderer.invoke('routing:set-strategy', strategy),
   setRelay: (id) => ipcRenderer.invoke('relay:set', id),

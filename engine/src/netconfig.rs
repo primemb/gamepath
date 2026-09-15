@@ -23,9 +23,10 @@ use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_OBJECT_ALREADY_E
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
     DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIpForwardTable2,
-    GetIpInterfaceEntry, GetUnicastIpAddressTable, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
-    MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_TABLE,
-    SetInterfaceDnsSettings, SetIpInterfaceEntry,
+    GetIpInterfaceEntry, GetIpInterfaceTable, GetUnicastIpAddressTable, IP_ADDRESS_PREFIX,
+    InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    MIB_IPINTERFACE_TABLE, MIB_UNICASTIPADDRESS_TABLE, SetInterfaceDnsSettings,
+    SetIpInterfaceEntry,
 };
 use windows_sys::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, RouterDiscoveryDisabled, SOCKADDR_IN,
@@ -266,6 +267,77 @@ const INTERFACE_READY_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// Called immediately after the adapter is created, so it tolerates the
 /// interface not being registered yet.
+/// Where the GamePath adapter sits when Windows ranks interfaces.
+///
+/// This decides two things at once: which route wins a tie, and - the reason
+/// the exact number matters - which interface's resolvers Windows prefers,
+/// because it asks the servers of the lowest-metric interface first.
+///
+/// 5 is chosen to sit **below a physical adapter and above another tunnel**.
+/// Windows gives a physical link an automatic metric from its speed, which is
+/// 5 only on a 2 Gbps-plus NIC and 10 to 45 on everything slower, while a VPN
+/// client that cares about winning sets its own low number - Windscribe uses
+/// 4. So GamePath takes name resolution away from the router, and hands it to
+/// another tunnel that is actually up. That ordering is deliberate: the other
+/// tunnel's resolver is reached through its own tunnel, so it is no more
+/// filtered than ours, and fighting it would only decide which of two working
+/// answers the machine got while breaking whatever DNS-based filtering the
+/// user chose that client for.
+///
+/// No fixed number can guarantee the ordering against every configuration - a
+/// 2 Gbps NIC left on automatic also lands on 5 - so
+/// [`lower_metric_ipv4_interfaces`] reports what actually outranks us instead
+/// of the code assuming it got this right.
+const TUNNEL_INTERFACE_METRIC: u32 = 5;
+
+// Windscribe's OpenVPN adapter sits at 4 on a live machine, and another
+// client that wants to win name resolution will be similar.
+const _: () = assert!(
+    TUNNEL_INTERFACE_METRIC > 4,
+    "the tunnel would take name resolution from another live VPN"
+);
+// The automatic metric Windows gives a 200 Mbps-2 Gbps link, and every slower
+// one; Ethernet on the same machine reported 25.
+const _: () = assert!(
+    TUNNEL_INTERFACE_METRIC < 10,
+    "the tunnel would leave name resolution with the local network"
+);
+
+/// Connected IPv4 interfaces Windows ranks above `interface_index`, as
+/// `(index, metric)`, lowest first.
+///
+/// Windows queries resolvers in interface-metric order, so this is the list of
+/// interfaces whose DNS servers get asked before the tunnel's.
+pub fn lower_metric_ipv4_interfaces(interface_index: u32) -> Vec<(u32, u32)> {
+    let mut table: *mut MIB_IPINTERFACE_TABLE = std::ptr::null_mut();
+    let status = unsafe { GetIpInterfaceTable(AF_INET, &mut table) };
+    if status != NO_ERROR || table.is_null() {
+        return Vec::new();
+    }
+    let mut ranked = Vec::new();
+    // SAFETY: `GetIpInterfaceTable` succeeded, so `table` points at a header
+    // followed by `NumEntries` rows, and is released by `FreeMibTable` below.
+    unsafe {
+        let rows =
+            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        let own = rows
+            .iter()
+            .find(|row| row.InterfaceIndex == interface_index)
+            .map(|row| row.Metric);
+        if let Some(own_metric) = own {
+            ranked.extend(rows.iter().filter_map(|row| {
+                (row.InterfaceIndex != interface_index
+                    && row.Connected != 0
+                    && row.Metric < own_metric)
+                    .then_some((row.InterfaceIndex, row.Metric))
+            }));
+        }
+        FreeMibTable(table.cast());
+    }
+    ranked.sort_by_key(|(_, metric)| *metric);
+    ranked
+}
+
 pub fn configure_tunnel_interface(interface_index: u32, mtu: u16) -> Result<(), String> {
     let deadline = Instant::now() + INTERFACE_READY_TIMEOUT;
     let mut row = loop {
@@ -276,7 +348,7 @@ pub fn configure_tunnel_interface(interface_index: u32, mtu: u16) -> Result<(), 
         }
     };
     row.NlMtu = u32::from(mtu);
-    row.Metric = 5;
+    row.Metric = TUNNEL_INTERFACE_METRIC;
     // Windows ignores `Metric` unless the automatic one is switched off.
     row.UseAutomaticMetric = 0;
     // A point-to-point tunnel address cannot collide, and each probe delays
@@ -653,6 +725,27 @@ pub fn set_interface_dns(adapter: u128, servers: &[Ipv4Addr]) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An interface that does not exist has nothing above it, rather than
+    /// everything: the caller reads a non-empty list as "something outranks
+    /// the tunnel" and must not be told that by a failed lookup.
+    #[test]
+    fn an_unknown_interface_reports_nothing_ahead_of_it() {
+        assert!(lower_metric_ipv4_interfaces(u32::MAX).is_empty());
+    }
+
+    /// An interface never outranks itself, whatever else is connected.
+    #[test]
+    fn an_interface_is_never_reported_as_outranking_itself() {
+        let Ok((_, uplink)) = default_ipv4_route() else {
+            return;
+        };
+        assert!(
+            lower_metric_ipv4_interfaces(uplink)
+                .iter()
+                .all(|(index, _)| *index != uplink)
+        );
+    }
 
     #[test]
     fn an_address_survives_the_round_trip_through_a_sockaddr() {

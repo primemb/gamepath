@@ -22,6 +22,11 @@ pub(crate) struct PacketCaptureManager {
     active: Option<WindowsPacketCapture>,
     #[cfg(windows)]
     active_split: Option<crate::split_capture::SplitPacketCapture>,
+    /// Split mode's resolver-only adapter. Held separately from the capture
+    /// because a live rule edit replaces the capture and must not disturb the
+    /// machine's name resolution.
+    #[cfg(windows)]
+    split_resolvers: Option<SplitResolverAdapter>,
 }
 
 #[cfg(windows)]
@@ -104,6 +109,204 @@ fn configure_tunnel_dns(
     }
 }
 
+/// Whether a capture restart keeps the resolver adapter it already built.
+///
+/// A live split rule edit is delivered as a fresh capture start, because
+/// WinDivert's kernel filter is immutable and has to be reopened. The session,
+/// its relay paths and - this - must survive that, or every rule change would
+/// blank the machine's resolvers for as long as it took to build a new adapter.
+#[cfg(windows)]
+fn resolvers_survive_restart(traffic_mode: &str) -> bool {
+    traffic_mode == "split"
+}
+
+/// Says where the tunnel's resolvers sit in the order Windows will ask them.
+///
+/// The interface metric decides this, and the metric is a fixed number that
+/// cannot be right for every machine ([`TUNNEL_INTERFACE_METRIC`] explains the
+/// choice). Rather than assume the intended ordering held, this reports what
+/// actually outranks the tunnel, so a machine where another client took a
+/// lower metric - or a fast NIC left on automatic tied with us - says so in
+/// the log instead of quietly resolving somewhere unexpected.
+#[cfg(windows)]
+fn log_resolver_priority(adapter_index: u32) {
+    let ahead = gamepath_engine::netconfig::lower_metric_ipv4_interfaces(adapter_index);
+    if ahead.is_empty() {
+        log_info!("tunnel resolvers are first in line for this machine's name lookups");
+        return;
+    }
+    let ahead = ahead
+        .iter()
+        .map(|(index, metric)| format!("interface {index} (metric {metric})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Not a warning. Another live tunnel ranking above this one is the
+    // expected arrangement, and its resolver is reached through its own
+    // tunnel, so lookups are still not going to the local network.
+    log_info!("name lookups are offered to {ahead} before the tunnel's resolvers");
+}
+
+/// The adapter split mode keeps solely so Windows has an interface to hang
+/// resolver settings on.
+///
+/// Windows chooses a resolver per interface. Split mode installs no routes, so
+/// before this the only interface with servers was the physical one, and every
+/// lookup went to whatever the router or the ISP offered - on a filtered
+/// connection, a poisoned answer while the tunnel beside it was healthy.
+///
+/// The servers are public ones rather than the relay's own `10.203.0.1`. The
+/// relay resolver lives inside the adapter's `/24` and reaching it would mean
+/// running the uplink and downlink threads here too, whose replies would then
+/// contend with WinDivert for the session's single inbound receiver. A public
+/// resolver needs none of that: it routes out the normal path and the existing
+/// port-53 capture rule carries it through the tunnel, which is the mechanism
+/// already proven in this mode.
+///
+/// The interface metric decides who wins when several VPNs are up.
+/// `configure_tunnel_interface` sets 5, which outranks a physical adapter
+/// (typically 25) and yields to another tunnel that asked for less - correct
+/// in both directions, because that tunnel's own resolver is reached through
+/// its own tunnel and is no more filtered than this one.
+#[cfg(windows)]
+struct SplitResolverAdapter {
+    stop: Arc<AtomicBool>,
+    session: Arc<wintun::Session>,
+    drain: Option<JoinHandle<()>>,
+    dns_adapter: Option<u128>,
+    servers: Vec<std::net::Ipv4Addr>,
+}
+
+#[cfg(windows)]
+impl SplitResolverAdapter {
+    fn start(
+        virtual_ipv4: std::net::Ipv4Addr,
+        effective_mtu: gamepath_engine::mtu::EffectiveMtu,
+    ) -> Result<Self, String> {
+        let adapter = open_gamepath_adapter()?;
+        let adapter_index = adapter
+            .get_adapter_index()
+            .map_err(|error| format!("could not read GamePath adapter index: {error}"))?;
+        configure_tunnel_interface(adapter_index, effective_mtu.mtu)?;
+        adapter
+            .set_network_addresses_tuple(
+                virtual_ipv4.into(),
+                std::net::Ipv4Addr::new(255, 255, 255, 0).into(),
+                None,
+            )
+            .map_err(|error| format!("could not configure GamePath adapter: {error}"))?;
+        // Wintun reports an adapter with no open session as media-disconnected,
+        // and Windows ignores a disconnected interface's resolvers. The session
+        // exists to make the interface count, not to carry traffic.
+        let session = Arc::new(
+            adapter
+                .start_session(wintun::MAX_RING_CAPACITY)
+                .map_err(|error| format!("could not start the GamePath adapter: {error}"))?,
+        );
+        let servers = gamepath_engine::dns::resolver_order(None);
+        let adapter_guid = adapter.get_guid();
+        let dns_adapter =
+            match gamepath_engine::netconfig::set_interface_dns(adapter_guid, &servers) {
+                Ok(()) => {
+                    log_info!(
+                        "split tunnel DNS: {}",
+                        servers
+                            .iter()
+                            .map(std::net::Ipv4Addr::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    Some(adapter_guid)
+                }
+                // Not fatal: name resolution falls back to the physical adapter's
+                // servers, which is exactly what every earlier release did.
+                Err(error) => {
+                    log_warn!("split-mode name resolution will not go through the tunnel: {error}");
+                    None
+                }
+            };
+        if dns_adapter.is_some() {
+            log_resolver_priority(adapter_index);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let drain_stop = Arc::clone(&stop);
+        let drain_session = Arc::clone(&session);
+        // Nothing should arrive: no route points here and the resolvers are
+        // off-link. This is here so that if anything ever does, the ring is
+        // emptied instead of filling and wedging the adapter.
+        let drain = std::thread::Builder::new()
+            .name("gamepath-split-resolver".into())
+            .spawn(move || {
+                while !drain_stop.load(Ordering::Acquire) {
+                    match drain_session.receive_blocking() {
+                        Ok(packet) => drop(packet),
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|error| format!("could not start the GamePath adapter drain: {error}"))?;
+        Ok(Self {
+            stop,
+            session,
+            drain: Some(drain),
+            dns_adapter,
+            servers,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SplitResolverAdapter {
+    fn drop(&mut self) {
+        if let Some(adapter) = self.dns_adapter {
+            if let Err(error) = gamepath_engine::netconfig::set_interface_dns(adapter, &[]) {
+                log_warn!("could not clear the split tunnel adapter's DNS servers: {error}");
+            }
+        }
+        self.stop.store(true, Ordering::Release);
+        let _ = self.session.shutdown();
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
+        }
+    }
+}
+
+/// Opens the one `GamePath` Wintun adapter, creating it if this is the first
+/// session since boot. Both traffic modes use the same adapter and the same
+/// GUID, so a mode change reuses the interface rather than making a second one.
+#[cfg(windows)]
+fn open_gamepath_adapter() -> Result<std::sync::Arc<wintun::Adapter>, String> {
+    let executable_dir = std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .parent()
+        .ok_or("engine executable has no parent directory")?
+        .to_path_buf();
+    let installed_dll = executable_dir.join("wintun.dll");
+    let project_dll = std::env::current_dir()
+        .unwrap_or_default()
+        .join("vendor")
+        .join("wintun")
+        .join("wintun.dll");
+    let dll = if installed_dll.is_file() {
+        installed_dll
+    } else {
+        project_dll
+    };
+    // SAFETY: only the repository's verified Wintun DLL or the installed copy
+    // beside the privileged engine is loaded.
+    let wintun = unsafe { wintun::load_from_path(&dll) }
+        .map_err(|error| format!("could not load Wintun: {error}"))?;
+    wintun::Adapter::open(&wintun, "GamePath")
+        .or_else(|_| {
+            wintun::Adapter::create(
+                &wintun,
+                "GamePath",
+                "GamePath",
+                Some(0x7f0a_9828_52ef_4ddd_913d_c11f_f0d4_a58a_u128),
+            )
+        })
+        .map_err(|error| format!("could not create GamePath adapter: {error}"))
+}
+
 impl PacketCaptureManager {
     #[cfg(windows)]
     pub(crate) fn start(
@@ -122,7 +325,19 @@ impl PacketCaptureManager {
             "all" => {}
             _ => return Err("traffic mode must be all or split".into()),
         }
-        self.stop();
+        // Not `stop()`: that clears the resolver adapter too, and a live split
+        // rule edit comes back through here. Rebuilding the adapter would drop
+        // the machine's resolvers for as long as it took to recreate them,
+        // every time a rule changed, which is precisely the kind of restart
+        // `commitRuleChange` exists to avoid.
+        #[cfg(windows)]
+        {
+            drop(self.active.take());
+            drop(self.active_split.take());
+            if !resolvers_survive_restart(&input.traffic_mode) {
+                drop(self.split_resolvers.take());
+            }
+        }
         let (virtual_ipv4, bypass_ips, data_receiver, effective_mtu) = {
             let manager = sessions.lock().unwrap();
             (
@@ -149,6 +364,23 @@ impl PacketCaptureManager {
             )?;
             let target_count = split.target_count();
             self.active_split = Some(split);
+            // After the capture, so the rule that carries name lookups exists
+            // before Windows is pointed at a resolver that depends on it.
+            if !input.remote_dns {
+                drop(self.split_resolvers.take());
+            }
+            if input.remote_dns && self.split_resolvers.is_none() {
+                match SplitResolverAdapter::start(virtual_ipv4, effective_mtu) {
+                    Ok(resolvers) => self.split_resolvers = Some(resolvers),
+                    // A session that carries traffic is worth more than this.
+                    Err(error) => log_warn!("split-mode DNS adapter unavailable: {error}"),
+                }
+            }
+            let dns_servers = self
+                .split_resolvers
+                .as_ref()
+                .map(|resolvers| resolvers.servers.clone())
+                .unwrap_or_default();
             return Ok(json!({
                 "state": "capturing",
                 "backend": "windivert",
@@ -156,6 +388,7 @@ impl PacketCaptureManager {
                 "targetCount": target_count,
                 "effectiveMtu": effective_mtu.mtu,
                 "tcpMss": effective_mtu.tcp_mss(),
+                "dnsServers": dns_servers.iter().map(std::net::Ipv4Addr::to_string).collect::<Vec<_>>(),
                 // Selected targets are matched as IPv4. A game reaching the
                 // same server over IPv6 is not captured at all, so the
                 // exposure is worth reporting in split mode too.
@@ -164,36 +397,7 @@ impl PacketCaptureManager {
         }
         let (default_gateway, default_interface) =
             gamepath_engine::netconfig::default_ipv4_route()?;
-        let executable_dir = std::env::current_exe()
-            .map_err(|error| error.to_string())?
-            .parent()
-            .ok_or("engine executable has no parent directory")?
-            .to_path_buf();
-        let installed_dll = executable_dir.join("wintun.dll");
-        let project_dll = std::env::current_dir()
-            .unwrap_or_default()
-            .join("vendor")
-            .join("wintun")
-            .join("wintun.dll");
-        let dll = if installed_dll.is_file() {
-            installed_dll
-        } else {
-            project_dll
-        };
-        // SAFETY: only the repository's verified Wintun DLL or the installed
-        // copy beside the privileged engine is loaded.
-        let wintun = unsafe { wintun::load_from_path(&dll) }
-            .map_err(|error| format!("could not load Wintun: {error}"))?;
-        let adapter = wintun::Adapter::open(&wintun, "GamePath")
-            .or_else(|_| {
-                wintun::Adapter::create(
-                    &wintun,
-                    "GamePath",
-                    "GamePath",
-                    Some(0x7f0a_9828_52ef_4ddd_913d_c11f_f0d4_a58a_u128),
-                )
-            })
-            .map_err(|error| format!("could not create GamePath adapter: {error}"))?;
+        let adapter = open_gamepath_adapter()?;
         let adapter_index = adapter
             .get_adapter_index()
             .map_err(|error| format!("could not read GamePath adapter index: {error}"))?;
@@ -275,8 +479,19 @@ impl PacketCaptureManager {
         // so pointing Windows at a tunnel resolver before they exist would ask
         // it to resolve through a path that is not there yet.
         let adapter_guid = adapter.get_guid();
-        let resolvers = configure_tunnel_dns(adapter_guid, &sessions, tunnel_gateway);
+        // With the setting off the adapter is left without servers, so Windows
+        // falls back to the physical interface's - the behaviour every release
+        // before the setting had.
+        let resolvers = if input.remote_dns {
+            configure_tunnel_dns(adapter_guid, &sessions, tunnel_gateway)
+        } else {
+            log_info!("remote DNS is off: name resolution stays with the local resolver");
+            Vec::new()
+        };
         capture.dns_adapter = (!resolvers.is_empty()).then_some(adapter_guid);
+        if capture.dns_adapter.is_some() {
+            log_resolver_priority(adapter_index);
+        }
         self.active = Some(capture);
         Ok(json!({
             "state": "capturing",
@@ -344,6 +559,17 @@ impl PacketCaptureManager {
                 "backend": "windivert",
                 "trafficMode": "split",
                 "targetCount": capture.target_count(),
+                "dnsServers": self
+                    .split_resolvers
+                    .as_ref()
+                    .map(|resolvers| {
+                        resolvers
+                            .servers
+                            .iter()
+                            .map(std::net::Ipv4Addr::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
                 "diagnostics": diagnostics,
             });
         }
@@ -355,6 +581,7 @@ impl PacketCaptureManager {
         {
             drop(self.active.take());
             drop(self.active_split.take());
+            drop(self.split_resolvers.take());
         }
         json!({ "state": "idle" })
     }
@@ -481,4 +708,25 @@ fn ipv4_source_address(packet: &[u8]) -> Option<std::net::Ipv4Addr> {
     Some(std::net::Ipv4Addr::new(
         packet[12], packet[13], packet[14], packet[15],
     ))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// `commitRuleChange` reapplies split rules without restarting the session.
+    /// The resolver adapter has to sit on the surviving side of that line.
+    #[test]
+    fn a_live_split_rule_edit_keeps_the_resolver_adapter() {
+        assert!(resolvers_survive_restart("split"));
+    }
+
+    /// Leaving split mode must take the adapter with it: all-traffic mode
+    /// builds its own with routes and the relay's resolver, and two adapters
+    /// configuring DNS would leave whichever lost the race pointing at a
+    /// resolver nothing routes to.
+    #[test]
+    fn leaving_split_mode_releases_the_resolver_adapter() {
+        assert!(!resolvers_survive_restart("all"));
+    }
 }

@@ -72,6 +72,30 @@ test('split targets are reapplied without restarting the network session', () =>
   assert.match(updateHandler, /"start-packet-capture"/)
 })
 
+test('the remote DNS setting reaches packet capture in both traffic modes', () => {
+  const main = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8')
+  const service = fs.readFileSync(path.join(__dirname, '..', 'service', 'src', 'main.rs'), 'utf8')
+  const capture = fs.readFileSync(path.join(__dirname, '..', 'engine', 'src', 'capture.rs'), 'utf8')
+
+  // The setting is the user's, so it has to survive every hop. A layer that
+  // drops it silently reverts to the default and the toggle stops meaning
+  // anything, which is not something a type checker can catch across three
+  // languages and two process boundaries.
+  assert.match(main, /remoteDns: state\.remoteDns !== false/)
+  assert.match(service, /payload\["remoteDns"\]\.as_bool\(\)\.unwrap_or\(true\)/)
+  assert.match(service, /"remoteDns": remote_dns/)
+
+  // And a live split rule edit has to reapply the session's choice rather
+  // than rebuild the payload from the default.
+  const updateHandler = service.slice(service.indexOf('fn update_session_rules'), service.indexOf('fn log_event'))
+  assert.match(updateHandler, /runtime\.remote_dns/)
+
+  // Both capture backends consult it: all-traffic mode gates the adapter's
+  // resolvers, split mode gates the adapter it keeps to hold them.
+  assert.match(capture, /input\.remote_dns \{[\s\S]{0,120}configure_tunnel_dns/)
+  assert.match(capture, /if !input\.remote_dns \{/)
+})
+
 test('the declared MSRV matches the toolchain the relay is built with', () => {
   const script = fs.readFileSync(path.join(__dirname, '..', 'deploy', 'install-relay.sh'), 'utf8')
   const pinned = script.match(/RUST_TOOLCHAIN="(\d+)\.(\d+)\.(\d+)"/)
