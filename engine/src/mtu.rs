@@ -48,9 +48,23 @@ const OUTER_IPV4_UDP: u16 = 20 + 8;
 /// WireGuard's transport-data message: 16-byte header plus the Poly1305 tag.
 const WIREGUARD_DATA: u16 = 16 + 16;
 
-/// OpenVPN UDP worst case: opcode/key-id and peer-id, a 16-byte cipher IV, the
-/// 8-byte packet id and a 32-byte SHA-256 auth tag.
-const OPENVPN_DATA: u16 = 4 + 16 + 8 + 32;
+/// OpenVPN worst case: opcode/key-id and peer-id, a 16-byte cipher IV, the
+/// 8-byte packet id, a 32-byte SHA-256 auth tag, and the 2-byte record length
+/// that stream mode puts in front of every packet.
+const OPENVPN_DATA: u16 = 4 + 16 + 8 + 32 + 2;
+
+/// IPv4 plus a TCP header carrying the options a long-lived stream negotiates,
+/// timestamps above all.
+///
+/// Charged to every OpenVPN path, including one configured for UDP.
+/// `OpenVpnPath::connect` retries a UDP remote over TCP, because a provider
+/// handing out a UDP profile almost always listens for TCP on the same port
+/// and that is the attempt which survives a link that drops large datagrams.
+/// So the protocol in use is decided while dialling, after this budget has
+/// been derived, and `path_overhead_bytes` is given only the transport kind,
+/// which says `openvpn` either way. Costing the cheaper of the two would mean
+/// sizing the tunnel for UDP and then running it over TCP.
+const OUTER_IPV4_TCP: u16 = 20 + 32;
 
 /// SOCKS5 UDP request header in front of an IPv4 target.
 const SOCKS5_UDP_REQUEST: u16 = 10;
@@ -73,7 +87,7 @@ pub fn path_overhead_bytes(mode: SessionMode, kind: &str) -> u16 {
     let (transport, outer) = match kind {
         "wireguard" => (WIREGUARD_DATA, OUTER_IPV4_UDP),
         "socks5" => (SOCKS5_UDP_REQUEST, OUTER_IPV4_UDP),
-        "openvpn" => (OPENVPN_DATA, OUTER_IPV4_UDP),
+        "openvpn" => (OPENVPN_DATA, OUTER_IPV4_TCP),
         "l2tp" => (L2TP_IPSEC_DATA, 0),
         // An unrecognised transport is assumed to cost as much as the most
         // expensive one this build knows about.
@@ -213,6 +227,25 @@ mod tests {
         assert!(mixed.mtu < 1356);
     }
 
+    /// An OpenVPN path is sized for TCP whichever protocol its profile names,
+    /// because `OpenVpnPath::connect` retries a UDP remote over TCP and the
+    /// `kind` string says `openvpn` either way. A tunnel sized for UDP and then
+    /// run over TCP puts the tail of every full-size packet past the end of the
+    /// link.
+    #[test]
+    fn openvpn_is_costed_for_the_stream_framing_it_can_fall_back_to() {
+        // Direct mode leaves only the transport's own cost in the figure.
+        let overhead = path_overhead_bytes(SessionMode::Direct, "openvpn");
+        // What UDP-only accounting charged: no record length, UDP outer.
+        let as_if_udp = OUTER_IPV4_UDP + 4 + 16 + 8 + 32;
+        assert!(
+            // A TCP header in place of the UDP one, plus the record length.
+            overhead >= as_if_udp + (20 - 8) + 2,
+            "an openvpn path is charged {overhead} bytes, barely more than the \
+             {as_if_udp} a udp-only path costs"
+        );
+    }
+
     #[test]
     fn mss_leaves_room_for_the_ipv4_and_tcp_headers() {
         let mtu = EffectiveMtu::for_session(SessionMode::Relay, ["wireguard"], LINK_MTU);
@@ -311,3 +344,4 @@ mod tests {
         );
     }
 }
+
