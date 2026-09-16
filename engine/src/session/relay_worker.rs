@@ -7,7 +7,7 @@ use super::dialer::{
     another_path_is_up, hold_redial_for_common_mode, next_backoff, schedule_redial,
 };
 use super::health::{
-    HEALTH_FAILURE_THRESHOLD, PROBE_INTERVAL, PROBE_INTERVAL_DEGRADED, publish_path_health,
+    HEALTH_FAILURE_THRESHOLD, PROBE_INTERVAL_DEGRADED, healthy_probe_interval, publish_path_health,
     record_path_receive, record_path_send, remember_expired_probe, take_late_probe_reply,
     update_path_status, update_scheduler_probe,
 };
@@ -396,7 +396,16 @@ pub(crate) fn run_path(
                                     ),
                                     None => {}
                                 }
-                                next_probe = Instant::now() + PROBE_INTERVAL;
+                                // A path the scheduler is not using is a
+                                // standby, and is measured more often so the
+                                // failover decision is made on a warm path
+                                // rather than a cold one.
+                                next_probe = Instant::now()
+                                    + healthy_probe_interval(
+                                        decision_mask.load(Ordering::Acquire)
+                                            & 1_u64.checked_shl(index as u32).unwrap_or(0)
+                                            != 0,
+                                    );
                             } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
                                 // Nothing outstanding: a control frame now can
                                 // only be answering a probe already given up

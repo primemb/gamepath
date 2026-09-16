@@ -541,6 +541,14 @@ struct Registry {
     /// means a selected application is talking to something on the LAN.
     local_destinations: AtomicU64,
     injected_return_packets: AtomicU64,
+    /// Return packets that could not be delivered, split by why. They sum to
+    /// [`Registry::unmatched_return_packets`], and exist because the three
+    /// causes want different answers: a malformed packet is a bug here, a
+    /// wrong destination means the relay sent something unexpected, and no
+    /// flow means the table lost a connection the far end still believes in.
+    return_not_ipv4: AtomicU64,
+    return_wrong_destination: AtomicU64,
+    return_without_flow: AtomicU64,
     unmatched_return_packets: AtomicU64,
     return_injection_errors: AtomicU64,
 }
@@ -696,6 +704,9 @@ impl SplitPacketCapture {
             tunnelled_dns: AtomicU64::new(0),
             local_destinations: AtomicU64::new(0),
             injected_return_packets: AtomicU64::new(0),
+            return_not_ipv4: AtomicU64::new(0),
+            return_wrong_destination: AtomicU64::new(0),
+            return_without_flow: AtomicU64::new(0),
             unmatched_return_packets: AtomicU64::new(0),
             return_injection_errors: AtomicU64::new(0),
             tcp_mss: effective_mtu.tcp_mss(),
@@ -914,6 +925,9 @@ impl SplitPacketCapture {
             "relayReturnPackets": self.registry.relay_return_packets.load(Ordering::Relaxed),
             "injectedReturnPackets": self.registry.injected_return_packets.load(Ordering::Relaxed),
             "unmatchedReturnPackets": self.registry.unmatched_return_packets.load(Ordering::Relaxed),
+            "unmatchedReturnsNotIpv4": self.registry.return_not_ipv4.load(Ordering::Relaxed),
+            "unmatchedReturnsWrongDestination": self.registry.return_wrong_destination.load(Ordering::Relaxed),
+            "unmatchedReturnsWithoutFlow": self.registry.return_without_flow.load(Ordering::Relaxed),
             "tunnelledDnsQueries": self.registry.tunnelled_dns.load(Ordering::Relaxed),
             "localDestinationsLeftUntunnelled": self.registry.local_destinations.load(Ordering::Relaxed),
             "returnInjectionErrors": self.registry.return_injection_errors.load(Ordering::Relaxed),
@@ -1934,12 +1948,16 @@ fn run_reply_injector(
             }
         };
         let Some(fields) = ipv4_fields(&packet) else {
+            registry.return_not_ipv4.fetch_add(1, Ordering::Relaxed);
             registry
                 .unmatched_return_packets
                 .fetch_add(1, Ordering::Relaxed);
             continue;
         };
         if fields.destination != virtual_ipv4 {
+            registry
+                .return_wrong_destination
+                .fetch_add(1, Ordering::Relaxed);
             registry
                 .unmatched_return_packets
                 .fetch_add(1, Ordering::Relaxed);
@@ -1948,6 +1966,7 @@ fn run_reply_injector(
         let path = {
             let mut paths = return_paths.lock().unwrap();
             let Some(path) = paths.get_mut(&ReturnKey::inbound(fields)) else {
+                registry.return_without_flow.fetch_add(1, Ordering::Relaxed);
                 registry
                     .unmatched_return_packets
                     .fetch_add(1, Ordering::Relaxed);
@@ -2416,6 +2435,27 @@ fn hostname_matches(name: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// An ICMP error carries no ports, so it keys as port 0 in both directions
+    /// and can never match a TCP or UDP flow. Whatever else is behind the
+    /// unmatched count, this part of it is structural.
+    #[test]
+    fn an_icmp_return_cannot_key_to_a_tcp_or_udp_flow() {
+        let game = Ipv4Fields {
+            source: Ipv4Addr::new(169, 150, 202, 130),
+            destination: Ipv4Addr::new(10, 203, 0, 5),
+            protocol: 17,
+            source_port: 17000,
+            destination_port: 51000,
+        };
+        let icmp = Ipv4Fields {
+            protocol: 1,
+            source_port: 0,
+            destination_port: 0,
+            ..game
+        };
+        assert_ne!(ReturnKey::inbound(game), ReturnKey::inbound(icmp));
+    }
     use super::*;
 
     fn fields(

@@ -26,6 +26,59 @@ pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// costs nothing the rest of the time because a healthy path never uses it.
 pub(crate) const PROBE_INTERVAL_DEGRADED: Duration = Duration::from_millis(150);
 
+/// Gap between probes on a healthy path the scheduler is not currently using.
+///
+/// A standby path is measured so it can be trusted in a failover, and at one
+/// probe a second it was being measured cold. Observed on a live session: the
+/// same WireGuard route reported 52 ms with 3 ms of jitter in the minutes it
+/// carried traffic and 70 ms with 17 ms of jitter in the minutes it did not -
+/// an 18 ms swing that had nothing to do with the path's quality and
+/// everything to do with a provider exit that lets an idle session go cold.
+/// The two other routes in the same session, on identical code, moved by 1 and
+/// 2 ms, so this is the far end rather than anything measurable here.
+///
+/// That is self-reinforcing, which is what makes it worth spending packets on:
+/// the score decides what carries traffic, so a route that measures badly
+/// while idle stays idle and keeps measuring badly. The route above was the
+/// joint-fastest in the set whenever it was actually used, and was passed over
+/// as a 70 ms path.
+///
+/// Probes are the right thing to send. They are control frames the relay
+/// answers rather than forwards, so nothing reaches the Internet, and the
+/// extra samples sharpen the estimate they are keeping warm.
+///
+/// 250 ms is four probes a second where there was one, against the ~140
+/// packets a second the same route sees while carrying traffic. It is a
+/// starting point rather than a derived figure: what makes an idle session go
+/// cold at the far end is the provider's business, so the useful number is
+/// whichever closes the measured gap, and this is the smallest step likely to.
+/// It stays no more aggressive than [`PROBE_INTERVAL_DEGRADED`], because a
+/// path that has actually missed a reply is the one that deserves the hardest
+/// probing.
+pub(crate) const PROBE_INTERVAL_STANDBY: Duration = Duration::from_millis(250);
+
+const _: () = assert!(
+    PROBE_INTERVAL_STANDBY.as_millis() < PROBE_INTERVAL.as_millis(),
+    "a standby path would be measured less often than one carrying traffic"
+);
+const _: () = assert!(
+    PROBE_INTERVAL_STANDBY.as_millis() >= PROBE_INTERVAL_DEGRADED.as_millis(),
+    "a standby path would out-probe one that has actually missed a reply"
+);
+
+/// The gap before the next probe on a healthy path, given whether the
+/// scheduler currently has it carrying traffic.
+///
+/// A carrying path is already warm and already measured by its own traffic, so
+/// it keeps the slow cadence; a standby path pays for its own accuracy.
+pub(crate) fn healthy_probe_interval(carrying: bool) -> Duration {
+    if carrying {
+        PROBE_INTERVAL
+    } else {
+        PROBE_INTERVAL_STANDBY
+    }
+}
+
 /// Consecutive unanswered probes before a path is declared down.
 ///
 /// One lost probe is not a failure. The control probe is a bare UDP datagram on
@@ -280,6 +333,39 @@ pub(crate) fn take_late_probe_reply(
 mod tests {
     use super::*;
     use gamepath_engine::scheduler::choose_paths;
+
+    /// The measurement this exists for: a standby route was reported 18 ms
+    /// slower and 14 ms jitterier than the same route carrying traffic, purely
+    /// because it was idle. It has to be measured more often than a carrying
+    /// route or the failover decision keeps being made on a cold path.
+    #[test]
+    fn a_standby_path_is_measured_more_often_than_a_carrying_one() {
+        assert!(healthy_probe_interval(false) < healthy_probe_interval(true));
+        assert_eq!(healthy_probe_interval(true), PROBE_INTERVAL);
+        assert_eq!(healthy_probe_interval(false), PROBE_INTERVAL_STANDBY);
+    }
+
+    /// Warming a standby path must never outrank finding out whether a path
+    /// that just missed a reply is coming back.
+    #[test]
+    fn a_path_in_doubt_is_still_probed_hardest() {
+        assert!(PROBE_INTERVAL_DEGRADED <= healthy_probe_interval(false));
+        assert!(PROBE_INTERVAL_DEGRADED < healthy_probe_interval(true));
+    }
+
+    /// Standby probing is an accuracy cost, not a bandwidth one: it has to stay
+    /// a small multiple of the carrying cadence rather than approach the rate
+    /// of real traffic.
+    #[test]
+    fn standby_probing_stays_a_background_cost() {
+        let carrying = PROBE_INTERVAL.as_millis();
+        let standby = healthy_probe_interval(false).as_millis();
+        assert!(
+            carrying / standby <= 8,
+            "a standby path probes {}x as often as a carrying one",
+            carrying / standby
+        );
+    }
 
     /// A redial is worth making only when something proves the uplink works.
     /// Two independent providers do not fail in the same second, so when no
