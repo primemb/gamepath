@@ -2,29 +2,6 @@ use serde::{Deserialize, Serialize};
 
 const SMOOTHING: f64 = 0.2;
 
-/// Smoothing for the loss estimate, deliberately much slower than
-/// [`SMOOTHING`].
-///
-/// [`PathMetrics::loss_ratio`] is an EWMA over a per-probe 0/1 indicator, so
-/// whatever this is set to, it still settles on the path's true loss rate.
-/// What it controls is how far one probe can move it, and at 0.2 one probe
-/// moved it all the way to 20% — a number that then decayed through 16, 13 and
-/// 10% over the following seconds.
-///
-/// That was not a display problem. At 200 points per unit of loss, one lost
-/// probe added 40 to [`PathMetrics::score`], while the whole spread between a
-/// 47 ms route and an 86 ms one is 39 points — so a single lost packet
-/// outranked every latency difference in the route set and the dispatcher
-/// reshuffled. Measured on a live three-route session: 50 selection changes in
-/// six minutes, and one summary line reporting `loss-ewma=16%` for a route
-/// that had lost exactly one probe out of sixty that minute, on a path whose
-/// real loss was around 3%.
-///
-/// A fifth of the old step averages over roughly twenty probes, which at the
-/// healthy probe cadence is a real estimate of a real rate rather than a
-/// readout of the last packet. Nothing is lost on the detection side, because
-/// a path that is actually failing is taken out by `consecutive_losses`
-/// reaching [`LOSSES_BEFORE_INACTIVE`] — a separate, immediate signal that
 /// this does not touch.
 const LOSS_SMOOTHING: f64 = 0.05;
 
@@ -38,28 +15,16 @@ const LOSSES_BEFORE_INACTIVE: u32 = 3;
 /// while avoiding extra outbound load on a severely stalled tunnel.
 const ADAPTIVE_DUPLICATE_DELAY_BUDGET_MS: f64 = 100.0;
 
-/// How much better than the route already carrying traffic a challenger has to
-/// score before it takes the slot.
-///
-/// Ranking is otherwise memoryless: every probe reply re-sorts the whole route
-/// set, so two routes within measurement noise of each other trade places on
-/// whichever was measured last. Live three-route session, three consecutive
-/// selections inside 2.1 seconds — `1+3`, then `1+2`, then `2+3` — decided by a
-/// single point between routes all sitting at ~52 ms with no loss.
-///
-/// Sized from the gap the decision actually turns on, the second-best route
-/// against the third: over 261 recorded selection changes its median was 1
-/// point and its 90th percentile 6. Those are ties. The smallest gap that ever
-/// separated genuinely different routes in the same log was 39 points, two
-/// 47 ms WireGuard paths against an 86 ms L2TP one, so a margin of 8 sits well
-/// inside the noise and nowhere near real signal. Replaying the recorded score
-/// sequences, it suppresses about 88% of the selection changes.
-///
-/// It cannot delay a failover. A path that stops answering scores
-/// [`f64::INFINITY`] through [`LOSSES_BEFORE_INACTIVE`], and infinity is not
-/// reachable from eight; a path that genuinely degrades moves its score by far
-/// more than this. The margin only ever decides ties.
 const INCUMBENCY_MARGIN: f64 = 8.0;
+
+const INCUMBENCY_JITTER_MARGIN: f64 = 1.0;
+
+/// How far ahead a challenger must be to take a slot off the route already
+/// carrying traffic: a constant floor, plus the part of that route's score
+/// which is a measure of its own variance rather than of it being worse.
+fn incumbency_margin(path: &PathMetrics) -> f64 {
+    INCUMBENCY_MARGIN + path.jitter_ms * INCUMBENCY_JITTER_MARGIN
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathMetrics {
@@ -185,7 +150,7 @@ pub fn choose_paths_with_incumbent(
     // `LOSSES_BEFORE_INACTIVE` cannot be held by having been chosen before.
     let ranked = |path: &PathMetrics| {
         if holding(path) {
-            path.score() - INCUMBENCY_MARGIN
+            path.score() - incumbency_margin(path)
         } else {
             path.score()
         }
@@ -212,7 +177,7 @@ pub fn choose_paths_with_incumbent(
                     // and prefer the one already armed when two are close.
                     let cost = path.latency_ms + path.jitter_ms * 2.0;
                     if holding(path) {
-                        cost - INCUMBENCY_MARGIN
+                        cost - incumbency_margin(path)
                     } else {
                         cost
                     }
@@ -341,6 +306,60 @@ mod tests {
             selection_changes(&recorded, true),
             0,
             "a one-point difference still moved the session between routes"
+        );
+    }
+
+    /// A path with an explicit score and jitter. [`scored`] pins jitter at zero,
+    /// which is exactly the term the margin has to survive, so the cases that
+    /// turn on it cannot be built with it.
+    fn scored_with_jitter(id: &str, score: f64, jitter: f64) -> PathMetrics {
+        let mut path = measured(id, score);
+        path.latency_ms = score - jitter * 2.0;
+        path.jitter_ms = jitter;
+        path
+    }
+
+    /// The recorded incident, with the jitter the routes actually had. Route 1
+    /// was carrying traffic when one 75 ms probe against a 53 ms baseline took
+    /// its jitter EWMA from 3 ms to 9 ms; at two points per millisecond that is
+    /// 18 points of score against a flat eight-point margin, and it lost its
+    /// slot to the L2TP route mid-match.
+    #[test]
+    fn a_jitter_excursion_does_not_eject_the_incumbent() {
+        let paths = [
+            scored_with_jitter("0", 83.0, 9.0),
+            scored_with_jitter("1", 69.0, 7.0),
+            scored_with_jitter("2", 71.0, 4.0),
+        ];
+        let Decision::Duplicate { path_ids } =
+            choose_paths_with_incumbent(&paths, Strategy::Adaptive, &["0", "1"])
+        else {
+            panic!("three healthy routes should duplicate");
+        };
+        assert!(
+            path_ids.contains(&"0".to_owned()),
+            "a route lost its slot to its own jitter estimate: {path_ids:?}"
+        );
+    }
+
+    /// And scaling with jitter must not turn the margin into a lock for a route
+    /// that is merely noisy *and* bad. One of the recorded changes it is meant
+    /// to leave standing: 103 points against a steady 62.
+    #[test]
+    fn a_jittery_incumbent_still_loses_to_a_clearly_better_route() {
+        let paths = [
+            scored_with_jitter("0", 103.0, 18.0),
+            scored_with_jitter("1", 62.0, 2.0),
+            scored_with_jitter("2", 72.0, 6.0),
+        ];
+        let Decision::Duplicate { path_ids } =
+            choose_paths_with_incumbent(&paths, Strategy::Adaptive, &["0", "1"])
+        else {
+            panic!("three healthy routes should duplicate");
+        };
+        assert!(
+            !path_ids.contains(&"0".to_owned()),
+            "incumbency held a route 30 points worse: {path_ids:?}"
         );
     }
 

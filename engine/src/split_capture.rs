@@ -2003,7 +2003,15 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
             registry.capture_receive_errors.load(Ordering::Relaxed),
             registry.pending_syn_overflow.load(Ordering::Relaxed),
             registry.slow_capture_loops.load(Ordering::Relaxed),
-            registry.unmatched_return_packets.load(Ordering::Relaxed),
+            // The three causes rather than their sum. They want different
+            // answers, and a return packet discarded because the flow table
+            // lost a connection the far end still believes in -- a game losing
+            // its inbound stream while every tunnel probe stays healthy --
+            // cannot be told apart from ordinary socket teardown once they are
+            // added together.
+            registry.return_not_ipv4.load(Ordering::Relaxed),
+            registry.return_wrong_destination.load(Ordering::Relaxed),
+            registry.return_without_flow.load(Ordering::Relaxed),
             registry.return_injection_errors.load(Ordering::Relaxed),
         ]
     };
@@ -2025,11 +2033,11 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
             continue;
         }
         let delta =
-            std::array::from_fn::<_, 7, _>(|index| current[index].saturating_sub(reported[index]));
+            std::array::from_fn::<_, 9, _>(|index| current[index].saturating_sub(reported[index]));
         gamepath_engine::log_warn!(
             "split capture anomaly: selected-fail-open=+{} bypass-queue-full=+{} \
              receive-errors=+{} pending-syn-overflow=+{} slow-loops=+{} \
-             unmatched-returns=+{} return-injection-errors=+{} peak-loop={}us",
+             returns-dropped=+{}/{}/{} (not-ipv4/wrong-dest/no-flow) \n             return-injection-errors=+{} peak-loop={}us",
             delta[0],
             delta[1],
             delta[2],
@@ -2037,6 +2045,8 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
             delta[4],
             delta[5],
             delta[6],
+            delta[7],
+            delta[8],
             registry.capture_loop_peak_us.load(Ordering::Relaxed),
         );
         reported = current;

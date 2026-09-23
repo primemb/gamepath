@@ -91,6 +91,10 @@ pub enum NodeSpec {
         label: Option<String>,
         #[serde(default)]
         runtime: Option<L2tpRuntime>,
+        /// Why the service could not dial this node. The route is then skipped
+        /// with that reason instead of taking the whole session down with it.
+        #[serde(default, rename = "dialError", skip_serializing_if = "Option::is_none")]
+        dial_error: Option<String>,
     },
 }
 
@@ -138,6 +142,10 @@ impl NodeSpec {
                 &self.socks5_config().ok_or("node is not a SOCKS5 node")?,
                 relay,
             )?)),
+            Self::L2tp {
+                dial_error: Some(error),
+                ..
+            } => Err(error.clone()),
             Self::L2tp {
                 server,
                 username,
@@ -1070,6 +1078,7 @@ mod tests {
             pre_shared_key: "shared-secret".into(),
             label: None,
             runtime: None,
+            dial_error: None,
         };
         assert!(l2tp.supports_direct());
         assert_eq!(l2tp.kind(), KIND_L2TP);
@@ -1100,6 +1109,27 @@ mod tests {
             pre_shared_key.clear();
         }
         assert!(missing_psk.validate().is_err());
+
+        // A node the service could not dial is skipped with the service's own
+        // reason, and never reaches the Windows RAS code.
+        let mut failed = l2tp.clone();
+        if let NodeSpec::L2tp {
+            pre_shared_key,
+            dial_error,
+            ..
+        } = &mut failed
+        {
+            pre_shared_key.clear();
+            *dial_error = Some("L2TP/IPsec connection failed: RAS error 628".into());
+        }
+        let relay = "203.0.113.1:51820".parse().unwrap();
+        assert_eq!(
+            failed.open(relay).err().as_deref(),
+            Some("L2TP/IPsec connection failed: RAS error 628")
+        );
+        let round_trip: NodeSpec =
+            serde_json::from_value(serde_json::to_value(&failed).unwrap()).unwrap();
+        assert!(round_trip.open(relay).is_err());
 
         // An OpenVPN node routes IP packets just as a WireGuard one does, so it
         // is offered for direct mode too. Opening it would dial a server, which

@@ -586,6 +586,10 @@ mod gamepath_service {
         }
     }
 
+    /// Dials every L2TP node. A direct session has exactly one node, so its
+    /// failure is the session's. In relay mode a failed node is only marked:
+    /// the engine skips that route with the reason and runs on the rest, the
+    /// same as it does for a dead WireGuard or OpenVPN node.
     fn connect_l2tp_nodes(
         nodes: &mut [NodeSpec],
         relay: Option<Ipv4Addr>,
@@ -599,6 +603,7 @@ mod gamepath_service {
                 password,
                 pre_shared_key,
                 runtime,
+                dial_error,
                 ..
             } = node
             else {
@@ -610,7 +615,7 @@ mod gamepath_service {
                 index + 1,
                 L2TP_PROFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             );
-            let mut session = L2tpSession::dial(
+            let dialed = L2tpSession::dial(
                 profile_name,
                 server,
                 username,
@@ -619,11 +624,26 @@ mod gamepath_service {
                 split_tunneling,
                 false,
             )
-            .map_err(|error| format!("route {}: {error}", index + 1))?;
-            if let Some(relay) = relay {
-                session
-                    .add_route(&format!("{relay}/32"))
-                    .map_err(|error| format!("route {}: {error}", index + 1))?;
+            .and_then(|mut session| {
+                if let Some(relay) = relay {
+                    session.add_route(&format!("{relay}/32"))?;
+                }
+                Ok(session)
+            });
+            let session = match dialed {
+                Ok(session) => session,
+                Err(error) if relay.is_some() => {
+                    log_event(&format!(
+                        "route {}: {error}; continuing without it",
+                        index + 1
+                    ));
+                    pre_shared_key.clear();
+                    *dial_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(format!("route {}: {error}", index + 1)),
+            };
+            if relay.is_some() {
                 // In relay mode this adapter exists only to carry GamePath's
                 // IPv4 frames to the relay, so an IPv6 default route picked up
                 // from the link's Router Advertisements is never wanted.
