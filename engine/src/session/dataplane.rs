@@ -169,7 +169,7 @@ impl WireGuardSessionManager {
         Err("no path returned the relayed packet before timeout".into())
     }
 
-    pub(crate) fn enqueue_data_packet(&mut self, packet: &[u8]) -> Result<(), String> {
+    pub(crate) fn enqueue_data_packet(&mut self, packet: &[u8]) -> Result<bool, String> {
         use gamepath_engine::protocol::FrameHeader;
 
         let session = self
@@ -198,6 +198,7 @@ impl WireGuardSessionManager {
         let healthy = session.telemetry.healthy_mask.load(Ordering::Acquire);
         let selected = selected_paths(decision, healthy);
         let mut selected_paths = 0;
+        let mut accepted_paths = 0;
         let queued_at = Instant::now();
         for (index, sender) in session.commands.iter().enumerate() {
             let bit = 1_u64.checked_shl(index as u32).unwrap_or(0);
@@ -210,6 +211,7 @@ impl WireGuardSessionManager {
                 queued_at,
             }) {
                 Ok(()) => {
+                    accepted_paths += 1;
                     if let Some(depth) = session.telemetry.queue_depth.get(index) {
                         let current = depth.fetch_add(1, Ordering::Relaxed) + 1;
                         if let Some(peak) = session.telemetry.queue_peak.get(index) {
@@ -239,7 +241,12 @@ impl WireGuardSessionManager {
         if selected_paths == 0 {
             return Err("no active path workers accepted the packet".into());
         }
-        Ok(())
+        if accepted_paths > 0 {
+            session
+                .user_bytes_sent
+                .fetch_add(packet.len() as u64, Ordering::Relaxed);
+        }
+        Ok(accepted_paths > 0)
     }
 
     fn receive_data_packet(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {

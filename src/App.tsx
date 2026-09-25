@@ -9,6 +9,7 @@ import { DashboardView } from './views/DashboardView'
 import { RoutesView } from './views/RoutesView'
 import { SettingsView } from './views/SettingsView'
 import { SplitView } from './views/SplitView'
+import { StatisticsView } from './views/StatisticsView'
 import type { AppState } from './types'
 
 function Sidebar({
@@ -141,6 +142,7 @@ function App() {
           {view === 'routes' && <RoutesView {...views} />}
           {view === 'split' && <SplitView {...views} />}
           {view === 'relays' && <ConnectionView {...views} />}
+          {view === 'statistics' && <StatisticsView notify={notify} />}
           {view === 'settings' && <SettingsView {...views} />}
         </div>
       </main>

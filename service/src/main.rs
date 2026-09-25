@@ -46,9 +46,9 @@ mod gamepath_service {
     };
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::NetworkManagement::Rras::{
-        HRASCONN, RASCONNSTATUSW, RASCS_Disconnected, RASDIALPARAMSW, RASP_PppIp, RASPPPIPW,
-        RasDeleteEntryW, RasDialW, RasGetConnectStatusW, RasGetErrorStringW, RasGetProjectionInfoW,
-        RasHangUpW,
+        HRASCONN, RAS_STATS, RASCONNSTATUSW, RASCS_Disconnected, RASDIALPARAMSW, RASP_PppIp,
+        RASPPPIPW, RasDeleteEntryW, RasDialW, RasGetConnectStatusW, RasGetConnectionStatistics,
+        RasGetErrorStringW, RasGetProjectionInfoW, RasHangUpW,
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -118,7 +118,39 @@ mod gamepath_service {
         native_l2tp_capture: Value,
         native_l2tp_probe_supported: bool,
         native_l2tp_probe_failures: u32,
+        native_l2tp_usage: NativeL2tpUsage,
         lease_deadline: Option<Instant>,
+    }
+
+    #[derive(Default)]
+    struct NativeL2tpUsage {
+        last: Option<(u32, u32, u32)>,
+        sent: u64,
+        received: u64,
+    }
+
+    impl NativeL2tpUsage {
+        fn sample(&mut self, sent: u32, received: u32, duration: u32) {
+            if let Some((old_sent, old_received, old_duration)) = self.last {
+                if duration >= old_duration {
+                    self.sent += u64::from(sent.wrapping_sub(old_sent));
+                    self.received += u64::from(received.wrapping_sub(old_received));
+                }
+            }
+            self.last = Some((sent, received, duration));
+        }
+    }
+
+    fn sample_l2tp_usage(connection: HRASCONN, usage: &mut NativeL2tpUsage) {
+        let mut statistics: RAS_STATS = unsafe { std::mem::zeroed() };
+        statistics.dwSize = std::mem::size_of::<RAS_STATS>() as u32;
+        if unsafe { RasGetConnectionStatistics(connection, &mut statistics) } == 0 {
+            usage.sample(
+                statistics.dwBytesXmited,
+                statistics.dwBytesRcved,
+                statistics.dwConnectDuration,
+            );
+        }
     }
 
     struct EngineProcess {
@@ -1050,6 +1082,7 @@ mod gamepath_service {
                         runtime.native_l2tp_capture = Value::Null;
                         runtime.native_l2tp_probe_supported = false;
                         runtime.native_l2tp_probe_failures = 0;
+                        runtime.native_l2tp_usage = NativeL2tpUsage::default();
                         Some((
                             runtime.engine.take(),
                             std::mem::take(&mut runtime.l2tp_sessions),
@@ -1200,6 +1233,7 @@ mod gamepath_service {
                 state.native_l2tp_capture = Value::Null;
                 state.native_l2tp_probe_supported = false;
                 state.native_l2tp_probe_failures = 0;
+                state.native_l2tp_usage = NativeL2tpUsage::default();
                 state.lease_deadline = None;
                 Ok(json!({ "sessionStatus": "idle" }))
             }
@@ -1385,6 +1419,7 @@ mod gamepath_service {
         runtime.native_l2tp_capture = Value::Null;
         runtime.native_l2tp_probe_supported = false;
         runtime.native_l2tp_probe_failures = 0;
+        runtime.native_l2tp_usage = NativeL2tpUsage::default();
         let request: ValidateRequest = serde_json::from_value(payload.clone())
             .map_err(|error| format!("invalid session request: {error}"))?;
         // Absent means on, matching the engine: a caller that predates the
@@ -1458,6 +1493,7 @@ mod gamepath_service {
             runtime.native_l2tp_capture = capture.clone();
             runtime.native_l2tp_probe_supported = true;
             runtime.native_l2tp_probe_failures = 0;
+            sample_l2tp_usage(session.connection, &mut runtime.native_l2tp_usage);
             runtime.l2tp_sessions = l2tp_sessions;
             log_event("native Windows L2TP direct routing started");
             return Ok(json!({ "paths": paths, "dataPlane": data_plane, "capture": capture }));
@@ -1648,6 +1684,19 @@ mod gamepath_service {
             } else {
                 json!("the L2TP connection is active but its data plane stopped answering")
             };
+            if ras_connected {
+                if let Some(connection) = runtime
+                    .l2tp_sessions
+                    .first()
+                    .map(|session| session.connection)
+                {
+                    sample_l2tp_usage(connection, &mut runtime.native_l2tp_usage);
+                }
+            }
+            result["userBytesSent"] = json!(runtime.native_l2tp_usage.sent);
+            result["userBytesReceived"] = json!(runtime.native_l2tp_usage.received);
+            result["paths"][0]["bytesSent"] = json!(runtime.native_l2tp_usage.sent);
+            result["paths"][0]["bytesReceived"] = json!(runtime.native_l2tp_usage.received);
             runtime.native_l2tp_status = result.clone();
             let mut capture = runtime.native_l2tp_capture.clone();
             capture["state"] = if connected {
@@ -1791,6 +1840,18 @@ mod gamepath_service {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn l2tp_usage_extends_wrapped_counters_without_counting_a_redial() {
+            let mut usage = NativeL2tpUsage::default();
+            usage.sample(u32::MAX - 10, 40, 1000);
+            usage.sample(20, 60, 2000);
+            assert_eq!((usage.sent, usage.received), (31, 20));
+            usage.sample(5, 5, 100);
+            assert_eq!((usage.sent, usage.received), (31, 20));
+            usage.sample(15, 25, 200);
+            assert_eq!((usage.sent, usage.received), (41, 40));
+        }
 
         /// Accepts one connection and hands it to `handle_connection`, the way
         /// the serve loop does.

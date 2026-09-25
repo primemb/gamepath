@@ -6,7 +6,9 @@ export const formatBytes = (bytes: number | undefined) => {
   const value = bytes ?? 0
   if (value < 1024) return `${value} B`
   if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`
-  return `${(value / 1024 ** 2).toFixed(2)} MB`
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(2)} MB`
+  if (value < 1024 ** 4) return `${(value / 1024 ** 3).toFixed(2)} GB`
+  return `${(value / 1024 ** 4).toFixed(2)} TB`
 }
 
 export const formatRate = (bytesPerSecond: number | undefined) => `${formatBytes(bytesPerSecond)}/s`

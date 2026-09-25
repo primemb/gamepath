@@ -255,9 +255,9 @@ pub(crate) fn record_path_send(
     let mut current = statuses.lock().unwrap();
     let status = &mut current[index];
     status.packets_sent += 1;
-    status.bytes_sent += sent_bytes as u64;
-    if let Err(error) = result {
-        status.last_error = Some(error);
+    match result {
+        Ok(()) => status.bytes_sent += sent_bytes as u64,
+        Err(error) => status.last_error = Some(error),
     }
 }
 
@@ -332,7 +332,21 @@ pub(crate) fn take_late_probe_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::state::initial_status;
     use gamepath_engine::scheduler::choose_paths;
+
+    #[test]
+    fn failed_sends_do_not_inflate_node_usage() {
+        let statuses = Mutex::new(vec![initial_status(
+            1,
+            "wireguard",
+            "route".into(),
+            "endpoint".into(),
+        )]);
+        record_path_send(&statuses, 0, 100, Err("send failed".into()));
+        record_path_send(&statuses, 0, 80, Ok(()));
+        assert_eq!(statuses.lock().unwrap()[0].bytes_sent, 80);
+    }
 
     /// The measurement this exists for: a standby route was reported 18 ms
     /// slower and 14 ms jitterier than the same route carrying traffic, purely

@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('gamepath', {
   bootstrap: () => ipcRenderer.invoke('app:bootstrap'),
+  queryUsage: (from, to) => ipcRenderer.invoke('usage:query', from, to),
+  resetUsage: () => ipcRenderer.invoke('usage:reset'),
   lookupIpCountry: (target) => ipcRenderer.invoke('ip-country:lookup', target),
   importWireGuard: () => ipcRenderer.invoke('tunnel:import'),
   chooseOpenVpnFiles: () => ipcRenderer.invoke('openvpn:choose'),

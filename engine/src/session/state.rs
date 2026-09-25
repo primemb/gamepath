@@ -108,6 +108,7 @@ pub(crate) struct ActiveWireGuardSession {
     pub(crate) overlay: SessionOverlay,
     pub(crate) session_id: u64,
     pub(crate) started_at: u128,
+    pub(crate) user_bytes_sent: AtomicU64,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) paths: Arc<Mutex<Vec<PathSessionStatus>>>,
     pub(crate) workers: Vec<JoinHandle<()>>,
@@ -167,6 +168,7 @@ pub(crate) struct DataReceiver {
     /// Workers authenticate and deduplicate relay traffic before admission;
     /// direct workers likewise provide validated inner packets.
     pub(crate) inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
+    pub(crate) user_bytes_received: AtomicU64,
 }
 
 impl DataReceiver {
@@ -178,6 +180,8 @@ impl DataReceiver {
                 return Err("all path receivers stopped".into());
             }
         };
+        self.user_bytes_received
+            .fetch_add(response.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(response))
     }
 }

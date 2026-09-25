@@ -58,6 +58,8 @@ impl WireGuardSessionManager {
             "mode": session.mode.as_str(),
             "sessionId": session.session_id.to_string(),
             "startedAt": session.started_at,
+            "userBytesSent": session.user_bytes_sent.load(Ordering::Relaxed),
+            "userBytesReceived": session.data_receiver.user_bytes_received.load(Ordering::Relaxed),
             "paths": paths,
             "skippedRoutes": session.skipped_routes,
             "strategy": match session.mode {

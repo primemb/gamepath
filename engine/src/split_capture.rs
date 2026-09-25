@@ -262,13 +262,20 @@ struct ReturnKey {
     remote_port: u16,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ReturnPath {
     local_ip: Ipv4Addr,
     interface_index: u32,
     subinterface_index: u32,
     process_id: Option<u32>,
+    usage: Arc<AppUsage>,
     last_seen: Instant,
+}
+
+#[derive(Default)]
+struct AppUsage {
+    sent: AtomicU64,
+    received: AtomicU64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -490,6 +497,7 @@ impl SelectorTable {
 }
 
 struct Registry {
+    capture_id: u64,
     dll: PathBuf,
     bypass: String,
     handles: Mutex<Vec<Arc<Handle>>>,
@@ -502,6 +510,7 @@ struct Registry {
     /// copy and take the lock only when the set has actually changed.
     table_version: AtomicU64,
     handled_connections: Mutex<HashMap<ReturnKey, HandledConnection>>,
+    app_usage: Mutex<HashMap<String, Arc<AppUsage>>>,
     /// Each selected remote endpoint is logged once per capture session. The
     /// fixed cap preserves enough game-server context without turning a busy
     /// application's connection churn into log spam.
@@ -552,6 +561,8 @@ struct Registry {
     unmatched_return_packets: AtomicU64,
     return_injection_errors: AtomicU64,
 }
+
+static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TrafficSelector {
@@ -674,6 +685,7 @@ impl SplitPacketCapture {
     ) -> Result<Self, String> {
         let plan = compile("split", rules)?;
         let registry = Arc::new(Registry {
+            capture_id: NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
             dll: dll_path()?,
             bypass: bypass_clause(bypass_ips),
             handles: Mutex::new(Vec::new()),
@@ -682,6 +694,7 @@ impl SplitPacketCapture {
             table: RwLock::new(Arc::new(SelectorTable::default())),
             table_version: AtomicU64::new(0),
             handled_connections: Mutex::new(HashMap::new()),
+            app_usage: Mutex::new(HashMap::new()),
             logged_destinations: Mutex::new(HashSet::new()),
             capture_loop_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             capture_loop_peak_us: AtomicU64::new(0),
@@ -900,7 +913,22 @@ impl SplitPacketCapture {
                 })
             })
             .collect::<Vec<_>>();
+        let app_usage = self
+            .registry
+            .app_usage
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, usage)| {
+                serde_json::json!({
+                    "application": name,
+                    "bytesSent": usage.sent.load(Ordering::Relaxed),
+                    "bytesReceived": usage.received.load(Ordering::Relaxed),
+                })
+            })
+            .collect::<Vec<_>>();
         serde_json::json!({
+            "captureId": self.registry.capture_id,
             "matchedSockets": self.registry.matched_sockets.load(Ordering::Relaxed),
             "captureFilterCount": selector_table(&self.registry).len,
             "captureScope": if self.scope.broad { "all-outbound" } else { "destinations" },
@@ -915,6 +943,7 @@ impl SplitPacketCapture {
             "relayedPackets": self.registry.relayed_packets.load(Ordering::Relaxed),
             "bypassedPackets": self.registry.bypassed_packets.load(Ordering::Relaxed),
             "handledConnections": handled_connections,
+            "appUsage": app_usage,
             "captureLoopHistogram": capture_loop_histogram,
             "captureLoopPeakUs": self.registry.capture_loop_peak_us.load(Ordering::Relaxed),
             "slowCaptureLoops": self.registry.slow_capture_loops.load(Ordering::Relaxed),
@@ -1311,6 +1340,18 @@ fn route_selected_packet(
             registry.handled_connections.lock().unwrap().remove(&oldest);
         }
     }
+    let usage = paths
+        .get(&connection_key)
+        .filter(|path| path.process_id == process_id)
+        .map(|path| Arc::clone(&path.usage))
+        .unwrap_or_else(|| {
+            let name = application.unwrap_or("Unattributed");
+            let mut all = registry.app_usage.lock().unwrap();
+            Arc::clone(
+                all.entry(name.to_owned())
+                    .or_insert_with(|| Arc::new(AppUsage::default())),
+            )
+        });
     let previous = paths.insert(
         connection_key,
         ReturnPath {
@@ -1318,6 +1359,7 @@ fn route_selected_packet(
             interface_index: address.network_data().interface_index,
             subinterface_index: address.network_data().subinterface_index,
             process_id,
+            usage: Arc::clone(&usage),
             last_seen: now,
         },
     );
@@ -1336,18 +1378,20 @@ fn route_selected_packet(
     tunneled[12..16].copy_from_slice(&virtual_ipv4.octets());
     clamp_tcp_mss(tunneled, registry.tcp_mss);
     let mut checksum_address = address;
-    if handle.checksums(tunneled, &mut checksum_address).is_err()
-        || sessions
-            .lock()
-            .unwrap()
-            .enqueue_data_packet(tunneled)
-            .is_err()
-    {
+    let forwarded = if handle.checksums(tunneled, &mut checksum_address).is_err() {
+        Err("could not update packet checksums".to_owned())
+    } else {
+        sessions.lock().unwrap().enqueue_data_packet(tunneled)
+    };
+    if forwarded.is_err() {
         // Fail open for the selected connection when the relay is unavailable.
         registry.bypassed_packets.fetch_add(1, Ordering::Relaxed);
         let _ = handle.send(packet, &address);
     } else {
         registry.relayed_packets.fetch_add(1, Ordering::Relaxed);
+        if forwarded == Ok(true) {
+            usage.sent.fetch_add(packet.len() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1973,7 +2017,7 @@ fn run_reply_injector(
                 continue;
             };
             path.last_seen = Instant::now();
-            *path
+            path.clone()
         };
         packet[16..20].copy_from_slice(&path.local_ip.octets());
         clamp_tcp_mss(&mut packet, 1000);
@@ -1984,6 +2028,9 @@ fn run_reply_injector(
             registry
                 .injected_return_packets
                 .fetch_add(1, Ordering::Relaxed);
+            path.usage
+                .received
+                .fetch_add(packet.len() as u64, Ordering::Relaxed);
         } else {
             registry
                 .return_injection_errors

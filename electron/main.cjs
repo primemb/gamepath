@@ -17,6 +17,7 @@ const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
 const { provisionRelay, removeRelay } = require('./vps.cjs')
 const { createIpCountryLookup } = require('./ip-country.cjs')
+const { UsageStore } = require('./usage.cjs')
 
 const lookupIpCountry = createIpCountryLookup()
 
@@ -58,6 +59,19 @@ let mainWindow = null
 let tray = null
 let isQuitting = false
 let closePromptOpen = false
+let usageStore = null
+let usageError = null
+let usageFlushTimer = null
+
+function recordUsage(runtime) {
+  if (!usageStore) return
+  try {
+    usageStore.record(runtime)
+  } catch (error) {
+    usageError = error.message
+    logger.warn(`usage accounting failed: ${error.message}`)
+  }
+}
 
 function statePath() {
   return path.join(app.getPath('userData'), 'gamepath-state.json')
@@ -404,6 +418,15 @@ function registerTunnel(tunnel) {
 
 function registerIpc() {
   ipcMain.handle('app:bootstrap', () => publicState())
+  ipcMain.handle('usage:query', (_event, from, to) => {
+    if (!usageStore) throw new Error(usageError || 'Usage storage is unavailable')
+    return usageStore.query(from, to)
+  })
+  ipcMain.handle('usage:reset', () => {
+    if (!usageStore) throw new Error(usageError || 'Usage storage is unavailable')
+    usageStore.reset()
+    return true
+  })
   ipcMain.handle('ip-country:lookup', (_event, target) => lookupIpCountry(String(target ?? '').slice(0, 300)))
 
   ipcMain.handle('node:add-socks5', (_event, input) => {
@@ -1037,6 +1060,18 @@ function registerIpc() {
             : relaySessionMessage(plan, paths, dataPlane),
         }
         state.session.capture = serviceSession.capture
+        if (usageStore) {
+          try {
+            usageStore.start(
+              paths.sessionId ?? crypto.randomUUID(),
+              enabledTunnels.map(({ id, name }) => ({ id, name })),
+            )
+            recordUsage({ ...paths, capture: serviceSession.capture })
+          } catch (error) {
+            usageError = error.message
+            logger.warn(`usage accounting failed: ${error.message}`)
+          }
+        }
         updateSessionMetrics(paths, dataPlane)
         startSessionKeepAlive()
         logger.info(
@@ -1098,6 +1133,7 @@ async function pollSessionStatus() {
   try {
     const runtime = await serviceBridge.request('session-status')
     updateSessionMetrics(runtime)
+    recordUsage(runtime)
     // Selected traffic keeps going into the tunnel while the workers are
     // alive, so it is not quietly falling back to the normal connection:
     // it is not getting through, and stopping the session is what fixes it.
@@ -1271,6 +1307,22 @@ app.whenReady().then(async () => {
     logger.flush()
   })
   loadState()
+  try {
+    fs.mkdirSync(app.getPath('userData'), { recursive: true })
+    usageStore = new UsageStore(app.getPath('userData'))
+    usageFlushTimer = setInterval(() => {
+      try {
+        usageStore.flush()
+      } catch (error) {
+        usageError = error.message
+        logger.warn(`usage storage failed: ${error.message}`)
+      }
+    }, 15000)
+    usageFlushTimer.unref?.()
+  } catch (error) {
+    usageError = error.message
+    logger.warn(`usage storage unavailable: ${error.message}`)
+  }
   const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
   engineBridge = new EngineBridge(projectRoot, app.isPackaged)
   serviceBridge = new ServiceBridge()
@@ -1286,6 +1338,12 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   isQuitting = true
+  if (usageFlushTimer) clearInterval(usageFlushTimer)
+  try {
+    usageStore?.close()
+  } catch (error) {
+    logger.warn(`usage storage close failed: ${error.message}`)
+  }
   engineBridge?.stop()
   tray?.destroy()
   tray = null

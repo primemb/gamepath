@@ -293,10 +293,27 @@ export type AppState = {
   }
 }
 
+export type UsageRow = {
+  category: 'total' | 'node' | 'app'
+  identity: string
+  label: string
+  sent: number
+  received: number
+}
+
+export type UsageReport = {
+  from: string
+  to: string
+  totals: UsageRow[]
+  days: Array<{ day: string; sent: number; received: number }>
+}
+
 export type AddRuleInput = Pick<SplitRule, 'kind' | 'value' | 'label' | 'groupId'>
 
 export type GamePathApi = {
   bootstrap: () => Promise<AppState>
+  queryUsage: (from: string, to: string) => Promise<UsageReport>
+  resetUsage: () => Promise<boolean>
   lookupIpCountry: (target: string) => Promise<IpCountry | null>
   importWireGuard: () => Promise<{ canceled: boolean; state?: AppState; errors?: string[] }>
   chooseOpenVpnFiles: () => Promise<OpenVpnChoice>

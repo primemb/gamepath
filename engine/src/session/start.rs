@@ -243,6 +243,7 @@ impl WireGuardSessionManager {
         }
         let data_receiver = Arc::new(DataReceiver {
             inbound: Mutex::new(inbound_rx),
+            user_bytes_received: AtomicU64::new(0),
         });
         workers.extend(spawn_uplink_monitor(&stop, &telemetry));
         let summary = spawn_session_summary(
@@ -268,6 +269,7 @@ impl WireGuardSessionManager {
             overlay: SessionOverlay::Relay { client_id, crypto },
             session_id,
             started_at: unix_time_millis(),
+            user_bytes_sent: AtomicU64::new(0),
             stop,
             paths: statuses,
             workers,
@@ -374,6 +376,7 @@ impl WireGuardSessionManager {
             overlay: SessionOverlay::Direct,
             session_id,
             started_at: unix_time_millis(),
+            user_bytes_sent: AtomicU64::new(0),
             stop,
             paths: statuses,
             workers,
@@ -381,6 +384,7 @@ impl WireGuardSessionManager {
             commands: vec![command_tx],
             data_receiver: Arc::new(DataReceiver {
                 inbound: Mutex::new(inbound_rx),
+                user_bytes_received: AtomicU64::new(0),
             }),
             virtual_ipv4,
             sequences: Arc::new(AtomicU64::new(1)),

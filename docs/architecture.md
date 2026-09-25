@@ -888,3 +888,11 @@ The Electron UI remains unprivileged. `GamePathService` runs through Windows Ser
 ## WireSock option
 
 WireSock Core SDK can replace parts of tunnel lifecycle and per-application filtering for personal or licensed commercial builds. It is not the default because its free license is non-commercial and includes mandatory telemetry, and its ordinary tunnel manager does not implement the GamePath relay's multipath framing or deduplication.
+
+## Usage accounting
+
+The privileged engine publishes two monotonic per-session counters for IP packets admitted to the session and delivered to its capture receiver. They count a relay packet once even when the scheduler sends copies on several paths. Existing per-path worker counters remain the physical node view, including framing overhead. Split capture attaches atomic sent/received counters to its known application flows and exports them with capture diagnostics; unattributed flows use their own bucket. Capture generations distinguish a live split-policy replacement from counter growth.
+
+Native direct L2TP is routed by Windows outside that engine data plane. The service samples `RasGetConnectionStatistics` for its connection and extends the 32-bit counters across wraparound, resetting the baseline if the connection duration restarts. These totals reflect RAS connection bytes rather than the engine's unique IPv4 packet count.
+
+Electron's main-process lease poll samples these counters without database work on the packet path. It accumulates deltas in memory and flushes daily local-time buckets to SQLite every 15 seconds. The statistics view queries that store only while visible. A reset deletes saved buckets while retaining the current session's counter baseline. This avoids replaying old totals at the next poll.

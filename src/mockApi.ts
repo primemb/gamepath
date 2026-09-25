@@ -96,6 +96,8 @@ let mockTelemetryTick = 0
 
 export const mockApi: GamePathApi = {
   bootstrap: async () => snapshot(),
+  queryUsage: async (from, to) => ({ from, to, totals: [], days: [] }),
+  resetUsage: async () => true,
   lookupIpCountry: async () => null,
   importWireGuard: async () => ({ canceled: true }),
   chooseOpenVpnFiles: async () => {
