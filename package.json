@@ -1,6 +1,6 @@
 {
   "name": "gamepath-client",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "author": "GamePath",
   "private": true,
   "type": "module",
