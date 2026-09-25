@@ -37,7 +37,7 @@ function RelayCard({
             <MapPin size={19} />
           </span>
           <div>
-            <strong>{relay.city}</strong>
+            <strong data-no-translate>{relay.city}</strong>
             <small>
               {relay.address ? (
                 <AddressWithCountry value={relay.address} suffix={`:${relay.port}`} />

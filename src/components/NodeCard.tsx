@@ -141,7 +141,7 @@ export function NodeCard({
 
       <div className="node-item-body">
         <div className="node-item-title">
-          <h3>{tunnel.name}</h3>
+          <h3 data-no-translate>{tunnel.name}</h3>
           <span className="kind-pill">{nodeKindLabels[tunnel.kind]}</span>
           <span className={`status-pill ${state.tone}`}>
             <i />
@@ -195,7 +195,7 @@ export function NodeCard({
           <select value={tunnel.groupId ?? ''} onChange={(event) => onMove(event.target.value || null)}>
             <option value="">No group</option>
             {groups.map((group) => (
-              <option key={group.id} value={group.id}>
+              <option key={group.id} value={group.id} data-no-translate>
                 {group.name}
               </option>
             ))}

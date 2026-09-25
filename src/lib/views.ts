@@ -1,6 +1,6 @@
 import { ChartNoAxesCombined, LayoutDashboard, Network, Route, Server } from 'lucide-react'
 
-export type View = 'dashboard' | 'routes' | 'split' | 'relays' | 'statistics' | 'settings'
+export type View = 'dashboard' | 'routes' | 'split' | 'relays' | 'statistics' | 'settings' | 'info'
 
 export const navItems: { id: View; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'dashboard', label: 'Overview', icon: LayoutDashboard },
@@ -18,4 +18,5 @@ export const viewTitles: Record<View, [string, string]> = {
   relays: ['Connection', 'Choose how your traffic leaves this PC.'],
   statistics: ['Statistics', 'Track tunnel usage over time, by node and application.'],
   settings: ['Settings', 'Control startup, diagnostics, and client behavior.'],
+  info: ['Info', 'About GamePath and its creator.'],
 }

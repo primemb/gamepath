@@ -12,3 +12,6 @@ vite.config.js
 vite.config.d.ts
 *.log
 .DS_Store
+font/*
+!font/IRANYekanX-Regular (1).woff2
+!font/IRANYekanX-Bold (1).woff2

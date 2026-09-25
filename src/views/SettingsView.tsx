@@ -1,75 +1,23 @@
 import { useState } from 'react'
-import {
-  Activity,
-  Code2,
-  Copy,
-  ExternalLink,
-  Link2,
-  MessageCircle,
-  Network,
-  Server,
-  ShieldCheck,
-  Zap,
-} from 'lucide-react'
+import { Activity, Link2, MessageCircle, Network, Server, ShieldCheck, Zap } from 'lucide-react'
 import { api } from '../api'
 import { Toggle } from '../components/Toggle'
 import { errorMessage, type Notify } from '../components/Toast'
+import type { Language } from '../lib/language'
 import type { AppState } from '../types'
-
-function CreatorCard({ notify }: { notify: Notify }) {
-  const copyDiscord = async () => {
-    try {
-      await navigator.clipboard.writeText('prime_lifesoul')
-      notify('Discord username copied: prime_lifesoul', 'success')
-    } catch {
-      notify('Could not copy the username. You can add prime_lifesoul on Discord.', 'error')
-    }
-  }
-
-  return (
-    <section className="creator-card" aria-labelledby="creator-title">
-      <div className="creator-heading">
-        <span className="creator-mark">
-          <Zap size={24} aria-hidden="true" />
-        </span>
-        <div>
-          <span className="eyebrow">Behind GamePath</span>
-          <h2 id="creator-title">Built by primemb</h2>
-          <p>A better path to your next game.</p>
-        </div>
-        <span className="creator-badge">Creator</span>
-      </div>
-      <div className="creator-links">
-        <a href="https://github.com/primemb/gamepath" target="_blank" rel="noopener noreferrer">
-          <Code2 size={20} aria-hidden="true" />
-          <span>
-            <strong>GamePath on GitHub</strong>
-            <small>primemb / gamepath</small>
-          </span>
-          <ExternalLink size={16} aria-hidden="true" />
-        </a>
-        <button type="button" onClick={copyDiscord} aria-label="Copy Discord username prime_lifesoul">
-          <MessageCircle size={20} aria-hidden="true" />
-          <span>
-            <strong>Connect on Discord</strong>
-            <small>prime_lifesoul</small>
-          </span>
-          <Copy size={16} aria-hidden="true" />
-        </button>
-      </div>
-      <p className="creator-legal">&copy; {new Date().getFullYear()} primemb. GamePath.</p>
-    </section>
-  )
-}
 
 export function SettingsView({
   state,
   setState,
   notify,
+  language,
+  onLanguageChange,
 }: {
   state: AppState
   setState: (next: AppState) => void
   notify: Notify
+  language: Language
+  onLanguageChange: (language: Language) => void
 }) {
   const [installing, setInstalling] = useState(false)
   const direct = state.connectionMode === 'direct'
@@ -98,7 +46,37 @@ export function SettingsView({
 
   return (
     <section className="page-section settings-list">
-      <CreatorCard notify={notify} />
+      <div className="settings-card">
+        <div>
+          <span className="setting-icon">
+            <MessageCircle size={18} />
+          </span>
+          <div>
+            <strong>Language</strong>
+            <p>Choose the interface language.</p>
+          </div>
+        </div>
+        <div className="segmented-control" role="radiogroup" aria-label="Language">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={language === 'en'}
+            className={language === 'en' ? 'active' : ''}
+            onClick={() => onLanguageChange('en')}
+          >
+            English
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={language === 'fa'}
+            className={language === 'fa' ? 'active' : ''}
+            onClick={() => onLanguageChange('fa')}
+          >
+            فارسی
+          </button>
+        </div>
+      </div>
 
       <div className="settings-card">
         <div>

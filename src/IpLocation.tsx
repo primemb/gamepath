@@ -30,7 +30,7 @@ export function IpCountryFlag({ target }: { target: string }) {
 
 export function AddressWithCountry({ value, suffix = '' }: { value: string; suffix?: string }) {
   return (
-    <span className="address-with-country">
+    <span className="address-with-country" data-no-translate>
       <span>{value + suffix}</span>
       <IpCountryFlag target={value} />
     </span>

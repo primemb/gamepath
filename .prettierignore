@@ -13,6 +13,7 @@ package-lock.json
 
 # Third-party sources kept verbatim
 vendor/
+font/
 
 # Rust (use cargo fmt instead)
 engine/

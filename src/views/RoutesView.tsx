@@ -80,7 +80,7 @@ function NodeGroupSection({
             {group ? <Layers size={17} /> : <Unlink size={17} />}
           </span>
           <span className="node-group-name">
-            <strong>{group ? group.name : 'Ungrouped nodes'}</strong>
+            <strong data-no-translate={group ? true : undefined}>{group ? group.name : 'Ungrouped nodes'}</strong>
             <small>{summary}</small>
           </span>
         </button>

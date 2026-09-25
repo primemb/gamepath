@@ -1,3 +1,19 @@
+@font-face {
+  font-family: 'IRANYekanX';
+  src: url('../font/IRANYekanX-Regular (1).woff2') format('woff2');
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'IRANYekanX';
+  src: url('../font/IRANYekanX-Bold (1).woff2') format('woff2');
+  font-style: normal;
+  font-weight: 700 900;
+  font-display: swap;
+}
+
 :root {
   font-family: 'Inter Variable', Inter, system-ui, sans-serif;
   color: #f4f7fb;
@@ -13,6 +29,93 @@
   --cyan-soft: rgba(38, 230, 205, 0.12);
   --violet: #8a7cff;
   --green: #4ee19b;
+}
+
+html[lang='fa'] {
+  font-family: 'IRANYekanX', 'Inter Variable', sans-serif;
+}
+
+html[lang='fa'] .topbar {
+  height: auto;
+  min-height: 135px;
+}
+
+html[lang='fa'] .topbar p {
+  line-height: 1.6;
+}
+
+html[lang='fa'] .eyebrow,
+html[lang='fa'] .nav-caption {
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 11px;
+}
+
+html[dir='rtl'] .app-shell {
+  grid-template-columns: 232px minmax(0, 1fr);
+}
+
+html[dir='rtl'] .sidebar {
+  border-right: 0;
+  border-left: 1px solid var(--line);
+}
+
+html[dir='rtl'] .sidebar nav button,
+html[dir='rtl'] .sidebar-bottom > button,
+html[dir='rtl'] .node-item,
+html[dir='rtl'] .settings-card,
+html[dir='rtl'] .usage-panel,
+html[dir='rtl'] .creator-links a,
+html[dir='rtl'] .creator-links button,
+html[dir='rtl'] .mode-card,
+html[dir='rtl'] .relay-card,
+html[dir='rtl'] .split-group-card,
+html[dir='rtl'] .table-row,
+html[dir='rtl'] .usage-data-table table {
+  text-align: right;
+}
+
+html[dir='rtl'] .sidebar nav button.active::before,
+html[dir='rtl'] .sidebar-bottom > button.active::before {
+  left: auto;
+  right: 0;
+}
+
+html[dir='rtl'] .brand em,
+html[dir='rtl'] .sidebar nav button b,
+html[dir='rtl'] .creator-badge {
+  margin-left: 0;
+  margin-right: auto;
+}
+
+html[dir='rtl'] .toast {
+  right: auto;
+  left: 28px;
+  border-left: 1px solid color-mix(in srgb, var(--notice-color) 35%, transparent);
+  border-right: 3px solid var(--notice-color);
+}
+
+html[dir='rtl'] .usage-data-table td {
+  text-align: left;
+  direction: ltr;
+}
+
+html[dir='rtl'] .session-mode svg:last-child,
+html[dir='rtl'] .mode-tradeoff button svg {
+  transform: scaleX(-1);
+}
+
+html[dir='rtl'] input[type='text'],
+html[dir='rtl'] input[type='url'],
+html[dir='rtl'] input[type='password'],
+html[dir='rtl'] input[type='number'],
+html[dir='rtl'] input[type='date'],
+html[dir='rtl'] .address-with-country,
+html[dir='rtl'] .node-item-endpoint,
+html[dir='rtl'] .version {
+  direction: ltr;
+  text-align: left;
+  unicode-bidi: isolate;
 }
 
 * {
@@ -2586,12 +2689,6 @@ select:focus-visible {
   display: flex;
   align-items: center;
   gap: 7px;
-}
-.creator-copyright {
-  display: block;
-  padding: 0 12px;
-  color: var(--muted);
-  font-size: 11px;
 }
 .creator-card {
   padding: 24px;

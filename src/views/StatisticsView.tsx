@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { ArrowDownLeft, ArrowUpRight, CalendarDays, Database, RotateCcw } from 'lucide-react'
 import { api } from '../api'
 import { formatBytes } from '../lib/format'
+import { tr } from '../lib/localizeDom'
 import type { UsageReport, UsageRow } from '../types'
 import type { NoticeKind } from '../components/Toast'
 
@@ -94,7 +95,9 @@ function UsageList({ title, rows }: { title: string; rows: UsageRow[] }) {
           {rows.map((row) => (
             <div className="usage-row" key={`${row.category}:${row.identity}`}>
               <div className="usage-row-top">
-                <strong title={row.label}>{row.label}</strong>
+                <strong title={row.label} data-no-translate>
+                  {row.label}
+                </strong>
                 <b>{formatBytes(row.sent + row.received)}</b>
               </div>
               <div className="usage-track" aria-hidden="true">
@@ -150,7 +153,7 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
   }, [range.from, range.to])
 
   const reset = async () => {
-    if (!window.confirm('Delete all saved usage statistics? This cannot be undone.')) return
+    if (!window.confirm(tr('Delete all saved usage statistics? This cannot be undone.'))) return
     setResetting(true)
     try {
       await api.resetUsage()

@@ -52,16 +52,18 @@ function RuleRow({
         <i aria-hidden="true">
           <Icon size={16} />
         </i>
-        <strong>{rule.label}</strong>
+        <strong data-no-translate>{rule.label}</strong>
       </span>
       <span className="kind-label">{rule.kind}</span>
-      <span className="truncate">{rule.kind === 'ip' ? <AddressWithCountry value={rule.value} /> : rule.value}</span>
+      <span className="truncate" data-no-translate>
+        {rule.kind === 'ip' ? <AddressWithCountry value={rule.value} /> : rule.value}
+      </span>
       <label className="rule-group-field">
         <span className="sr-only">Group for {rule.label}</span>
         <select value={rule.groupId ?? ''} onChange={(event) => onMove(event.target.value || null)}>
           <option value="">Ungrouped</option>
           {groups.map((group) => (
-            <option key={group.id} value={group.id}>
+            <option key={group.id} value={group.id} data-no-translate>
               {group.name}
             </option>
           ))}
@@ -332,7 +334,7 @@ export function SplitView({
                           <Layers size={22} />
                         </span>
                         <span className="split-group-card-copy">
-                          <strong>{group.name}</strong>
+                          <strong data-no-translate>{group.name}</strong>
                           <small>
                             {group.enabled ? `${activeCount} active` : 'Paused'} · {rules.length} targets
                           </small>

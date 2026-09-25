@@ -1,11 +1,14 @@
-import { useEffect, useState } from 'react'
-import { Settings, ShieldCheck, Zap } from 'lucide-react'
+import { useEffect, useLayoutEffect, useState } from 'react'
+import { Info, Settings, ShieldCheck, Zap } from 'lucide-react'
 import { api } from './api'
 import { Toast, type Notice, type NoticeKind } from './components/Toast'
 import { useSessionTelemetry } from './lib/useSessionTelemetry'
+import { savedLanguage, saveLanguage, type Language } from './lib/language'
+import { observeLanguage } from './lib/localizeDom'
 import { navItems, viewTitles, type View } from './lib/views'
 import { ConnectionView } from './views/ConnectionView'
 import { DashboardView } from './views/DashboardView'
+import { InfoView } from './views/InfoView'
 import { RoutesView } from './views/RoutesView'
 import { SettingsView } from './views/SettingsView'
 import { SplitView } from './views/SplitView'
@@ -52,6 +55,10 @@ function Sidebar({
           <Settings size={18} />
           Settings
         </button>
+        <button className={view === 'info' ? 'active' : ''} onClick={() => onNavigate('info')}>
+          <Info size={18} />
+          Info
+        </button>
         <div className="client-card">
           <span>
             <ShieldCheck size={16} />
@@ -64,18 +71,25 @@ function Sidebar({
         <div className="version">
           Client {clientVersion ?? 'development'} <i /> Alpha build
         </div>
-        <small className="creator-copyright">&copy; {new Date().getFullYear()} primemb</small>
       </div>
     </aside>
   )
 }
 
 function App() {
+  const [language, setLanguage] = useState<Language>(savedLanguage)
   const [state, setState] = useState<AppState | null>(null)
   const [view, setView] = useState<View>('dashboard')
   const [notice, setNotice] = useState<Notice | null>(null)
   const notify = (message: string, kind: NoticeKind = 'info') => setNotice({ message, kind })
   const { histories, rates } = useSessionTelemetry(state)
+
+  useLayoutEffect(() => observeLanguage(document.getElementById('root')!, language), [language, state === null])
+
+  const changeLanguage = (next: Language) => {
+    saveLanguage(next)
+    setLanguage(next)
+  }
 
   useEffect(() => {
     api.bootstrap().then(setState)
@@ -143,7 +157,8 @@ function App() {
           {view === 'split' && <SplitView {...views} />}
           {view === 'relays' && <ConnectionView {...views} />}
           {view === 'statistics' && <StatisticsView notify={notify} />}
-          {view === 'settings' && <SettingsView {...views} />}
+          {view === 'settings' && <SettingsView {...views} language={language} onLanguageChange={changeLanguage} />}
+          {view === 'info' && <InfoView notify={notify} />}
         </div>
       </main>
 
