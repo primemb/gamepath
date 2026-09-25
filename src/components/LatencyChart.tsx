@@ -1,10 +1,6 @@
-import { formatMetric, pathColors, type PathHistory, type PathSample } from '../lib/format'
+import { formatMetric, pathColors, type PathHistory } from '../lib/format'
 import type { PathMetric } from '../types'
-
-const CHART_WIDTH = 600
-const CHART_HEIGHT = 160
-const CHART_TOP = 4
-const CHART_BOTTOM = 156
+import { AnimatedLatencySeries, CHART_BOTTOM, CHART_HEIGHT, CHART_TOP, CHART_WIDTH } from './AnimatedLatencySeries'
 
 export function LatencyChart({ histories, paths }: { histories: PathHistory; paths: PathMetric[] }) {
   const series = paths.map((path, index) => ({
@@ -18,14 +14,6 @@ export function LatencyChart({ histories, paths }: { histories: PathHistory; pat
   const padding = Math.max((maximum - minimum) * 0.15, 4)
   const low = Math.max(0, minimum - padding)
   const high = maximum + padding
-  const range = Math.max(high - low, 1)
-  const project = (latency: number) => CHART_BOTTOM - ((latency - low) / range) * (CHART_BOTTOM - CHART_TOP)
-  const line = (samples: PathSample[]) => {
-    const values = samples.length === 1 ? [samples[0], samples[0]] : samples
-    return values
-      .map((sample, index) => `${(index / Math.max(values.length - 1, 1)) * CHART_WIDTH},${project(sample.latency)}`)
-      .join(' ')
-  }
   if (!series.length) return <p className="chart-empty">Route latency appears here as soon as a session is running.</p>
   return (
     <>
@@ -55,27 +43,18 @@ export function LatencyChart({ histories, paths }: { histories: PathHistory; pat
             <line x1="0" y1={(CHART_TOP + CHART_BOTTOM) / 2} x2={CHART_WIDTH} y2={(CHART_TOP + CHART_BOTTOM) / 2} />
             <line x1="0" y1={CHART_BOTTOM} x2={CHART_WIDTH} y2={CHART_BOTTOM} />
           </g>
-          {series.map((item) => {
-            if (!item.samples.length) return null
-            const points = line(item.samples)
-            return (
-              <g key={item.path.route}>
-                <polygon
-                  points={`0,${CHART_HEIGHT} ${points} ${CHART_WIDTH},${CHART_HEIGHT}`}
-                  fill={`url(#route-fill-${item.path.route})`}
-                />
-                <polyline
-                  points={points}
-                  fill="none"
-                  stroke={item.color}
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  vectorEffect="non-scaling-stroke"
-                />
-              </g>
-            )
-          })}
+          {series.map((item) =>
+            item.samples.length ? (
+              <AnimatedLatencySeries
+                key={item.path.route}
+                samples={item.samples}
+                low={low}
+                high={high}
+                color={item.color}
+                route={item.path.route}
+              />
+            ) : null,
+          )}
         </svg>
       </div>
       <div className="chart-legend">

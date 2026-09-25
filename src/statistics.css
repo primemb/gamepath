@@ -303,10 +303,23 @@
   }
 }
 @media (prefers-reduced-motion: no-preference) {
+  .usage-chart-bars span {
+    transition: height 0.45s ease-out;
+    transform-origin: bottom;
+    animation: usage-bar-enter 0.45s ease-out both;
+  }
+  .usage-track span {
+    transition: width 0.45s ease-out;
+  }
   .usage-periods button,
   .usage-reset {
     transition:
       background 0.16s ease,
       color 0.16s ease;
+  }
+}
+@keyframes usage-bar-enter {
+  from {
+    transform: scaleY(0);
   }
 }
