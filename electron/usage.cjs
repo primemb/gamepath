@@ -34,12 +34,14 @@ class UsageStore {
     this.last = new Map()
     this.session = null
     this.captureId = null
+    this.lanProxyStartedAt = null
   }
 
   start(session, nodes) {
     this.flush()
     this.last.clear()
     this.captureId = null
+    this.lanProxyStartedAt = null
     this.session = { id: String(session), nodes }
   }
 
@@ -59,6 +61,15 @@ class UsageStore {
     }
     for (const app of diagnostics?.appUsage ?? []) {
       this.addCounter(day, 'app', app.application, app.application, app.bytesSent, app.bytesReceived)
+    }
+    // A proxy restarted by a settings change counts from zero again.
+    const proxy = runtime.lanProxy
+    if (proxy?.startedAt != null && proxy.startedAt !== this.lanProxyStartedAt) {
+      this.lanProxyStartedAt = proxy.startedAt
+      for (const key of this.last.keys()) if (key.startsWith('device\0')) this.last.delete(key)
+    }
+    for (const device of proxy?.clients ?? []) {
+      this.addCounter(day, 'device', device.address, device.address, device.bytesSent, device.bytesReceived)
     }
   }
 

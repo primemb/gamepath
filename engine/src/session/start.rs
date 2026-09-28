@@ -9,6 +9,7 @@
 
 use super::dialer::PathDialer;
 use super::direct_worker::run_direct_path;
+use super::local_tap::{InboundSink, LocalTap};
 use super::monitors::{spawn_session_summary, spawn_uplink_monitor};
 use super::relay_worker::run_path;
 use super::state::{
@@ -190,6 +191,8 @@ impl WireGuardSessionManager {
         let mut workers = Vec::with_capacity(route_count);
         let mut commands = Vec::with_capacity(route_count);
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
+        let local_tap = Arc::new(LocalTap::default());
+        let inbound = InboundSink::new(inbound_tx, Arc::clone(&local_tap));
         let ingress = Arc::new(RelayIngress {
             client_id,
             session_id,
@@ -202,7 +205,7 @@ impl WireGuardSessionManager {
             let worker_stop = Arc::clone(&stop);
             let worker_statuses = Arc::clone(&statuses);
             let worker_sequences = Arc::clone(&sequences);
-            let worker_inbound = inbound_tx.clone();
+            let worker_inbound = inbound.clone();
             let worker_ingress = Arc::clone(&ingress);
             let worker_metrics = Arc::clone(&scheduler_metrics);
             let worker_decision = Arc::clone(&decision_mask);
@@ -283,6 +286,7 @@ impl WireGuardSessionManager {
             scheduler_metrics,
             effective_mtu,
             bypass_ips,
+            local_tap,
             timer,
         });
         Ok(())
@@ -321,6 +325,8 @@ impl WireGuardSessionManager {
         let scheduler_metrics = Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())]));
         let (command_tx, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
+        let local_tap = Arc::new(LocalTap::default());
+        let inbound = InboundSink::new(inbound_tx, Arc::clone(&local_tap));
         let telemetry = PathTelemetry {
             iterations: Arc::new(vec![AtomicU64::new(0)]),
             queue_depth: Arc::new(vec![AtomicU64::new(0)]),
@@ -347,7 +353,7 @@ impl WireGuardSessionManager {
                     worker_stop,
                     worker_statuses,
                     command_rx,
-                    inbound_tx,
+                    inbound,
                     worker_metrics,
                     worker_telemetry,
                     session_id,
@@ -394,6 +400,7 @@ impl WireGuardSessionManager {
             scheduler_metrics,
             effective_mtu,
             bypass_ips,
+            local_tap,
             timer,
         });
         Ok(())

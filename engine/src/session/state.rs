@@ -2,6 +2,7 @@
 //! overlay captured packets are wrapped in, and the ingress that admits the
 //! first authenticated copy of an inbound packet.
 
+use super::local_tap::{InboundQueue, LocalTap};
 use super::worker::{PathCommand, PathTelemetry};
 use gamepath_engine::auth::SessionCrypto;
 use gamepath_engine::mtu::EffectiveMtu;
@@ -122,6 +123,8 @@ pub(crate) struct ActiveWireGuardSession {
     pub(crate) scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     pub(crate) effective_mtu: EffectiveMtu,
     pub(crate) bypass_ips: Vec<std::net::Ipv4Addr>,
+    /// Diverts replies for the LAN proxy's own flows away from capture.
+    pub(crate) local_tap: Arc<LocalTap>,
     // Held for the session so the path workers wake on a millisecond timer
     // instead of Windows' default ~15.6 ms one.
     pub(crate) timer: HighResolutionTimer,
@@ -142,7 +145,7 @@ impl RelayIngress {
         &self,
         header: &gamepath_engine::protocol::FrameHeader,
         plaintext: Vec<u8>,
-        inbound: &mpsc::SyncSender<Vec<u8>>,
+        inbound: &impl InboundQueue,
     ) -> Result<bool, mpsc::TrySendError<Vec<u8>>> {
         use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT};
         if header.client_id != self.client_id

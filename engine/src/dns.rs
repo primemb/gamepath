@@ -89,6 +89,71 @@ pub fn verdict(response: &[u8], id: u16) -> ResolverVerdict {
     }
 }
 
+/// What a resolver said about a name.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// Every A record in the answer, and the shortest TTL among them.
+    Addresses { addresses: Vec<Ipv4Addr>, ttl: u32 },
+    /// The resolver answered, but not with an address: NXDOMAIN, a refusal,
+    /// or a name with only IPv6 records.
+    NoAddress { rcode: u16 },
+}
+
+/// Reads the A records out of the answer to the query sent as `id`.
+///
+/// `None` means the message is not that answer at all, which a caller racing
+/// several resolvers should treat as nothing having arrived. CNAME records in
+/// the answer are skipped over; a recursive resolver includes the addresses
+/// they lead to in the same answer.
+pub fn read_answer(response: &[u8], id: u16) -> Option<Answer> {
+    match verdict(response, id) {
+        ResolverVerdict::Mismatched => return None,
+        ResolverVerdict::Refused { rcode } => return Some(Answer::NoAddress { rcode }),
+        ResolverVerdict::Answered => {}
+    }
+    let count = |at: usize| u16::from_be_bytes([response[at], response[at + 1]]);
+    let (questions, answers) = (count(4), count(6));
+    let mut at = HEADER_LEN;
+    for _ in 0..questions {
+        at = skip_name(response, at)? + 4;
+    }
+    let mut addresses = Vec::new();
+    let mut ttl = u32::MAX;
+    for _ in 0..answers {
+        at = skip_name(response, at)?;
+        let fixed = response.get(at..at + 10)?;
+        let record_type = u16::from_be_bytes([fixed[0], fixed[1]]);
+        let record_class = u16::from_be_bytes([fixed[2], fixed[3]]);
+        let record_ttl = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+        let length = usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
+        let data = response.get(at + 10..at + 10 + length)?;
+        if record_type == TYPE_A && record_class == CLASS_IN && length == 4 {
+            addresses.push(Ipv4Addr::new(data[0], data[1], data[2], data[3]));
+            ttl = ttl.min(record_ttl);
+        }
+        at += 10 + length;
+    }
+    Some(if addresses.is_empty() {
+        Answer::NoAddress { rcode: 0 }
+    } else {
+        Answer::Addresses { addresses, ttl }
+    })
+}
+
+/// The offset just past the name starting at `at`, following the wire format's
+/// compression: a pointer ends the name in two bytes wherever it points.
+fn skip_name(message: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let length = *message.get(at)?;
+        match length {
+            0 => return Some(at + 1),
+            length if length & 0xc0 == 0xc0 => return message.get(at + 1).map(|_| at + 2),
+            length if length & 0xc0 == 0 => at += 1 + usize::from(length),
+            _ => return None,
+        }
+    }
+}
+
 /// The name the probe asks for. Never connected to — only resolved.
 ///
 /// `example.com` is reserved by IANA for exactly this kind of use, so it is
@@ -205,6 +270,59 @@ mod tests {
         assert_eq!(verdict(&request, 0x1234), ResolverVerdict::Mismatched);
         assert_eq!(verdict(&[], 0x1234), ResolverVerdict::Mismatched);
         assert_eq!(verdict(&request[..8], 0x1234), ResolverVerdict::Mismatched);
+    }
+
+    /// A typical recursive answer: a CNAME, then two addresses, each record
+    /// naming its owner through a compression pointer.
+    #[test]
+    fn addresses_are_read_past_a_cname_and_compressed_names() {
+        let mut response = query(0x2222, "www.example.com").unwrap();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[7] = 3;
+        let mut record = |record_type: u16, ttl: u32, data: &[u8]| {
+            response.extend_from_slice(&[0xc0, 0x0c]);
+            response.extend_from_slice(&record_type.to_be_bytes());
+            response.extend_from_slice(&CLASS_IN.to_be_bytes());
+            response.extend_from_slice(&ttl.to_be_bytes());
+            response.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            response.extend_from_slice(data);
+        };
+        record(5, 300, &[3, b'c', b'd', b'n', 0xc0, 0x10]);
+        record(TYPE_A, 120, &[93, 184, 216, 34]);
+        record(TYPE_A, 60, &[93, 184, 216, 35]);
+        assert_eq!(
+            read_answer(&response, 0x2222),
+            Some(Answer::Addresses {
+                addresses: vec![
+                    Ipv4Addr::new(93, 184, 216, 34),
+                    Ipv4Addr::new(93, 184, 216, 35)
+                ],
+                ttl: 60,
+            })
+        );
+        assert_eq!(read_answer(&response, 0x2223), None);
+    }
+
+    #[test]
+    fn a_name_that_does_not_exist_has_no_address() {
+        let mut response = query(0x3333, "missing.example").unwrap();
+        response[2] = 0x81;
+        response[3] = 0x83;
+        assert_eq!(
+            read_answer(&response, 0x3333),
+            Some(Answer::NoAddress { rcode: 3 })
+        );
+    }
+
+    #[test]
+    fn a_truncated_record_is_not_read_past_the_message() {
+        let mut response = query(0x4444, "example.com").unwrap();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[7] = 1;
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2]);
+        assert_eq!(read_answer(&response, 0x4444), None);
     }
 
     #[test]

@@ -18,6 +18,13 @@ const { ServiceBridge } = require('./service.cjs')
 const { provisionRelay, removeRelay } = require('./vps.cjs')
 const { createIpCountryLookup } = require('./ip-country.cjs')
 const { UsageStore } = require('./usage.cjs')
+const {
+  defaultLanProxy,
+  normalizeLanProxy,
+  parseLanProxySettings,
+  lanProxySessionPayload,
+  publicLanProxy,
+} = require('./lan-proxy.cjs')
 
 const lookupIpCountry = createIpCountryLookup()
 
@@ -35,6 +42,7 @@ const defaultState = () => ({
   remoteDns: true,
   connectionMode: 'relay',
   routingStrategy: 'smart',
+  lanProxy: defaultLanProxy(),
   relays: [
     {
       id: 'tr-istanbul-01',
@@ -62,6 +70,19 @@ let closePromptOpen = false
 let usageStore = null
 let usageError = null
 let usageFlushTimer = null
+// This PC's LAN addresses, as the engine sees them. Node's own interface list
+// cannot tell a VPN adapter from a network card, so it is not used for this.
+let lanAddresses = []
+
+async function refreshLanAddresses() {
+  if (engineBridge?.status.status !== 'ready') return
+  try {
+    const addresses = await engineBridge.request('lan-addresses')
+    lanAddresses = addresses.map((entry) => entry.address)
+  } catch (error) {
+    logger.warn(`could not list LAN addresses: ${error.message}`)
+  }
+}
 
 function recordUsage(runtime) {
   if (!usageStore) return
@@ -78,9 +99,11 @@ function statePath() {
 }
 
 function publicState() {
-  const { encryptedConfigs, encryptedRelayTokens, ...safeState } = state
+  const { encryptedConfigs, encryptedRelayTokens, encryptedLanProxyPassword, ...safeState } = state
   return structuredClone({
     ...safeState,
+    lanProxy: publicLanProxy(state.lanProxy, Boolean(encryptedLanProxyPassword)),
+    lanAddresses,
     clientVersion: app.getVersion(),
     engine: engineBridge?.status ?? {
       status: 'offline',
@@ -111,6 +134,7 @@ function loadState() {
     // Sessions saved before direct mode existed all went through a relay.
     if (state.connectionMode !== 'direct') state.connectionMode = 'relay'
     if (state.routingStrategy !== 'manual') state.routingStrategy = 'smart'
+    state.lanProxy = normalizeLanProxy(state.lanProxy)
     state.nodeGroups = Array.isArray(state.nodeGroups) ? state.nodeGroups : []
     const nodeGroupIds = new Set(state.nodeGroups.map((group) => group.id))
     // Nodes imported before SOCKS5 support existed are all WireGuard routes,
@@ -305,6 +329,7 @@ function updateSessionMetrics(runtime, dataPlane) {
     }
   }
   if (runtime.capture) state.session.capture = runtime.capture
+  if (runtime.lanProxy) state.session.lanProxy = runtime.lanProxy
   state.session.routeLatencies = paths
     .filter((path) => path.latencyMs != null)
     .map((path) => Math.max(1, Math.round(path.latencyMs)))
@@ -400,6 +425,13 @@ function probeSocks5Node(host, port, credentials) {
   )
 }
 
+/** The proxy settings a session is started with, password decrypted. */
+function lanProxyPayload() {
+  const stored = state.encryptedLanProxyPassword
+  const password = stored ? safeStorage.decryptString(Buffer.from(stored, 'base64')) : null
+  return lanProxySessionPayload(state.lanProxy, password)
+}
+
 function activeRelayWithToken() {
   const relay = state.relays.find((item) => item.id === state.activeRelayId)
   const encryptedToken = relay && state.encryptedRelayTokens[relay.id]
@@ -417,7 +449,10 @@ function registerTunnel(tunnel) {
 }
 
 function registerIpc() {
-  ipcMain.handle('app:bootstrap', () => publicState())
+  ipcMain.handle('app:bootstrap', async () => {
+    await refreshLanAddresses()
+    return publicState()
+  })
   ipcMain.handle('usage:query', (_event, from, to) => {
     if (!usageStore) throw new Error(usageError || 'Usage storage is unavailable')
     return usageStore.query(from, to)
@@ -786,6 +821,36 @@ function registerIpc() {
     return publicState()
   })
 
+  // Applied to a running session straight away. Only the proxy restarts; the
+  // session, its paths and every game connection stay up.
+  ipcMain.handle('lan-proxy:configure', async (_event, input) => {
+    const { settings, password } = parseLanProxySettings(
+      input ?? {},
+      state.lanProxy,
+      Boolean(state.encryptedLanProxyPassword),
+    )
+    const previous = { settings: state.lanProxy, password: state.encryptedLanProxyPassword }
+    state.lanProxy = settings
+    if (password === null) delete state.encryptedLanProxyPassword
+    else if (password !== undefined) state.encryptedLanProxyPassword = encryptConfig(password)
+    if (state.session.status === 'connected' && serviceBridge?.status.status === 'ready') {
+      try {
+        state.session.lanProxy = await serviceBridge.request('update-lan-proxy', { lanProxy: lanProxyPayload() })
+      } catch (error) {
+        state.lanProxy = previous.settings
+        if (previous.password) state.encryptedLanProxyPassword = previous.password
+        else delete state.encryptedLanProxyPassword
+        throw error
+      }
+    }
+    logger.info(
+      `LAN proxy ${settings.enabled ? `on, port ${settings.port}` : 'off'}` +
+        (settings.enabled ? `, ${settings.username ? 'login required' : 'no login'}` : ''),
+    )
+    saveState()
+    return publicState()
+  })
+
   ipcMain.handle('traffic:set-remote-dns', (_event, enabled) => {
     state.remoteDns = Boolean(enabled)
     saveState()
@@ -1047,6 +1112,7 @@ function registerIpc() {
             trafficMode: state.trafficMode,
             remoteDns: state.remoteDns !== false,
             rules,
+            lanProxy: lanProxyPayload(),
           },
           nodes.some((node) => node.kind === 'l2tp') ? 60000 : 30000,
         )
@@ -1060,13 +1126,14 @@ function registerIpc() {
             : relaySessionMessage(plan, paths, dataPlane),
         }
         state.session.capture = serviceSession.capture
+        state.session.lanProxy = serviceSession.lanProxy ?? { state: 'stopped' }
         if (usageStore) {
           try {
             usageStore.start(
               paths.sessionId ?? crypto.randomUUID(),
               enabledTunnels.map(({ id, name }) => ({ id, name })),
             )
-            recordUsage({ ...paths, capture: serviceSession.capture })
+            recordUsage({ ...paths, capture: serviceSession.capture, lanProxy: serviceSession.lanProxy })
           } catch (error) {
             usageError = error.message
             logger.warn(`usage accounting failed: ${error.message}`)
@@ -1078,8 +1145,12 @@ function registerIpc() {
           `session started: mode=${mode} traffic=${state.trafficMode} ` +
             `dns=${state.remoteDns !== false ? 'remote' : 'local'} ` +
             `routes=${paths.paths.length} skipped=${(paths.skippedRoutes ?? []).length} ` +
-            `mtu=${serviceSession.capture?.effectiveMtu ?? 'unknown'}`,
+            `mtu=${serviceSession.capture?.effectiveMtu ?? 'unknown'} ` +
+            `lanProxy=${serviceSession.lanProxy?.state === 'listening' ? serviceSession.lanProxy.port : (serviceSession.lanProxy?.state ?? 'off')}`,
         )
+        if (serviceSession.lanProxy?.state === 'error') {
+          logger.warn(`LAN proxy did not start: ${serviceSession.lanProxy.error}`)
+        }
         for (const route of paths.skippedRoutes ?? []) {
           logger.warn(`route ${route.route} (${route.label}) did not join: ${route.reason}`)
         }
@@ -1327,6 +1398,9 @@ app.whenReady().then(async () => {
   engineBridge = new EngineBridge(projectRoot, app.isPackaged)
   serviceBridge = new ServiceBridge()
   await engineBridge.start()
+  await refreshLanAddresses()
+  // Cable unplugged, Wi-Fi changed: the address to show changes with it.
+  setInterval(refreshLanAddresses, 15000).unref?.()
   await serviceBridge.inspect()
   registerIpc()
   createWindow()

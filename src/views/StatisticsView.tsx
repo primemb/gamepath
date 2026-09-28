@@ -169,6 +169,7 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
   const total = report?.totals.find((row) => row.category === 'total')
   const nodes = report?.totals.filter((row) => row.category === 'node') ?? []
   const apps = report?.totals.filter((row) => row.category === 'app') ?? []
+  const devices = report?.totals.filter((row) => row.category === 'device') ?? []
   const series = report ? timeline(report, period) : { points: [], grouping: 'day' }
   const points = series.points
   const highest = Math.max(1, ...points.flatMap((point) => [point.sent, point.received]))
@@ -332,12 +333,14 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
       <div className="usage-details">
         <UsageList title="Nodes" rows={nodes} />
         <UsageList title="Applications" rows={apps} />
+        <UsageList title="Devices" rows={devices} />
       </div>
       <p className="usage-note">
         In engine-managed modes, totals count selected IPv4 packets once. Node totals include tunnel overhead and extra
         relay copies, so they can exceed the overall total. Direct L2TP totals use Windows RAS connection counters.
         Split-tunnel flows without a process name appear as Unattributed. All-traffic and direct L2TP sessions do not
-        provide per-application usage.
+        provide per-application usage. Devices are the LAN proxy's clients, by address; their traffic is also part of
+        the overall total.
       </p>
     </div>
   )

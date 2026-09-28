@@ -889,6 +889,41 @@ The Electron UI remains unprivileged. `GamePathService` runs through Windows Ser
 
 WireSock Core SDK can replace parts of tunnel lifecycle and per-application filtering for personal or licensed commercial builds. It is not the default because its free license is non-commercial and includes mandatory telemetry, and its ordinary tunnel manager does not implement the GamePath relay's multipath framing or deduplication.
 
+## LAN proxy
+
+The proxy a session offers to consoles lives in the privileged engine (`engine/src/socks/`), on one
+event-loop thread using non-blocking sockets throughout. A console opens dozens of connections at once, and
+one owner for every socket is also what the user-space stack behind it requires.
+
+**It does not use Windows' networking to reach the tunnel.** In split mode nothing routes to the tunnel at
+all, and in all-traffic mode the routes exist but a proxy relying on them would be carried by capture
+policy it has no reason to depend on. So the proxy terminates the client's TCP and speaks TCP again itself,
+from the session address, in smoltcp (`tunnel_egress`), handing every packet it produces to
+`enqueue_data_packet` like a captured one. That is why proxied traffic ignores split rules: it never meets
+capture. Direct L2TP/IPsec has no engine data plane to enter, so there the service starts an engine child
+for the proxy alone, and its flows are plain sockets pinned to the RAS adapter with `IP_UNICAST_IF`
+(`interface_egress`).
+
+Replies come back on the same inbound path as a game's, so the path workers pass each one through
+`session::LocalTap` first. The stack claims every local port it uses in an atomic bitmap, one per
+protocol, and a reply to a claimed port goes to the stack instead of capture — which would otherwise hand
+it to Windows, which has no socket for it and would reset the connection. Each port is taken from Windows
+first by binding a real socket with `SO_EXCLUSIVEADDRUSE`, so no application whose traffic capture
+carries can ever be given the same one. Later fragments of a diverted datagram carry no port and follow
+their first fragment by IP identification. With no proxy running, the tap costs one relaxed load per
+packet.
+
+smoltcp is pinned to 0.12, the last release inside the 1.85 MSRV, with its build-time buffers raised: a
+full 64 KiB UDP datagram in each direction, four reassembly slots, and 16 out-of-order TCP segments
+rather than 4, which matters on the lossy paths this client is used on. Nagle is off and congestion
+control is CUBIC. Hostnames are resolved through the same egress, racing every resolver the session can
+reach and retrying every 700 ms, with answers cached for their TTL clamped to 30 s–10 min.
+
+The loop is woken by the client sockets, by the egress's own sockets, or by a `mio::Waker` the tap fires
+when the first packet of a batch arrives, so a reply reaches its client in the turn it arrives. Packets
+the stack produces are flushed to the session under a single lock per turn. The proxy thread takes the
+session lock, so it is always stopped before the session is, never while the lock is held.
+
 ## Usage accounting
 
 The privileged engine publishes two monotonic per-session counters for IP packets admitted to the session and delivered to its capture receiver. They count a relay packet once even when the scheduler sends copies on several paths. Existing per-path worker counters remain the physical node view, including framing overhead. Split capture attaches atomic sent/received counters to its known application flows and exports them with capture diagnostics; unattributed flows use their own bucket. Capture generations distinguish a live split-policy replacement from counter growth.

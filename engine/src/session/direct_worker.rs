@@ -4,6 +4,7 @@
 
 use super::health::{PROBE_INTERVAL, publish_path_health, record_path_receive, record_path_send};
 use super::latency::{LatencyEvent, LatencyWatch};
+use super::local_tap::{InboundQueue, InboundSink};
 use super::state::PathSessionStatus;
 use super::worker::{
     PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN, WORKER_RECEIVE_TIMEOUT,
@@ -56,7 +57,7 @@ pub(crate) fn run_direct_path(
     stop: Arc<AtomicBool>,
     statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
     commands: mpsc::Receiver<PathCommand>,
-    inbound: mpsc::SyncSender<Vec<u8>>,
+    inbound: InboundSink,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     telemetry: PathTelemetry,
     session_id: u64,
@@ -437,7 +438,7 @@ mod tests {
                     stop,
                     statuses,
                     command_rx,
-                    inbound_tx,
+                    InboundSink::new(inbound_tx, Arc::default()),
                     Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())])),
                     telemetry,
                     1,

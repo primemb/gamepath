@@ -119,6 +119,9 @@ mod gamepath_service {
         native_l2tp_probe_supported: bool,
         native_l2tp_probe_failures: u32,
         native_l2tp_usage: NativeL2tpUsage,
+        /// The LAN proxy's last status, for when there is no engine to ask:
+        /// it failed to start, or it was never asked for.
+        lan_proxy: Value,
         lease_deadline: Option<Instant>,
     }
 
@@ -1083,6 +1086,7 @@ mod gamepath_service {
                         runtime.native_l2tp_probe_supported = false;
                         runtime.native_l2tp_probe_failures = 0;
                         runtime.native_l2tp_usage = NativeL2tpUsage::default();
+                        runtime.lan_proxy = Value::Null;
                         Some((
                             runtime.engine.take(),
                             std::mem::take(&mut runtime.l2tp_sessions),
@@ -1214,6 +1218,7 @@ mod gamepath_service {
             "probe-l2tp-node" => probe_l2tp_node(request.payload),
             "start-session" => start_session(request.payload, state),
             "update-session-rules" => update_session_rules(request.payload, state),
+            "update-lan-proxy" => update_lan_proxy(request.payload, state),
             "session-status" => session_status(state),
             "stop-session" => {
                 let mut state = state.lock().unwrap();
@@ -1234,6 +1239,7 @@ mod gamepath_service {
                 state.native_l2tp_probe_supported = false;
                 state.native_l2tp_probe_failures = 0;
                 state.native_l2tp_usage = NativeL2tpUsage::default();
+                state.lan_proxy = Value::Null;
                 state.lease_deadline = None;
                 Ok(json!({ "sessionStatus": "idle" }))
             }
@@ -1420,6 +1426,8 @@ mod gamepath_service {
         runtime.native_l2tp_probe_supported = false;
         runtime.native_l2tp_probe_failures = 0;
         runtime.native_l2tp_usage = NativeL2tpUsage::default();
+        runtime.lan_proxy = Value::Null;
+        let lan_proxy = lan_proxy_request(&payload);
         let request: ValidateRequest = serde_json::from_value(payload.clone())
             .map_err(|error| format!("invalid session request: {error}"))?;
         // Absent means on, matching the engine: a caller that predates the
@@ -1496,7 +1504,13 @@ mod gamepath_service {
             sample_l2tp_usage(session.connection, &mut runtime.native_l2tp_usage);
             runtime.l2tp_sessions = l2tp_sessions;
             log_event("native Windows L2TP direct routing started");
-            return Ok(json!({ "paths": paths, "dataPlane": data_plane, "capture": capture }));
+            let lan_proxy = apply_lan_proxy(&mut runtime, lan_proxy);
+            return Ok(json!({
+                "paths": paths,
+                "dataPlane": data_plane,
+                "capture": capture,
+                "lanProxy": lan_proxy,
+            }));
         }
         // Starting the engine child and dialling L2TP do not depend on each
         // other, and the dial is the long pole in bringing a session up: IKE
@@ -1538,6 +1552,12 @@ mod gamepath_service {
             )
             .inspect_err(|error| log_event(error))?;
         log_event("Windows packet capture started");
+        // After capture, and never fatal: a session that routes the game is
+        // worth more than the proxy beside it.
+        let lan_proxy_status = match lan_proxy {
+            Some(request) => start_lan_proxy(&mut engine, request),
+            None => json!({ "state": "stopped" }),
+        };
         runtime.session_status = "connected".into();
         runtime.route_count = paths["paths"].as_array().map_or(0, Vec::len);
         runtime.traffic_mode = traffic_mode;
@@ -1546,7 +1566,111 @@ mod gamepath_service {
         runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
         runtime.engine = Some(engine);
         runtime.l2tp_sessions = l2tp_sessions;
-        Ok(json!({ "paths": paths, "dataPlane": data_plane, "capture": capture }))
+        runtime.lan_proxy = lan_proxy_status.clone();
+        Ok(json!({
+            "paths": paths,
+            "dataPlane": data_plane,
+            "capture": capture,
+            "lanProxy": lan_proxy_status,
+        }))
+    }
+
+    /// The proxy settings a `start-session` or `update-lan-proxy` payload asks
+    /// for, or `None` when the proxy is off.
+    fn lan_proxy_request(payload: &Value) -> Option<Value> {
+        let settings = payload.get("lanProxy")?;
+        (settings["enabled"].as_bool() == Some(true)).then(|| {
+            json!({
+                "port": settings["port"].as_u64().unwrap_or(1080),
+                "username": settings["username"],
+                "password": settings["password"],
+            })
+        })
+    }
+
+    fn start_lan_proxy(engine: &mut EngineProcess, request: Value) -> Value {
+        match engine.request("start-socks-server", request) {
+            Ok(status) => status,
+            Err(error) => {
+                log_event(&format!("LAN proxy did not start: {error}"));
+                json!({ "state": "error", "error": error })
+            }
+        }
+    }
+
+    /// Starts, restarts or stops the proxy for the running session.
+    ///
+    /// Native L2TP/IPsec routes through Windows with no engine at all, so the
+    /// proxy gets an engine child of its own there, sending through sockets
+    /// pinned to the VPN adapter.
+    fn apply_lan_proxy(runtime: &mut RuntimeState, request: Option<Value>) -> Value {
+        let status = match request {
+            None => {
+                if let Some(engine) = runtime.engine.as_mut() {
+                    let _ = engine.request("stop-socks-server", json!({}));
+                }
+                if runtime.native_l2tp_direct {
+                    runtime.engine = None;
+                }
+                json!({ "state": "stopped" })
+            }
+            Some(mut request) => {
+                let mut failure = None;
+                if runtime.native_l2tp_direct {
+                    match runtime.l2tp_sessions.first() {
+                        Some(session) => {
+                            request["egress"] = json!({
+                                "kind": "interface",
+                                "address": session.local_address,
+                                "interfaceIndex": session.interface_index,
+                            });
+                        }
+                        None => failure = Some("no active L2TP connection".to_owned()),
+                    }
+                    if failure.is_none() && runtime.engine.is_none() {
+                        match EngineProcess::start() {
+                            Ok(engine) => runtime.engine = Some(engine),
+                            Err(error) => failure = Some(error),
+                        }
+                    }
+                }
+                match (failure, runtime.engine.as_mut()) {
+                    (None, Some(engine)) => start_lan_proxy(engine, request),
+                    (Some(error), _) => json!({ "state": "error", "error": error }),
+                    (None, None) => {
+                        json!({ "state": "error", "error": "no active network session" })
+                    }
+                }
+            }
+        };
+        runtime.lan_proxy = status.clone();
+        status
+    }
+
+    fn update_lan_proxy(payload: Value, state: &Mutex<RuntimeState>) -> Result<Value, String> {
+        let mut runtime = state.lock().unwrap();
+        if runtime.session_status != "connected" {
+            return Ok(json!({ "state": "stopped" }));
+        }
+        let request = lan_proxy_request(&payload);
+        log_event(if request.is_some() {
+            "LAN proxy settings applied to the running session"
+        } else {
+            "LAN proxy turned off for the running session"
+        });
+        Ok(apply_lan_proxy(&mut runtime, request))
+    }
+
+    /// The live figures while the proxy runs, otherwise why it is not running.
+    fn lan_proxy_status(runtime: &mut RuntimeState) -> Value {
+        if runtime.lan_proxy["state"] == json!("listening") {
+            if let Some(engine) = runtime.engine.as_mut() {
+                if let Ok(status) = engine.request("socks-server-status", json!({})) {
+                    return status;
+                }
+            }
+        }
+        runtime.lan_proxy.clone()
     }
 
     fn update_session_rules(payload: Value, state: &Mutex<RuntimeState>) -> Result<Value, String> {
@@ -1714,6 +1838,7 @@ mod gamepath_service {
             if let Some(object) = result.as_object_mut() {
                 object.insert("capture".into(), capture);
             }
+            result["lanProxy"] = lan_proxy_status(&mut runtime);
             runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
             return Ok(result);
         }
@@ -1723,6 +1848,7 @@ mod gamepath_service {
         if let Some(object) = result.as_object_mut() {
             object.insert("capture".into(), capture);
         }
+        result["lanProxy"] = lan_proxy_status(&mut runtime);
         runtime.lease_deadline = Some(Instant::now() + SESSION_LEASE);
         Ok(result)
     }

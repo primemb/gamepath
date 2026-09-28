@@ -1,4 +1,52 @@
-import type { AppState, GamePathApi } from './types'
+import type { AppState, GamePathApi, LanProxyStatus } from './types'
+
+const mockLanProxyStartedAt = Date.now() - 600_000
+
+/** A proxy with two consoles on it, for exploring the sharing screen. */
+function mockLanProxy(): LanProxyStatus {
+  if (!state.lanProxy.enabled) return { state: 'stopped' }
+  const now = Date.now()
+  const device = (address: string, tcp: number, udp: number, sent: number, received: number) => ({
+    address,
+    activeTcp: tcp,
+    activeUdp: udp,
+    totalConnections: tcp + 12,
+    failedConnections: 0,
+    bytesSent: sent,
+    bytesReceived: received,
+    firstSeenAt: now - 600_000,
+    lastActiveAt: now,
+    connected: true,
+  })
+  return {
+    state: 'listening',
+    port: state.lanProxy.port,
+    requestedPort: state.lanProxy.port,
+    authRequired: Boolean(state.lanProxy.username),
+    egress: 'tunnel',
+    startedAt: mockLanProxyStartedAt,
+    addresses: [
+      {
+        address: '192.168.1.20',
+        prefixLength: 24,
+        interfaceIndex: 12,
+        interfaceName: 'Ethernet',
+        wireless: false,
+        hardware: true,
+        hasGateway: true,
+      },
+    ],
+    activeConnections: 9,
+    udpAssociations: 2,
+    totalConnections: 33,
+    failedConnections: 0,
+    rejectedConnections: 0,
+    clients: [
+      device('192.168.1.41', 7, 1, 1_800_000 + mockTelemetryTick * 9000, 42_000_000 + mockTelemetryTick * 310_000),
+      device('192.168.1.57', 2, 1, 240_000 + mockTelemetryTick * 4000, 900_000 + mockTelemetryTick * 12_000),
+    ],
+  }
+}
 
 let state: AppState = {
   clientVersion: '0.1.14',
@@ -52,6 +100,7 @@ let state: AppState = {
   remoteDns: true,
   connectionMode: 'relay',
   routingStrategy: 'smart',
+  lanProxy: { enabled: true, port: 1080, username: '', hasPassword: false },
   relays: [
     {
       id: 'tr-istanbul-01',
@@ -258,6 +307,17 @@ export const mockApi: GamePathApi = {
   },
   setRemoteDns: async (enabled) => {
     state.remoteDns = enabled
+    return snapshot()
+  },
+  configureLanProxy: async (input) => {
+    const username = input.username ?? state.lanProxy.username
+    state.lanProxy = {
+      enabled: input.enabled ?? state.lanProxy.enabled,
+      port: input.port ?? state.lanProxy.port,
+      username,
+      hasPassword: Boolean(username && (input.password || state.lanProxy.hasPassword)),
+    }
+    if (state.session.status === 'connected') state.session.lanProxy = mockLanProxy()
     return snapshot()
   },
   setConnectionMode: async (mode) => {
@@ -480,6 +540,7 @@ export const mockApi: GamePathApi = {
         probesSent: (path.probesSent ?? 0) + 1,
         probesReceived: (path.probesReceived ?? 0) + 1,
       }))
+      state.session.lanProxy = mockLanProxy()
     }
     return snapshot()
   },

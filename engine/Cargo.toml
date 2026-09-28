@@ -17,11 +17,14 @@ name = "gamepath-engine"
 path = "src/main.rs"
 
 [features]
-default = ["openvpn"]
+default = ["openvpn", "socks-server"]
 # The user-space OpenVPN client. It is the only thing in this crate that needs
 # TLS, so the relay -- which links this crate purely for its frame and session
 # types -- builds without it and keeps a much smaller dependency tree.
 openvpn = ["dep:rustls", "dep:rustls-pemfile", "dep:aes", "dep:ctr", "dep:aes-gcm", "dep:hmac", "dep:sha1", "dep:md-5"]
+# The LAN proxy consoles connect to. It terminates their TCP in a user-space
+# stack, which only the Windows data plane needs; the relay links none of it.
+socks-server = ["dep:mio", "dep:smoltcp"]
 
 [dependencies]
 aes = { version = "0.8", optional = true }
@@ -44,5 +47,23 @@ socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.8"
+mio = { version = "1", features = ["os-poll", "net"], optional = true }
+# 0.13 and later need Rust 1.91, past this crate's MSRV. Buffer sizes are sized
+# for a full 64 KiB UDP datagram in either direction and for TCP reordering on
+# lossy paths; the defaults hold one 1500-byte datagram and four out-of-order
+# segments.
+smoltcp = { version = "0.12", default-features = false, optional = true, features = [
+  "std",
+  "medium-ip",
+  "proto-ipv4",
+  "proto-ipv4-fragmentation",
+  "socket-tcp",
+  "socket-tcp-cubic",
+  "socket-udp",
+  "fragmentation-buffer-size-65536",
+  "reassembly-buffer-size-65536",
+  "reassembly-buffer-count-4",
+  "assembler-max-segment-count-16",
+] }
 wintun = "0.5.1"
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_Rras", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_System_ProcessStatus"] }

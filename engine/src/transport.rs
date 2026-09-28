@@ -135,13 +135,15 @@ impl MultipathSender {
 }
 
 #[cfg(windows)]
-pub fn bind_to_interface(
-    socket: &UdpSocket,
+use std::os::windows::io::AsRawSocket;
+
+#[cfg(windows)]
+pub fn bind_to_interface<S: AsRawSocket>(
+    socket: &S,
     address: IpAddr,
     interface_index: u32,
 ) -> io::Result<()> {
     use std::mem::size_of;
-    use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
         IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET_ERROR, setsockopt,
     };
@@ -152,7 +154,7 @@ pub fn bind_to_interface(
         IpAddr::V6(_) => (IPPROTO_IPV6, IPV6_UNICAST_IF, interface_index),
     };
     // SAFETY: setsockopt reads exactly one u32 from a valid pointer for the
-    // lifetime of this call. The socket handle belongs to the live UdpSocket.
+    // lifetime of this call. The socket handle belongs to the live socket.
     let result = unsafe {
         setsockopt(
             raw_socket,

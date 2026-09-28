@@ -1620,6 +1620,10 @@ select:focus-visible {
   background: var(--cyan);
   box-shadow: 0 0 8px rgba(38, 230, 205, 0.4);
 }
+/* In RTL the knob starts at the right edge, so "on" slides it left. */
+html[dir='rtl'] .toggle.is-on span {
+  transform: translateX(-15px);
+}
 .toggle:disabled {
   cursor: not-allowed;
   opacity: 0.4;

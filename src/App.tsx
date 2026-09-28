@@ -11,6 +11,7 @@ import { DashboardView } from './views/DashboardView'
 import { InfoView } from './views/InfoView'
 import { RoutesView } from './views/RoutesView'
 import { SettingsView } from './views/SettingsView'
+import { SharingView } from './views/SharingView'
 import { SplitView } from './views/SplitView'
 import { StatisticsView } from './views/StatisticsView'
 import type { AppState } from './types'
@@ -156,6 +157,7 @@ function App() {
           {view === 'routes' && <RoutesView {...views} />}
           {view === 'split' && <SplitView {...views} />}
           {view === 'relays' && <ConnectionView {...views} />}
+          {view === 'sharing' && <SharingView {...views} />}
           {view === 'statistics' && <StatisticsView notify={notify} />}
           {view === 'settings' && <SettingsView {...views} language={language} onLanguageChange={changeLanguage} />}
           {view === 'info' && <InfoView notify={notify} />}

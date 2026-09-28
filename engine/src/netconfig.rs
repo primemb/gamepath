@@ -22,15 +22,17 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
-    DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIpForwardTable2,
-    GetIpInterfaceEntry, GetIpInterfaceTable, GetUnicastIpAddressTable, IP_ADDRESS_PREFIX,
-    InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIfEntry2,
+    GetIpForwardTable2, GetIpInterfaceEntry, GetIpInterfaceTable, GetUnicastIpAddressTable,
+    IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
+    MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
     MIB_IPINTERFACE_TABLE, MIB_UNICASTIPADDRESS_TABLE, SetInterfaceDnsSettings,
     SetIpInterfaceEntry,
 };
+use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::Networking::WinSock::{
-    ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, RouterDiscoveryDisabled, SOCKADDR_IN,
-    SOCKADDR_INET,
+    ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IpDadStatePreferred,
+    RouterDiscoveryDisabled, SOCKADDR_IN, SOCKADDR_INET,
 };
 use windows_sys::core::GUID;
 
@@ -1064,4 +1066,86 @@ mod tests {
             "{gateway} via {interface_index} is not in {candidates:?}"
         );
     }
+}
+
+/// An address other devices on the local network can reach this PC at.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LanAddress {
+    pub address: Ipv4Addr,
+    pub prefix_length: u8,
+    pub interface_index: u32,
+    pub interface_name: String,
+    pub wireless: bool,
+    /// A physical network card rather than a software adapter. TAP-based VPNs
+    /// and virtual switches report themselves as Ethernet too; this is what
+    /// tells them apart.
+    pub hardware: bool,
+    /// Whether this interface also holds a default route, which is what makes
+    /// it the network a console on the same router is on.
+    pub has_gateway: bool,
+}
+
+/// Private IPv4 addresses on connected Ethernet and Wi-Fi interfaces, the
+/// likeliest one first.
+///
+/// Tunnel, PPP and loopback interfaces are left out by type: an address on the
+/// GamePath adapter or a RAS connection is not one a console can reach.
+pub fn lan_ipv4_addresses() -> Vec<LanAddress> {
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    if unsafe { GetUnicastIpAddressTable(AF_INET, &mut table) } != NO_ERROR || table.is_null() {
+        return Vec::new();
+    }
+    let gateways = default_ipv4_route_candidates()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, interface_index, _)| interface_index)
+        .collect::<Vec<_>>();
+    let mut addresses = Vec::new();
+    // SAFETY: the call succeeded with a non-null table, so `NumEntries` rows
+    // are initialised; nothing borrowed from them outlives the free below.
+    unsafe {
+        let count = (*table).NumEntries as usize;
+        for row in std::slice::from_raw_parts((*table).Table.as_ptr(), count) {
+            let Some(address) = ipv4_from(&row.Address) else {
+                continue;
+            };
+            if !address.is_private() || row.DadState != IpDadStatePreferred {
+                continue;
+            }
+            let mut interface: MIB_IF_ROW2 = std::mem::zeroed();
+            interface.InterfaceIndex = row.InterfaceIndex;
+            if GetIfEntry2(&mut interface) != NO_ERROR
+                || interface.OperStatus != IfOperStatusUp
+                || !matches!(interface.Type, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211)
+            {
+                continue;
+            }
+            let alias_length = interface
+                .Alias
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(interface.Alias.len());
+            addresses.push(LanAddress {
+                address,
+                prefix_length: row.OnLinkPrefixLength,
+                interface_index: row.InterfaceIndex,
+                interface_name: String::from_utf16_lossy(&interface.Alias[..alias_length]),
+                wireless: interface.Type == IF_TYPE_IEEE80211,
+                // Bit 0 of the flags is `HardwareInterface`.
+                hardware: interface.InterfaceAndOperStatusFlags._bitfield & 1 != 0,
+                has_gateway: gateways.contains(&row.InterfaceIndex),
+            });
+        }
+        FreeMibTable(table.cast());
+    }
+    addresses.sort_by_key(|lan| {
+        (
+            !lan.hardware,
+            !lan.has_gateway,
+            lan.wireless,
+            lan.interface_index,
+        )
+    });
+    addresses
 }

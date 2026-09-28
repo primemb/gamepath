@@ -11,6 +11,7 @@ mod dialer;
 mod direct_worker;
 mod health;
 mod latency;
+mod local_tap;
 mod monitors;
 mod relay_worker;
 mod start;
@@ -21,6 +22,9 @@ mod worker;
 #[cfg(test)]
 mod failover_tests;
 
+#[cfg(test)]
+pub(crate) use local_tap::Diversion;
+pub(crate) use local_tap::{LocalStackSink, LocalTap, Protocol};
 pub(crate) use state::DataReceiver;
 
 use crate::ipc::SessionRequest;
@@ -33,6 +37,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub(crate) struct LocalStackBinding {
+    pub(crate) tap: Arc<LocalTap>,
+    pub(crate) address: std::net::Ipv4Addr,
+    pub(crate) mtu: u16,
+    pub(crate) mode: SessionMode,
+    /// Diverted replies never pass through the receiver, so the stack counts
+    /// them into its total itself.
+    pub(crate) data_receiver: Arc<DataReceiver>,
+}
 
 #[derive(Default)]
 pub(crate) struct WireGuardSessionManager {
@@ -134,6 +148,17 @@ impl WireGuardSessionManager {
 
     pub(crate) fn effective_mtu(&self) -> Option<EffectiveMtu> {
         self.active.as_ref().map(|session| session.effective_mtu)
+    }
+
+    /// What the LAN proxy needs to open flows of its own through this session.
+    pub(crate) fn local_stack_binding(&self) -> Option<LocalStackBinding> {
+        self.active.as_ref().map(|session| LocalStackBinding {
+            tap: Arc::clone(&session.local_tap),
+            address: session.virtual_ipv4,
+            mtu: session.effective_mtu.mtu,
+            mode: session.mode,
+            data_receiver: Arc::clone(&session.data_receiver),
+        })
     }
 
     pub(crate) fn bypass_ips(&self) -> Vec<std::net::Ipv4Addr> {

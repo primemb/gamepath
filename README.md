@@ -76,6 +76,7 @@ cargo test --locked --manifest-path relay/Cargo.toml
 - Import any number of OpenVPN `.ovpn` files, over UDP or TCP, and run several at once without an adapter or a driver.
 - Add L2TP/IPsec nodes backed by the native Windows RAS client, and test the real connection before saving.
 - Add any number of SOCKS5 proxy nodes, alone or beside WireGuard routes, and test each one for real UDP support before saving it.
+- Share a running session with a console, phone or second PC through a built-in SOCKS5 and HTTP proxy on the local network.
 - Enable, disable, and remove individual routes.
 - Choose all-system traffic or split-tunnel rules.
 - Add split rules for executables, folders, hostnames, and IP ranges.
@@ -262,6 +263,29 @@ A proxy running on this PC is refused in all-traffic mode: the tunnel would own
 the default route the proxy itself needs, and its forwarded traffic would be
 captured and looped back. Split-tunnel mode captures only the chosen targets, so
 a local proxy is fine there.
+
+## Console sharing
+
+Turn on **Console sharing** and every session also opens a proxy on this PC's local network address,
+port 1080 by default, so a device that cannot run GamePath can still use the tunnel. The screen shows the
+address and port to enter, which devices are connected, what each one is doing now, and their totals;
+Statistics keeps per-device usage alongside nodes and applications.
+
+- **SOCKS5** carries TCP (`CONNECT`) and UDP (`UDP ASSOCIATE`). A hostname the client sends is resolved
+  through the tunnel, never by this PC's resolver, and UDP DNS queries travel through it like any other
+  datagram.
+- **HTTP** proxying (`CONNECT` and plain requests) answers on the same port, because that is the only kind
+  of proxy PlayStation and Nintendo Switch let you configure. It carries TCP only: sign-in, the store,
+  downloads and most matchmaking. Game traffic those consoles send over UDP still leaves directly; a SOCKS5
+  client on a router in front of the console carries it too. Xbox has no proxy setting at all.
+- **Split-tunnel rules do not apply.** Proxied traffic is carried by the engine's own network stack straight
+  into the session, so it is tunnelled in split mode and all-traffic mode alike. With native L2TP/IPsec,
+  where Windows routes the VPN itself, the proxy sends through sockets pinned to the VPN adapter instead.
+- A login is optional and off by default. When set, it is required by both protocols, and the password is
+  encrypted with the other secrets. Changing any setting restarts only the proxy, never the session.
+- Only devices on private, link-local and carrier-grade NAT addresses are accepted, and the Windows
+  firewall rule the engine adds is limited to the local subnet. If the port is taken, the next free one is
+  used and the screen says so.
 
 ## CI and tagged releases
 

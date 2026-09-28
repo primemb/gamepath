@@ -12,6 +12,7 @@ use super::health::{
     update_path_status, update_scheduler_probe,
 };
 use super::latency::{LatencyEvent, LatencyWatch};
+use super::local_tap::InboundSink;
 use super::state::{PathSessionStatus, RelayIngress};
 use super::worker::{
     PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN, WORKER_RECEIVE_TIMEOUT,
@@ -37,7 +38,7 @@ pub(crate) fn run_path(
     stop: Arc<AtomicBool>,
     statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
     commands: mpsc::Receiver<PathCommand>,
-    inbound: mpsc::SyncSender<Vec<u8>>,
+    inbound: InboundSink,
     ingress: Arc<RelayIngress>,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     decision_mask: Arc<AtomicU64>,

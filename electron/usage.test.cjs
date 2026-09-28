@@ -51,3 +51,28 @@ test('usage deltas survive restarts and reset during a live session', () => {
     fs.rmSync(directory, { recursive: true, force: true })
   }
 })
+
+test('proxy devices are counted per address and survive a proxy restart', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gamepath-usage-'))
+  try {
+    const store = new UsageStore(directory)
+    store.start('session-1', [])
+    const at = new Date(2026, 8, 28, 20)
+    const snapshot = (startedAt, sent) => ({
+      userBytesSent: 0,
+      userBytesReceived: 0,
+      lanProxy: { startedAt, clients: [{ address: '192.168.1.40', bytesSent: sent, bytesReceived: sent * 10 }] },
+    })
+    store.record(snapshot(1, 100), at)
+    store.record(snapshot(1, 150), at)
+    // Restarted by a settings change: its counters begin again.
+    store.record(snapshot(2, 30), at)
+    const device = store.query('2026-09-28', '2026-09-28').totals.find((row) => row.category === 'device')
+    assert.equal(device.identity, '192.168.1.40')
+    assert.equal(device.sent, 180)
+    assert.equal(device.received, 1800)
+    store.close()
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})

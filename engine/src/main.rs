@@ -12,6 +12,8 @@ mod ipc;
 mod netutil;
 mod session;
 
+#[cfg(all(windows, feature = "socks-server"))]
+mod socks;
 #[cfg(windows)]
 mod split_capture;
 
@@ -41,13 +43,14 @@ fn main() {
     let mut stdout = io::stdout().lock();
     let sessions = Arc::new(Mutex::new(WireGuardSessionManager::default()));
     let mut capture = PacketCaptureManager::default();
+    let mut proxy = LanProxy::default();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle_request(request, &sessions, &mut capture),
+            Ok(request) => handle_request(request, &sessions, &mut capture, &mut proxy),
             Err(error) => Response {
                 id: 0,
                 ok: false,
@@ -72,10 +75,47 @@ fn main() {
     }
 }
 
+#[cfg(all(windows, feature = "socks-server"))]
+type LanProxy = socks::SocksServerManager;
+
+/// Stands in where the proxy is not built, so every caller can still ask.
+#[cfg(not(all(windows, feature = "socks-server")))]
+#[derive(Default)]
+struct LanProxy;
+
+#[cfg(not(all(windows, feature = "socks-server")))]
+impl LanProxy {
+    fn start(
+        &mut self,
+        _payload: serde_json::Value,
+        _sessions: &Arc<Mutex<WireGuardSessionManager>>,
+    ) -> Result<serde_json::Value, String> {
+        Err("this engine was built without the LAN proxy".into())
+    }
+
+    fn status(&self) -> serde_json::Value {
+        json!({ "state": "stopped" })
+    }
+
+    fn stop(&mut self) -> serde_json::Value {
+        self.status()
+    }
+}
+
+/// Where other devices can reach this PC. Needs no privilege, so the client's
+/// own engine answers it before any session exists.
+fn lan_addresses() -> serde_json::Value {
+    #[cfg(windows)]
+    return json!(gamepath_engine::netconfig::lan_ipv4_addresses());
+    #[cfg(not(windows))]
+    json!([])
+}
+
 fn handle_request(
     request: Request,
     sessions: &Arc<Mutex<WireGuardSessionManager>>,
     capture: &mut PacketCaptureManager,
+    proxy: &mut LanProxy,
 ) -> Response {
     let result = match request.command.as_str() {
         "hello" => Ok(json!({
@@ -84,18 +124,29 @@ fn handle_request(
             "protocolVersion": 1,
         })),
         "inspect-system" => Ok(inspect_system()),
+        "lan-addresses" => Ok(lan_addresses()),
         "prepare-session" => prepare_session(request.payload),
         "probe-relay" => probe_relay(request.payload),
         "probe-wireguard-routes" => probe_wireguard_routes(request.payload),
         "probe-socks5-node" => probe_socks5_node(request.payload),
-        "start-wireguard-session" => sessions.lock().unwrap().start(request.payload),
+        "start-wireguard-session" => {
+            // Its flows live in the session being replaced.
+            proxy.stop();
+            sessions.lock().unwrap().start(request.payload)
+        }
         "wireguard-session-status" => Ok(sessions.lock().unwrap().status()),
         "probe-data-plane" => sessions.lock().unwrap().probe_data_plane(),
         "start-packet-capture" => capture.start(request.payload, Arc::clone(sessions)),
         "update-packet-capture" => capture.update(request.payload, Arc::clone(sessions)),
         "packet-capture-status" => Ok(capture.status()),
         "stop-packet-capture" => Ok(capture.stop()),
+        "start-socks-server" => proxy.start(request.payload, sessions),
+        "socks-server-status" => Ok(proxy.status()),
+        "stop-socks-server" => Ok(proxy.stop()),
         "stop-wireguard-session" => {
+            // Before the session: the proxy's thread takes the session lock
+            // for every packet, and is joined here.
+            proxy.stop();
             capture.stop();
             Ok(sessions.lock().unwrap().stop())
         }

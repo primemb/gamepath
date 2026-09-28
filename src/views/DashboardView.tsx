@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Activity, ChevronRight, CircleGauge, Power, Route, Sparkles, Waypoints, Zap } from 'lucide-react'
+import { LanProxyCard } from '../components/LanProxyCard'
 import { SetupDrawer, type SetupItem } from '../components/SetupDrawer'
 import { TelemetryPanel } from '../components/TelemetryPanel'
 import type { PathHistory, PathRate } from '../lib/format'
@@ -161,6 +162,8 @@ export function DashboardView({
         direct={direct}
         onManageRoutes={() => onNavigate('routes')}
       />
+
+      {state.lanProxy.enabled && <LanProxyCard state={state} onOpen={() => onNavigate('sharing')} />}
 
       <TelemetryPanel state={state} histories={histories} rates={rates} />
     </div>

@@ -11,6 +11,8 @@ if ($service) {
 }
 & sc.exe stop WinDivert | Out-Null
 & sc.exe delete WinDivert | Out-Null
+# Added by the engine when the LAN proxy first starts.
+& netsh.exe advfirewall firewall delete rule name="GamePath LAN proxy" | Out-Null
 
 # Remove only routes attached to GamePath-created interfaces.
 $interfaceIndexes = @(Get-NetAdapter -Name 'GamePath*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ifIndex)

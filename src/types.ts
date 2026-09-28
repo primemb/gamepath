@@ -173,6 +173,65 @@ export type HandledConnection = {
   startedAt: number
 }
 
+/** How the LAN proxy is configured. The password itself never leaves the main process. */
+export type LanProxySettings = {
+  enabled: boolean
+  port: number
+  username: string
+  hasPassword: boolean
+}
+
+export type LanProxySettingsInput = {
+  enabled?: boolean
+  port?: number
+  username?: string
+  password?: string
+}
+
+export type LanAddress = {
+  address: string
+  prefixLength: number
+  interfaceIndex: number
+  interfaceName: string
+  wireless: boolean
+  hardware: boolean
+  hasGateway: boolean
+}
+
+export type LanProxyDevice = {
+  address: string
+  activeTcp: number
+  activeUdp: number
+  totalConnections: number
+  failedConnections: number
+  /** From the device towards the Internet. */
+  bytesSent: number
+  bytesReceived: number
+  firstSeenAt: number
+  lastActiveAt: number
+  connected: boolean
+}
+
+/** The running proxy, as the engine reports it. */
+export type LanProxyStatus = {
+  state: 'listening' | 'stopped' | 'error'
+  error?: string
+  port?: number
+  requestedPort?: number
+  authRequired?: boolean
+  egress?: 'tunnel' | 'interface'
+  startedAt?: number
+  addresses?: LanAddress[]
+  activeConnections?: number
+  udpAssociations?: number
+  totalConnections?: number
+  failedConnections?: number
+  rejectedConnections?: number
+  bytesSent?: number
+  bytesReceived?: number
+  clients?: LanProxyDevice[]
+}
+
 export type AppState = {
   clientVersion?: string
   tunnels: Tunnel[]
@@ -184,6 +243,9 @@ export type AppState = {
   connectionMode: ConnectionMode
   /** Smart uses the best two paths; manual duplicates across every healthy path. */
   routingStrategy: 'smart' | 'manual'
+  lanProxy: LanProxySettings
+  /** This PC's private IPv4 addresses, the likeliest first. */
+  lanAddresses?: string[]
   relays: Relay[]
   activeRelayId: string | null
   session: {
@@ -214,6 +276,7 @@ export type AppState = {
       droppedPackets: number[]
     }
     pathMetrics?: PathMetric[]
+    lanProxy?: LanProxyStatus
     capture?: {
       state: string
       backend: string
@@ -294,7 +357,7 @@ export type AppState = {
 }
 
 export type UsageRow = {
-  category: 'total' | 'node' | 'app'
+  category: 'total' | 'node' | 'app' | 'device'
   identity: string
   label: string
   sent: number
@@ -342,6 +405,7 @@ export type GamePathApi = {
   removeRuleGroup: (id: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
   setRemoteDns: (enabled: boolean) => Promise<AppState>
+  configureLanProxy: (input: LanProxySettingsInput) => Promise<AppState>
   setConnectionMode: (mode: ConnectionMode) => Promise<AppState>
   setRoutingStrategy: (strategy: 'smart' | 'manual') => Promise<AppState>
   setRelay: (id: string) => Promise<AppState>

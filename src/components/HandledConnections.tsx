@@ -52,8 +52,7 @@ export function HandledConnections({ capture }: { capture: CaptureDiagnostics | 
           <h3>Traffic currently routed</h3>
         </div>
         <small>
-          {connections.length} active connection{connections.length === 1 ? '' : 's'} · {groups.length} application
-          {groups.length === 1 ? '' : 's'}
+          {`${connections.length} active connection${connections.length === 1 ? '' : 's'} · ${groups.length} application${groups.length === 1 ? '' : 's'}`}
         </small>
         <ChevronDown size={15} aria-hidden="true" />
       </button>
@@ -133,7 +132,7 @@ export function HandledConnections({ capture }: { capture: CaptureDiagnostics | 
           {capture && (
             <div className="capture-health">
               <span>
-                Capture p99 <strong>{captureP99 == null ? '—' : `≤ ${captureP99} µs`}</strong>
+                Capture p99 <strong dir="ltr">{captureP99 == null ? '—' : `≤ ${captureP99} µs`}</strong>
               </span>
               <span>
                 Pending SYN <strong>{capture.pendingSynDepth ?? 0}</strong>
