@@ -167,6 +167,8 @@ export type PathMetric = {
 
 export type HandledConnection = {
   application: string
+  /** Full executable path, absent for destination-only matches or an exited process. */
+  path?: string
   destinationIp: string
   destinationPort: number
   protocol: string
@@ -378,6 +380,8 @@ export type GamePathApi = {
   queryUsage: (from: string, to: string) => Promise<UsageReport>
   resetUsage: () => Promise<boolean>
   lookupIpCountry: (target: string) => Promise<IpCountry | null>
+  /** Shell icon of an executable as a data URL. */
+  getFileIcon: (path: string) => Promise<string | null>
   importWireGuard: () => Promise<{ canceled: boolean; state?: AppState; errors?: string[] }>
   chooseOpenVpnFiles: () => Promise<OpenVpnChoice>
   addOpenVpnNodes: (input: { filePaths: string[]; username?: string; password?: string }) => Promise<OpenVpnAddResult>

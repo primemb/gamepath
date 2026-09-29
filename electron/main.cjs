@@ -17,6 +17,7 @@ const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
 const { provisionRelay, removeRelay } = require('./vps.cjs')
 const { createIpCountryLookup } = require('./ip-country.cjs')
+const { fileIconDataUrl } = require('./file-icon.cjs')
 const { UsageStore } = require('./usage.cjs')
 const {
   defaultLanProxy,
@@ -463,6 +464,8 @@ function registerIpc() {
     return true
   })
   ipcMain.handle('ip-country:lookup', (_event, target) => lookupIpCountry(String(target ?? '').slice(0, 300)))
+
+  ipcMain.handle('file-icon:get', (_event, target) => fileIconDataUrl(target))
 
   ipcMain.handle('node:add-socks5', (_event, input) => {
     const { node, credentials } = parseSocks5Node(input ?? {}, crypto.randomUUID())

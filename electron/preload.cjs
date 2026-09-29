@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('gamepath', {
   queryUsage: (from, to) => ipcRenderer.invoke('usage:query', from, to),
   resetUsage: () => ipcRenderer.invoke('usage:reset'),
   lookupIpCountry: (target) => ipcRenderer.invoke('ip-country:lookup', target),
+  getFileIcon: (target) => ipcRenderer.invoke('file-icon:get', target),
   importWireGuard: () => ipcRenderer.invoke('tunnel:import'),
   chooseOpenVpnFiles: () => ipcRenderer.invoke('openvpn:choose'),
   addOpenVpnNodes: (input) => ipcRenderer.invoke('openvpn:add', input),

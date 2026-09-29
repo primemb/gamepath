@@ -29,6 +29,40 @@
   --cyan-soft: rgba(38, 230, 205, 0.12);
   --violet: #8a7cff;
   --green: #4ee19b;
+  --scrollbar-thumb: rgba(255, 255, 255, 0.14);
+  --scrollbar-thumb-hover: rgba(38, 230, 205, 0.45);
+}
+
+/* Chromium ignores these pseudo-elements once `scrollbar-color`/`scrollbar-width` is set on an element,
+   so don't set those anywhere or that element falls back to the thin native bar. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: var(--scrollbar-thumb) padding-box;
+  min-height: 32px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  border-width: 2px;
+  background-color: var(--scrollbar-thumb-hover);
+}
+
+::-webkit-scrollbar-thumb:active {
+  background-color: var(--cyan);
+}
+
+::-webkit-scrollbar-button {
+  display: none;
 }
 
 html[lang='fa'] {
@@ -1254,6 +1288,10 @@ main {
 .connection-app-name svg {
   flex: 0 0 auto;
   color: var(--cyan);
+}
+.connection-app-name .app-icon {
+  flex: 0 0 auto;
+  object-fit: contain;
 }
 .connection-app-name .connection-app-chevron {
   color: #687487;

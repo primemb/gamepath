@@ -148,6 +148,7 @@ export const mockApi: GamePathApi = {
   queryUsage: async (from, to) => ({ from, to, totals: [], days: [] }),
   resetUsage: async () => true,
   lookupIpCountry: async () => null,
+  getFileIcon: async () => null,
   importWireGuard: async () => ({ canceled: true }),
   chooseOpenVpnFiles: async () => {
     // The mock stands in when no preload bridge is present, which happens when

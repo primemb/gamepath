@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
-import { AppWindow, ChevronDown, ChevronRight } from 'lucide-react'
+import { ChevronDown, ChevronRight } from 'lucide-react'
+import { AppIcon } from './AppIcon'
 import { AddressWithCountry } from '../IpLocation'
 import { formatClockTime, histogramPercentile } from '../lib/format'
 import type { AppState, HandledConnection } from '../types'
@@ -81,7 +82,7 @@ export function HandledConnections({ capture }: { capture: CaptureDiagnostics | 
                     >
                       <span className="connection-app-name">
                         <ChevronRight className="connection-app-chevron" size={14} aria-hidden="true" />
-                        <AppWindow size={14} aria-hidden="true" />
+                        <AppIcon path={group.connections.find((connection) => connection.path)?.path} />
                         <strong>{group.application}</strong>
                       </span>
                       <span className="connection-count">

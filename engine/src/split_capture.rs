@@ -286,6 +286,9 @@ struct HandledConnection {
     destination_port: u16,
     protocol: String,
     started_at: u64,
+    /// Filled in when diagnostics are read, off the capture loop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
     #[serde(skip)]
     process_id: Option<u32>,
 }
@@ -902,6 +905,29 @@ impl SplitPacketCapture {
                     .then_some(connection.clone())
             })
             .collect::<Vec<_>>();
+        drop(return_paths);
+        let active_processes = handled_connections
+            .iter()
+            .filter_map(|connection| connection.process_id)
+            .collect::<HashSet<_>>();
+        // Reuse the path the socket tracker already resolved rather than query
+        // the process again: anti-cheat drivers watch handles opened to games.
+        let process_paths = self
+            .registry
+            .selector_state
+            .lock()
+            .unwrap()
+            .flow_owners
+            .values()
+            .flatten()
+            .filter(|owner| active_processes.contains(&owner.process_id))
+            .map(|owner| (owner.process_id, owner.path.clone()))
+            .collect::<HashMap<_, _>>();
+        for connection in &mut handled_connections {
+            connection.path = connection
+                .process_id
+                .and_then(|process_id| process_paths.get(&process_id).cloned());
+        }
         handled_connections.sort_by_key(|connection| std::cmp::Reverse(connection.started_at));
         let capture_loop_histogram = [10_u64, 25, 50, 100, 250, 500, 1000, u64::MAX]
             .into_iter()
@@ -2369,6 +2395,7 @@ fn record_handled_connection(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            path: None,
             process_id,
         },
     );
