@@ -1,48 +1,45 @@
-const crypto = require('node:crypto')
 const path = require('node:path')
-const { app } = require('electron')
-
-// Kept for the life of the app: an executable's icon does not change while it
-// runs, and the set of executables a user routes is small.
-const icons = new Map()
-let genericIcon
+const { nativeImage } = require('electron')
 
 /**
- * Windows answers an executable without an icon resource with its stock
- * executable icon rather than nothing. A path that cannot exist gets exactly
- * that icon, so it is the reference for "this program has no icon of its own".
+ * Icons of executables, as data URLs, read by the unprivileged engine.
+ *
+ * Electron's `app.getFileIcon` returns the stock Windows icon for some
+ * executables that have their own (BsgLauncher.exe, for one), so the engine
+ * reads the icon resource directly. `null` means the file has no icon and the
+ * UI draws its placeholder.
+ *
+ * Answers are kept for the life of the app: an executable's icon does not
+ * change while it runs. A failed request is not kept, so an engine that was
+ * briefly unavailable does not leave a placeholder behind for good.
  */
-function genericExecutableIcon() {
-  genericIcon ??= app
-    .getFileIcon(path.join(app.getPath('temp'), `${crypto.randomUUID()}.exe`), { size: 'normal' })
-    .then((image) => image.toBitmap())
-    .catch(() => null)
-  return genericIcon
+function createFileIconLookup(request) {
+  const icons = new Map()
+
+  return function fileIconDataUrl(target) {
+    const filePath = typeof target === 'string' ? target.slice(0, 1024) : ''
+    // A drive path only: the path comes from the renderer, and reading a UNC
+    // path would make Windows authenticate to whatever server it names.
+    if (!/^[a-z]:\\/i.test(filePath) || path.win32.extname(filePath).toLowerCase() !== '.exe') {
+      return Promise.resolve(null)
+    }
+    const key = filePath.toLowerCase()
+    let icon = icons.get(key)
+    if (!icon) {
+      icon = Promise.resolve(filePath)
+        .then(request)
+        .then((result) =>
+          result?.bgra
+            ? nativeImage
+                .createFromBitmap(Buffer.from(result.bgra, 'base64'), { width: result.width, height: result.height })
+                .toDataURL()
+            : null,
+        )
+      icon.catch(() => icons.delete(key))
+      icons.set(key, icon)
+    }
+    return icon.catch(() => null)
+  }
 }
 
-/**
- * The shell icon of an executable, as a data URL, or `null` when it has no
- * icon of its own and the UI should draw its placeholder. Only absolute `.exe`
- * paths are accepted: the path comes from the renderer, and nothing else in
- * the UI needs an icon.
- */
-function fileIconDataUrl(target) {
-  const filePath = typeof target === 'string' ? target.slice(0, 1024) : ''
-  if (!path.win32.isAbsolute(filePath) || path.extname(filePath).toLowerCase() !== '.exe') {
-    return Promise.resolve(null)
-  }
-  const key = filePath.toLowerCase()
-  let icon = icons.get(key)
-  if (!icon) {
-    icon = Promise.all([app.getFileIcon(filePath, { size: 'normal' }), genericExecutableIcon()])
-      .then(([image, generic]) => {
-        if (image.isEmpty() || generic?.equals(image.toBitmap())) return null
-        return image.toDataURL()
-      })
-      .catch(() => null)
-    icons.set(key, icon)
-  }
-  return icon
-}
-
-module.exports = { fileIconDataUrl }
+module.exports = { createFileIconLookup }

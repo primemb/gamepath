@@ -7,6 +7,8 @@
 
 mod capture;
 mod commands;
+#[cfg(windows)]
+mod file_icon;
 mod icmp;
 mod ipc;
 mod netutil;
@@ -125,6 +127,8 @@ fn handle_request(
         })),
         "inspect-system" => Ok(inspect_system()),
         "lan-addresses" => Ok(lan_addresses()),
+        #[cfg(windows)]
+        "file-icon" => file_icon::file_icon(request.payload),
         "prepare-session" => prepare_session(request.payload),
         "probe-relay" => probe_relay(request.payload),
         "probe-wireguard-routes" => probe_wireguard_routes(request.payload),

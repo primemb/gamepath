@@ -17,7 +17,7 @@ const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
 const { provisionRelay, removeRelay } = require('./vps.cjs')
 const { createIpCountryLookup } = require('./ip-country.cjs')
-const { fileIconDataUrl } = require('./file-icon.cjs')
+const { createFileIconLookup } = require('./file-icon.cjs')
 const { UsageStore } = require('./usage.cjs')
 const {
   defaultLanProxy,
@@ -28,6 +28,7 @@ const {
 } = require('./lan-proxy.cjs')
 
 const lookupIpCountry = createIpCountryLookup()
+const fileIconDataUrl = createFileIconLookup((filePath) => engineBridge.request('file-icon', { path: filePath }))
 
 const defaultState = () => ({
   tunnels: [],
