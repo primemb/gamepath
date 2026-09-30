@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { Activity, ArrowDownRight, ArrowUpRight, Radio } from 'lucide-react'
+import { Activity, ArrowDownRight, ArrowUpRight, Radio, ShieldCheck } from 'lucide-react'
 import { AddressWithCountry } from '../IpLocation'
 import {
   formatBytes,
@@ -14,6 +14,20 @@ import {
 import { HandledConnections } from './HandledConnections'
 import { LatencyChart } from './LatencyChart'
 import type { AppState, PathMetric } from '../types'
+
+function lossRepairSummary(repair: AppState['session']['lossRepair'], live: boolean) {
+  if (!live || !repair) return '—'
+  switch (repair.state) {
+    case 'off':
+      return 'Relay mode only'
+    case 'unsupported':
+      return 'Update the relay to enable'
+    case 'negotiating':
+      return 'Starting'
+    case 'active':
+      return `1 repair per ${repair.uplinkGroup ?? '—'} packets · ${repair.recovered ?? 0} rebuilt`
+  }
+}
 
 /** One leg of the journey: what was measured, the reading, and where it came from. */
 type JourneyStage = [label: string, value: number | null | undefined, detail: ReactNode]
@@ -202,6 +216,12 @@ export function TelemetryPanel({
               <Radio size={15} />
               <span>
                 Packets<strong>{metrics ? `${metrics.packetsReceived} / ${metrics.packetsSent}` : '—'}</strong>
+              </span>
+            </div>
+            <div className="transfer-wide" title="Rebuilds a packet lost on every path from a small repair packet">
+              <ShieldCheck size={15} />
+              <span>
+                Loss repair<strong>{lossRepairSummary(state.session.lossRepair, live)}</strong>
               </span>
             </div>
           </div>

@@ -1516,6 +1516,9 @@ main {
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
+.transfer-grid > .transfer-wide {
+  grid-column: 1 / -1;
+}
 
 .page-section {
   max-width: 1050px;

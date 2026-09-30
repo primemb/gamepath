@@ -143,7 +143,11 @@ impl SocksServerManager {
         .map_err(|error| format!("could not start the LAN proxy: {error}"))?;
         let thread = std::thread::Builder::new()
             .name("gamepath-lan-proxy".into())
-            .spawn(move || server.run())
+            .spawn(move || {
+                // It carries a console's game traffic the way capture carries this PC's.
+                gamepath_engine::thread_priority::raise_current_for_data_plane();
+                server.run()
+            })
             .map_err(|error| format!("could not start the LAN proxy: {error}"))?;
         firewall::allow_inbound();
         log_info!(

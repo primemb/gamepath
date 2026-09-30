@@ -4,18 +4,16 @@
 use super::health::{mask_for_decision, selected_paths};
 use super::state::RelayIngress;
 use gamepath_engine::auth::SessionCrypto;
-use gamepath_engine::protocol::{FLAG_SERVER_TO_CLIENT, FrameHeader};
+use gamepath_engine::fec::{self, Encoder};
+use gamepath_engine::protocol::{FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader};
 use gamepath_engine::replay::ReplayWindow;
 use gamepath_engine::scheduler::{PathMetrics, Strategy, choose_paths};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::Instant;
 
 fn ingress() -> RelayIngress {
-    RelayIngress {
-        client_id: [7; 16],
-        session_id: 123,
-        server_replay: Mutex::new(ReplayWindow::default()),
-    }
+    RelayIngress::new([7; 16], 123)
 }
 
 fn header(sequence: u64) -> FrameHeader {
@@ -241,4 +239,91 @@ fn sudden_primary_loss_and_tcp_stalls_preserve_the_working_path() {
         "a stalled path delayed a working copy"
     );
     assert_eq!(rx.try_iter().count(), 200);
+}
+
+fn repair_header(sequence: u64) -> FrameHeader {
+    FrameHeader {
+        flags: FLAG_SERVER_TO_CLIENT | FLAG_REPAIR,
+        ..header(sequence)
+    }
+}
+
+/// The relay's encoder and the client's ingress, joined as they are in a
+/// session: a reply lost on every path is rebuilt from its group's repair,
+/// arrives exactly once, and its original turning up late is a duplicate.
+#[test]
+fn a_reply_lost_on_every_path_is_rebuilt_from_its_repair() {
+    let ingress = ingress();
+    let (tx, rx) = mpsc::sync_channel(16);
+    let mut encoder = Encoder::new(fec::MULTIPATH_GROUP, 1400);
+    let now = Instant::now();
+    let replies: Vec<Vec<u8>> = (1..=4).map(|tag| vec![tag; 60 + tag as usize]).collect();
+    for (sequence, reply) in (1..).zip(&replies) {
+        assert!(encoder.push(sequence, reply, now).is_none());
+    }
+    let repair = encoder.flush_due(now + fec::GROUP_MAX_AGE).unwrap();
+    // A first repair teaches the ingress to keep history, as the first group
+    // of a real session does.
+    let mut warmup = Encoder::new(fec::MULTIPATH_GROUP, 1400);
+    warmup.push(100, &[9; 20], now);
+    warmup.push(101, &[9; 20], now);
+    let warmup = warmup.flush_due(now + fec::GROUP_MAX_AGE).unwrap();
+    assert!(!ingress.enqueue_repair(&repair_header(102), &warmup, &tx));
+
+    for (sequence, reply) in (1..).zip(&replies) {
+        if sequence != 3 {
+            ingress
+                .enqueue_authenticated(&header(sequence), reply.clone(), &tx)
+                .unwrap();
+        }
+    }
+    assert!(ingress.enqueue_repair(&repair_header(5), &repair, &tx));
+    // The same repair down a second path rebuilds nothing twice.
+    assert!(!ingress.enqueue_repair(&repair_header(5), &repair, &tx));
+    assert!(
+        !ingress
+            .enqueue_authenticated(&header(3), replies[2].clone(), &tx)
+            .unwrap()
+    );
+    let delivered: Vec<_> = rx.try_iter().collect();
+    assert_eq!(
+        delivered,
+        vec![
+            replies[0].clone(),
+            replies[1].clone(),
+            replies[3].clone(),
+            replies[2].clone()
+        ]
+    );
+    assert_eq!(ingress.repair_counters().recovered, 1);
+}
+
+#[test]
+fn a_single_path_repair_carries_its_reply_on_its_own() {
+    let ingress = ingress();
+    let (tx, rx) = mpsc::sync_channel(4);
+    let mut encoder = Encoder::new(fec::SINGLE_PATH_GROUP, 1400);
+    let now = Instant::now();
+    encoder.push(1, &[7; 80], now);
+    let repair = encoder.flush_due(now + fec::GROUP_MAX_AGE).unwrap();
+    assert!(ingress.enqueue_repair(&repair_header(2), &repair, &tx));
+    assert_eq!(rx.try_recv().unwrap(), vec![7; 80]);
+    // Once the reply itself arrives it is recognised as already delivered.
+    assert!(
+        !ingress
+            .enqueue_authenticated(&header(1), vec![7; 80], &tx)
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_repair_is_never_mistaken_for_a_reply() {
+    let ingress = ingress();
+    let (tx, rx) = mpsc::sync_channel(4);
+    assert!(
+        !ingress
+            .enqueue_authenticated(&repair_header(1), vec![1; 40], &tx)
+            .unwrap()
+    );
+    assert!(rx.try_recv().is_err());
 }

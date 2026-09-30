@@ -13,6 +13,7 @@ use super::health::{
 };
 use super::latency::{LatencyEvent, LatencyWatch};
 use super::local_tap::InboundSink;
+use super::repair::LossRepair;
 use super::state::{PathSessionStatus, RelayIngress};
 use super::worker::{
     PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN, WORKER_RECEIVE_TIMEOUT,
@@ -40,6 +41,7 @@ pub(crate) fn run_path(
     commands: mpsc::Receiver<PathCommand>,
     inbound: InboundSink,
     ingress: Arc<RelayIngress>,
+    repair: Arc<LossRepair>,
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     decision_mask: Arc<AtomicU64>,
     fallback_mask: u64,
@@ -49,7 +51,10 @@ pub(crate) fn run_path(
     route_count: usize,
 ) {
     use gamepath_engine::auth::SessionCrypto;
-    use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader};
+    use gamepath_engine::fec;
+    use gamepath_engine::protocol::{
+        FLAG_CONTROL, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader,
+    };
 
     let Ok(crypto) = SessionCrypto::new(&key, session_id) else {
         return;
@@ -274,6 +279,7 @@ pub(crate) fn run_path(
                         strategy,
                         session_id,
                     );
+                    repair.reassess(&scheduler_metrics);
                     update_path_status(&statuses, index, Err(error));
                     failures += 1;
                     if failures == HEALTH_FAILURE_THRESHOLD - 1 {
@@ -297,6 +303,21 @@ pub(crate) fn run_path(
                 }
             }
         }
+        let own_bit = 1_u64.checked_shl(index as u32).unwrap_or(0);
+        let own_healthy = telemetry.healthy_mask.load(Ordering::Acquire) & own_bit != 0;
+        if let Some(offer) = repair.offer_due(own_healthy) {
+            let header = FrameHeader {
+                flags: FLAG_CONTROL,
+                client_id,
+                session_id,
+                sequence: sequences.fetch_add(1, Ordering::Relaxed),
+            };
+            // Unanswered offers are simply sent again, so a failure here needs
+            // no handling of its own.
+            if let Ok(frame) = crypto.seal_client(header, &fec::offer(offer)) {
+                let _ = path.send_probe(&frame);
+            }
+        }
         match path.receive_frames(WORKER_RECEIVE_TIMEOUT) {
             Ok(frames) => {
                 for frame in frames {
@@ -305,6 +326,12 @@ pub(crate) fn run_path(
                             continue;
                         }
                         if header.flags & FLAG_CONTROL != 0 {
+                            if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
+                                if let Some(group) = fec::accepted_group(&plaintext) {
+                                    repair.accepted(group);
+                                    continue;
+                                }
+                            }
                             if let Some((sequence, started)) = pending_probe {
                                 if header.flags & FLAG_SERVER_TO_CLIENT == 0
                                     || !gamepath_engine::protocol::probe_reply_matches(
@@ -372,6 +399,7 @@ pub(crate) fn run_path(
                                     strategy,
                                     session_id,
                                 );
+                                repair.reassess(&scheduler_metrics);
                                 match latency_watch.observe(latency, Instant::now()) {
                                     Some(LatencyEvent::Degraded {
                                         baseline_ms,
@@ -417,6 +445,9 @@ pub(crate) fn run_path(
                                     rtt.record(elapsed);
                                 }
                             }
+                        } else if header.flags & FLAG_REPAIR != 0 {
+                            record_path_receive(&statuses, index, frame.len());
+                            ingress.enqueue_repair(&header, &plaintext, &inbound);
                         } else if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
                             record_path_receive(&statuses, index, frame.len());
                             // Blocking on a saturated inbound queue would stall
@@ -463,6 +494,7 @@ pub(crate) fn run_path(
                 strategy,
                 session_id,
             );
+            repair.reassess(&scheduler_metrics);
             let note = path.health_note();
             failures += 1;
             schedule_redial(failures, backoff, &mut next_redial);

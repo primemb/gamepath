@@ -2,19 +2,23 @@
 //! overlay captured packets are wrapped in, and the ingress that admits the
 //! first authenticated copy of an inbound packet.
 
+use super::dispatch::Dispatch;
 use super::local_tap::{InboundQueue, LocalTap};
-use super::worker::{PathCommand, PathTelemetry};
+use super::repair::LossRepair;
+use super::worker::PathTelemetry;
 use gamepath_engine::auth::SessionCrypto;
+use gamepath_engine::fec::Decoder;
 use gamepath_engine::mtu::EffectiveMtu;
+use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader};
 use gamepath_engine::relay_path::SessionMode;
 use gamepath_engine::replay::ReplayWindow;
 use gamepath_engine::scheduler::{PathMetrics, Strategy};
 use gamepath_engine::timer::HighResolutionTimer;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,7 +118,10 @@ pub(crate) struct ActiveWireGuardSession {
     pub(crate) paths: Arc<Mutex<Vec<PathSessionStatus>>>,
     pub(crate) workers: Vec<JoinHandle<()>>,
     pub(crate) skipped_routes: Vec<SkippedRoute>,
-    pub(crate) commands: Vec<mpsc::SyncSender<PathCommand>>,
+    pub(crate) dispatch: Arc<Dispatch>,
+    /// Relay sessions only: a direct node cannot decode repairs.
+    pub(crate) loss_repair: Option<Arc<LossRepair>>,
+    pub(crate) ingress: Option<Arc<RelayIngress>>,
     pub(crate) data_receiver: Arc<DataReceiver>,
     pub(crate) virtual_ipv4: std::net::Ipv4Addr,
     pub(crate) sequences: Arc<AtomicU64>,
@@ -133,37 +140,139 @@ pub(crate) struct ActiveWireGuardSession {
 /// Shared by the path workers: admit the first authenticated copy before it
 /// enters the bounded receive queue. No waiting for slower paths or ordering
 /// barrier, and no dependency on the outbound scheduler's current choice.
+///
+/// Loss repair lives under the same lock as the replay window because the two
+/// answer one question between them: whether a sequence has reached the game
+/// yet, by a path or by being rebuilt.
 pub(crate) struct RelayIngress {
-    pub(crate) client_id: [u8; 16],
-    pub(crate) session_id: u64,
-    pub(crate) server_replay: Mutex<ReplayWindow>,
+    client_id: [u8; 16],
+    session_id: u64,
+    state: Mutex<IngressState>,
+    pub(crate) recovered: AtomicU64,
+}
+
+struct IngressState {
+    replay: ReplayWindow,
+    repair: Decoder,
+}
+
+/// What the ingress has seen of the relay's repairs, for session status.
+pub(crate) struct RepairCounters {
+    pub(crate) received: u64,
+    pub(crate) recovered: u64,
+    pub(crate) unrecoverable: u64,
 }
 
 impl RelayIngress {
+    pub(crate) fn new(client_id: [u8; 16], session_id: u64) -> Self {
+        Self {
+            client_id,
+            session_id,
+            state: Mutex::new(IngressState {
+                replay: ReplayWindow::default(),
+                repair: Decoder::default(),
+            }),
+            recovered: AtomicU64::new(0),
+        }
+    }
+
+    fn is_ours(&self, header: &FrameHeader) -> bool {
+        header.client_id == self.client_id
+            && header.session_id == self.session_id
+            && header.flags & FLAG_SERVER_TO_CLIENT != 0
+            && header.flags & FLAG_CONTROL == 0
+    }
+
     /// `header` and `plaintext` must come from successful `open_server`.
     pub(crate) fn enqueue_authenticated(
         &self,
-        header: &gamepath_engine::protocol::FrameHeader,
+        header: &FrameHeader,
         plaintext: Vec<u8>,
         inbound: &impl InboundQueue,
     ) -> Result<bool, mpsc::TrySendError<Vec<u8>>> {
-        use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT};
-        if header.client_id != self.client_id
-            || header.session_id != self.session_id
-            || header.flags & FLAG_SERVER_TO_CLIENT == 0
-            || header.flags & FLAG_CONTROL != 0
-        {
+        if !self.is_ours(header) || header.flags & FLAG_REPAIR != 0 {
             return Ok(false);
         }
-        let mut replay = self.server_replay.lock().unwrap();
-        if !replay.would_accept(header.sequence) {
+        let mut state = self.state.lock().unwrap();
+        if !state.replay.would_accept(header.sequence) {
             return Ok(false);
         }
+        // Kept even if the queue turns it away: its bytes still let a repair
+        // rebuild one of its neighbours.
+        state.repair.remember(header.sequence, &plaintext);
         inbound.try_send(plaintext)?;
         // A full queue must not consume the sequence: a backup arriving after
         // space is available can still rescue this packet.
-        replay.accept(header.sequence);
+        state.replay.accept(header.sequence);
+        self.retry_pending(&mut state, inbound);
         Ok(true)
+    }
+
+    /// Takes a repair frame from the relay. Returns whether it rebuilt a packet.
+    pub(crate) fn enqueue_repair(
+        &self,
+        header: &FrameHeader,
+        payload: &[u8],
+        inbound: &impl InboundQueue,
+    ) -> bool {
+        if !self.is_ours(header) || header.flags & FLAG_REPAIR == 0 {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        // Repairs travel every path too; only the first copy is worth decoding.
+        if !state.replay.accept(header.sequence) {
+            return false;
+        }
+        let IngressState { replay, repair } = &mut *state;
+        let rebuilt = repair.accept_repair(payload, Instant::now(), |sequence| {
+            !replay.would_accept(sequence)
+        });
+        let admitted = rebuilt.is_some_and(|(sequence, packet)| {
+            self.admit_rebuilt(&mut state, sequence, packet, inbound)
+        });
+        self.retry_pending(&mut state, inbound);
+        admitted
+    }
+
+    fn admit_rebuilt(
+        &self,
+        state: &mut IngressState,
+        sequence: u64,
+        packet: Vec<u8>,
+        inbound: &impl InboundQueue,
+    ) -> bool {
+        if !state.replay.would_accept(sequence) {
+            return false;
+        }
+        state.repair.remember(sequence, &packet);
+        if inbound.try_send(packet).is_err() {
+            return false;
+        }
+        state.replay.accept(sequence);
+        self.recovered.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// A delivery can complete a repair that was waiting on more than one member.
+    fn retry_pending(&self, state: &mut IngressState, inbound: &impl InboundQueue) {
+        while state.repair.has_pending() {
+            let IngressState { replay, repair } = &mut *state;
+            let Some((sequence, packet)) =
+                repair.retry_pending(Instant::now(), |sequence| !replay.would_accept(sequence))
+            else {
+                return;
+            };
+            self.admit_rebuilt(state, sequence, packet, inbound);
+        }
+    }
+
+    pub(crate) fn repair_counters(&self) -> RepairCounters {
+        let state = self.state.lock().unwrap();
+        RepairCounters {
+            received: state.repair.repairs_received,
+            recovered: self.recovered.load(Ordering::Relaxed),
+            unrecoverable: state.repair.unrecoverable,
+        }
     }
 }
 
@@ -184,7 +293,7 @@ impl DataReceiver {
             }
         };
         self.user_bytes_received
-            .fetch_add(response.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(response.len() as u64, Ordering::Relaxed);
         Ok(Some(response))
     }
 }

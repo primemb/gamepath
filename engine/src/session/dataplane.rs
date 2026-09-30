@@ -8,7 +8,6 @@
 use super::WireGuardSessionManager;
 use super::health::selected_paths;
 use super::state::SessionOverlay;
-use super::worker::PathCommand;
 use crate::icmp::{icmp_echo_packet, is_matching_icmp_reply};
 use gamepath_engine::relay_path::SessionMode;
 use gamepath_engine::userspace_wireguard::{ipv4_udp_packet, ipv4_udp_payload};
@@ -16,7 +15,6 @@ use gamepath_engine::{dns, log_warn};
 use serde_json::{Value, json};
 use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// How long the resolver probe waits. Short on purpose: it sits on the connect
@@ -176,7 +174,7 @@ impl WireGuardSessionManager {
             .active
             .as_mut()
             .ok_or("start the WireGuard session before sending packets")?;
-        let frame = match &session.overlay {
+        let (frame, sequence) = match &session.overlay {
             SessionOverlay::Relay { client_id, crypto } => {
                 let sequence = session.sequences.fetch_add(1, Ordering::Relaxed);
                 let header = FrameHeader {
@@ -185,68 +183,39 @@ impl WireGuardSessionManager {
                     session_id: session.session_id,
                     sequence,
                 };
-                crypto.seal_client(header, packet)?
+                (crypto.seal_client(header, packet)?, Some(sequence))
             }
             // The node routes the packet as it stands, so there is nothing to
             // wrap it in and no sequence for anyone to compare copies by.
-            SessionOverlay::Direct => packet.to_vec(),
+            SessionOverlay::Direct => (packet.to_vec(), None),
         };
         // The scheduler's pick, narrowed to the paths that are actually
         // carrying traffic. A path that never came up would otherwise take a
         // copy of every packet and throw it away.
         let decision = session.decision_mask.load(Ordering::Acquire);
         let healthy = session.telemetry.healthy_mask.load(Ordering::Acquire);
-        let selected = selected_paths(decision, healthy);
-        let mut selected_paths = 0;
-        let mut accepted_paths = 0;
-        let queued_at = Instant::now();
-        for (index, sender) in session.commands.iter().enumerate() {
-            let bit = 1_u64.checked_shl(index as u32).unwrap_or(0);
-            if selected & bit == 0 {
-                continue;
-            }
-            selected_paths += 1;
-            match sender.try_send(PathCommand {
-                frame: frame.clone(),
-                queued_at,
-            }) {
-                Ok(()) => {
-                    accepted_paths += 1;
-                    if let Some(depth) = session.telemetry.queue_depth.get(index) {
-                        let current = depth.fetch_add(1, Ordering::Relaxed) + 1;
-                        if let Some(peak) = session.telemetry.queue_peak.get(index) {
-                            peak.fetch_max(current, Ordering::Relaxed);
-                        }
-                    }
-                }
-                // A full queue means the path is already behind. Shedding the
-                // newest packet keeps the backlog bounded: game traffic is
-                // stale by the time it would drain, and TCP retransmits.
-                Err(mpsc::TrySendError::Full(_)) => {
-                    if let Some(dropped) = session.telemetry.dropped.get(index) {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Some(dropped) = session.telemetry.queue_full_dropped.get(index) {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => {}
-            }
-        }
+        let dispatched = session
+            .dispatch
+            .send(frame, selected_paths(decision, healthy));
         // Nothing to send down. Split mode reads this as the relay being
         // unavailable and lets the packet take the normal route; that fail-open
         // is only correct here, when no path was ever chosen. A packet dropped
         // because every chosen path is saturated must not bypass: half a flow
         // arriving from a different source address breaks it at the server.
-        if selected_paths == 0 {
+        if dispatched.selected == 0 {
             return Err("no active path workers accepted the packet".into());
         }
-        if accepted_paths > 0 {
+        // Covered even when every chosen queue was full: the relay can still
+        // rebuild it from the repair, and it was never going to bypass.
+        if let (Some(repair), Some(sequence)) = (&session.loss_repair, sequence) {
+            repair.protect(sequence, packet);
+        }
+        if dispatched.accepted > 0 {
             session
                 .user_bytes_sent
                 .fetch_add(packet.len() as u64, Ordering::Relaxed);
         }
-        Ok(accepted_paths > 0)
+        Ok(dispatched.accepted > 0)
     }
 
     fn receive_data_packet(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {

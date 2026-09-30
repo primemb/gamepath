@@ -793,6 +793,7 @@ impl SplitPacketCapture {
         let worker = thread::Builder::new()
             .name("gamepath-windivert-pending-syn".into())
             .spawn(move || {
+                gamepath_engine::thread_priority::raise_current_for_data_plane();
                 run_pending_syns(
                     pending_handle,
                     pending_stop,
@@ -812,6 +813,7 @@ impl SplitPacketCapture {
         let worker = thread::Builder::new()
             .name("gamepath-windivert-bypass".into())
             .spawn(move || {
+                gamepath_engine::thread_priority::raise_current_for_data_plane();
                 run_bypass_injector(bypass_handle, bypass_stop, bypass_registry, bypass_rx)
             })
             .map_err(|error| format!("could not start the bypass injector: {error}"))?;
@@ -832,6 +834,7 @@ impl SplitPacketCapture {
             let worker = thread::Builder::new()
                 .name(format!("gamepath-windivert-selected-{}", index + 1))
                 .spawn(move || {
+                    gamepath_engine::thread_priority::raise_current_for_data_plane();
                     run_selected_capture(
                         capture_handle,
                         capture_stop,
@@ -853,6 +856,7 @@ impl SplitPacketCapture {
         let worker = thread::Builder::new()
             .name("gamepath-windivert-inject".into())
             .spawn(move || {
+                gamepath_engine::thread_priority::raise_current_for_data_plane();
                 run_reply_injector(
                     send_handle,
                     inject_stop,

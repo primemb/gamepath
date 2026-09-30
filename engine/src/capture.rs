@@ -426,6 +426,7 @@ impl PacketCaptureManager {
         let uplink = thread::Builder::new()
             .name("gamepath-wintun-uplink".into())
             .spawn(move || {
+                gamepath_engine::thread_priority::raise_current_for_data_plane();
                 run_wintun_uplink(uplink_session, uplink_sessions, virtual_ipv4, uplink_stop)
             })
             .map_err(|error| format!("could not start Wintun uplink: {error}"))?;
@@ -433,7 +434,10 @@ impl PacketCaptureManager {
         let downlink_session = Arc::clone(&session);
         let downlink = thread::Builder::new()
             .name("gamepath-wintun-downlink".into())
-            .spawn(move || run_wintun_downlink(downlink_session, data_receiver, downlink_stop))
+            .spawn(move || {
+                gamepath_engine::thread_priority::raise_current_for_data_plane();
+                run_wintun_downlink(downlink_session, data_receiver, downlink_stop)
+            })
             .map_err(|error| format!("could not start Wintun downlink: {error}"))?;
 
         let mut capture = WindowsPacketCapture {

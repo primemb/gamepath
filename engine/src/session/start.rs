@@ -9,9 +9,11 @@
 
 use super::dialer::PathDialer;
 use super::direct_worker::run_direct_path;
+use super::dispatch::Dispatch;
 use super::local_tap::{InboundSink, LocalTap};
 use super::monitors::{spawn_session_summary, spawn_uplink_monitor};
 use super::relay_worker::run_path;
+use super::repair::{LossRepair, spawn_flusher};
 use super::state::{
     ActiveWireGuardSession, DataReceiver, RelayIngress, SessionOverlay, SkippedRoute,
     initial_status,
@@ -23,8 +25,8 @@ use crate::netutil::{link_mtu_for_endpoints, resolve_ipv4, warn_if_below_link_bu
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::relay_path::{NodeSpec, RelayPath, SessionMode};
-use gamepath_engine::replay::ReplayWindow;
 use gamepath_engine::scheduler::{PathMetrics, Strategy};
+use gamepath_engine::thread_priority;
 use gamepath_engine::timer::HighResolutionTimer;
 use gamepath_engine::uplink::UplinkMonitor;
 use gamepath_engine::{log_info, log_warn};
@@ -188,25 +190,37 @@ impl WireGuardSessionManager {
             healthy_mask: Arc::new(AtomicU64::new(0)),
             uplink: Arc::new(UplinkMonitor::new()),
         };
-        let mut workers = Vec::with_capacity(route_count);
-        let mut commands = Vec::with_capacity(route_count);
+        let mut workers = Vec::with_capacity(route_count + 1);
+        let (commands, receivers): (Vec<_>, Vec<_>) = (0..route_count)
+            .map(|_| mpsc::sync_channel(PATH_QUEUE_DEPTH))
+            .unzip();
+        let dispatch = Arc::new(Dispatch {
+            commands,
+            telemetry: telemetry.clone(),
+        });
+        let loss_repair = Arc::new(LossRepair::new(
+            Arc::clone(&crypto),
+            client_id,
+            session_id,
+            Arc::clone(&sequences),
+            Arc::clone(&dispatch),
+            Arc::clone(&decision_mask),
+            effective_mtu.mtu,
+        ));
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let local_tap = Arc::new(LocalTap::default());
         let inbound = InboundSink::new(inbound_tx, Arc::clone(&local_tap));
-        let ingress = Arc::new(RelayIngress {
-            client_id,
-            session_id,
-            server_replay: Mutex::new(ReplayWindow::default()),
-        });
-        for (index, (_, _, node, path)) in paths.into_iter().enumerate() {
+        let ingress = Arc::new(RelayIngress::new(client_id, session_id));
+        for (index, ((_, _, node, path), command_rx)) in
+            paths.into_iter().zip(receivers).enumerate()
+        {
             let status_index = index;
-            let (command_tx, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
-            commands.push(command_tx);
             let worker_stop = Arc::clone(&stop);
             let worker_statuses = Arc::clone(&statuses);
             let worker_sequences = Arc::clone(&sequences);
             let worker_inbound = inbound.clone();
             let worker_ingress = Arc::clone(&ingress);
+            let worker_repair = Arc::clone(&loss_repair);
             let worker_metrics = Arc::clone(&scheduler_metrics);
             let worker_decision = Arc::clone(&decision_mask);
             let worker_telemetry = telemetry.clone();
@@ -220,6 +234,7 @@ impl WireGuardSessionManager {
                 thread::Builder::new()
                     .name(format!("gamepath-{worker_kind}-{}", index + 1))
                     .spawn(move || {
+                        thread_priority::raise_current_for_data_plane();
                         run_path(
                             path,
                             status_index,
@@ -232,6 +247,7 @@ impl WireGuardSessionManager {
                             command_rx,
                             worker_inbound,
                             worker_ingress,
+                            worker_repair,
                             worker_metrics,
                             worker_decision,
                             initial_mask,
@@ -244,6 +260,10 @@ impl WireGuardSessionManager {
                     .map_err(|error| format!("could not start path worker: {error}"))?,
             );
         }
+        workers.push(
+            spawn_flusher(&loss_repair, &stop)
+                .map_err(|error| format!("could not start loss repair: {error}"))?,
+        );
         let data_receiver = Arc::new(DataReceiver {
             inbound: Mutex::new(inbound_rx),
             user_bytes_received: AtomicU64::new(0),
@@ -277,7 +297,9 @@ impl WireGuardSessionManager {
             paths: statuses,
             workers,
             skipped_routes,
-            commands,
+            dispatch,
+            loss_repair: Some(loss_repair),
+            ingress: Some(ingress),
             data_receiver,
             virtual_ipv4: enrollment.virtual_ipv4,
             sequences,
@@ -340,6 +362,7 @@ impl WireGuardSessionManager {
             uplink: Arc::new(UplinkMonitor::new()),
         };
         let worker_telemetry = telemetry.clone();
+        let dispatch_telemetry = telemetry.clone();
         let worker_stop = Arc::clone(&stop);
         let worker_statuses = Arc::clone(&statuses);
         let worker_metrics = Arc::clone(&scheduler_metrics);
@@ -347,6 +370,7 @@ impl WireGuardSessionManager {
         let worker = thread::Builder::new()
             .name("gamepath-direct-1".into())
             .spawn(move || {
+                thread_priority::raise_current_for_data_plane();
                 run_direct_path(
                     path,
                     virtual_ipv4,
@@ -387,7 +411,12 @@ impl WireGuardSessionManager {
             paths: statuses,
             workers,
             skipped_routes: Vec::new(),
-            commands: vec![command_tx],
+            dispatch: Arc::new(Dispatch {
+                commands: vec![command_tx],
+                telemetry: dispatch_telemetry,
+            }),
+            loss_repair: None,
+            ingress: None,
             data_receiver: Arc::new(DataReceiver {
                 inbound: Mutex::new(inbound_rx),
                 user_bytes_received: AtomicU64::new(0),

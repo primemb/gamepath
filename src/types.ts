@@ -278,6 +278,22 @@ export type AppState = {
       droppedPackets: number[]
     }
     pathMetrics?: PathMetric[]
+    /**
+     * Repair frames that rebuild a packet lost on every path. Relay sessions
+     * only; `unsupported` means the relay predates loss repair.
+     */
+    lossRepair?: {
+      state: 'active' | 'negotiating' | 'unsupported' | 'off'
+      /** Packets per repair this PC sends: 4 with several healthy paths, 1 with one. */
+      uplinkGroup?: number
+      /** Packets per repair the relay confirmed for its replies. */
+      downlinkGroup?: number | null
+      repairsSent?: number
+      repairsReceived?: number
+      /** Replies rebuilt on this PC after being lost on every path. */
+      recovered?: number
+      unrecoverable?: number
+    } | null
     lanProxy?: LanProxyStatus
     capture?: {
       state: string

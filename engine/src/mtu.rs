@@ -7,6 +7,7 @@
 //! here are the worst case for each layer, so the derived MTU is safe rather
 //! than optimal.
 
+use crate::fec::REPAIR_HEADER_MAX;
 use crate::protocol::HEADER_LEN;
 use crate::relay_path::SessionMode;
 
@@ -74,8 +75,9 @@ const SOCKS5_UDP_REQUEST: u16 = 10;
 const L2TP_IPSEC_DATA: u16 = 116;
 
 /// A relay frame is an IPv4/UDP datagram carrying the GamePath header and the
-/// AEAD tag that seals it.
-const RELAY_OVERLAY: u16 = 20 + 8 + HEADER_LEN as u16 + 16;
+/// AEAD tag that seals it. A loss-repair frame covering a full-size packet is
+/// larger than that packet by its own header, so that is reserved too.
+const RELAY_OVERLAY: u16 = 20 + 8 + HEADER_LEN as u16 + 16 + REPAIR_HEADER_MAX as u16;
 
 /// AEAD tag length appended by [`crate::auth::SessionCrypto`].
 pub const AEAD_TAG: u16 = 16;
@@ -195,8 +197,8 @@ mod tests {
     #[test]
     fn relay_over_wireguard_fits_a_1500_byte_link() {
         let mtu = EffectiveMtu::for_session(SessionMode::Relay, ["wireguard"], LINK_MTU);
-        assert_eq!(mtu.overhead, 144);
-        assert_eq!(mtu.mtu, 1356);
+        assert_eq!(mtu.overhead, 159);
+        assert_eq!(mtu.mtu, 1341);
         assert!(u32::from(mtu.mtu) + u32::from(mtu.overhead) <= u32::from(LINK_MTU));
     }
 
@@ -214,8 +216,8 @@ mod tests {
         assert_eq!(direct.mtu, 1384);
 
         let relay = EffectiveMtu::for_session(SessionMode::Relay, ["l2tp"], LINK_MTU);
-        assert_eq!(relay.overhead, 200);
-        assert_eq!(relay.mtu, 1300);
+        assert_eq!(relay.overhead, 215);
+        assert_eq!(relay.mtu, 1285);
     }
 
     #[test]
@@ -224,7 +226,7 @@ mod tests {
             EffectiveMtu::for_session(SessionMode::Relay, ["wireguard", "openvpn"], LINK_MTU);
         let openvpn = EffectiveMtu::for_session(SessionMode::Relay, ["openvpn"], LINK_MTU);
         assert_eq!(mixed, openvpn);
-        assert!(mixed.mtu < 1356);
+        assert!(mixed.mtu < 1341);
     }
 
     /// An OpenVPN path is sized for TCP whichever protocol its profile names,
@@ -249,7 +251,7 @@ mod tests {
     #[test]
     fn mss_leaves_room_for_the_ipv4_and_tcp_headers() {
         let mtu = EffectiveMtu::for_session(SessionMode::Relay, ["wireguard"], LINK_MTU);
-        assert_eq!(mtu.tcp_mss(), 1316);
+        assert_eq!(mtu.tcp_mss(), 1301);
         // The old fixed clamp cost 316 bytes of payload on every segment.
         assert!(mtu.tcp_mss() > 1000);
     }

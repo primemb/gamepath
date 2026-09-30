@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
-use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_SERVER_TO_CLIENT, FrameHeader, HEADER_LEN};
+use gamepath_engine::fec::{self, Decoder, Encoder, Offer};
 use gamepath_engine::mtu::{LINK_MTU, relay_tun_mtu};
+use gamepath_engine::protocol::{
+    FLAG_CONTROL, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader, HEADER_LEN,
+};
 use gamepath_engine::replay::ReplayWindow;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,10 +12,10 @@ use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tun_rs::DeviceBuilder;
+use tun_rs::{DeviceBuilder, SyncDevice};
 
 const MAX_PACKET: usize = 65_535;
 const MAX_ENDPOINTS_PER_SESSION: usize = 8;
@@ -32,6 +35,10 @@ const MAX_SESSIONS_PER_CLIENT: usize = 8;
 /// replay window are invisible from both ends otherwise: the client sees
 /// unanswered probes and the relay sees nothing at all.
 const STATS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Longest the repair flusher sleeps with no group open. Replies wake it when
+/// they open a group, so this only bounds a missed wakeup.
+const REPAIR_IDLE_WAIT: Duration = Duration::from_millis(250);
 
 #[derive(Parser)]
 #[command(name = "gamepath-relay", version, about)]
@@ -103,6 +110,31 @@ struct SessionState {
     /// expected and counted here too; a count climbing far faster than the
     /// duplicate rate means frames are arriving outside the window.
     rejected_frames: u64,
+    /// Present once the client has offered loss repair. A client from before
+    /// loss repair never offers, and its session carries no repairs either way.
+    repair: Option<RepairState>,
+}
+
+struct RepairState {
+    /// Protects replies, in groups sized by the client's latest offer.
+    encoder: Encoder,
+    /// Rebuilds client frames from the client's repairs.
+    decoder: Decoder,
+    /// Sequence of the offer applied last. Offers travel every path, so an
+    /// older one overtaken on a faster path must not undo the newer one.
+    offer_sequence: u64,
+    recovered: u64,
+}
+
+impl RepairState {
+    fn new(offer: Offer) -> Self {
+        Self {
+            encoder: Encoder::new(offer.group_size, reply_repair_limit(offer)),
+            decoder: Decoder::default(),
+            offer_sequence: 0,
+            recovered: 0,
+        }
+    }
 }
 
 impl RelayClient {
@@ -139,7 +171,40 @@ impl SessionState {
             outbound_sequence: 0,
             last_seen: Instant::now(),
             rejected_frames: 0,
+            repair: None,
         }
+    }
+
+    /// Seals `payload` as the next reply-direction frame and sends it to every
+    /// endpoint this session has been seen from recently. Returns the sequence
+    /// used, or `None` when there is nowhere left to send it.
+    fn fan_out(
+        &mut self,
+        socket: &UdpSocket,
+        crypto: &SessionCrypto,
+        client_id: [u8; 16],
+        session_id: u64,
+        flags: u8,
+        payload: &[u8],
+    ) -> Option<u64> {
+        let now = Instant::now();
+        self.endpoints
+            .retain(|(_, seen)| now.duration_since(*seen) <= ENDPOINT_TTL);
+        if self.endpoints.is_empty() {
+            return None;
+        }
+        self.outbound_sequence = self.outbound_sequence.wrapping_add(1);
+        let header = FrameHeader {
+            flags: flags | FLAG_SERVER_TO_CLIENT,
+            client_id,
+            session_id,
+            sequence: self.outbound_sequence,
+        };
+        let frame = crypto.seal_server(header, payload).ok()?;
+        for (endpoint, _) in &self.endpoints {
+            let _ = socket.send_to(&frame, endpoint);
+        }
+        Some(header.sequence)
     }
 
     fn observe_endpoint(&mut self, endpoint: SocketAddr) {
@@ -298,12 +363,23 @@ fn serve(
             let mut reported = 0_u64;
             loop {
                 thread::sleep(STATS_INTERVAL);
-                let (sessions, endpoints, rejected) = {
+                let (sessions, endpoints, rejected, recovered) = {
                     let clients = stats_clients.lock().unwrap();
-                    clients.values().fold((0, 0, 0), |totals, client| {
-                        client.sessions.values().fold(totals, |(s, e, r), session| {
-                            (s + 1, e + session.endpoints.len(), r + session.rejected_frames)
-                        })
+                    clients.values().fold((0, 0, 0, 0), |totals, client| {
+                        client
+                            .sessions
+                            .values()
+                            .fold(totals, |(s, e, r, f), session| {
+                                (
+                                    s + 1,
+                                    e + session.endpoints.len(),
+                                    r + session.rejected_frames,
+                                    f + session
+                                        .repair
+                                        .as_ref()
+                                        .map_or(0, |repair| repair.recovered),
+                                )
+                            })
                     })
                 };
                 // Only speak up when something changed, so an idle relay stays
@@ -311,23 +387,36 @@ fn serve(
                 if rejected != reported || sessions > 0 {
                     gamepath_engine::log_info!(
                         "sessions={sessions} endpoints={endpoints} rejected_frames={rejected} \
-                         (+{} since last report)",
+                         (+{} since last report) recovered_frames={recovered}",
                         rejected.saturating_sub(reported)
                     );
                     reported = rejected;
                 }
             }
         })?;
+    let repair_wake = Arc::new(Condvar::new());
+    let flush_socket = Arc::clone(&socket);
+    let flush_clients = Arc::clone(&clients);
+    let flush_wake = Arc::clone(&repair_wake);
+    thread::Builder::new()
+        .name("gamepath-repair-flush".into())
+        .spawn(move || flush_repairs(&flush_socket, &flush_clients, &flush_wake))?;
     let tun_writer = Arc::clone(&tun);
     let reply_socket = Arc::clone(&socket);
     let reply_clients = Arc::clone(&clients);
+    let reply_wake = Arc::clone(&repair_wake);
     thread::Builder::new()
         .name("gamepath-tun-replies".into())
         .spawn(move || {
             let mut packet = [0_u8; MAX_PACKET];
             loop {
                 match tun.recv(&mut packet) {
-                    Ok(length) => forward_reply(&reply_socket, &reply_clients, &packet[..length]),
+                    Ok(length) => forward_reply(
+                        &reply_socket,
+                        &reply_clients,
+                        &reply_wake,
+                        &packet[..length],
+                    ),
                     Err(error) => {
                         gamepath_engine::log_error!("TUN receive failed: {error}");
                         thread::sleep(Duration::from_millis(100));
@@ -377,6 +466,18 @@ fn serve(
             continue;
         }
         if verified_header.flags & FLAG_CONTROL != 0 {
+            if let Some(offer) = fec::parse_offer(&plaintext) {
+                apply_repair_offer(
+                    session,
+                    &socket,
+                    &crypto,
+                    (client_id, header.session_id),
+                    verified_header.sequence,
+                    offer,
+                    endpoint,
+                );
+                continue;
+            }
             let Some(response) = gamepath_engine::protocol::probe_response(&plaintext) else {
                 continue;
             };
@@ -392,18 +493,183 @@ fn serve(
             }
             continue;
         }
+        if verified_header.flags & FLAG_REPAIR != 0 {
+            let SessionState { replay, repair, .. } = &mut *session;
+            let Some(repair) = repair.as_mut() else {
+                continue;
+            };
+            let rebuilt = repair
+                .decoder
+                .accept_repair(&plaintext, Instant::now(), |sequence| {
+                    !replay.would_accept(sequence)
+                });
+            if let Some((sequence, packet)) = rebuilt {
+                admit_rebuilt(session, &tun_writer, virtual_ipv4, sequence, packet);
+            }
+            retry_pending_repairs(session, &tun_writer, virtual_ipv4);
+            continue;
+        }
         if ipv4_source(&plaintext) != Some(virtual_ipv4) {
             continue;
         }
         if let Err(error) = tun_writer.send(&plaintext) {
             gamepath_engine::log_error!("TUN send failed: {error}");
         }
+        if let Some(repair) = session.repair.as_mut() {
+            repair
+                .decoder
+                .remember(verified_header.sequence, &plaintext);
+            retry_pending_repairs(session, &tun_writer, virtual_ipv4);
+        }
+    }
+}
+
+/// Largest reply worth protecting for a client. Its tunnel MTU comes from its
+/// own link and transports, which can be well under what this relay assumes;
+/// a repair of a reply near that size would not fit the client's link.
+fn reply_repair_limit(offer: Offer) -> usize {
+    usize::from(offer.mtu.min(relay_tun_mtu(LINK_MTU)))
+}
+
+/// Applies the group size and MTU a client asked its replies to be protected
+/// with, and confirms the size in use on the path the offer came by, like a
+/// probe reply, so the client hears back even while its other paths are down.
+fn apply_repair_offer(
+    session: &mut SessionState,
+    socket: &UdpSocket,
+    crypto: &SessionCrypto,
+    (client_id, session_id): ([u8; 16], u64),
+    offer_sequence: u64,
+    offer: Offer,
+    endpoint: SocketAddr,
+) {
+    let repair = session.repair.get_or_insert_with(|| {
+        gamepath_engine::log_info!(
+            "session {session_id:016x} loss repair on, replies in groups of {} up to {} bytes",
+            offer.group_size,
+            reply_repair_limit(offer)
+        );
+        RepairState::new(offer)
+    });
+    let mut closed = None;
+    if offer_sequence >= repair.offer_sequence {
+        if repair.encoder.group_size() != offer.group_size {
+            gamepath_engine::log_info!(
+                "session {session_id:016x} loss repair replies now in groups of {}",
+                offer.group_size
+            );
+        }
+        repair.offer_sequence = offer_sequence;
+        repair.encoder.set_max_packet(reply_repair_limit(offer));
+        closed = repair.encoder.set_group_size(offer.group_size);
+    }
+    let applied = repair.encoder.group_size();
+    if let Some(payload) = closed {
+        session.fan_out(socket, crypto, client_id, session_id, FLAG_REPAIR, &payload);
+    }
+    session.outbound_sequence = session.outbound_sequence.wrapping_add(1);
+    let header = FrameHeader {
+        flags: FLAG_CONTROL | FLAG_SERVER_TO_CLIENT,
+        client_id,
+        session_id,
+        sequence: session.outbound_sequence,
+    };
+    if let Ok(accept) = crypto.seal_server(header, &fec::accept(applied)) {
+        let _ = socket.send_to(&accept, endpoint);
+    }
+}
+
+/// Forwards a client packet rebuilt from a repair exactly as if it had
+/// arrived: the same source check, and its sequence consumed so the original
+/// turning up late by a slower path is a duplicate.
+fn admit_rebuilt(
+    session: &mut SessionState,
+    tun: &SyncDevice,
+    virtual_ipv4: Ipv4Addr,
+    sequence: u64,
+    packet: Vec<u8>,
+) {
+    if ipv4_source(&packet) != Some(virtual_ipv4) || !session.replay.accept(sequence) {
+        return;
+    }
+    if let Err(error) = tun.send(&packet) {
+        gamepath_engine::log_error!("TUN send failed: {error}");
+    }
+    if let Some(repair) = session.repair.as_mut() {
+        repair.decoder.remember(sequence, &packet);
+        repair.recovered += 1;
+    }
+}
+
+/// A delivery can complete a repair that was waiting on more than one member.
+fn retry_pending_repairs(session: &mut SessionState, tun: &SyncDevice, virtual_ipv4: Ipv4Addr) {
+    loop {
+        let SessionState { replay, repair, .. } = &mut *session;
+        let Some(repair) = repair
+            .as_mut()
+            .filter(|repair| repair.decoder.has_pending())
+        else {
+            return;
+        };
+        let Some((sequence, packet)) = repair
+            .decoder
+            .retry_pending(Instant::now(), |sequence| !replay.would_accept(sequence))
+        else {
+            return;
+        };
+        admit_rebuilt(session, tun, virtual_ipv4, sequence, packet);
+    }
+}
+
+/// Closes reply groups that stopped growing, so the last reply before a pause
+/// is covered within [`fec::GROUP_MAX_AGE`].
+fn flush_repairs(
+    socket: &UdpSocket,
+    clients: &Mutex<HashMap<[u8; 16], RelayClient>>,
+    wake: &Condvar,
+) {
+    let mut guard = clients.lock().unwrap();
+    loop {
+        let now = Instant::now();
+        let mut next: Option<Instant> = None;
+        for client in guard.values_mut() {
+            let RelayClient {
+                client_id,
+                key,
+                sessions,
+                ..
+            } = client;
+            for (&session_id, session) in sessions.iter_mut() {
+                let Some(repair) = session.repair.as_mut() else {
+                    continue;
+                };
+                if let Some(payload) = repair.encoder.flush_due(now) {
+                    if let Ok(crypto) = SessionCrypto::new(key, session_id) {
+                        session.fan_out(
+                            socket,
+                            &crypto,
+                            *client_id,
+                            session_id,
+                            FLAG_REPAIR,
+                            &payload,
+                        );
+                    }
+                } else if let Some(deadline) = repair.encoder.deadline() {
+                    next = Some(next.map_or(deadline, |next| next.min(deadline)));
+                }
+            }
+        }
+        let wait = next.map_or(REPAIR_IDLE_WAIT, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        guard = wake.wait_timeout(guard, wait).unwrap().0;
     }
 }
 
 fn forward_reply(
     socket: &UdpSocket,
     clients: &Mutex<HashMap<[u8; 16], RelayClient>>,
+    repair_wake: &Condvar,
     packet: &[u8],
 ) {
     let Some(destination) = ipv4_destination(packet) else {
@@ -423,28 +689,32 @@ fn forward_reply(
     else {
         return;
     };
-    let now = Instant::now();
-    session
-        .endpoints
-        .retain(|(_, seen)| now.duration_since(*seen) <= ENDPOINT_TTL);
-    if session.endpoints.is_empty() {
-        return;
-    }
-    session.outbound_sequence = session.outbound_sequence.wrapping_add(1);
-    let header = FrameHeader {
-        flags: FLAG_SERVER_TO_CLIENT,
-        client_id: client.client_id,
-        session_id,
-        sequence: session.outbound_sequence,
-    };
     let Ok(crypto) = SessionCrypto::new(&client.key, session_id) else {
         return;
     };
-    let Ok(frame) = crypto.seal_server(header, packet) else {
+    let Some(sequence) = session.fan_out(socket, &crypto, client.client_id, session_id, 0, packet)
+    else {
         return;
     };
-    for (endpoint, _) in &session.endpoints {
-        let _ = socket.send_to(&frame, endpoint);
+    let Some(repair) = session.repair.as_mut() else {
+        return;
+    };
+    let idle = repair.encoder.deadline().is_none();
+    let closed = repair.encoder.push(sequence, packet, Instant::now());
+    // A flusher already waiting on a deadline rereads every encoder when it
+    // wakes, so only one sleeping with nothing open needs telling.
+    if idle && repair.encoder.deadline().is_some() {
+        repair_wake.notify_one();
+    }
+    if let Some(payload) = closed {
+        session.fan_out(
+            socket,
+            &crypto,
+            client.client_id,
+            session_id,
+            FLAG_REPAIR,
+            &payload,
+        );
     }
 }
 
@@ -596,6 +866,67 @@ mod tests {
         assert!(replay.accept(11));
         assert!(!replay.accept(11));
         assert!(!replay.accept(10));
+    }
+
+    /// Offers travel every path, so an older one arriving after a newer one
+    /// must not put the reply group size back, and each is still answered.
+    #[test]
+    fn a_stale_repair_offer_cannot_undo_a_newer_one() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let endpoint = client.local_addr().unwrap();
+        let crypto = SessionCrypto::new(&[5; 32], 9).unwrap();
+        let mut session = SessionState::new();
+        let offer = |session: &mut SessionState, sequence, group_size| {
+            let offer = Offer {
+                group_size,
+                mtu: 1341,
+            };
+            apply_repair_offer(
+                session,
+                &socket,
+                &crypto,
+                ([1; 16], 9),
+                sequence,
+                offer,
+                endpoint,
+            );
+            let mut reply = [0_u8; 256];
+            let length = client.recv(&mut reply).unwrap();
+            let (_, plaintext) = crypto.open_server(&reply[..length]).unwrap();
+            fec::accepted_group(&plaintext)
+        };
+        assert_eq!(offer(&mut session, 10, fec::MULTIPATH_GROUP), Some(4));
+        assert_eq!(offer(&mut session, 20, fec::SINGLE_PATH_GROUP), Some(1));
+        // The multipath offer sent first, arriving last by a slower path.
+        assert_eq!(offer(&mut session, 10, fec::MULTIPATH_GROUP), Some(1));
+        assert_eq!(session.repair.as_ref().unwrap().encoder.group_size(), 1);
+    }
+
+    /// A client on a narrow link has a smaller tunnel than this relay assumes,
+    /// and a reply near that size must not be given a repair it cannot carry.
+    #[test]
+    fn replies_are_protected_only_up_to_the_clients_own_mtu() {
+        let narrow = Offer {
+            group_size: fec::MULTIPATH_GROUP,
+            mtu: 1200,
+        };
+        assert_eq!(reply_repair_limit(narrow), 1200);
+        let wide = Offer {
+            mtu: u16::MAX,
+            ..narrow
+        };
+        assert_eq!(
+            reply_repair_limit(wide),
+            usize::from(relay_tun_mtu(LINK_MTU))
+        );
+        let mut repair = RepairState::new(narrow);
+        let now = Instant::now();
+        assert!(repair.encoder.push(1, &[0x45; 1201], now).is_none());
+        assert!(repair.encoder.deadline().is_none());
     }
 
     #[test]

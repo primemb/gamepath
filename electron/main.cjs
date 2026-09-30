@@ -330,6 +330,7 @@ function updateSessionMetrics(runtime, dataPlane) {
       droppedPackets: runtime.droppedPackets ?? [],
     }
   }
+  state.session.lossRepair = runtime.lossRepair ?? null
   if (runtime.capture) state.session.capture = runtime.capture
   if (runtime.lanProxy) state.session.lanProxy = runtime.lanProxy
   state.session.routeLatencies = paths

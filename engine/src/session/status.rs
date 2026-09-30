@@ -48,6 +48,23 @@ impl WireGuardSessionManager {
             .iter()
             .map(|count| count.load(Ordering::Relaxed))
             .collect::<Vec<_>>();
+        let loss_repair = match (&session.loss_repair, &session.ingress) {
+            (Some(repair), Some(ingress)) => {
+                let status = repair.status();
+                let counters = ingress.repair_counters();
+                json!({
+                    "state": status.state,
+                    "uplinkGroup": status.uplink_group,
+                    "downlinkGroup": status.downlink_group,
+                    "repairsSent": status.repairs_sent,
+                    "repairsReceived": counters.received,
+                    "recovered": counters.recovered,
+                    "unrecoverable": counters.unrecoverable,
+                })
+            }
+            // A direct node is the last hop and knows nothing of repairs.
+            _ => json!({ "state": "off" }),
+        };
         let state = if paths.iter().any(|path| path.reachable) {
             "connected"
         } else {
@@ -110,6 +127,7 @@ impl WireGuardSessionManager {
                 UplinkState::Unknown => "unknown",
             },
             "highResolutionTimer": session.timer.active(),
+            "lossRepair": loss_repair,
         })
     }
 }

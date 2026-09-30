@@ -425,6 +425,15 @@ export const mockApi: GamePathApi = {
             routeLatencies: [34, 39],
             strategy: 'adaptive',
             selectedRoutes: [2],
+            lossRepair: {
+              state: 'active',
+              uplinkGroup: 4,
+              downlinkGroup: 4,
+              repairsSent: 41,
+              repairsReceived: 58,
+              recovered: 3,
+              unrecoverable: 0,
+            },
             pathMetrics: [
               {
                 route: 1,

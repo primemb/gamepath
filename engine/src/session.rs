@@ -9,11 +9,13 @@
 mod dataplane;
 mod dialer;
 mod direct_worker;
+mod dispatch;
 mod health;
 mod latency;
 mod local_tap;
 mod monitors;
 mod relay_worker;
+mod repair;
 mod start;
 mod state;
 mod status;
@@ -202,7 +204,9 @@ impl WireGuardSessionManager {
             unix_time_millis().saturating_sub(session.started_at) / 1000
         );
         session.stop.store(true, Ordering::Release);
-        session.commands.clear();
+        if let Some(repair) = &session.loss_repair {
+            repair.wake_flusher();
+        }
         for worker in session.workers.drain(..) {
             let _ = worker.join();
         }

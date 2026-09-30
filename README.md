@@ -146,6 +146,18 @@ travels through every node. The relay currently sends replies to every recently
 authenticated endpoint, including endpoints kept alive by probes. This mode
 needs a VPS and adds bandwidth overhead for redundancy.
 
+Relay mode also sends **loss repair** in both directions: a small repair packet
+that lets the other end rebuild a packet lost on every path, including the
+common case where one Wi-Fi or ISP hiccup takes both duplicate copies. With two
+or more healthy routes there is one repair per four packets, or per two when
+every route has been losing packets for a while; with one healthy route every
+packet gets its own. The size switches on the next packet when a route fails or
+recovers, while the four-to-two step waits until the loss is sustained and
+steps back only after a longer clean spell. Packets are never delayed to build repairs; only a
+lost packet waits, a few milliseconds, for its rebuild. It needs an updated
+relay, and the dashboard shows **Update the relay to enable** until the relay
+supports it.
+
 Failover preserves the relay session and public source address. Its quality
 still depends on a usable alternative: a slower backup can increase ping, and
 paths sharing an ISP bottleneck or the same relay cannot bypass failure of that

@@ -411,6 +411,88 @@ Authenticated GamePath frames are wrapped in an inner IPv4/UDP packet addressed 
 
 Direct and WireGuard workers share one atomic sequence allocator, so control traffic and data traffic never reuse an authenticated nonce or fall behind the relay replay window. The client sends one encrypted data frame to every selected path and accepts the first authenticated reply; later copies are discarded by sequence number.
 
+## Loss repair
+
+Duplication covers one path failing. It cannot cover a loss both copies share,
+and that is the common kind: the copies leave at the same instant through the
+same Wi-Fi radio, router and ISP line, so one hiccup there takes both. A
+session whose second path is down, or too slow to duplicate onto, has no
+protection from duplication at all.
+
+Both ends of a relay session therefore send repair frames (`FLAG_REPAIR`,
+`engine/src/fec.rs`). A repair is the XOR of a group of recent data frames,
+length-prefixed so members of different sizes can be rebuilt exactly, and it
+names its members by sequence. When exactly one member was lost the receiver
+rebuilds it from the repair and the members that arrived, and admits it
+through the same replay window as a delivered frame, so the original arriving
+late by a slower path is discarded as a duplicate.
+
+- **Group size follows the healthy paths.** With two or more healthy paths
+  duplication already covers a path failing, so one repair per
+  `MULTIPATH_GROUP` (4) packets is enough for the loss both copies share, at a
+  quarter of the bandwidth. With one healthy path every packet gets its own
+  repair (`SINGLE_PATH_GROUP`, 1). The client reads the health mask for every
+  packet it sends, so the size changes on the next packet when a path fails or
+  comes back, and a group already open is closed first so nothing in it goes
+  unprotected.
+- **Multipath shrinks to 2 only when every path is bad, and slowly.**
+  `MultipathPolicy` reads the lowest smoothed probe loss among the paths
+  carrying data after every probe, since a packet is lost for good only when
+  every copy of it is; a clean standby the scheduler is not sending on rescues
+  nothing, so it does not count. When even the best path has stayed at `LOSSY_PATH_LOSS` (10%) or
+  more for `LOSSY_AFTER` (5 s), two losses in one group of four become likely,
+  so the multipath group drops to `LOSSY_MULTIPATH_GROUP` (2). It goes back to
+  4 only after the best path has stayed under `RECOVERED_PATH_LOSS` (4%) for
+  `RECOVERED_AFTER` (15 s). The scheduler's loss average moves 5% per probe, so
+  one stray lost probe reads exactly 5% and cannot trigger it, and the gap
+  between the two thresholds and the two holds is what stops a session sitting
+  near either edge from flapping. Any clean reading while shrinking, or lossy
+  one while growing, restarts that clock. All of these are constants in
+  `engine/src/fec.rs`.
+- **Data never waits.** Packets leave the moment they are captured, as before.
+  A group closes when the next packet cannot join it or after
+  `GROUP_MAX_AGE` (5 ms), whichever is first, and a flusher thread on each end
+  closes groups that stopped growing. Only a lost packet pays latency, and at
+  most that. A game sending one packet per tick gets a repair per packet a few
+  milliseconds behind it, which is cheap at game rates and is the spacing that
+  lets a repair survive the burst that took the original.
+- **Repairs go to every healthy path**, not only the ones the scheduler picked
+  for data. A backup too slow to be picked for game packets still carries their
+  repairs, and a burst on the fast path cannot take a packet and its repair
+  together. A path whose queue is past `REPAIR_QUEUE_LIMIT` (a quarter full)
+  gets no repairs: it is saturated, and a repair must never take queue space a
+  game packet then cannot get.
+- **Negotiated, never assumed.** Path workers send an `offer` control frame
+  naming the group size the relay should use for its replies and this
+  session's tunnel MTU, repeat it within `OFFER_RETRY` whenever the size
+  changes, and refresh it every `OFFER_REFRESH` so a relay that restarted picks
+  it up again. The relay applies an offer only if it is newer
+  than the last one it applied, since offers travel every path and can arrive
+  out of order, and answers on the path the offer came by. The client sends no
+  repairs of its own until a relay has answered. A relay from before loss
+  repair ignores offers; after `OFFER_LIMIT` unanswered ones the session is
+  reported as `unsupported` and runs exactly as it did before, while offers
+  continue every `LEGACY_OFFER_RETRY` in case a bad network ate the answers.
+  A repair payload starts with a byte that can never read as IPv4, so an old
+  relay that treats one as data drops it at its source-address check.
+- **Budget.** A repair covering a full-size packet is larger than that packet
+  by `REPAIR_HEADER_MAX` (15) bytes, and `RELAY_OVERLAY` reserves them, so the
+  tunnel MTU is sized for the repair and not only the packet. A packet above the
+  tunnel MTU would fragment anyway and is left out of its group. The tunnel MTU
+  is derived per session from the client's own link and transports, which the
+  relay cannot see, so the offer carries it and the relay leaves replies larger
+  than it out of its groups too, instead of sizing them for the 1500-byte link
+  it assumes for its TUN.
+- **History.** The receiver keeps recent delivered packets to rebuild from, but
+  only once the peer has sent a group of more than one: a group of one carries
+  its packet whole. A repair that arrives while two members are still missing
+  waits for a slower path to deliver one of them, for up to 500 ms.
+
+Session status reports `lossRepair` with the state, both group sizes, repairs
+sent and received, packets rebuilt, and repairs that arrived too late or with
+too much missing to use. The relay logs `recovered_frames` in its periodic
+counters line.
+
 ## Queueing
 
 Each path has a bounded outbound queue. The dispatcher offers a packet with a

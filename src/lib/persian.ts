@@ -121,6 +121,12 @@ export const persian: Record<string, string> = {
   'Node latency': 'تأخیر گره',
   'Best route': 'بهترین مسیر',
   'Packet loss': 'افت بسته',
+  'Loss repair': 'ترمیم افت بسته',
+  'Rebuilds a packet lost on every path from a small repair packet':
+    'بسته‌ای را که در همه مسیرها از دست رفته، با یک بسته ترمیم کوچک بازسازی می‌کند',
+  'Relay mode only': 'فقط در حالت رله',
+  'Update the relay to enable': 'برای فعال‌سازی، رله را به‌روزرسانی کنید',
+  Starting: 'در حال آغاز',
   'Start session': 'شروع اتصال',
   'Stop session': 'قطع اتصال',
   'Starting…': 'در حال اتصال…',
@@ -510,6 +516,10 @@ const dynamic: [RegExp, (...parts: string[]) => string][] = [
   [/^(\d+) active routes?$/, (count) => `${count} مسیر فعال`],
   [/^(\d+) of (\d+) routes carrying traffic$/, (active, total) => `${active} از ${total} مسیر در حال انتقال ترافیک`],
   [/^(\d+) game packets routed$/, (count) => `${count} بسته بازی مسیریابی شد`],
+  [
+    /^1 repair per (\d+) packets · (\d+) rebuilt$/,
+    (group, rebuilt) => `یک بسته ترمیم برای هر ${group} بسته · ${rebuilt} بازسازی‌شده`,
+  ],
   [/^(\d+) tracked$/, (count) => `${count} مورد ثبت‌شده`],
   [/^(\d+) files could not be added$/, (count) => `افزودن ${count} فایل ممکن نشد`],
   [/^Add (\d+) nodes$/, (count) => `افزودن ${count} گره`],
