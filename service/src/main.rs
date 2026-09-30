@@ -408,12 +408,15 @@ mod gamepath_service {
             unsafe {
                 RasHangUpW(connection);
             }
+            // Microsoft's contract is to poll until the handle is invalid:
+            // only then is the port released. Stopping at RASCS_Disconnected,
+            // then deleting the profile, left the port busy, and a session
+            // started seconds later lost this route to RAS error 633.
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 let mut status: RASCONNSTATUSW = unsafe { std::mem::zeroed() };
                 status.dwSize = std::mem::size_of::<RASCONNSTATUSW>() as u32;
-                let result = unsafe { RasGetConnectStatusW(connection, &mut status) };
-                if result != 0 || status.rasconnstate == RASCS_Disconnected {
+                if unsafe { RasGetConnectStatusW(connection, &mut status) } != 0 {
                     break;
                 }
                 thread::sleep(Duration::from_millis(50));

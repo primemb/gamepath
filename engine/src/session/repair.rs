@@ -195,7 +195,8 @@ impl LossRepair {
         let previous = self.multipath_group.swap(group, Ordering::AcqRel);
         if previous != group {
             log_info!(
-                "session {} loss repair now 1 per {group} packets on multipath: the best                  carrying path lost {:.0}% of its recent probes",
+                "session {} loss repair now 1 per {group} packets on multipath: the best \
+                 carrying path lost {:.0}% of its recent probes",
                 self.session_id,
                 best_loss * 100.0
             );

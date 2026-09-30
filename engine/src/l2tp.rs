@@ -258,17 +258,19 @@ fn live_adapter(profile_name: &str) -> Option<(Ipv4Addr, u32)> {
 ///
 /// `RasHangUpW` returns before the session is gone, and dialling the same entry
 /// while the previous one is still disconnecting is how a redial races itself.
+/// Microsoft's contract is to poll `RasGetConnectStatus` until it fails with
+/// `ERROR_INVALID_HANDLE`: only then is the port released. Reaching
+/// `RASCS_Disconnected` comes earlier, and stopping there left the port busy,
+/// so a session started seconds after the previous one stopped lost its route
+/// to RAS error 633.
 #[cfg(windows)]
 fn wait_for_disconnect(handle: windows_sys::Win32::NetworkManagement::Rras::HRASCONN) {
-    use windows_sys::Win32::NetworkManagement::Rras::{
-        RASCONNSTATUSW, RASCS_Disconnected, RasGetConnectStatusW,
-    };
+    use windows_sys::Win32::NetworkManagement::Rras::{RASCONNSTATUSW, RasGetConnectStatusW};
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         let mut status: RASCONNSTATUSW = unsafe { std::mem::zeroed() };
         status.dwSize = std::mem::size_of::<RASCONNSTATUSW>() as u32;
-        let result = unsafe { RasGetConnectStatusW(handle, &mut status) };
-        if result != 0 || status.rasconnstate == RASCS_Disconnected {
+        if unsafe { RasGetConnectStatusW(handle, &mut status) } != 0 {
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -485,6 +487,9 @@ fn redial_ras(
     if status != 0 {
         if handle != 0 {
             unsafe { RasHangUpW(handle) };
+            // The caller may dial again at once, which the port refuses until
+            // this attempt has fully let go of it.
+            wait_for_disconnect(handle);
         }
         return Err(format!("RAS error {status}"));
     }

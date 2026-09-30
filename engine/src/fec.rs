@@ -55,7 +55,7 @@ const _: () = assert!(
 );
 
 /// Probe loss, over a path's [`ProbeHistory`], at which it counts as losing
-/// packets: four of the last forty. One stray lost probe reads 2.5%.
+/// packets: six of the last sixty. One stray lost probe reads under 2%.
 pub const LOSSY_PATH_LOSS: f64 = 0.10;
 
 /// Loss a path has to fall back under before the session counts as healthy
@@ -64,13 +64,13 @@ pub const LOSSY_PATH_LOSS: f64 = 0.10;
 pub const RECOVERED_PATH_LOSS: f64 = 0.04;
 
 /// How long every healthy path has to stay lossy before the group shrinks.
-pub const LOSSY_AFTER: Duration = Duration::from_secs(5);
+pub const LOSSY_AFTER: Duration = Duration::from_secs(10);
 
 /// How long the best path has to stay recovered before the group grows back.
 /// Longer than [`LOSSY_AFTER`] on purpose: shrinking too late costs a few
 /// unrecoverable losses, growing too early puts the session straight back into
 /// them.
-pub const RECOVERED_AFTER: Duration = Duration::from_secs(15);
+pub const RECOVERED_AFTER: Duration = Duration::from_secs(60);
 
 /// Longest a group stays open. This is the most a rebuilt packet can trail
 /// its original by, on top of the path's own latency.
@@ -183,11 +183,11 @@ impl MultipathPolicy {
 }
 
 /// Probe outcomes [`MultipathPolicy`] judges a path by.
-pub const LOSS_WINDOW: u32 = 40;
+pub const LOSS_WINDOW: u32 = 60;
 
 /// Outcomes a path needs before its loss counts at all. Until then it is
 /// treated as clean, so a path that has only just joined cannot shrink groups.
-pub const MIN_LOSS_SAMPLES: u32 = 20;
+pub const MIN_LOSS_SAMPLES: u32 = 30;
 
 const _: () = assert!(LOSS_WINDOW <= u64::BITS && MIN_LOSS_SAMPLES <= LOSS_WINDOW);
 
@@ -858,16 +858,24 @@ mod tests {
     fn every_path_has_to_stay_lossy_before_the_group_shrinks() {
         let mut policy = MultipathPolicy::default();
         let start = Instant::now();
-        // One stray lost probe reads 5%, well short of lossy.
         assert_eq!(policy.observe(0.05, start), MULTIPATH_GROUP);
-        assert_eq!(policy.observe(0.12, seconds(start, 1.0)), MULTIPATH_GROUP);
-        assert_eq!(policy.observe(0.12, seconds(start, 4.0)), MULTIPATH_GROUP);
-        // A clean reading restarts the clock rather than pausing it.
-        assert_eq!(policy.observe(0.08, seconds(start, 5.0)), MULTIPATH_GROUP);
-        assert_eq!(policy.observe(0.12, seconds(start, 6.0)), MULTIPATH_GROUP);
-        assert_eq!(policy.observe(0.12, seconds(start, 10.9)), MULTIPATH_GROUP);
+        let lossy = seconds(start, 1.0);
+        assert_eq!(policy.observe(0.12, lossy), MULTIPATH_GROUP);
         assert_eq!(
-            policy.observe(0.12, seconds(start, 11.0)),
+            policy.observe(0.12, lossy + LOSSY_AFTER / 2),
+            MULTIPATH_GROUP
+        );
+        // A clean reading restarts the clock rather than pausing it.
+        let clean = lossy + LOSSY_AFTER - Duration::from_millis(100);
+        assert_eq!(policy.observe(0.08, clean), MULTIPATH_GROUP);
+        let again = clean + Duration::from_secs(1);
+        assert_eq!(policy.observe(0.12, again), MULTIPATH_GROUP);
+        assert_eq!(
+            policy.observe(0.12, again + LOSSY_AFTER - Duration::from_millis(100)),
+            MULTIPATH_GROUP
+        );
+        assert_eq!(
+            policy.observe(0.12, again + LOSSY_AFTER),
             LOSSY_MULTIPATH_GROUP
         );
     }

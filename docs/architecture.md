@@ -440,17 +440,17 @@ late by a slower path is discarded as a duplicate.
   carrying data, since a packet is lost for good only when every copy of it
   is; a clean standby the scheduler is not sending on rescues nothing, so it
   does not count. When even the best carrying path has stayed at
-  `LOSSY_PATH_LOSS` (10%) or more for `LOSSY_AFTER` (5 s), two losses in one
+  `LOSSY_PATH_LOSS` (10%) or more for `LOSSY_AFTER` (10 s), two losses in one
   group of four become likely, so the multipath group drops to
   `LOSSY_MULTIPATH_GROUP` (2). It goes back to 4 only after the best path has
-  stayed under `RECOVERED_PATH_LOSS` (4%) for `RECOVERED_AFTER` (15 s). The gap
+  stayed under `RECOVERED_PATH_LOSS` (4%) for `RECOVERED_AFTER` (60 s). The gap
   between the two thresholds and the two holds stops a session sitting near
   either edge from flapping, and any clean reading while shrinking, or lossy
   one while growing, restarts that clock. All of these are constants in
   `engine/src/fec.rs`.
 
   The loss it reads is each path's `ProbeHistory` — the last `LOSS_WINDOW`
-  (40) probes, counted only after `MIN_LOSS_SAMPLES` (20) — and not the
+  (60) probes, counted only after `MIN_LOSS_SAMPLES` (30) — and not the
   scheduler's average, because an outage is not a path in bad condition. Seen
   live: two five-second international blackouts took all four routes of a
   session, on two providers, down within 200 ms of each other, with the
