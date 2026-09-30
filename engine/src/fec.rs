@@ -54,9 +54,8 @@ const _: () = assert!(
     "every group size must fit the encoder, whose limit is MAX_GROUP"
 );
 
-/// Smoothed probe loss at which a path counts as losing packets. Well above
-/// what one stray lost probe produces: the scheduler's loss average moves 5%
-/// per probe, so a single loss reads exactly 5% and decays from there.
+/// Probe loss, over a path's [`ProbeHistory`], at which it counts as losing
+/// packets: four of the last forty. One stray lost probe reads 2.5%.
 pub const LOSSY_PATH_LOSS: f64 = 0.10;
 
 /// Loss a path has to fall back under before the session counts as healthy
@@ -142,7 +141,7 @@ pub struct MultipathPolicy {
 }
 
 impl MultipathPolicy {
-    /// Takes the lowest smoothed probe loss among the carrying paths, as a ratio,
+    /// Takes the lowest [`ProbeHistory`] loss among the carrying paths, as a ratio,
     /// and returns the multipath group size to use from now on.
     pub fn observe(&mut self, best_loss: f64, now: Instant) -> u8 {
         let crossing = if self.lossy {
@@ -173,6 +172,62 @@ impl MultipathPolicy {
         } else {
             MULTIPATH_GROUP
         }
+    }
+
+    /// Restarts the clock toward a change without changing the size, for a
+    /// moment when there is nothing trustworthy to observe, such as every
+    /// carrying path being down at once.
+    pub fn interrupt(&mut self) {
+        self.crossing_since = None;
+    }
+}
+
+/// Probe outcomes [`MultipathPolicy`] judges a path by.
+pub const LOSS_WINDOW: u32 = 40;
+
+/// Outcomes a path needs before its loss counts at all. Until then it is
+/// treated as clean, so a path that has only just joined cannot shrink groups.
+pub const MIN_LOSS_SAMPLES: u32 = 20;
+
+const _: () = assert!(LOSS_WINDOW <= u64::BITS && MIN_LOSS_SAMPLES <= LOSS_WINDOW);
+
+/// The last [`LOSS_WINDOW`] probe outcomes of one path, with outages taken out.
+///
+/// The scheduler's loss average cannot serve here. While every path is down
+/// its probes go out every 150 ms and all of them are lost, so a five-second
+/// blackout of the whole uplink reads as 25-50% loss for half a minute after
+/// it ends, on paths that are perfectly clean again. A blackout is not a path
+/// in bad condition and a smaller group does nothing for it, so the run of
+/// losses that ended in a path being declared down is forgotten here. What
+/// remains is the scattered loss of a path that stays up, which is what two
+/// losses landing in one group actually comes from.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeHistory {
+    /// Bit 0 is the newest outcome; a set bit is a lost probe.
+    lost: u64,
+    samples: u32,
+}
+
+impl ProbeHistory {
+    pub fn record(&mut self, lost: bool) {
+        let window = u64::MAX >> (u64::BITS - LOSS_WINDOW);
+        self.lost = ((self.lost << 1) | u64::from(lost)) & window;
+        self.samples = (self.samples + 1).min(LOSS_WINDOW);
+    }
+
+    /// Forgets the unbroken run of losses at the newest end: the outage that
+    /// took the path down, rather than loss on a path that was carrying.
+    pub fn forget_outage(&mut self) {
+        while self.samples > 0 && self.lost & 1 == 1 {
+            self.lost >>= 1;
+            self.samples -= 1;
+        }
+    }
+
+    /// Lost share of the window, once it holds [`MIN_LOSS_SAMPLES`].
+    pub fn loss(&self) -> Option<f64> {
+        (self.samples >= MIN_LOSS_SAMPLES)
+            .then(|| f64::from(self.lost.count_ones()) / f64::from(self.samples))
     }
 }
 
@@ -843,6 +898,64 @@ mod tests {
         assert_eq!(
             policy.observe(0.02, clean + RECOVERED_AFTER),
             MULTIPATH_GROUP
+        );
+    }
+
+    #[test]
+    fn a_blackout_is_forgotten_but_scattered_loss_is_kept() {
+        let mut history = ProbeHistory::default();
+        for probe in 0..30 {
+            // One loss in ten while the path stays up.
+            history.record(probe % 10 == 9);
+        }
+        let before = history.loss().unwrap();
+        assert!((before - 0.1).abs() < 1e-9);
+        // The whole uplink goes dark: a run of losses that takes the path down.
+        for _ in 0..15 {
+            history.record(true);
+        }
+        history.forget_outage();
+        history.record(false);
+        let after = history.loss().unwrap();
+        assert!(
+            after <= before,
+            "{after} after a blackout vs {before} before"
+        );
+    }
+
+    #[test]
+    fn a_path_is_clean_until_it_has_enough_history() {
+        let mut history = ProbeHistory::default();
+        for _ in 0..MIN_LOSS_SAMPLES - 1 {
+            history.record(true);
+        }
+        assert_eq!(history.loss(), None);
+        history.record(true);
+        assert_eq!(history.loss(), Some(1.0));
+    }
+
+    #[test]
+    fn the_window_keeps_only_the_newest_outcomes() {
+        let mut history = ProbeHistory::default();
+        for _ in 0..LOSS_WINDOW {
+            history.record(true);
+        }
+        for _ in 0..LOSS_WINDOW {
+            history.record(false);
+        }
+        assert_eq!(history.loss(), Some(0.0));
+    }
+
+    #[test]
+    fn an_interruption_restarts_the_clock_without_changing_the_size() {
+        let mut policy = MultipathPolicy::default();
+        let start = Instant::now();
+        policy.observe(0.2, start);
+        policy.interrupt();
+        assert_eq!(policy.observe(0.2, start + LOSSY_AFTER), MULTIPATH_GROUP);
+        assert_eq!(
+            policy.observe(0.2, start + LOSSY_AFTER * 2),
+            LOSSY_MULTIPATH_GROUP
         );
     }
 

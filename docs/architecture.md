@@ -436,19 +436,32 @@ late by a slower path is discarded as a duplicate.
   comes back, and a group already open is closed first so nothing in it goes
   unprotected.
 - **Multipath shrinks to 2 only when every path is bad, and slowly.**
-  `MultipathPolicy` reads the lowest smoothed probe loss among the paths
-  carrying data after every probe, since a packet is lost for good only when
-  every copy of it is; a clean standby the scheduler is not sending on rescues
-  nothing, so it does not count. When even the best path has stayed at `LOSSY_PATH_LOSS` (10%) or
-  more for `LOSSY_AFTER` (5 s), two losses in one group of four become likely,
-  so the multipath group drops to `LOSSY_MULTIPATH_GROUP` (2). It goes back to
-  4 only after the best path has stayed under `RECOVERED_PATH_LOSS` (4%) for
-  `RECOVERED_AFTER` (15 s). The scheduler's loss average moves 5% per probe, so
-  one stray lost probe reads exactly 5% and cannot trigger it, and the gap
-  between the two thresholds and the two holds is what stops a session sitting
-  near either edge from flapping. Any clean reading while shrinking, or lossy
+  `MultipathPolicy` reads, after every probe, the lowest loss among the paths
+  carrying data, since a packet is lost for good only when every copy of it
+  is; a clean standby the scheduler is not sending on rescues nothing, so it
+  does not count. When even the best carrying path has stayed at
+  `LOSSY_PATH_LOSS` (10%) or more for `LOSSY_AFTER` (5 s), two losses in one
+  group of four become likely, so the multipath group drops to
+  `LOSSY_MULTIPATH_GROUP` (2). It goes back to 4 only after the best path has
+  stayed under `RECOVERED_PATH_LOSS` (4%) for `RECOVERED_AFTER` (15 s). The gap
+  between the two thresholds and the two holds stops a session sitting near
+  either edge from flapping, and any clean reading while shrinking, or lossy
   one while growing, restarts that clock. All of these are constants in
   `engine/src/fec.rs`.
+
+  The loss it reads is each path's `ProbeHistory` — the last `LOSS_WINDOW`
+  (40) probes, counted only after `MIN_LOSS_SAMPLES` (20) — and not the
+  scheduler's average, because an outage is not a path in bad condition. Seen
+  live: two five-second international blackouts took all four routes of a
+  session, on two providers, down within 200 ms of each other, with the
+  outside-the-tunnel uplink probe failing too. Probes on a path in doubt go out
+  every 150 ms, so the scheduler's average read 25-49% on clean paths
+  afterwards, and a policy fed from it shrank the group for 37 s after each
+  blackout had ended. The history forgets the run of losses that ended in a
+  path being declared down, and the policy sets its clock back while nothing
+  is carrying, so what shrinks the group is scattered loss on paths that stay
+  up.
+
 - **Data never waits.** Packets leave the moment they are captured, as before.
   A group closes when the next packet cannot join it or after
   `GROUP_MAX_AGE` (5 ms), whichever is first, and a flusher thread on each end
@@ -521,6 +534,12 @@ The scheduler still sees the first loss immediately through `record_loss`, so a
 path that begins dropping packets is de-prioritised by its score straight away.
 The threshold governs only the harder decision to stop using the path at all,
 and two in a row is reached inside four seconds.
+
+A path already declared down stops feeding its losses to the scheduler. It is
+out of the pick either way, and the probes it keeps losing at the degraded
+cadence only wrecked its score for the moment it came back: after a shared
+blackout the route that kept probing throughout, and recovered first, read
+49% loss and was the one the scheduler avoided.
 
 ### Reported loss is current, not cumulative
 

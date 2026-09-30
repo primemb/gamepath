@@ -13,12 +13,10 @@
 //! exactly as it did before, and nothing is spent on repairs it would discard.
 
 use super::dispatch::Dispatch;
-use super::health::selected_paths;
 use super::worker::PATH_QUEUE_DEPTH;
 use gamepath_engine::auth::SessionCrypto;
-use gamepath_engine::fec::{self, Encoder, MultipathPolicy, Offer};
+use gamepath_engine::fec::{self, Encoder, MultipathPolicy, Offer, ProbeHistory};
 use gamepath_engine::protocol::{FLAG_REPAIR, FrameHeader};
-use gamepath_engine::scheduler::PathMetrics;
 use gamepath_engine::thread_priority;
 use gamepath_engine::{log_info, log_warn};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -70,6 +68,7 @@ pub(crate) struct LossRepair {
     wake: Condvar,
     tunnel_mtu: u16,
     policy: Mutex<MultipathPolicy>,
+    histories: Mutex<Vec<ProbeHistory>>,
     /// What `policy` last decided, read per packet without its lock.
     multipath_group: AtomicU8,
     support: AtomicU8,
@@ -79,6 +78,15 @@ pub(crate) struct LossRepair {
     clock: Instant,
     last_offer_ms: AtomicU64,
     repairs_sent: AtomicU64,
+}
+
+/// One probe result, as [`LossRepair::record_probe`] needs it.
+pub(crate) enum Probe {
+    Lost,
+    /// `after_outage` when the path had been declared down until this answer.
+    Answered {
+        after_outage: bool,
+    },
 }
 
 pub(crate) struct RepairStatus {
@@ -99,6 +107,7 @@ impl LossRepair {
         decision_mask: Arc<AtomicU64>,
         tunnel_mtu: u16,
     ) -> Self {
+        let routes = dispatch.commands.len();
         Self {
             crypto,
             client_id,
@@ -113,6 +122,7 @@ impl LossRepair {
             wake: Condvar::new(),
             tunnel_mtu,
             policy: Mutex::new(MultipathPolicy::default()),
+            histories: Mutex::new(vec![ProbeHistory::default(); routes]),
             multipath_group: AtomicU8::new(fec::MULTIPATH_GROUP),
             support: AtomicU8::new(UNKNOWN),
             downlink_group: AtomicU8::new(0),
@@ -136,33 +146,56 @@ impl LossRepair {
         )
     }
 
-    /// Feeds the policy the latest probe results, after a path worker has
-    /// recorded one. Only the paths carrying data count: a packet is lost for
-    /// good when every copy of it is, and a clean standby the scheduler is not
-    /// sending on rescues none of them.
-    pub(crate) fn reassess(&self, metrics: &Mutex<Vec<PathMetrics>>) {
-        let carrying = selected_paths(self.decision_mask.load(Ordering::Acquire), self.healthy());
-        let best_loss = metrics
-            .lock()
-            .unwrap()
+    /// Feeds the policy one probe result from path `index`, after its worker
+    /// has recorded it. Only the paths carrying data count: a packet is lost
+    /// for good when every copy of it is, and a clean standby the scheduler is
+    /// not sending on rescues none of them.
+    pub(crate) fn record_probe(&self, index: usize, probe: Probe) {
+        let healthy = self.healthy();
+        let bit = 1_u64.checked_shl(index as u32).unwrap_or(0);
+        let mut histories = self.histories.lock().unwrap();
+        if let Some(history) = histories.get_mut(index) {
+            match probe {
+                // The path is already out of service, so this loss belongs to
+                // the outage that took it out, as did the run before it.
+                Probe::Lost if healthy & bit == 0 => history.forget_outage(),
+                Probe::Lost => history.record(true),
+                Probe::Answered { after_outage } => {
+                    if after_outage {
+                        history.forget_outage();
+                    }
+                    history.record(false);
+                }
+            }
+        }
+        // What the dispatcher is sending on, as `selected_paths` has it, except
+        // that nothing healthy means nothing carrying rather than a fallback.
+        let decision = self.decision_mask.load(Ordering::Acquire);
+        let carrying = if decision & healthy != 0 {
+            decision & healthy
+        } else {
+            healthy
+        };
+        let mut policy = self.policy.lock().unwrap();
+        if carrying == 0 {
+            // Nothing is carrying, so nothing observed now says anything about
+            // how the paths carry. Whatever was building up starts over.
+            policy.interrupt();
+            return;
+        }
+        let best_loss = histories
             .iter()
             .enumerate()
-            .filter(|(index, _)| carrying & 1_u64.checked_shl(*index as u32).unwrap_or(0) != 0)
-            .map(|(_, path)| path.loss_ratio)
-            .reduce(f64::min);
-        let Some(best_loss) = best_loss else {
-            return;
-        };
-        let group = self
-            .policy
-            .lock()
-            .unwrap()
-            .observe(best_loss, Instant::now());
+            .filter(|(path, _)| carrying & 1_u64.checked_shl(*path as u32).unwrap_or(0) != 0)
+            .map(|(_, history)| history.loss().unwrap_or(0.0))
+            .fold(f64::INFINITY, f64::min);
+        drop(histories);
+        let group = policy.observe(best_loss, Instant::now());
+        drop(policy);
         let previous = self.multipath_group.swap(group, Ordering::AcqRel);
         if previous != group {
             log_info!(
-                "session {} loss repair now 1 per {group} packets on multipath: the best \
-                 carrying path's loss is {:.0}%",
+                "session {} loss repair now 1 per {group} packets on multipath: the best                  carrying path lost {:.0}% of its recent probes",
                 self.session_id,
                 best_loss * 100.0
             );

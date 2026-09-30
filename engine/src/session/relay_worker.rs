@@ -13,7 +13,7 @@ use super::health::{
 };
 use super::latency::{LatencyEvent, LatencyWatch};
 use super::local_tap::InboundSink;
-use super::repair::LossRepair;
+use super::repair::{LossRepair, Probe};
 use super::state::{PathSessionStatus, RelayIngress};
 use super::worker::{
     PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN, WORKER_RECEIVE_TIMEOUT,
@@ -270,16 +270,21 @@ pub(crate) fn run_path(
                 Ok(()) => pending_probe = Some((sequence, Instant::now())),
                 Err(error) => {
                     statuses.lock().unwrap()[index].probes_lost += 1;
-                    update_scheduler_probe(
-                        &scheduler_metrics,
-                        &decision_mask,
-                        fallback_mask,
-                        index,
-                        None,
-                        strategy,
-                        session_id,
-                    );
-                    repair.reassess(&scheduler_metrics);
+                    // A path already declared down is out of the pick; more
+                    // losses on it only leave its score wrecked after it
+                    // recovers, which is the moment it is needed.
+                    if failures < HEALTH_FAILURE_THRESHOLD {
+                        update_scheduler_probe(
+                            &scheduler_metrics,
+                            &decision_mask,
+                            fallback_mask,
+                            index,
+                            None,
+                            strategy,
+                            session_id,
+                        );
+                    }
+                    repair.record_probe(index, Probe::Lost);
                     update_path_status(&statuses, index, Err(error));
                     failures += 1;
                     if failures == HEALTH_FAILURE_THRESHOLD - 1 {
@@ -381,6 +386,7 @@ pub(crate) fn run_path(
                                         index + 1
                                     );
                                 }
+                                let after_outage = failures >= HEALTH_FAILURE_THRESHOLD;
                                 failures = 0;
                                 backoff = RECONNECT_BACKOFF_MIN;
                                 next_redial = None;
@@ -399,7 +405,7 @@ pub(crate) fn run_path(
                                     strategy,
                                     session_id,
                                 );
-                                repair.reassess(&scheduler_metrics);
+                                repair.record_probe(index, Probe::Answered { after_outage });
                                 match latency_watch.observe(latency, Instant::now()) {
                                     Some(LatencyEvent::Degraded {
                                         baseline_ms,
@@ -485,16 +491,23 @@ pub(crate) fn run_path(
             pending_probe = None;
             remember_expired_probe(&mut expired_probes, sequence, started);
             statuses.lock().unwrap()[index].probes_lost += 1;
-            update_scheduler_probe(
-                &scheduler_metrics,
-                &decision_mask,
-                fallback_mask,
-                index,
-                None,
-                strategy,
-                session_id,
-            );
-            repair.reassess(&scheduler_metrics);
+            // Losses past the threshold are the outage that took the path down,
+            // not loss on a path that was carrying. Counting them left every
+            // path scored as 25-50% lossy for half a minute after a five-second
+            // uplink blackout, and the one that kept probing through it the
+            // worst of all.
+            if failures < HEALTH_FAILURE_THRESHOLD {
+                update_scheduler_probe(
+                    &scheduler_metrics,
+                    &decision_mask,
+                    fallback_mask,
+                    index,
+                    None,
+                    strategy,
+                    session_id,
+                );
+            }
+            repair.record_probe(index, Probe::Lost);
             let note = path.health_note();
             failures += 1;
             schedule_redial(failures, backoff, &mut next_redial);
