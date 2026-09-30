@@ -15,7 +15,7 @@ const {
 } = require('./connection.cjs')
 const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
-const { provisionRelay, removeRelay } = require('./vps.cjs')
+const { enrollExistingRelay, provisionRelay, removeRelay } = require('./vps.cjs')
 const { createIpCountryLookup } = require('./ip-country.cjs')
 const { createFileIconLookup } = require('./file-icon.cjs')
 const { UsageStore } = require('./usage.cjs')
@@ -950,7 +950,7 @@ function registerIpc() {
     return { state: publicState(), result }
   })
 
-  ipcMain.handle('relay:vps-provision', async (_event, id, input) => {
+  const vpsSetupInput = (id, input) => {
     const relay = state.relays.find((item) => item.id === id)
     if (!relay) throw new Error('Relay not found')
     const host = String(input.host ?? '').trim()
@@ -962,24 +962,36 @@ function registerIpc() {
     if (!username || !password) throw new Error('Enter the SSH username and password')
     if (![sshPort, relayPort].every((port) => Number.isInteger(port) && port >= 1 && port <= 65535))
       throw new Error('Ports must be between 1 and 65535')
-    const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
-    const progress = (update) => _event.sender.send('relay:vps-progress', { relayId: id, ...update })
-    const result = await provisionRelay(
-      projectRoot,
-      { host, username, password, sshPort, relayPort, expectedFingerprint: relay.sshFingerprint },
-      progress,
-    )
-    state.encryptedRelayTokens[id] = encryptConfig(result.token)
+    return { relay, host, username, password, sshPort, relayPort, expectedFingerprint: relay.sshFingerprint }
+  }
+
+  const saveVpsEnrollment = (relay, host, port, result) => {
+    state.encryptedRelayTokens[relay.id] = encryptConfig(result.token)
     Object.assign(relay, {
       address: host,
-      port: relayPort,
+      port,
       status: 'ready',
       hasEnrollmentToken: true,
       sshFingerprint: result.fingerprint,
     })
-    state.activeRelayId = id
+    state.activeRelayId = relay.id
     saveState()
     return publicState()
+  }
+
+  ipcMain.handle('relay:vps-provision', async (_event, id, input) => {
+    const { relay, ...ssh } = vpsSetupInput(id, input)
+    const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
+    const progress = (update) => _event.sender.send('relay:vps-progress', { relayId: id, ...update })
+    const result = await provisionRelay(projectRoot, ssh, progress)
+    return saveVpsEnrollment(relay, ssh.host, ssh.relayPort, result)
+  })
+
+  ipcMain.handle('relay:vps-enroll', async (_event, id, input) => {
+    const { relay, ...ssh } = vpsSetupInput(id, input)
+    const progress = (update) => _event.sender.send('relay:vps-progress', { relayId: id, ...update })
+    const result = await enrollExistingRelay(ssh, progress)
+    return saveVpsEnrollment(relay, ssh.host, result.port, result)
   })
 
   ipcMain.handle('relay:vps-remove', async (_event, id, input) => {

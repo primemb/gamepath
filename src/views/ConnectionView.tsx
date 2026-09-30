@@ -231,17 +231,21 @@ export function ConnectionView({
           relay={vpsRelay}
           action={vpsTarget.action}
           onClose={() => setVpsTarget(null)}
-          onSubmit={(input) =>
+          onSubmit={({ existing, ...input }) =>
             guard(async () => {
               setState(
-                vpsTarget.action === 'provision'
-                  ? await api.provisionRelayVps(vpsRelay.id, input)
-                  : await api.removeRelayVps(vpsRelay.id, input),
+                vpsTarget.action === 'remove'
+                  ? await api.removeRelayVps(vpsRelay.id, input)
+                  : existing
+                    ? await api.enrollRelayVps(vpsRelay.id, input)
+                    : await api.provisionRelayVps(vpsRelay.id, input),
               )
               notify(
-                vpsTarget.action === 'provision'
-                  ? 'VPS configured and enrollment protected by Windows.'
-                  : 'GamePath was removed from the VPS.',
+                vpsTarget.action === 'remove'
+                  ? 'GamePath was removed from the VPS.'
+                  : existing
+                    ? 'This PC is enrolled on the VPS relay and the credential is protected by Windows.'
+                    : 'VPS configured and enrollment protected by Windows.',
                 'success',
               )
               setVpsTarget(null)

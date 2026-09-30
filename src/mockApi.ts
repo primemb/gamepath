@@ -401,6 +401,7 @@ export const mockApi: GamePathApi = {
     state.activeRelayId = id
     return snapshot()
   },
+  enrollRelayVps: async (id, input) => mockApi.provisionRelayVps(id, input),
   removeRelayVps: async (id) => {
     state.relays = state.relays.map((relay) =>
       relay.id === id ? { ...relay, hasEnrollmentToken: false, status: 'setup-required', latency: undefined } : relay,

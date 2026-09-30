@@ -165,6 +165,50 @@ async function provisionRelay(projectRoot, input, onProgress = () => {}) {
   }
 }
 
+// Enrols this PC on a relay that is already installed, without re-uploading or
+// recompiling it. The relay reads its client records only at startup, so the
+// service restarts once for the new credential to be accepted.
+const ENROLL_EXISTING_SCRIPT = `set -euo pipefail
+if [[ ! -x /usr/local/bin/gamepath-relay || ! -f /etc/gamepath/relay.env ]]; then
+  echo "GamePath relay is not installed on this VPS. Turn off 'already installed' to run the full setup." >&2
+  exit 3
+fi
+. /etc/gamepath/relay.env
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+umask 077
+/usr/local/bin/gamepath-relay enroll --name windows-client --clients-dir "\${GAMEPATH_CLIENTS:-/etc/gamepath/clients}" --output "$dir/client.enroll" >/dev/null
+chmod 0640 "\${GAMEPATH_CLIENTS:-/etc/gamepath/clients}"/*.json
+chown root:gamepath "\${GAMEPATH_CLIENTS:-/etc/gamepath/clients}"/*.json
+systemctl restart gamepath-relay.service
+echo "GAMEPATH_BIND=\${GAMEPATH_BIND:-}"
+echo "GAMEPATH_TOKEN=$(cat "$dir/client.enroll")"`
+
+function parseEnrollOutput(output) {
+  const value = (key) => output.match(new RegExp(`^${key}=(.*)$`, 'm'))?.[1].trim() ?? ''
+  const port = Number(value('GAMEPATH_BIND').match(/:(\d+)$/)?.[1])
+  return { token: value('GAMEPATH_TOKEN'), port: Number.isInteger(port) && port > 0 && port < 65536 ? port : null }
+}
+
+async function enrollExistingRelay(input, onProgress = () => {}) {
+  onProgress({ stage: 'connect', percent: 5, message: 'Connecting to the VPS over SSH' })
+  const { connection, fingerprint } = await connectSsh(input)
+  try {
+    const isRoot = (await execute(connection, 'id -u')).trim() === '0'
+    onProgress({ stage: 'verify', percent: 30, message: 'SSH identity verified' })
+    onProgress({ stage: 'enrollment', percent: 60, message: 'Enrolling this PC on the existing relay' })
+    const { token, port } = parseEnrollOutput(
+      await rootCommand(connection, ENROLL_EXISTING_SCRIPT, input.password, isRoot),
+    )
+    if (!token.startsWith('gpe1_') || token.length < 80)
+      throw new Error('The server returned an invalid enrollment credential')
+    onProgress({ stage: 'complete', percent: 100, message: 'This PC is enrolled on the relay' })
+    return { token, fingerprint, port: port ?? input.relayPort }
+  } finally {
+    connection.end()
+  }
+}
+
 async function removeRelay(projectRoot, input, onProgress = () => {}) {
   onProgress({ stage: 'connect', percent: 5, message: 'Connecting to the VPS over SSH' })
   const { connection, fingerprint } = await connectSsh(input)
@@ -186,4 +230,4 @@ async function removeRelay(projectRoot, input, onProgress = () => {}) {
   }
 }
 
-module.exports = { deploymentFiles, provisionRelay, removeRelay }
+module.exports = { deploymentFiles, enrollExistingRelay, parseEnrollOutput, provisionRelay, removeRelay }

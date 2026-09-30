@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld('gamepath', {
   importRelayEnrollment: (id) => ipcRenderer.invoke('relay:import-enrollment', id),
   testRelay: (id) => ipcRenderer.invoke('relay:test', id),
   provisionRelayVps: (id, input) => ipcRenderer.invoke('relay:vps-provision', id, input),
+  enrollRelayVps: (id, input) => ipcRenderer.invoke('relay:vps-enroll', id, input),
   removeRelayVps: (id, input) => ipcRenderer.invoke('relay:vps-remove', id, input),
   onRelayVpsProgress: (callback) => {
     const handler = (_event, update) => callback(update)

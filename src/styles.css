@@ -2702,6 +2702,24 @@ html[dir='rtl'] .toggle.is-on span {
 .enrollment-field {
   margin-top: 14px;
 }
+.vps-existing {
+  margin-top: 14px;
+  padding: 11px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.vps-existing strong {
+  font-size: 10px;
+}
+.vps-existing p {
+  margin: 3px 0 0;
+  color: #8792a6;
+  font-size: 9px;
+}
 .file-import-button {
   width: 100%;
   margin-top: 10px;

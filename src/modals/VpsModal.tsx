@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { X } from 'lucide-react'
 import { api } from '../api'
+import { Toggle } from '../components/Toggle'
 import type { Relay } from '../types'
 
 /**
@@ -41,6 +42,7 @@ export function VpsModal({
     username: string
     password: string
     relayPort: number
+    existing: boolean
   }) => Promise<void>
 }) {
   const [host, setHost] = useState(relay.address)
@@ -48,6 +50,7 @@ export function VpsModal({
   const [username, setUsername] = useState('root')
   const [password, setPassword] = useState('')
   const [relayPort, setRelayPort] = useState(String(relay.port || 51821))
+  const [existing, setExisting] = useState(false)
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState({ stage: 'preparing', percent: 0, message: 'Preparing deployment' })
 
@@ -80,6 +83,7 @@ export function VpsModal({
 
   const displayedPercent = Math.min(100, Math.round(progress.percent))
   const incomplete = !host.trim() || !username.trim() || !password || !sshPort || !relayPort
+  const enrollOnly = action === 'provision' && existing
 
   return (
     <div className="modal-backdrop" onMouseDown={busy ? undefined : onClose}>
@@ -94,9 +98,11 @@ export function VpsModal({
           </button>
         </div>
         <p className="modal-intro">
-          {action === 'provision'
-            ? "GamePath supports Debian 13+ and Ubuntu 22.04+. It uploads the relay source, installs dependencies, configures the service and firewall, then imports this PC's enrollment automatically."
-            : 'This removes the GamePath service, firewall tables, configuration, clients, and binary from this server.'}{' '}
+          {enrollOnly
+            ? 'GamePath signs in to your VPS, enrolls this PC on the relay that is already running there, and restarts it once. Nothing is reinstalled.'
+            : action === 'provision'
+              ? "GamePath supports Debian 13+ and Ubuntu 22.04+. It uploads the relay source, installs dependencies, configures the service and firewall, then imports this PC's enrollment automatically."
+              : 'This removes the GamePath service, firewall tables, configuration, clients, and binary from this server.'}{' '}
           The SSH password is used only for this operation and is never saved.
         </p>
         <div className="relay-fields">
@@ -128,6 +134,20 @@ export function VpsModal({
           </label>
         </div>
         {action === 'provision' && (
+          <div className="vps-existing">
+            <div>
+              <strong>Relay already installed on this VPS</strong>
+              <p>Skip the install and only enroll this PC. Takes a few seconds.</p>
+            </div>
+            <Toggle
+              checked={existing}
+              onChange={setExisting}
+              label="Relay already installed on this VPS"
+              disabled={busy}
+            />
+          </div>
+        )}
+        {action === 'provision' && !existing && (
           <label className="field-label enrollment-field">
             Relay UDP port
             <input
@@ -153,7 +173,7 @@ export function VpsModal({
             >
               <b style={{ transform: `scaleX(${progress.percent / 100})` }} />
             </i>
-            <small>Keep GamePath open. A first-time Rust build can take several minutes.</small>
+            {!enrollOnly && <small>Keep GamePath open. A first-time Rust build can take several minutes.</small>}
           </div>
         )}
         <div className="modal-actions">
@@ -164,7 +184,11 @@ export function VpsModal({
             className={`button ${action === 'remove' ? 'danger' : 'primary'}`}
             disabled={busy || incomplete}
             onClick={async () => {
-              setProgress({ stage: 'preparing', percent: 1, message: 'Preparing deployment' })
+              setProgress({
+                stage: 'preparing',
+                percent: 1,
+                message: enrollOnly ? 'Preparing enrollment' : 'Preparing deployment',
+              })
               setBusy(true)
               try {
                 await onSubmit({
@@ -173,6 +197,7 @@ export function VpsModal({
                   username: username.trim(),
                   password,
                   relayPort: Number(relayPort),
+                  existing: enrollOnly,
                 })
               } finally {
                 setBusy(false)
@@ -180,12 +205,16 @@ export function VpsModal({
             }}
           >
             {busy
-              ? action === 'provision'
-                ? 'Configuring VPS…'
-                : 'Removing…'
-              : action === 'provision'
-                ? 'Configure VPS'
-                : 'Remove from VPS'}
+              ? enrollOnly
+                ? 'Enrolling…'
+                : action === 'provision'
+                  ? 'Configuring VPS…'
+                  : 'Removing…'
+              : enrollOnly
+                ? 'Enroll this PC'
+                : action === 'provision'
+                  ? 'Configure VPS'
+                  : 'Remove from VPS'}
           </button>
         </div>
       </section>

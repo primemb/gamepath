@@ -421,6 +421,7 @@ export type GamePathApi = {
     id: string,
   ) => Promise<{ state: AppState; result: { reachable: boolean; latencyMs: number; virtualIpv4: string } }>
   provisionRelayVps: (id: string, input: VpsCredentials & { relayPort: number }) => Promise<AppState>
+  enrollRelayVps: (id: string, input: VpsCredentials & { relayPort: number }) => Promise<AppState>
   removeRelayVps: (id: string, input: VpsCredentials) => Promise<AppState>
   onRelayVpsProgress: (
     callback: (update: { relayId: string; stage: string; percent: number; message: string }) => void,

@@ -313,6 +313,18 @@ export const persian: Record<string, string> = {
   'Configure Linux VPS': 'تنظیم VPS لینوکس',
   'Configure VPS': 'تنظیم VPS',
   'Configuring VPS…': 'در حال تنظیم VPS…',
+  'Relay already installed on this VPS': 'رله از قبل روی این VPS نصب شده است',
+  'Skip the install and only enroll this PC. Takes a few seconds.':
+    'نصب را رد کن و فقط این رایانه را ثبت کن. چند ثانیه طول می‌کشد.',
+  'GamePath signs in to your VPS, enrolls this PC on the relay that is already running there, and restarts it once. Nothing is reinstalled.':
+    'GamePath وارد VPS شما می‌شود، این رایانه را روی رله‌ای که از قبل آنجا اجرا می‌شود ثبت می‌کند و آن را یک بار راه‌اندازی مجدد می‌کند. چیزی دوباره نصب نمی‌شود.',
+  'Enroll this PC': 'ثبت این رایانه',
+  'Enrolling…': 'در حال ثبت…',
+  'Preparing enrollment': 'در حال آماده‌سازی ثبت',
+  'Enrolling this PC on the existing relay': 'در حال ثبت این رایانه روی رله موجود',
+  'This PC is enrolled on the relay': 'این رایانه روی رله ثبت شد',
+  'This PC is enrolled on the VPS relay and the credential is protected by Windows.':
+    'این رایانه روی رله VPS ثبت شد و اعتبارنامه توسط ویندوز محافظت می‌شود.',
   'Could not copy the username. You can add prime_lifesoul on Discord.':
     'کپی نام کاربری ممکن نشد. می‌توانید prime_lifesoul را در Discord اضافه کنید.',
   'Could not load usage statistics.': 'بارگذاری آمار مصرف ممکن نشد.',
