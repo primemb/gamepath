@@ -210,6 +210,19 @@ export const persian: Record<string, string> = {
   Workspace: 'محیط کار',
   Overview: 'نمای کلی',
   Node: 'گره',
+  'The one node the VPN connects through.': 'تنها گرهی که VPN از طریق آن متصل می‌شود.',
+  'No node yet': 'هنوز گرهی نیست',
+  Protection: 'حفاظت',
+  'Kill switch on': 'قطع‌کننده اضطراری روشن',
+  'Kill switch off': 'قطع‌کننده اضطراری خاموش',
+  'Names resolved through the VPN': 'نام‌ها از طریق VPN یافته می‌شوند',
+  'Names resolved by this PC': 'نام‌ها توسط این رایانه یافته می‌شوند',
+  'Turn on the VPN to see the apps and destinations it carries.':
+    'VPN را روشن کنید تا برنامه‌ها و مقصدهایی را که منتقل می‌کند ببینید.',
+  'Open an app you selected for the VPN to see its connections here.':
+    'برنامه‌ای را که برای VPN انتخاب کرده‌اید باز کنید تا اتصال‌هایش اینجا دیده شود.',
+  'In all-traffic mode the VPN carries everything except your game, so connections are not listed per app.':
+    'در حالت همه ترافیک، VPN همه چیز به جز بازی شما را منتقل می‌کند، پس اتصال‌ها به تفکیک برنامه فهرست نمی‌شوند.',
   'Game sections': 'بخش‌های بازی',
   'VPN sections': 'بخش‌های VPN',
   Active: 'فعال',
@@ -643,6 +656,7 @@ const dynamic: [RegExp, (...parts: string[]) => string][] = [
   [/^Rename (.+)$/, (name) => `تغییر نام ${name}`],
   [/^Enable (.+)$/, (name) => `فعال کردن ${name}`],
   [/^Disable (.+)$/, (name) => `غیرفعال کردن ${name}`],
+  [/^(\d+) targets? selected$/, (count) => `${count} مقصد انتخاب شده`],
   [/^Group for (.+)$/, (name) => `گروه ${name}`],
   [/^Carry traffic through (.+)$/, (name) => `انتقال ترافیک از ${name}`],
   [/^(.+) connection details$/, (name) => `جزئیات اتصال‌های ${name}`],

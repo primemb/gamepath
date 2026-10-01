@@ -14,6 +14,8 @@ mod ipc;
 mod netutil;
 mod session;
 
+#[cfg(windows)]
+mod proxy_identity;
 #[cfg(all(windows, feature = "socks-server"))]
 mod socks;
 #[cfg(windows)]

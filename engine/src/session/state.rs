@@ -130,9 +130,9 @@ pub(crate) struct ActiveWireGuardSession {
     pub(crate) scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
     pub(crate) effective_mtu: EffectiveMtu,
     pub(crate) bypass_ips: Vec<std::net::Ipv4Addr>,
-    /// The path is a local proxy that may answer name lookups with fake-IP
-    /// addresses only it can reach.
-    pub(crate) proxy_fake_ips: bool,
+    /// The SOCKS5 proxy a direct VPN session runs through. Such a proxy may
+    /// answer name lookups with fake-IP addresses only it can reach.
+    pub(crate) socks_proxy: Option<std::net::SocketAddr>,
     /// Diverts replies for the LAN proxy's own flows away from capture.
     pub(crate) local_tap: Arc<LocalTap>,
     // Held for the session so the path workers wake on a millisecond timer

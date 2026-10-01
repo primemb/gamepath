@@ -1160,6 +1160,12 @@ applications with their own DNS client (Chrome, Discord). Everything else follow
 through the game's tunnel with remote DNS on, or the local resolver with it off. Otherwise a game resolved
 through a fake-IP proxy got an address only that proxy can reach, and its traffic ended up in the VPN.
 
+**The proxy's own lookups are never redirected.** A local proxy client resolves its upstream server with the
+machine's DNS servers, from its own process (sing-box does, `dns/transport/local`). Redirected, that lookup went
+into the proxy itself; with fake IP on, Throne answered its own WARP server with `198.18.0.3` after a restart and
+nothing went through it again. `proxy_identity` finds the process listening on the proxy's port and leaves its
+UDP lookups alone, so it resolves exactly as it would without GamePath.
+
 **Connections already open are ended, not left to hang.** A TCP connection an application opened before the
 VPN started (or before a rule selected it) is carried from its next packet on, but from the session's address,
 so the server stops answering it and the application only notices when its own timeout fires. When the VPN's

@@ -205,9 +205,32 @@
 .vpn-card .card-head small {
   font-size: 11px;
 }
-.vpn-split-tab {
+.vpn-overview {
   display: grid;
   gap: 14px;
+}
+.vpn-overview .connections-card {
+  margin-top: 0;
+}
+.vpn-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+.vpn-summary-tile:hover {
+  border-color: var(--vpn-accent-line);
+}
+.vpn-summary-tile:focus-visible {
+  outline-color: var(--vpn-accent);
+}
+.vpn-summary-tile .lan-proxy-card-copy {
+  min-width: 0;
+}
+.vpn-summary-tile .lan-proxy-card-copy strong {
+  overflow: hidden;
+  font-family: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .vpn-columns {
   display: grid;
@@ -492,6 +515,9 @@
 }
 
 @media (max-width: 1180px) {
+  .vpn-summary-grid {
+    grid-template-columns: 1fr;
+  }
   .vpn-columns {
     grid-template-columns: minmax(0, 1fr);
   }

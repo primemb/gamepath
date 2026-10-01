@@ -12,7 +12,7 @@ import {
 
 export type View = 'game' | 'vpn' | 'statistics' | 'settings' | 'info'
 export type GameTab = 'overview' | 'routes' | 'split' | 'connection' | 'sharing'
-export type VpnTab = 'node' | 'split'
+export type VpnTab = 'overview' | 'node' | 'split'
 
 type Icon = typeof Gamepad2
 
@@ -54,11 +54,12 @@ export const gameTabs: TabDefinition<GameTab>[] = [
 
 export const vpnTabs: TabDefinition<VpnTab>[] = [
   {
-    id: 'node',
-    label: 'Node',
-    icon: ShieldCheck,
+    id: 'overview',
+    label: 'Overview',
+    icon: LayoutDashboard,
     description: 'A second connection for everyday apps, beside your game and never in its way.',
   },
+  { id: 'node', label: 'Node', icon: ShieldCheck, description: 'The one node the VPN connects through.' },
   {
     id: 'split',
     label: 'Split tunnel',

@@ -15,7 +15,13 @@ type CaptureDiagnostics = NonNullable<NonNullable<AppState['session']['capture']
  * the moment a session got going; the application is what the user recognises,
  * and its destinations stay one click away.
  */
-export function HandledConnections({ capture }: { capture: CaptureDiagnostics | undefined }) {
+export function HandledConnections({
+  capture,
+  emptyText = 'Start the game to see each executable and destination IP handled by GamePath.',
+}: {
+  capture: CaptureDiagnostics | undefined
+  emptyText?: string
+}) {
   const [open, setOpen] = useState(true)
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
   const connections = capture?.handledConnections ?? []
@@ -126,9 +132,7 @@ export function HandledConnections({ capture }: { capture: CaptureDiagnostics | 
               })}
             </div>
           ) : (
-            <p className="connections-empty">
-              Start the game to see each executable and destination IP handled by GamePath.
-            </p>
+            <p className="connections-empty">{emptyText}</p>
           )}
           {capture && (
             <div className="capture-health">

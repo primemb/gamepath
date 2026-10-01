@@ -170,10 +170,8 @@ impl WireGuardSessionManager {
             .unwrap_or_default()
     }
 
-    pub(crate) fn proxy_fake_ips(&self) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|session| session.proxy_fake_ips)
+    pub(crate) fn socks_proxy(&self) -> Option<std::net::SocketAddr> {
+        self.active.as_ref().and_then(|session| session.socks_proxy)
     }
 
     fn all_paths_reachable(&self) -> bool {

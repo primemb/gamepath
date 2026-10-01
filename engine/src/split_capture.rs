@@ -540,6 +540,8 @@ struct Registry {
     redirected_dns: AtomicU64,
     /// The session is a proxy that may hand out fake-IP addresses.
     proxy_fake_ips: bool,
+    /// The proxy's own process, when it runs on this machine.
+    proxy: Option<crate::proxy_identity::ProxyIdentity>,
     /// See `PacketCaptureRequest::own_hostnames`.
     own_hostnames: HashSet<String>,
     fake_ip_packets: AtomicU64,
@@ -791,7 +793,8 @@ impl SplitPacketCapture {
                 HashMap::new(),
             ),
         };
-        let proxy_fake_ips = sessions.lock().unwrap().proxy_fake_ips();
+        let socks_proxy = sessions.lock().unwrap().socks_proxy();
+        let proxy_fake_ips = socks_proxy.is_some();
         let registry = Arc::new(Registry {
             capture_id,
             dll: dll_path()?,
@@ -806,6 +809,7 @@ impl SplitPacketCapture {
             clock: Instant::now(),
             redirected_dns: AtomicU64::new(0),
             proxy_fake_ips,
+            proxy: socks_proxy.and_then(crate::proxy_identity::ProxyIdentity::for_endpoint),
             own_hostnames: own_hostnames
                 .iter()
                 .map(|name| name.trim_end_matches('.').to_ascii_lowercase())
@@ -1396,9 +1400,13 @@ fn run_selected_capture(
         let question = lookup_name(packet, fields);
         // GamePath resolving its own nodes: left exactly as it would go with
         // this session off, whichever session's capture sees it first.
-        let own_lookup = question
-            .as_deref()
-            .is_some_and(|name| registry.own_hostnames.contains(name));
+        let own_lookup = question.as_deref().is_some_and(|name| {
+            registry.own_hostnames.contains(name)
+                || registry
+                    .proxy
+                    .as_ref()
+                    .is_some_and(|proxy| proxy.owns_udp_port(fields.source_port))
+        });
         let rule_selected = selected;
         let own_apps_only = registry.dns_own_apps_only.load(Ordering::Relaxed);
         let mut implicit_dns = false;
@@ -2810,7 +2818,7 @@ fn record_handled_connection(
     );
 }
 
-fn process_path(process_id: u32) -> Option<String> {
+pub(crate) fn process_path(process_id: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
         if handle == 0 {

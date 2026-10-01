@@ -82,7 +82,7 @@ function App() {
   const [view, setView] = useState<View>('game')
   // Kept here, not in the pages, so a tab survives a trip to another screen.
   const [gameTab, setGameTab] = useState<GameTab>('overview')
-  const [vpnTab, setVpnTab] = useState<VpnTab>('node')
+  const [vpnTab, setVpnTab] = useState<VpnTab>('overview')
   const [notice, setNotice] = useState<Notice | null>(null)
   const notify = (message: string, kind: NoticeKind = 'info') => setNotice({ message, kind })
   const { histories, rates } = useSessionTelemetry(state)

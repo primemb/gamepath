@@ -308,7 +308,7 @@ impl WireGuardSessionManager {
             scheduler_metrics,
             effective_mtu,
             bypass_ips,
-            proxy_fake_ips: false,
+            socks_proxy: None,
             local_tap,
             timer,
         });
@@ -340,6 +340,8 @@ impl WireGuardSessionManager {
         let timer = HighResolutionTimer::raise();
         let stop = Arc::new(AtomicBool::new(false));
         let kind = path.kind();
+        let socks_proxy =
+            (kind == gamepath_engine::relay_path::KIND_SOCKS5).then(|| path.endpoint());
         let label_for_log = label.clone();
         let link_mtu = link_mtu_for_endpoints(path.bypass_ipv4());
         let effective_mtu = EffectiveMtu::for_session(SessionMode::Direct, [kind], link_mtu)
@@ -430,7 +432,7 @@ impl WireGuardSessionManager {
             scheduler_metrics,
             effective_mtu,
             bypass_ips,
-            proxy_fake_ips: kind == gamepath_engine::relay_path::KIND_SOCKS5,
+            socks_proxy,
             local_tap,
             timer,
         });
