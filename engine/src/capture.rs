@@ -261,6 +261,12 @@ impl PacketCaptureManager {
                     kill_switch: input.kill_switch,
                     own_hostnames: input.own_hostnames.clone(),
                     carried,
+                    // Only the VPN, and only with no game running: the VPN
+                    // cannot see the game's rules, and must never end a
+                    // connection the game carries.
+                    reset_existing: gamepath_engine::role::Role::current()
+                        == gamepath_engine::role::Role::Vpn
+                        && !input.other_session_active,
                 },
             )?;
             let target_count = split.target_count();

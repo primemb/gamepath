@@ -1160,6 +1160,14 @@ applications with their own DNS client (Chrome, Discord). Everything else follow
 through the game's tunnel with remote DNS on, or the local resolver with it off. Otherwise a game resolved
 through a fake-IP proxy got an address only that proxy can reach, and its traffic ended up in the VPN.
 
+**Connections already open are ended, not left to hang.** A TCP connection an application opened before the
+VPN started (or before a rule selected it) is carried from its next packet on, but from the session's address,
+so the server stops answering it and the application only notices when its own timeout fires. When the VPN's
+capture opens, `tcp_reset` ends those connections with `SetTcpEntry(MIB_TCP_STATE_DELETE_TCB)`, as Windscribe
+does, and the applications reconnect through the VPN at once. Connections the session already carries are
+kept, and nothing is ended while a game session runs, because the VPN cannot see the game's rules and must never
+end a connection the game carries.
+
 A capture restart (a live rule edit, or the other session starting or stopping) hands the new capture its
 predecessor's reply table, routed-connection list and usage counters (`CarriedFlows`), under the same capture
 id. Before, every live connection's replies were dropped until it next sent something: 101 in the ten

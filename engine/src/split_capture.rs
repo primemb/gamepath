@@ -651,6 +651,9 @@ pub struct SplitOptions {
     pub own_hostnames: Vec<String>,
     /// The flows of the capture this one replaces.
     pub carried: Option<CarriedFlows>,
+    /// End the selected applications' connections that opened before this
+    /// capture, so they reconnect through it; see [`crate::tcp_reset`].
+    pub reset_existing: bool,
 }
 
 /// What a replaced capture hands its successor. A rule edit, or the other
@@ -771,6 +774,7 @@ impl SplitPacketCapture {
             kill_switch,
             own_hostnames,
             carried,
+            reset_existing,
         } = options;
         let plan = compile("split", rules)?;
         let (capture_id, carried_paths, carried_handled, carried_usage) = match carried {
@@ -1009,6 +1013,17 @@ impl SplitPacketCapture {
             .map_err(|error| format!("could not start capture diagnostics: {error}"))?;
         registry.workers.lock().unwrap().push(worker);
 
+        // Only now, with capture open, so the reconnection is caught.
+        if reset_existing {
+            let closed = close_preexisting_connections(&registry, &return_paths);
+            if closed > 0 {
+                gamepath_engine::log_info!(
+                    "ended {closed} connection(s) the selected apps opened before this session, \
+                     so they reconnect through it"
+                );
+            }
+        }
+
         Ok(Self {
             stop,
             registry,
@@ -1179,6 +1194,43 @@ impl Drop for SplitPacketCapture {
             let _ = worker.join();
         }
     }
+}
+
+/// Ends the TCP connections this capture's rules select but that are not yet
+/// going through the session, because they opened before it: an application
+/// that was already running when the session started, or one a rule just
+/// added. Connections the session already carries are left alone.
+fn close_preexisting_connections(
+    registry: &Registry,
+    return_paths: &Mutex<HashMap<ReturnKey, ReturnPath>>,
+) -> usize {
+    let table = selector_table(registry);
+    let carried = return_paths.lock().unwrap();
+    let mut paths: HashMap<u32, Option<String>> = HashMap::new();
+    let mut closed = 0;
+    for connection in crate::tcp_reset::established() {
+        let fields = Ipv4Fields {
+            source: *connection.local.ip(),
+            destination: *connection.remote.ip(),
+            protocol: 6,
+            source_port: connection.local.port(),
+            destination_port: connection.remote.port(),
+        };
+        if !crate::netutil::is_globally_routable_ipv4(fields.destination)
+            || carried.contains_key(&ReturnKey::outbound(fields))
+        {
+            continue;
+        }
+        let by_process = paths
+            .entry(connection.process_id)
+            .or_insert_with(|| process_path(connection.process_id))
+            .as_deref()
+            .is_some_and(|path| path_matches(path, &registry.applications, &registry.folders));
+        if (by_process || table.lookup(fields).is_some()) && crate::tcp_reset::close(&connection) {
+            closed += 1;
+        }
+    }
+    closed
 }
 
 fn add_selector(registry: &Registry, selector: TrafficSelector) {
@@ -2246,7 +2298,7 @@ fn existing_ipv4_process_sockets() -> Option<HashSet<ExistingSocket>> {
     Some(sockets)
 }
 
-fn ip_table(call: impl Fn(*mut c_void, *mut u32) -> u32) -> Option<Vec<u8>> {
+pub(crate) fn ip_table(call: impl Fn(*mut c_void, *mut u32) -> u32) -> Option<Vec<u8>> {
     let mut size = 0_u32;
     let _ = call(std::ptr::null_mut(), &mut size);
     if size < 4 {
@@ -2269,7 +2321,7 @@ fn ip_table(call: impl Fn(*mut c_void, *mut u32) -> u32) -> Option<Vec<u8>> {
     None
 }
 
-fn dword_rows(buffer: &[u8], width: usize) -> Vec<Vec<u32>> {
+pub(crate) fn dword_rows(buffer: &[u8], width: usize) -> Vec<Vec<u32>> {
     if buffer.len() < 4 {
         return Vec::new();
     }
@@ -2289,7 +2341,7 @@ fn dword_rows(buffer: &[u8], width: usize) -> Vec<Vec<u32>> {
         .collect()
 }
 
-fn port_from_dword(value: u32) -> u16 {
+pub(crate) fn port_from_dword(value: u32) -> u16 {
     u16::from_be(value as u16)
 }
 

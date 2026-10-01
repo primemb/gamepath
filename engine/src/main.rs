@@ -18,6 +18,8 @@ mod session;
 mod socks;
 #[cfg(windows)]
 mod split_capture;
+#[cfg(windows)]
+mod tcp_reset;
 
 use capture::PacketCaptureManager;
 use commands::{
