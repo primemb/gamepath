@@ -111,7 +111,7 @@ test('the remote DNS setting reaches packet capture in both traffic modes', () =
   // Both capture backends consult it: all-traffic mode gates the adapter's
   // resolvers, split mode gates redirecting the router's lookups.
   assert.match(capture, /input\.remote_dns \{[\s\S]{0,120}configure_tunnel_dns/)
-  assert.match(capture, /split\.set_redirect_dns\(input\.remote_dns\)/)
+  assert.match(capture, /split\.set_redirect_dns\(input\.remote_dns,/)
 })
 
 test('the declared MSRV matches the toolchain the relay is built with', () => {

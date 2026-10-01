@@ -1,0 +1,118 @@
+/* ---- In-page tabs ----
+   Game and VPN keep their session switch above the tabs, so the connection is
+   one click away whichever part of the page is open. */
+
+.game-page {
+  display: grid;
+  gap: 14px;
+  max-width: 1200px;
+  margin: auto;
+}
+/* Every tab fills the page width, so the edges do not jump between tabs. */
+.game-page .page-section {
+  max-width: none;
+}
+
+.page-tabs {
+  --tab-accent: var(--cyan);
+  --tab-accent-soft: var(--cyan-soft);
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  background: #0a0e16;
+}
+.page-tabs.is-vpn {
+  --tab-accent: var(--vpn-accent);
+  --tab-accent-soft: var(--vpn-accent-soft);
+}
+
+.page-tabs button {
+  flex: 1 0 auto;
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #8993a5;
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    color 0.16s ease,
+    background-color 0.16s ease,
+    border-color 0.16s ease;
+}
+.page-tabs button:hover {
+  color: #dce2ec;
+  background: rgba(255, 255, 255, 0.035);
+}
+.page-tabs button.active {
+  color: var(--tab-accent);
+  border-color: color-mix(in srgb, var(--tab-accent) 22%, transparent);
+  background: var(--tab-accent-soft);
+}
+.page-tabs button:focus-visible {
+  outline: 2px solid var(--tab-accent);
+  outline-offset: 1px;
+}
+
+.page-tabs b {
+  min-width: 20px;
+  padding: 2px 6px;
+  border-radius: 8px;
+  color: #c3cad6;
+  background: rgba(255, 255, 255, 0.07);
+  font-size: 10.5px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+.page-tabs button.active b {
+  color: var(--tab-accent);
+  background: color-mix(in srgb, var(--tab-accent) 14%, transparent);
+}
+
+.page-tab-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+}
+.page-tab-dot.is-live {
+  background: var(--tab-accent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--tab-accent) 70%, transparent);
+}
+.page-tab-dot.is-pending {
+  border: 2px solid #687386;
+}
+.page-tab-dot.is-warning {
+  background: #ffb35c;
+}
+
+.page-tab-panel {
+  min-width: 0;
+  animation: page-tab-in 0.16s ease-out;
+}
+@keyframes page-tab-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .page-tabs button {
+    transition: none;
+  }
+  .page-tab-panel {
+    animation: none;
+  }
+}

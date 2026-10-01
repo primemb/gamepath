@@ -6,6 +6,7 @@ import './styles.css'
 import './statistics.css'
 import './sharing.css'
 import './vpn.css'
+import './tabs.css'
 import App from './App'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(

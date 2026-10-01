@@ -36,8 +36,12 @@ impl SlotSummary {
         }
     }
 
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.status.as_str(), "starting" | "connected")
+    }
+
     pub(crate) fn owns_all_traffic(&self) -> bool {
-        matches!(self.status.as_str(), "starting" | "connected") && self.traffic_mode == "all"
+        self.is_active() && self.traffic_mode == "all"
     }
 
     fn to_json(&self) -> Value {
@@ -104,10 +108,9 @@ impl Registry {
                     );
                 });
             }
-        } else if previous.bypass != summary.bypass {
-            let addresses = summary.bypass;
+        } else if previous.bypass != summary.bypass || previous.is_active() != summary.is_active() {
             self.in_background(move |registry| {
-                crate::session::set_foreign_bypass(SlotId::Vpn, &registry, &addresses);
+                crate::session::set_foreign_bypass(SlotId::Vpn, &registry, &summary);
             });
         }
     }

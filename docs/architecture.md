@@ -1150,8 +1150,15 @@ node, relay and VPN node hostname. Lookups for them go out as they would with th
 Without this, a game node resolved while a SOCKS5 VPN was on got the proxy's fake-IP answer
 (`198.18.0.101:903`, measured), and that game route then ran through the VPN.
 
-This applies to the game and the VPN alike. The resolver cache is flushed when remote DNS starts and when it
-stops, so neither filtered nor fake-IP answers outlive the switch.
+This applies to the game and the VPN alike. The resolver cache is flushed whenever this changes, so neither
+filtered nor fake-IP answers outlive the switch.
+
+**Name resolution belongs to the game while it runs.** Windows resolves for every application, the game
+included, so these lookups cannot be split by app. While the game session is starting or running
+(`otherSessionActive`), the VPN redirects only the lookups its own rules select, which are those from
+applications with their own DNS client (Chrome, Discord). Everything else follows the game's own setting:
+through the game's tunnel with remote DNS on, or the local resolver with it off. Otherwise a game resolved
+through a fake-IP proxy got an address only that proxy can reach, and its traffic ended up in the VPN.
 
 A capture restart (a live rule edit, or the other session starting or stopping) hands the new capture its
 predecessor's reply table, routed-connection list and usage counters (`CarriedFlows`), under the same capture

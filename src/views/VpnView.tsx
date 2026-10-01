@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import { HandledConnections } from '../components/HandledConnections'
+import { PageTabs, TabPanel, type TabExtras } from '../components/PageTabs'
 import { errorMessage, type Notify } from '../components/Toast'
 import { VpnCoexistence } from '../components/vpn/VpnCoexistence'
 import { VpnCommandCard } from '../components/vpn/VpnCommandCard'
@@ -8,6 +9,7 @@ import { VpnNodePanel } from '../components/vpn/VpnNodePanel'
 import { VpnTargetList } from '../components/vpn/VpnTargetList'
 import { VpnTargetModal } from '../components/vpn/VpnTargetModal'
 import { VpnTrafficCard } from '../components/vpn/VpnTrafficCard'
+import { vpnTabs, type VpnTab } from '../lib/views'
 import { vpnLive, vpnOn } from '../lib/vpn'
 import { L2tpModal } from '../modals/L2tpModal'
 import { OpenVpnLoginModal } from '../modals/OpenVpnLoginModal'
@@ -32,11 +34,15 @@ export function VpnView({
   state,
   setState,
   notify,
+  tab,
+  onTabChange,
   onOpenGameTraffic,
 }: {
   state: AppState
   setState: (next: AppState) => void
   notify: Notify
+  tab: VpnTab
+  onTabChange: (tab: VpnTab) => void
   onOpenGameTraffic: () => void
 }) {
   const [modal, setModal] = useState<Modal>(null)
@@ -116,34 +122,51 @@ export function VpnView({
     notify(`${what} node saved for the VPN.`, 'success')
   }
 
+  const extras: Partial<Record<VpnTab, TabExtras>> = {
+    node: { dot: vpn.node ? null : 'warning' },
+    split: {
+      badge: vpn.trafficMode === 'split' ? vpn.rules.filter((rule) => rule.enabled).length : null,
+      dot: Object.keys(vpn.limitations).length ? 'warning' : null,
+    },
+  }
+
   return (
     <div className="vpn-page">
       <VpnCommandCard vpn={vpn} onToggle={toggle} busy={toggling} />
       <VpnCoexistence state={state} onOpenGame={onOpenGameTraffic} />
-      <VpnNodePanel
-        node={vpn.node}
-        connected={vpnLive(vpn.session.status)}
-        onChoose={chooseNode}
-        onTest={testSavedNode}
-        onRemove={() => guard(() => api.vpn.removeNode())}
-      />
-      <div className="vpn-columns">
-        <VpnTrafficCard
-          vpn={vpn}
-          onTrafficMode={(mode) => void guard(() => api.vpn.setTrafficMode(mode))}
-          onRemoteDns={(enabled) => void guard(() => api.vpn.setRemoteDns(enabled))}
-          onKillSwitch={(enabled) => void guard(() => api.vpn.setKillSwitch(enabled))}
-        />
-        <VpnTargetList
-          vpn={vpn}
-          onAdd={(initial) => setModal({ kind: 'target', initial })}
-          onToggle={(id, enabled) => void guard(() => api.vpn.setRuleEnabled(id, enabled))}
-          onRemove={(id) => void guard(() => api.vpn.removeRule(id))}
-        />
-      </div>
-      {vpnLive(vpn.session.status) && vpn.trafficMode === 'split' && (
-        <HandledConnections capture={vpn.session.capture?.diagnostics} />
-      )}
+      <PageTabs scope="vpn" label="VPN sections" tabs={vpnTabs} active={tab} onChange={onTabChange} extras={extras} />
+      <TabPanel scope="vpn" id={tab}>
+        {tab === 'node' && (
+          <VpnNodePanel
+            node={vpn.node}
+            connected={vpnLive(vpn.session.status)}
+            onChoose={chooseNode}
+            onTest={testSavedNode}
+            onRemove={() => guard(() => api.vpn.removeNode())}
+          />
+        )}
+        {tab === 'split' && (
+          <div className="vpn-split-tab">
+            <div className="vpn-columns">
+              <VpnTrafficCard
+                vpn={vpn}
+                onTrafficMode={(mode) => void guard(() => api.vpn.setTrafficMode(mode))}
+                onRemoteDns={(enabled) => void guard(() => api.vpn.setRemoteDns(enabled))}
+                onKillSwitch={(enabled) => void guard(() => api.vpn.setKillSwitch(enabled))}
+              />
+              <VpnTargetList
+                vpn={vpn}
+                onAdd={(initial) => setModal({ kind: 'target', initial })}
+                onToggle={(id, enabled) => void guard(() => api.vpn.setRuleEnabled(id, enabled))}
+                onRemove={(id) => void guard(() => api.vpn.removeRule(id))}
+              />
+            </div>
+            {vpnLive(vpn.session.status) && vpn.trafficMode === 'split' && (
+              <HandledConnections capture={vpn.session.capture?.diagnostics} />
+            )}
+          </div>
+        )}
+      </TabPanel>
 
       {modal?.kind === 'socks5' && (
         <Socks5Modal

@@ -35,7 +35,7 @@ export function VpnCommandCard({ vpn, onToggle, busy }: { vpn: VpnState; onToggl
           {/* Announced, so a status change is heard as well as seen. */}
           <p aria-live="polite">
             {session.message ??
-              (vpn.node ? `${vpn.node.name} is ready to connect.` : 'Add a node below to get started.')}
+              (vpn.node ? `${vpn.node.name} is ready to connect.` : 'Add a node in the Node tab to get started.')}
           </p>
         </div>
       </div>

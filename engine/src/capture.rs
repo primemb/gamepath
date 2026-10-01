@@ -223,7 +223,7 @@ impl PacketCaptureManager {
             _ => return Err("traffic mode must be all or split".into()),
         }
         #[cfg(windows)]
-        let was_redirecting = self.redirects_dns();
+        let previous_dns = self.dns_mode();
         #[cfg(windows)]
         let carried = {
             drop(self.active.take());
@@ -264,18 +264,30 @@ impl PacketCaptureManager {
                 },
             )?;
             let target_count = split.target_count();
-            split.set_redirect_dns(input.remote_dns);
+            // The game always wins name resolution too. Its own lookups, made
+            // for it by Windows, must not come back as the VPN proxy's fake
+            // IPs: the game's tunnel cannot reach those, so the game would end
+            // up carried by the VPN.
+            let own_apps_only = gamepath_engine::role::Role::current()
+                == gamepath_engine::role::Role::Vpn
+                && input.other_session_active;
+            split.set_redirect_dns(input.remote_dns, own_apps_only);
             self.active_split = Some(split);
+            let dns = self.dns_mode();
             // Answers cached before the switch would outlive it: the router's
             // filtered ones going in, a proxy's fake-IP ones coming out.
-            if input.remote_dns != was_redirecting {
+            if dns != previous_dns {
                 gamepath_engine::netconfig::flush_dns_cache();
-            }
-            if input.remote_dns && !was_redirecting {
-                log_info!(
-                    "split tunnel DNS: lookups to LAN resolvers are answered by {} through the tunnel",
-                    crate::split_capture::TUNNEL_RESOLVER
-                );
+                match dns {
+                    Some(false) => log_info!(
+                        "split tunnel DNS: lookups to LAN resolvers are answered by {} through the tunnel",
+                        crate::split_capture::TUNNEL_RESOLVER
+                    ),
+                    Some(true) => log_info!(
+                        "the game session is running: only this session's own apps resolve through it"
+                    ),
+                    None => {}
+                }
             }
             let dns_servers = self.split_dns_servers();
             return Ok(json!({
@@ -460,6 +472,7 @@ impl PacketCaptureManager {
             return Ok(json!({ "state": "idle" }));
         };
         request["foreignBypass"] = json!(addresses);
+        request["otherSessionActive"] = json!(payload["otherSessionActive"] == json!(true));
         if let Some(capture) = self.active.as_mut() {
             capture.set_foreign_bypass(&addresses)?;
             self.last_request = Some(request);
@@ -518,7 +531,7 @@ impl PacketCaptureManager {
         self.last_request = None;
         #[cfg(windows)]
         {
-            let was_redirecting = self.redirects_dns();
+            let was_redirecting = self.dns_mode().is_some();
             drop(self.active.take());
             drop(self.active_split.take());
             if was_redirecting {
@@ -528,16 +541,18 @@ impl PacketCaptureManager {
         json!({ "state": "idle" })
     }
 
+    /// How the split capture redirects lookups: `None` not at all, else
+    /// whether only its own apps' lookups.
     #[cfg(windows)]
-    fn redirects_dns(&self) -> bool {
+    fn dns_mode(&self) -> Option<bool> {
         self.active_split
             .as_ref()
-            .is_some_and(crate::split_capture::SplitPacketCapture::redirects_dns)
+            .and_then(crate::split_capture::SplitPacketCapture::dns_mode)
     }
 
     #[cfg(windows)]
     fn split_dns_servers(&self) -> Vec<String> {
-        if self.redirects_dns() {
+        if self.dns_mode().is_some() {
             vec![crate::split_capture::TUNNEL_RESOLVER.to_string()]
         } else {
             Vec::new()

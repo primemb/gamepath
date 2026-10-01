@@ -156,6 +156,10 @@ pub(crate) struct PacketCaptureRequest {
     /// a fake-IP answer and its route then ran through the VPN.
     #[serde(default)]
     pub(crate) own_hostnames: Vec<String>,
+    /// The other session is starting or running. The VPN then leaves the
+    /// machine's name lookups to the game and redirects only its own apps'.
+    #[serde(default)]
+    pub(crate) other_session_active: bool,
 }
 
 const fn enabled() -> bool {

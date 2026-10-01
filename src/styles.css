@@ -2958,9 +2958,6 @@ html[dir='rtl'] .toggle.is-on span {
     padding-left: 28px;
     padding-right: 28px;
   }
-  .dashboard-grid {
-    grid-template-columns: 1fr 1fr;
-  }
   .route-map {
     grid-template-columns: 70px 1fr 135px 1fr 70px;
   }

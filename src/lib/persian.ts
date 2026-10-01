@@ -30,7 +30,7 @@ export const persian: Record<string, string> = {
   'Connected for': 'مدت اتصال',
   'Turn off VPN': 'خاموش کردن VPN',
   'Turn on VPN': 'روشن کردن VPN',
-  'Add a node below to get started.': 'برای شروع، یک گره در پایین اضافه کنید.',
+  'Add a node in the Node tab to get started.': 'برای شروع، در زبانه گره یک گره اضافه کنید.',
   'The VPN is paused for your game': 'VPN به خاطر بازی شما متوقف شده است',
   'Game traffic settings': 'تنظیمات ترافیک بازی',
   'Your game session is running and takes priority': 'اتصال بازی شما فعال است و اولویت دارد',
@@ -209,6 +209,14 @@ export const persian: Record<string, string> = {
   'Devices using the proxy': 'دستگاه‌های استفاده‌کننده از پراکسی',
   Workspace: 'محیط کار',
   Overview: 'نمای کلی',
+  Node: 'گره',
+  'Game sections': 'بخش‌های بازی',
+  'VPN sections': 'بخش‌های VPN',
+  Active: 'فعال',
+  Waiting: 'در انتظار',
+  'Needs attention': 'نیاز به بررسی',
+  'Choose which apps and websites use the VPN, and how it behaves when the node goes quiet.':
+    'انتخاب کنید کدام برنامه‌ها و وب‌سایت‌ها از VPN استفاده کنند و وقتی گره پاسخ نمی‌دهد چه رفتاری داشته باشد.',
   'Routes and nodes': 'مسیرها و گره‌ها',
   'Split tunnel': 'تونل تفکیکی',
   Connection: 'اتصال',
@@ -639,7 +647,7 @@ const dynamic: [RegExp, (...parts: string[]) => string][] = [
   [/^Carry traffic through (.+)$/, (name) => `انتقال ترافیک از ${name}`],
   [/^(.+) connection details$/, (name) => `جزئیات اتصال‌های ${name}`],
   [
-    /^(\d+) of (\d+) requirements ready — open Setup below\.$/,
+    /^(\d+) of (\d+) requirements ready — finish Setup in Overview\.$/,
     (ready, total) => `${ready} از ${total} پیش‌نیاز آماده است؛ بخش راه‌اندازی را باز کنید.`,
   ],
   [

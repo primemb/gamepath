@@ -53,7 +53,9 @@ fn engine_bypass(paths: &Value) -> Vec<Ipv4Addr> {
         .unwrap_or_default()
 }
 
-fn capture_request(slot: &SessionSlot, rules: &Value, foreign_bypass: &[Ipv4Addr]) -> Value {
+/// `foreign` is the other slot: its tunnel is kept out of this capture, and
+/// while it runs the VPN leaves the machine's name lookups to the game.
+fn capture_request(slot: &SessionSlot, rules: &Value, foreign: &SlotSummary) -> Value {
     let remote_dns = slot.remote_dns;
     json!({
         "trafficMode": slot.traffic_mode,
@@ -61,7 +63,8 @@ fn capture_request(slot: &SessionSlot, rules: &Value, foreign_bypass: &[Ipv4Addr
         "remoteDns": remote_dns,
         "killSwitch": slot.kill_switch,
         "ownHostnames": slot.own_hostnames,
-        "foreignBypass": foreign_bypass,
+        "foreignBypass": foreign.bypass,
+        "otherSessionActive": foreign.is_active(),
     })
 }
 
@@ -171,7 +174,8 @@ fn start_slot(
     // Published before anything is opened: a game taking all traffic stops
     // the VPN now, before its own routes go in.
     registry.publish(id, summary_of(runtime, "starting", Vec::new()));
-    let foreign_bypass = registry.summary(id.other()).bypass;
+    let foreign = registry.summary(id.other());
+    let foreign_bypass = foreign.bypass.clone();
     let rules = payload["rules"].clone();
     if request.mode == SessionMode::Direct && matches!(nodes.as_slice(), [NodeSpec::L2tp { .. }]) {
         return start_native_l2tp(
@@ -221,7 +225,7 @@ fn start_slot(
             "not answered"
         }
     ));
-    let capture_payload = capture_request(runtime, &rules, &foreign_bypass);
+    let capture_payload = capture_request(runtime, &rules, &foreign);
     let engine = runtime.engine.as_mut().ok_or("no active network session")?;
     let capture = engine.request("start-packet-capture", capture_payload)?;
     // After capture, and never fatal: a session that routes the game is
@@ -458,7 +462,7 @@ pub(crate) fn update_session_rules(
         .filter(|rules| rules.is_array())
         .cloned()
         .ok_or("live target update requires a rules array")?;
-    let foreign_bypass = registry.summary(id.other()).bypass;
+    let foreign = registry.summary(id.other());
     let mut runtime = registry.slot(id).lock().unwrap();
     if !runtime.is_connected() || runtime.traffic_mode != "split" {
         return Err("live target updates require a connected split session".into());
@@ -504,8 +508,8 @@ pub(crate) fn update_session_rules(
             "targetCount": 0,
         }));
     }
-    let update = capture_request(&runtime, &rules, &foreign_bypass);
-    let restore = capture_request(&runtime, &previous_rules, &foreign_bypass);
+    let update = capture_request(&runtime, &rules, &foreign);
+    let restore = capture_request(&runtime, &previous_rules, &foreign);
     let target_count = rules.as_array().map_or(0, Vec::len);
     let engine = runtime.engine.as_mut().ok_or("no active network session")?;
     let command = if previous_rules_are_empty {
@@ -542,7 +546,8 @@ pub(crate) fn update_session_rules(
 
 /// Keeps `id`'s capture and routes clear of the other slot's tunnel after
 /// that slot started, stopped or moved relay.
-pub(crate) fn set_foreign_bypass(id: SlotId, registry: &Arc<Registry>, addresses: &[Ipv4Addr]) {
+pub(crate) fn set_foreign_bypass(id: SlotId, registry: &Arc<Registry>, foreign: &SlotSummary) {
+    let addresses = foreign.bypass.as_slice();
     let mut runtime = registry.slot(id).lock().unwrap();
     if !runtime.is_connected() {
         return;
@@ -555,7 +560,10 @@ pub(crate) fn set_foreign_bypass(id: SlotId, registry: &Arc<Registry>, addresses
         Ok(0)
     } else if let Some(engine) = runtime.engine.as_mut() {
         engine
-            .request("set-foreign-bypass", json!({ "addresses": addresses }))
+            .request(
+                "set-foreign-bypass",
+                json!({ "addresses": addresses, "otherSessionActive": foreign.is_active() }),
+            )
             .map(|_| addresses.len())
     } else {
         Ok(0)
@@ -697,8 +705,15 @@ mod tests {
         assert_eq!(names, ["turkey1.pingkhor.xyz"]);
         let mut slot = SessionSlot::new(SlotId::Game);
         slot.own_hostnames = names;
-        let request = capture_request(&slot, &json!([]), &[]);
+        let request = capture_request(&slot, &json!([]), &SlotSummary::idle(None));
         assert_eq!(request["ownHostnames"], json!(["turkey1.pingkhor.xyz"]));
+        assert_eq!(request["otherSessionActive"], json!(false));
+        let game = SlotSummary {
+            status: "starting".into(),
+            ..SlotSummary::idle(None)
+        };
+        let request = capture_request(&slot, &json!([]), &game);
+        assert_eq!(request["otherSessionActive"], json!(true));
     }
 
     #[test]

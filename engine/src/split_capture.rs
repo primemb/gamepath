@@ -522,6 +522,9 @@ struct Registry {
     /// Remote DNS: lookups to a LAN resolver are answered by
     /// [`TUNNEL_RESOLVER`] through the tunnel, see [`is_outside_name_resolution`].
     redirect_dns: AtomicBool,
+    /// Redirect only lookups this session's rules select: the other session
+    /// owns the rest. See `PacketCaptureRequest::other_session_active`.
+    dns_own_apps_only: AtomicBool,
     /// When the oldest tunnelled name lookup still waiting for an answer was
     /// sent, in [`Registry::clock_ms`] (0: none waiting). Lookups are only
     /// redirected while the tunnel answers, so a dead tunnel never leaves the
@@ -792,6 +795,7 @@ impl SplitPacketCapture {
             kill_switch,
             held_packets: AtomicU64::new(0),
             redirect_dns: AtomicBool::new(false),
+            dns_own_apps_only: AtomicBool::new(false),
             unanswered_dns_since: AtomicU64::new(0),
             dns_fallback: AtomicBool::new(false),
             last_dns_probe: AtomicU64::new(0),
@@ -1016,14 +1020,22 @@ impl SplitPacketCapture {
 
     /// Answers lookups aimed at LAN resolvers through the tunnel, for as long
     /// as the tunnel answers them.
-    pub fn set_redirect_dns(&self, redirect: bool) {
+    pub fn set_redirect_dns(&self, redirect: bool, own_apps_only: bool) {
+        self.registry
+            .dns_own_apps_only
+            .store(own_apps_only, Ordering::Relaxed);
         self.registry
             .redirect_dns
             .store(redirect, Ordering::Relaxed);
     }
 
-    pub fn redirects_dns(&self) -> bool {
-        self.registry.redirect_dns.load(Ordering::Relaxed)
+    /// `None` when lookups are not redirected, else whether only this
+    /// session's own apps' are.
+    pub fn dns_mode(&self) -> Option<bool> {
+        self.registry
+            .redirect_dns
+            .load(Ordering::Relaxed)
+            .then(|| self.registry.dns_own_apps_only.load(Ordering::Relaxed))
     }
 
     pub fn target_count(&self) -> usize {
@@ -1131,6 +1143,7 @@ impl SplitPacketCapture {
             "unmatchedReturnsWithoutFlow": self.registry.return_without_flow.load(Ordering::Relaxed),
             "tunnelledDnsQueries": self.registry.tunnelled_dns.load(Ordering::Relaxed),
             "redirectDns": self.registry.redirect_dns.load(Ordering::Relaxed),
+            "dnsOwnAppsOnly": self.registry.dns_own_apps_only.load(Ordering::Relaxed),
             "redirectedDnsQueries": self.registry.redirected_dns.load(Ordering::Relaxed),
             "fakeIpPackets": self.registry.fake_ip_packets.load(Ordering::Relaxed),
             "localDestinationsLeftUntunnelled": self.registry.local_destinations.load(Ordering::Relaxed),
@@ -1334,8 +1347,10 @@ fn run_selected_capture(
         let own_lookup = question
             .as_deref()
             .is_some_and(|name| registry.own_hostnames.contains(name));
+        let rule_selected = selected;
+        let own_apps_only = registry.dns_own_apps_only.load(Ordering::Relaxed);
         let mut implicit_dns = false;
-        if !selected && !own_lookup && is_name_resolution(fields) {
+        if !selected && !own_apps_only && !own_lookup && is_name_resolution(fields) {
             selected = true;
             implicit_dns = true;
             registry.tunnelled_dns.fetch_add(1, Ordering::Relaxed);
@@ -1353,6 +1368,7 @@ fn run_selected_capture(
         // sent to the router because the router is a LAN address.
         let mut redirect = None;
         if registry.redirect_dns.load(Ordering::Relaxed)
+            && (rule_selected || !own_apps_only)
             && is_outside_name_resolution(fields)
             && !own_lookup
             && !question

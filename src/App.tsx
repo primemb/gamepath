@@ -5,14 +5,10 @@ import { Toast, type Notice, type NoticeKind } from './components/Toast'
 import { useSessionTelemetry } from './lib/useSessionTelemetry'
 import { savedLanguage, saveLanguage, type Language } from './lib/language'
 import { observeLanguage } from './lib/localizeDom'
-import { navItems, viewTitles, type View } from './lib/views'
-import { ConnectionView } from './views/ConnectionView'
-import { DashboardView } from './views/DashboardView'
+import { gameTabs, navItems, viewTitles, vpnTabs, type GameTab, type View, type VpnTab } from './lib/views'
+import { GameView } from './views/GameView'
 import { InfoView } from './views/InfoView'
-import { RoutesView } from './views/RoutesView'
 import { SettingsView } from './views/SettingsView'
-import { SharingView } from './views/SharingView'
-import { SplitView } from './views/SplitView'
 import { StatisticsView } from './views/StatisticsView'
 import { VpnView } from './views/VpnView'
 import { gameNavStatus, vpnNavStatus, type NavStatus as NavStatusValue } from './lib/navStatus'
@@ -22,13 +18,11 @@ import type { AppState } from './types'
 function Sidebar({
   view,
   onNavigate,
-  nodeCount,
   statuses,
   clientVersion,
 }: {
   view: View
   onNavigate: (next: View) => void
-  nodeCount: number
   statuses: Partial<Record<View, NavStatusValue | null>>
   clientVersion: string | undefined
 }) {
@@ -51,7 +45,6 @@ function Sidebar({
             <button key={item.id} className={view === item.id ? 'active' : ''} onClick={() => onNavigate(item.id)}>
               <Icon size={18} />
               <span>{item.label}</span>
-              {item.id === 'routes' && nodeCount > 0 && <b>{nodeCount}</b>}
               <NavStatus status={statuses[item.id] ?? null} />
             </button>
           )
@@ -86,7 +79,10 @@ function Sidebar({
 function App() {
   const [language, setLanguage] = useState<Language>(savedLanguage)
   const [state, setState] = useState<AppState | null>(null)
-  const [view, setView] = useState<View>('dashboard')
+  const [view, setView] = useState<View>('game')
+  // Kept here, not in the pages, so a tab survives a trip to another screen.
+  const [gameTab, setGameTab] = useState<GameTab>('overview')
+  const [vpnTab, setVpnTab] = useState<VpnTab>('node')
   const [notice, setNotice] = useState<Notice | null>(null)
   const notify = (message: string, kind: NoticeKind = 'info') => setNotice({ message, kind })
   const { histories, rates } = useSessionTelemetry(state)
@@ -133,7 +129,17 @@ function App() {
   }
 
   const engineStatus = state.engine.status
-  const [heading, description] = viewTitles[view]
+  const [heading, viewDescription] = viewTitles[view]
+  const description =
+    view === 'game'
+      ? gameTabs.find((tab) => tab.id === gameTab)!.description
+      : view === 'vpn'
+        ? vpnTabs.find((tab) => tab.id === vpnTab)!.description
+        : viewDescription
+  const openGameTab = (tab: GameTab) => {
+    setGameTab(tab)
+    setView('game')
+  }
   const views = { state, setState, notify }
 
   return (
@@ -141,9 +147,8 @@ function App() {
       <Sidebar
         view={view}
         onNavigate={setView}
-        nodeCount={state.tunnels.length}
         statuses={{
-          dashboard: gameNavStatus(state.session.status),
+          game: gameNavStatus(state.session.status),
           vpn: vpnNavStatus(state.vpn.session.status),
         }}
         clientVersion={state.clientVersion}
@@ -163,20 +168,20 @@ function App() {
         </header>
 
         <div className="content">
-          {view === 'dashboard' && (
-            <DashboardView
-              state={state}
+          {view === 'game' && (
+            <GameView
+              {...views}
               histories={histories}
               rates={rates}
-              onNavigate={setView}
+              tab={gameTab}
+              onTabChange={setGameTab}
               onToggleSession={toggleSession}
+              onOpenVpn={() => setView('vpn')}
             />
           )}
-          {view === 'vpn' && <VpnView {...views} onOpenGameTraffic={() => setView('split')} />}
-          {view === 'routes' && <RoutesView {...views} />}
-          {view === 'split' && <SplitView {...views} />}
-          {view === 'relays' && <ConnectionView {...views} />}
-          {view === 'sharing' && <SharingView {...views} />}
+          {view === 'vpn' && (
+            <VpnView {...views} tab={vpnTab} onTabChange={setVpnTab} onOpenGameTraffic={() => openGameTab('split')} />
+          )}
           {view === 'statistics' && <StatisticsView notify={notify} />}
           {view === 'settings' && <SettingsView {...views} language={language} onLanguageChange={changeLanguage} />}
           {view === 'info' && <InfoView notify={notify} />}
