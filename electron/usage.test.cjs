@@ -76,3 +76,36 @@ test('proxy devices are counted per address and survive a proxy restart', () => 
     fs.rmSync(directory, { recursive: true, force: true })
   }
 })
+
+test('a VPN session counts beside the game without disturbing its baselines', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gamepath-usage-'))
+  try {
+    const store = new UsageStore(directory)
+    const vpn = store.session('vpn-')
+    store.start('game-1', [{ id: 'game-node', name: 'Game route' }])
+    vpn.start('vpn-1', [{ id: 'vpn-node', name: 'VPN node' }])
+    const at = new Date(2026, 9, 1, 12)
+    const snapshot = (sent) => ({
+      userBytesSent: sent,
+      userBytesReceived: sent,
+      paths: [{ route: 1, bytesSent: sent, bytesReceived: sent }],
+    })
+    // Interleaved polls: each session's counters are its own.
+    store.record(snapshot(100), at)
+    vpn.record(snapshot(10), at)
+    store.record(snapshot(150), at)
+    vpn.record(snapshot(40), at)
+    const rows = store.query('2026-10-01', '2026-10-01').totals
+    const row = (category) => rows.find((entry) => entry.category === category)
+    assert.equal(row('total').sent, 150)
+    assert.equal(row('vpn-total').sent, 40)
+    assert.equal(row('node').identity, 'game-node')
+    assert.equal(row('vpn-node').identity, 'vpn-node')
+    // Each has its own day series; the game's keeps its old name.
+    assert.equal(store.query('2026-10-01', '2026-10-01').days[0].sent, 150)
+    assert.equal(store.query('2026-10-01', '2026-10-01').vpnDays[0].sent, 40)
+    store.close()
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})

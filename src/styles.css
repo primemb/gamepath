@@ -3552,3 +3552,39 @@ html[dir='rtl'] .toggle.is-on span {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* A session's state beside its sidebar entry. Solid and glowing while it carries traffic, a pulsing
+   ring while it is starting, reconnecting or paused; the label is always there for screen readers. */
+.nav-status {
+  --status-color: var(--cyan);
+  width: 8px;
+  height: 8px;
+  flex: none;
+  margin-left: auto;
+  border-radius: 50%;
+}
+.nav-status.is-vpn {
+  --status-color: var(--violet);
+}
+.nav-status.is-live {
+  background: var(--status-color);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--status-color) 70%, transparent);
+}
+.nav-status.is-pending {
+  border: 2px solid var(--status-color);
+  animation: nav-status-pulse 1.4s ease-in-out infinite;
+}
+@keyframes nav-status-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+html[dir='rtl'] .nav-status {
+  margin-left: 0;
+  margin-right: auto;
+}
+@media (prefers-reduced-motion: reduce) {
+  .nav-status.is-pending {
+    animation: none;
+  }
+}

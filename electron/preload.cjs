@@ -56,4 +56,29 @@ contextBridge.exposeInMainWorld('gamepath', {
   startSession: () => ipcRenderer.invoke('engine:start'),
   stopSession: () => ipcRenderer.invoke('engine:stop'),
   refreshSession: () => ipcRenderer.invoke('engine:session-status'),
+  vpn: {
+    importWireGuard: () => ipcRenderer.invoke('vpn:import-wireguard'),
+    chooseOpenVpn: () => ipcRenderer.invoke('vpn:choose-openvpn'),
+    addOpenVpn: (input) => ipcRenderer.invoke('vpn:add-openvpn', input),
+    addSocks5: (input) => ipcRenderer.invoke('vpn:add-socks5', input),
+    addL2tp: (input) => ipcRenderer.invoke('vpn:add-l2tp', input),
+    testL2tp: (input) => ipcRenderer.invoke('vpn:test-l2tp', input),
+    testSocks5: (input) => ipcRenderer.invoke('vpn:test-socks5', input),
+    removeNode: () => ipcRenderer.invoke('vpn:remove-node'),
+    setTrafficMode: (mode) => ipcRenderer.invoke('vpn:set-traffic-mode', mode),
+    setRemoteDns: (enabled) => ipcRenderer.invoke('vpn:set-remote-dns', enabled),
+    setKillSwitch: (enabled) => ipcRenderer.invoke('vpn:set-kill-switch', enabled),
+    browseTarget: (kind) => ipcRenderer.invoke('vpn:browse-target', kind),
+    addRule: (input) => ipcRenderer.invoke('vpn:add-rule', input),
+    setRuleEnabled: (id, enabled) => ipcRenderer.invoke('vpn:set-rule-enabled', id, enabled),
+    removeRule: (id) => ipcRenderer.invoke('vpn:remove-rule', id),
+    connect: () => ipcRenderer.invoke('vpn:connect'),
+    disconnect: () => ipcRenderer.invoke('vpn:disconnect'),
+    status: () => ipcRenderer.invoke('vpn:status'),
+    onChanged: (callback) => {
+      const handler = (_event, vpn) => callback(vpn)
+      ipcRenderer.on('vpn:changed', handler)
+      return () => ipcRenderer.removeListener('vpn:changed', handler)
+    },
+  },
 })

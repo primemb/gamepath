@@ -1,3 +1,4 @@
+import { createMockVpn, seedVpn } from './mockVpn'
 import type { AppState, GamePathApi, LanProxyStatus } from './types'
 
 const mockLanProxyStartedAt = Date.now() - 600_000
@@ -139,6 +140,7 @@ let state: AppState = {
     },
   },
   service: { status: 'not-installed', version: '', message: 'Network service is not installed', elevated: false },
+  vpn: seedVpn(),
 }
 
 const snapshot = () => structuredClone(state)
@@ -146,7 +148,7 @@ let mockTelemetryTick = 0
 
 export const mockApi: GamePathApi = {
   bootstrap: async () => snapshot(),
-  queryUsage: async (from, to) => ({ from, to, totals: [], days: [] }),
+  queryUsage: async (from, to) => ({ from, to, totals: [], days: [], vpnDays: [] }),
   resetUsage: async () => true,
   lookupIpCountry: async () => null,
   getFileIcon: async () => null,
@@ -543,6 +545,7 @@ export const mockApi: GamePathApi = {
     state.session = { status: 'idle' }
     return snapshot()
   },
+  vpn: createMockVpn(() => state, snapshot),
   refreshSession: async () => {
     if (state.session.status === 'connected' && state.session.pathMetrics) {
       mockTelemetryTick += 1

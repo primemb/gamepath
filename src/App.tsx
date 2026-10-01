@@ -14,17 +14,22 @@ import { SettingsView } from './views/SettingsView'
 import { SharingView } from './views/SharingView'
 import { SplitView } from './views/SplitView'
 import { StatisticsView } from './views/StatisticsView'
+import { VpnView } from './views/VpnView'
+import { gameNavStatus, vpnNavStatus, type NavStatus as NavStatusValue } from './lib/navStatus'
+import { NavStatus } from './components/NavStatus'
 import type { AppState } from './types'
 
 function Sidebar({
   view,
   onNavigate,
   nodeCount,
+  statuses,
   clientVersion,
 }: {
   view: View
   onNavigate: (next: View) => void
   nodeCount: number
+  statuses: Partial<Record<View, NavStatusValue | null>>
   clientVersion: string | undefined
 }) {
   return (
@@ -47,6 +52,7 @@ function Sidebar({
               <Icon size={18} />
               <span>{item.label}</span>
               {item.id === 'routes' && nodeCount > 0 && <b>{nodeCount}</b>}
+              <NavStatus status={statuses[item.id] ?? null} />
             </button>
           )
         })}
@@ -96,6 +102,9 @@ function App() {
     api.bootstrap().then(setState)
   }, [])
 
+  // The main process pushes VPN changes; the window keeps no timer for them.
+  useEffect(() => api.vpn.onChanged((vpn) => setState((current) => current && { ...current, vpn })), [])
+
   useEffect(() => {
     if (state?.session.status !== 'connected') return
     const timer = window.setInterval(() => api.refreshSession().then(setState), 2000)
@@ -129,7 +138,16 @@ function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar view={view} onNavigate={setView} nodeCount={state.tunnels.length} clientVersion={state.clientVersion} />
+      <Sidebar
+        view={view}
+        onNavigate={setView}
+        nodeCount={state.tunnels.length}
+        statuses={{
+          dashboard: gameNavStatus(state.session.status),
+          vpn: vpnNavStatus(state.vpn.session.status),
+        }}
+        clientVersion={state.clientVersion}
+      />
 
       <main>
         <header className="topbar">
@@ -154,6 +172,7 @@ function App() {
               onToggleSession={toggleSession}
             />
           )}
+          {view === 'vpn' && <VpnView {...views} onOpenGameTraffic={() => setView('split')} />}
           {view === 'routes' && <RoutesView {...views} />}
           {view === 'split' && <SplitView {...views} />}
           {view === 'relays' && <ConnectionView {...views} />}

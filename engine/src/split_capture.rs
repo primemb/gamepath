@@ -3,6 +3,7 @@
 use crate::session::{DataReceiver, WireGuardSessionManager};
 use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::policy::{InterceptionPlan, RuleSpec, compile};
+use gamepath_engine::role::Role;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString, c_char, c_void};
@@ -118,7 +119,13 @@ unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
 
 impl Handle {
-    fn open(path: &Path, filter: &str, layer: u32, flags: u64) -> Result<Self, String> {
+    fn open(
+        path: &Path,
+        filter: &str,
+        layer: u32,
+        priority: i16,
+        flags: u64,
+    ) -> Result<Self, String> {
         let filter = CString::new(filter).map_err(|_| "WinDivert filter contains NUL")?;
         unsafe {
             let library = libloading::Library::new(path)
@@ -147,7 +154,7 @@ impl Handle {
                     .map_err(|error| error.to_string())?,
                 _library: library,
             });
-            let raw = open(filter.as_ptr(), layer, 0, flags);
+            let raw = open(filter.as_ptr(), layer, priority, flags);
             if raw == -1 {
                 return Err(format!(
                     "WinDivertOpen failed: {}",
@@ -270,6 +277,8 @@ struct ReturnPath {
     process_id: Option<u32>,
     usage: Arc<AppUsage>,
     last_seen: Instant,
+    /// Set for a redirected lookup: replies are rewritten to come from it.
+    resolver: Option<Ipv4Addr>,
 }
 
 #[derive(Default)]
@@ -503,6 +512,34 @@ struct Registry {
     capture_id: u64,
     dll: PathBuf,
     bypass: String,
+    /// Drop rule-selected packets the session cannot carry instead of letting
+    /// them out on the normal connection. Never applies to the name lookups
+    /// captured without a rule, or a down tunnel would stop the whole machine
+    /// resolving.
+    kill_switch: bool,
+    /// Packets dropped by the kill switch.
+    held_packets: AtomicU64,
+    /// Remote DNS: lookups to a LAN resolver are answered by
+    /// [`TUNNEL_RESOLVER`] through the tunnel, see [`is_outside_name_resolution`].
+    redirect_dns: AtomicBool,
+    /// When the oldest tunnelled name lookup still waiting for an answer was
+    /// sent, in [`Registry::clock_ms`] (0: none waiting). Lookups are only
+    /// redirected while the tunnel answers, so a dead tunnel never leaves the
+    /// machine unable to resolve. Handing a packet to the session proves
+    /// nothing here: with every path down it is still sent on the last one.
+    unanswered_dns_since: AtomicU64,
+    /// Lookups go to the LAN resolver because the tunnel stopped answering.
+    dns_fallback: AtomicBool,
+    /// When a lookup was last redirected anyway to see whether the tunnel
+    /// answers again, in [`Registry::clock_ms`].
+    last_dns_probe: AtomicU64,
+    clock: Instant,
+    redirected_dns: AtomicU64,
+    /// The session is a proxy that may hand out fake-IP addresses.
+    proxy_fake_ips: bool,
+    /// See `PacketCaptureRequest::own_hostnames`.
+    own_hostnames: HashSet<String>,
+    fake_ip_packets: AtomicU64,
     handles: Mutex<Vec<Arc<Handle>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     selector_state: Mutex<SelectorState>,
@@ -604,6 +641,27 @@ impl TrafficSelector {
     }
 }
 
+/// Session choices a split capture is started with, beyond its rules.
+pub struct SplitOptions {
+    pub kill_switch: bool,
+    /// See `PacketCaptureRequest::own_hostnames`.
+    pub own_hostnames: Vec<String>,
+    /// The flows of the capture this one replaces.
+    pub carried: Option<CarriedFlows>,
+}
+
+/// What a replaced capture hands its successor. A rule edit, or the other
+/// session starting or stopping, reopens the kernel filter; without this every
+/// live connection's replies were dropped until it next sent something.
+/// Observed: 101 replies dropped in the ten seconds after the game started.
+/// The capture id is kept too, so usage keeps counting where it left off.
+pub struct CarriedFlows {
+    capture_id: u64,
+    return_paths: HashMap<ReturnKey, ReturnPath>,
+    handled_connections: HashMap<ReturnKey, HandledConnection>,
+    app_usage: HashMap<String, Arc<AppUsage>>,
+}
+
 pub struct SplitPacketCapture {
     stop: Arc<AtomicBool>,
     registry: Arc<Registry>,
@@ -626,6 +684,25 @@ pub struct CaptureScope {
 
 /// The kernel-filter half of [`is_name_resolution`].
 const DNS_CLAUSE: &str = "(udp.DstPort == 53 or tcp.DstPort == 53)";
+
+/// Where split mode's remote DNS sends a lookup aimed at a LAN resolver.
+pub const TUNNEL_RESOLVER: Ipv4Addr = gamepath_engine::dns::FALLBACK_RESOLVERS[0];
+
+/// 198.18.0.0/15 as a selector range, see [`crate::netutil::is_fake_ip`].
+const FAKE_IP_RANGE: (u32, u32) = (0xc612_0000, 0xc613_ffff);
+
+/// Priority of the send-only handle that injects replies inbound.
+///
+/// WinDivert diverts an injected packet only to handles *below* the priority
+/// of the handle that injected it, and only once per priority level. The DNS
+/// observers of both engines are sniff handles at their capture priority, so
+/// a reply injected at that same priority was invisible to the observer that
+/// most needed it: every tunnelled DNS answer, which is how wildcard and
+/// changing hostname targets learn new addresses. Injecting from above every
+/// capture priority lets each observer see every answer, whichever session's
+/// tunnel it came back through. The handle diverts nothing (`"false"`), so
+/// sharing this level between the two engines cannot clash.
+const INJECT_PRIORITY: i16 = 1000;
 
 /// Ranges beyond which a destination filter stops being worth building. Each
 /// range costs two comparisons in the kernel's filter program, and past this
@@ -685,19 +762,54 @@ impl SplitPacketCapture {
         sessions: Arc<Mutex<WireGuardSessionManager>>,
         data_receiver: Arc<DataReceiver>,
         effective_mtu: EffectiveMtu,
+        options: SplitOptions,
     ) -> Result<Self, String> {
+        let SplitOptions {
+            kill_switch,
+            own_hostnames,
+            carried,
+        } = options;
         let plan = compile("split", rules)?;
+        let (capture_id, carried_paths, carried_handled, carried_usage) = match carried {
+            Some(flows) => (
+                flows.capture_id,
+                flows.return_paths,
+                flows.handled_connections,
+                flows.app_usage,
+            ),
+            None => (
+                NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ),
+        };
+        let proxy_fake_ips = sessions.lock().unwrap().proxy_fake_ips();
         let registry = Arc::new(Registry {
-            capture_id: NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
+            capture_id,
             dll: dll_path()?,
             bypass: bypass_clause(bypass_ips),
+            kill_switch,
+            held_packets: AtomicU64::new(0),
+            redirect_dns: AtomicBool::new(false),
+            unanswered_dns_since: AtomicU64::new(0),
+            dns_fallback: AtomicBool::new(false),
+            last_dns_probe: AtomicU64::new(0),
+            clock: Instant::now(),
+            redirected_dns: AtomicU64::new(0),
+            proxy_fake_ips,
+            own_hostnames: own_hostnames
+                .iter()
+                .map(|name| name.trim_end_matches('.').to_ascii_lowercase())
+                .collect(),
+            fake_ip_packets: AtomicU64::new(0),
             handles: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
             selector_state: Mutex::new(SelectorState::default()),
             table: RwLock::new(Arc::new(SelectorTable::default())),
             table_version: AtomicU64::new(0),
-            handled_connections: Mutex::new(HashMap::new()),
-            app_usage: Mutex::new(HashMap::new()),
+            handled_connections: Mutex::new(carried_handled),
+            app_usage: Mutex::new(carried_usage),
             logged_destinations: Mutex::new(HashSet::new()),
             capture_loop_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             capture_loop_peak_us: AtomicU64::new(0),
@@ -728,8 +840,14 @@ impl SplitPacketCapture {
             tcp_mss: effective_mtu.tcp_mss(),
         });
         let stop = Arc::new(AtomicBool::new(false));
-        let return_paths = Arc::new(Mutex::new(HashMap::new()));
-        let send_handle = Arc::new(Handle::open(&registry.dll, "false", 0, 0x0008)?);
+        let return_paths = Arc::new(Mutex::new(carried_paths));
+        let send_handle = Arc::new(Handle::open(
+            &registry.dll,
+            "false",
+            0,
+            INJECT_PRIORITY,
+            0x0008,
+        )?);
 
         for selector in destination_selectors(&plan)? {
             add_selector(&registry, selector);
@@ -770,12 +888,22 @@ impl SplitPacketCapture {
         // fixed when the handle opens, while those two learn new addresses and
         // ports while the session runs, so they need the broad filter and the
         // in-memory classifier behind it.
-        let scope = capture_scope(&plan, &selector_table(&registry).destinations);
+        let mut destinations = selector_table(&registry).destinations.clone();
+        if proxy_fake_ips {
+            destinations.push(FAKE_IP_RANGE);
+        }
+        let scope = capture_scope(&plan, &destinations);
         let network_filter = format!(
             "outbound and ip and !loopback and {} and {}",
             scope.clause, registry.bypass
         );
-        let network_handle = Arc::new(Handle::open(&registry.dll, &network_filter, 0, 0)?);
+        let network_handle = Arc::new(Handle::open(
+            &registry.dll,
+            &network_filter,
+            0,
+            Role::current().capture_priority(),
+            0,
+        )?);
         network_handle.set_param(0, 1024)?;
         network_handle.set_param(1, 100)?;
         network_handle.set_param(2, 8 * 1024 * 1024)?;
@@ -886,6 +1014,18 @@ impl SplitPacketCapture {
         })
     }
 
+    /// Answers lookups aimed at LAN resolvers through the tunnel, for as long
+    /// as the tunnel answers them.
+    pub fn set_redirect_dns(&self, redirect: bool) {
+        self.registry
+            .redirect_dns
+            .store(redirect, Ordering::Relaxed);
+    }
+
+    pub fn redirects_dns(&self) -> bool {
+        self.registry.redirect_dns.load(Ordering::Relaxed)
+    }
+
     pub fn target_count(&self) -> usize {
         self.target_count
     }
@@ -972,6 +1112,8 @@ impl SplitPacketCapture {
             "capturedBytes": self.registry.captured_bytes.load(Ordering::Relaxed),
             "relayedPackets": self.registry.relayed_packets.load(Ordering::Relaxed),
             "bypassedPackets": self.registry.bypassed_packets.load(Ordering::Relaxed),
+            "killSwitch": self.registry.kill_switch,
+            "heldPackets": self.registry.held_packets.load(Ordering::Relaxed),
             "handledConnections": handled_connections,
             "appUsage": app_usage,
             "captureLoopHistogram": capture_loop_histogram,
@@ -988,10 +1130,28 @@ impl SplitPacketCapture {
             "unmatchedReturnsWrongDestination": self.registry.return_wrong_destination.load(Ordering::Relaxed),
             "unmatchedReturnsWithoutFlow": self.registry.return_without_flow.load(Ordering::Relaxed),
             "tunnelledDnsQueries": self.registry.tunnelled_dns.load(Ordering::Relaxed),
+            "redirectDns": self.registry.redirect_dns.load(Ordering::Relaxed),
+            "redirectedDnsQueries": self.registry.redirected_dns.load(Ordering::Relaxed),
+            "fakeIpPackets": self.registry.fake_ip_packets.load(Ordering::Relaxed),
             "localDestinationsLeftUntunnelled": self.registry.local_destinations.load(Ordering::Relaxed),
             "returnInjectionErrors": self.registry.return_injection_errors.load(Ordering::Relaxed),
             "driverQueueTimeMs": 100,
         })
+    }
+}
+
+impl SplitPacketCapture {
+    /// Stops this capture and hands its flows to the one replacing it.
+    pub fn into_carried(self) -> CarriedFlows {
+        let registry = Arc::clone(&self.registry);
+        let return_paths = Arc::clone(&self.return_paths);
+        drop(self);
+        CarriedFlows {
+            capture_id: registry.capture_id,
+            return_paths: std::mem::take(&mut *return_paths.lock().unwrap()),
+            handled_connections: std::mem::take(&mut *registry.handled_connections.lock().unwrap()),
+            app_usage: std::mem::take(&mut *registry.app_usage.lock().unwrap()),
+        }
     }
 }
 
@@ -1168,9 +1328,60 @@ fn run_selected_capture(
         // If the session cannot carry it, `route_selected_packet` fails open
         // and the query takes the normal route, so this can cost lookups
         // latency but never the ability to resolve.
-        if !selected && is_name_resolution(fields) {
+        let question = lookup_name(packet, fields);
+        // GamePath resolving its own nodes: left exactly as it would go with
+        // this session off, whichever session's capture sees it first.
+        let own_lookup = question
+            .as_deref()
+            .is_some_and(|name| registry.own_hostnames.contains(name));
+        let mut implicit_dns = false;
+        if !selected && !own_lookup && is_name_resolution(fields) {
             selected = true;
+            implicit_dns = true;
             registry.tunnelled_dns.fetch_add(1, Ordering::Relaxed);
+        }
+        // Remote DNS without touching Windows' resolver settings: a lookup to
+        // the router is answered by a public resolver through the tunnel, and
+        // the reply is rewritten to come from the router. Pointing a tunnel
+        // adapter at a resolver instead does not work in split mode. Windows
+        // asks every adapter's resolvers at once and takes the first answer, so
+        // the router's filtered reply wins; and a query sent from an adapter
+        // with no route to its resolver never leaves the machine at all.
+        // Whoever sent it: Chromium-based apps (Chrome, Discord, Electron)
+        // resolve with their own DNS client, so a selected app's lookup
+        // arrives here already selected by its rule, and would otherwise be
+        // sent to the router because the router is a LAN address.
+        let mut redirect = None;
+        if registry.redirect_dns.load(Ordering::Relaxed)
+            && is_outside_name_resolution(fields)
+            && !own_lookup
+            && !question
+                .as_deref()
+                .is_some_and(gamepath_engine::dns::is_local_only_name)
+            && registry.tunnel_answers_dns()
+        {
+            if registry.redirected_dns.fetch_add(1, Ordering::Relaxed) == 0 {
+                gamepath_engine::log_info!(
+                    "name lookups to {} are answered by {TUNNEL_RESOLVER} through the tunnel",
+                    fields.destination
+                );
+            }
+            redirect = Some(fields.destination);
+            selected = true;
+            implicit_dns = true;
+        }
+        // An address the proxy invented reaches nothing but the proxy, whoever
+        // looked it up.
+        let fake_ip = registry.proxy_fake_ips && crate::netutil::is_fake_ip(fields.destination);
+        if fake_ip {
+            if registry.fake_ip_packets.fetch_add(1, Ordering::Relaxed) == 0 {
+                gamepath_engine::log_info!(
+                    "the proxy answers name lookups with fake-IP addresses; connections to {} \
+                     and the rest of 198.18.0.0/15 go through it whichever app made them",
+                    fields.destination
+                );
+            }
+            selected = true;
         }
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
@@ -1234,7 +1445,11 @@ fn run_selected_capture(
         // itself. It applies to every way a packet can be selected, because a
         // rule naming an application selects a LAN game server, a printer or a
         // NAS exactly as readily as it selects the game's own servers.
-        if selected && !crate::netutil::is_globally_routable_ipv4(fields.destination) {
+        if selected
+            && !fake_ip
+            && redirect.is_none()
+            && !crate::netutil::is_globally_routable_ipv4(fields.destination)
+        {
             selected = false;
             registry.local_destinations.fetch_add(1, Ordering::Relaxed);
         }
@@ -1242,7 +1457,7 @@ fn run_selected_capture(
             reinject(&handle, &bypass, &registry, packet, address);
             continue;
         }
-        route_selected_packet(
+        let carried = route_selected_packet(
             &handle,
             &sessions,
             &return_paths,
@@ -1254,8 +1469,85 @@ fn run_selected_capture(
             application.as_deref(),
             process_id,
             &mut tunnel_buffer,
+            registry.kill_switch && !implicit_dns,
+            redirect,
         );
+        if implicit_dns {
+            registry.dns_sent(carried);
+        }
     }
+}
+
+/// How long a tunnelled lookup may go unanswered before lookups go to the LAN
+/// resolver instead. Windows retries a lookup after one second, so a dead
+/// tunnel costs a lookup about two seconds before the fallback answers it.
+const DNS_ANSWER_TIMEOUT_MS: u64 = 2_000;
+
+/// How often one lookup is still sent through the tunnel during a fallback.
+/// Without it nothing would be sent there, and nothing could notice the tunnel
+/// answering again.
+const DNS_PROBE_INTERVAL_MS: u64 = 1_000;
+
+impl Registry {
+    /// Milliseconds since the capture started, never 0.
+    fn clock_ms(&self) -> u64 {
+        self.clock.elapsed().as_millis() as u64 + 1
+    }
+
+    fn dns_sent(&self, carried: bool) {
+        if carried {
+            let _ = self.unanswered_dns_since.compare_exchange(
+                0,
+                self.clock_ms(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        } else {
+            // Not handed to the session at all: as unanswered as it gets.
+            self.unanswered_dns_since.store(1, Ordering::Relaxed);
+        }
+    }
+
+    fn dns_answered(&self) {
+        self.unanswered_dns_since.store(0, Ordering::Relaxed);
+        if self.dns_fallback.swap(false, Ordering::Relaxed) {
+            gamepath_engine::log_info!("the tunnel answers name lookups again");
+        }
+    }
+
+    /// Whether this lookup should go through the tunnel.
+    fn tunnel_answers_dns(&self) -> bool {
+        let now = self.clock_ms();
+        if answered_in_time(self.unanswered_dns_since.load(Ordering::Relaxed), now) {
+            return true;
+        }
+        if !self.dns_fallback.swap(true, Ordering::Relaxed) {
+            gamepath_engine::log_warn!(
+                "the tunnel left a name lookup unanswered for {DNS_ANSWER_TIMEOUT_MS} ms; \
+                 lookups go to the LAN resolver until it answers again"
+            );
+        }
+        let last = self.last_dns_probe.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= DNS_PROBE_INTERVAL_MS
+            && self
+                .last_dns_probe
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+}
+
+fn answered_in_time(unanswered_since: u64, now: u64) -> bool {
+    unanswered_since == 0 || now.saturating_sub(unanswered_since) < DNS_ANSWER_TIMEOUT_MS
+}
+
+/// The name a UDP lookup asks for. TCP lookups are not parsed: they are rare,
+/// and a stream's first segment carries no question.
+fn lookup_name(packet: &[u8], fields: Ipv4Fields) -> Option<String> {
+    if fields.protocol != 17 || fields.destination_port != 53 {
+        return None;
+    }
+    let header = usize::from(packet[0] & 0x0f) * 4;
+    gamepath_engine::dns::question_name(packet.get(header + 8..)?)
 }
 
 /// Hands a packet that is not ours to the reinjector, or puts it back inline
@@ -1352,7 +1644,17 @@ fn route_selected_packet(
     application: Option<&str>,
     process_id: Option<u32>,
     tunnel_buffer: &mut Vec<u8>,
-) {
+    hold_on_failure: bool,
+    // The LAN resolver a redirected lookup was sent to.
+    redirect: Option<Ipv4Addr>,
+) -> bool {
+    let fields = match redirect {
+        Some(_) => Ipv4Fields {
+            destination: TUNNEL_RESOLVER,
+            ..fields
+        },
+        None => fields,
+    };
     let connection_key = ReturnKey::outbound(fields);
     let now = Instant::now();
     let mut paths = return_paths.lock().unwrap();
@@ -1391,6 +1693,7 @@ fn route_selected_packet(
             process_id,
             usage: Arc::clone(&usage),
             last_seen: now,
+            resolver: redirect,
         },
     );
     drop(paths);
@@ -1406,6 +1709,9 @@ fn route_selected_packet(
     tunnel_buffer.extend_from_slice(packet);
     let tunneled = &mut tunnel_buffer[..];
     tunneled[12..16].copy_from_slice(&virtual_ipv4.octets());
+    if redirect.is_some() {
+        tunneled[16..20].copy_from_slice(&TUNNEL_RESOLVER.octets());
+    }
     clamp_tcp_mss(tunneled, registry.tcp_mss);
     let mut checksum_address = address;
     let forwarded = if handle.checksums(tunneled, &mut checksum_address).is_err() {
@@ -1413,7 +1719,9 @@ fn route_selected_packet(
     } else {
         sessions.lock().unwrap().enqueue_data_packet(tunneled)
     };
-    if forwarded.is_err() {
+    if forwarded.is_err() && hold_on_failure {
+        registry.held_packets.fetch_add(1, Ordering::Relaxed);
+    } else if forwarded.is_err() {
         // Fail open for the selected connection when the relay is unavailable.
         registry.bypassed_packets.fetch_add(1, Ordering::Relaxed);
         let _ = handle.send(packet, &address);
@@ -1423,6 +1731,7 @@ fn route_selected_packet(
             usage.sent.fetch_add(packet.len() as u64, Ordering::Relaxed);
         }
     }
+    forwarded.is_ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1466,6 +1775,8 @@ fn run_pending_syns(
                 application,
                 process_id,
                 &mut tunnel_buffer,
+                registry.kill_switch,
+                None,
             );
         } else {
             let _ = handle.send(&item.packet, &item.address);
@@ -1481,7 +1792,13 @@ fn spawn_process_tracker(
 ) -> Result<(), String> {
     // SOCKET events are observation-only. SNIFF|RECV_ONLY copies events while
     // allowing Windows to create every socket normally.
-    let handle = Arc::new(Handle::open(&registry.dll, "true", 3, 0x0005)?);
+    let handle = Arc::new(Handle::open(
+        &registry.dll,
+        "true",
+        3,
+        Role::current().capture_priority(),
+        0x0005,
+    )?);
     registry.handles.lock().unwrap().push(Arc::clone(&handle));
     let applications = plan.application_paths.clone();
     let folders = plan.folder_prefixes.clone();
@@ -1970,6 +2287,7 @@ fn spawn_dns_tracker(
         &registry.dll,
         "inbound and ip and udp.SrcPort == 53",
         0,
+        Role::current().capture_priority(),
         0x0005,
     )?);
     registry.handles.lock().unwrap().push(Arc::clone(&handle));
@@ -2049,7 +2367,13 @@ fn run_reply_injector(
             path.last_seen = Instant::now();
             path.clone()
         };
+        if fields.source_port == 53 {
+            registry.dns_answered();
+        }
         packet[16..20].copy_from_slice(&path.local_ip.octets());
+        if let Some(resolver) = path.resolver {
+            packet[12..16].copy_from_slice(&resolver.octets());
+        }
         clamp_tcp_mss(&mut packet, 1000);
         let mut address = Address::inbound(path.interface_index, path.subinterface_index);
         if handle.checksums(&mut packet, &mut address).is_ok()
@@ -2090,6 +2414,7 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
             registry.return_wrong_destination.load(Ordering::Relaxed),
             registry.return_without_flow.load(Ordering::Relaxed),
             registry.return_injection_errors.load(Ordering::Relaxed),
+            registry.held_packets.load(Ordering::Relaxed),
         ]
     };
     let mut reported = read();
@@ -2110,11 +2435,12 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
             continue;
         }
         let delta =
-            std::array::from_fn::<_, 9, _>(|index| current[index].saturating_sub(reported[index]));
+            std::array::from_fn::<_, 10, _>(|index| current[index].saturating_sub(reported[index]));
         gamepath_engine::log_warn!(
             "split capture anomaly: selected-fail-open=+{} bypass-queue-full=+{} \
              receive-errors=+{} pending-syn-overflow=+{} slow-loops=+{} \
-             returns-dropped=+{}/{}/{} (not-ipv4/wrong-dest/no-flow) \n             return-injection-errors=+{} peak-loop={}us",
+             returns-dropped=+{}/{}/{} (not-ipv4/wrong-dest/no-flow) \
+             return-injection-errors=+{} kill-switch-held=+{} peak-loop={}us",
             delta[0],
             delta[1],
             delta[2],
@@ -2124,6 +2450,7 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
             delta[6],
             delta[7],
             delta[8],
+            delta[9],
             registry.capture_loop_peak_us.load(Ordering::Relaxed),
         );
         reported = current;
@@ -2194,6 +2521,16 @@ struct Ipv4Fields {
 /// to break it or to change which resolver the machine uses, and silently
 /// doing the second from inside a packet filter is not something split mode
 /// should do.
+/// A lookup aimed at a resolver on this side of the tunnel: the router, or
+/// anything else the LAN or the ISP hands out. Loopback is left alone, because
+/// a resolver on this machine is one the user chose.
+fn is_outside_name_resolution(fields: Ipv4Fields) -> bool {
+    matches!(fields.protocol, 6 | 17)
+        && fields.destination_port == 53
+        && !fields.destination.is_loopback()
+        && !crate::netutil::is_globally_routable_ipv4(fields.destination)
+}
+
 fn is_name_resolution(fields: Ipv4Fields) -> bool {
     matches!(fields.protocol, 6 | 17)
         && fields.destination_port == 53
@@ -3041,5 +3378,49 @@ mod tests {
     fn the_kernel_clause_and_the_classifier_agree() {
         assert!(DNS_CLAUSE.contains("udp.DstPort == 53"));
         assert!(DNS_CLAUSE.contains("tcp.DstPort == 53"));
+    }
+
+    /// The router is the leak; a public resolver is carried instead, and one
+    /// on this machine is the user's own choice.
+    #[test]
+    fn only_a_lan_resolver_counts_as_outside_name_resolution() {
+        for (resolver, outside) in [
+            (Ipv4Addr::new(192, 168, 1, 1), true),
+            (Ipv4Addr::new(10, 0, 0, 1), true),
+            (Ipv4Addr::new(100, 64, 0, 1), true),
+            (Ipv4Addr::new(8, 8, 8, 8), false),
+            (Ipv4Addr::new(127, 0, 0, 1), false),
+        ] {
+            for protocol in [6, 17] {
+                let mut fields = dns_fields(protocol, 53);
+                fields.destination = resolver;
+                assert_eq!(is_outside_name_resolution(fields), outside, "{resolver}");
+            }
+        }
+        let mut web = dns_fields(6, 443);
+        web.destination = Ipv4Addr::new(192, 168, 1, 1);
+        assert!(!is_outside_name_resolution(web));
+    }
+
+    /// Redirecting holds while answers come back, and lifts once one is late.
+    #[test]
+    fn lookups_are_redirected_only_while_the_tunnel_answers() {
+        assert!(answered_in_time(0, 10_000), "nothing waiting");
+        assert!(answered_in_time(9_000, 10_000), "one second waiting");
+        assert!(
+            !answered_in_time(7_500, 10_000),
+            "two and a half seconds waiting"
+        );
+        assert!(!answered_in_time(1, 10_000), "never handed to the session");
+    }
+
+    #[test]
+    fn the_fake_ip_range_matches_the_routability_check() {
+        let (first, last) = FAKE_IP_RANGE;
+        for address in [first, last] {
+            assert!(crate::netutil::is_fake_ip(Ipv4Addr::from(address)));
+        }
+        assert!(!crate::netutil::is_fake_ip(Ipv4Addr::from(first - 1)));
+        assert!(!crate::netutil::is_fake_ip(Ipv4Addr::from(last + 1)));
     }
 }

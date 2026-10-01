@@ -310,6 +310,37 @@ Statistics keeps per-device usage alongside nodes and applications.
   firewall rule the engine adds is limited to the local subnet. If the port is taken, the next free one is
   used and the screen says so.
 
+## VPN
+
+The **VPN** section is a second connection for everyday apps, running beside the game session and never in its
+way: a browser, a chat client or a launcher's store can use a VPN while the game uses its own tunnel, and
+everything else keeps the normal connection.
+
+- **One node, connected directly.** WireGuard, OpenVPN, L2TP/IPsec or SOCKS5. Nothing is duplicated and no
+  relay is involved. Adding a node while one is saved replaces it; a running VPN reconnects through the new one.
+- **Its own targets.** Applications, folders, websites and IP ranges, exactly like the game's split rules, or
+  all traffic except the game. Edits apply live, without reconnecting.
+- **The game always comes first.** Whatever the game session selects goes through the game, even if the VPN
+  lists it too; such a target is marked **Game rule wins**. A game session in all-traffic mode pauses the VPN,
+  which resumes by itself when that session stops or switches to split mode. Starting the game is never
+  refused because of the VPN.
+- **SOCKS5 forwards everything.** TCP is carried with `CONNECT` and UDP with `UDP ASSOCIATE`; if the proxy has
+  no UDP support, its UDP traffic is lost, and nothing is ever sent around the proxy instead. Name lookups go
+  over TCP through it, so they work through TCP-only proxies too. **Test proxy** logs in and opens a
+  connection through it, with no relay needed.
+- **L2TP/IPsec routes by address.** In split mode it carries websites and IP ranges, not individual apps; use
+  all-traffic mode or another kind of node for those, as with direct game sessions.
+- **Kill switch** (off by default). While the node is not answering, selected apps are blocked instead of
+  using the normal connection. Name lookups are never blocked. During an automatic reconnect there is a gap
+  of a second or two where it cannot hold traffic.
+- **It stays up.** A dropped VPN reconnects on its own, quickly at first and then every 30 s, and right away
+  after the PC wakes from sleep. A VPN left on when the app quits comes back on at the next launch. The tray
+  menu has a **Connect VPN** / **Disconnect VPN** item for use while a game is fullscreen.
+- Its traffic is counted apart from the game's, under **VPN** on the Statistics screen.
+
+IPv6 is not carried, as for the game: on a dual-stack connection, a selected app can still reach a site over
+IPv6 directly. `npm run vpn:coexist-test` checks both sessions together on a real machine.
+
 ## CI and tagged releases
 
 [GitHub Actions](.github/workflows/ci.yml) runs on pull requests, pushes to

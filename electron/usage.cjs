@@ -6,31 +6,18 @@ const dayKey = (date) => {
   return `${local.getFullYear()}-${String(local.getMonth() + 1).padStart(2, '0')}-${String(local.getDate()).padStart(2, '0')}`
 }
 
-class UsageStore {
-  constructor(directory) {
-    this.db = new DatabaseSync(path.join(directory, 'usage.sqlite'))
-    this.db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA synchronous = NORMAL;
-      CREATE TABLE IF NOT EXISTS usage_daily (
-        day TEXT NOT NULL,
-        category TEXT NOT NULL,
-        identity TEXT NOT NULL,
-        label TEXT NOT NULL,
-        sent INTEGER NOT NULL DEFAULT 0,
-        received INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (day, category, identity)
-      );
-    `)
-    this.insert = this.db.prepare(`
-      INSERT INTO usage_daily (day, category, identity, label, sent, received)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(day, category, identity) DO UPDATE SET
-        label = excluded.label,
-        sent = sent + excluded.sent,
-        received = received + excluded.received
-    `)
-    this.pending = new Map()
+/**
+ * Turns one running session's cumulative counters into deltas.
+ *
+ * Each session keeps its own baselines, so the game and the VPN can report at
+ * the same time without either reading the other's counters as a reset. The
+ * prefix keeps their rows apart in the shared table: the game writes the
+ * categories it always did, the VPN writes `vpn-total`, `vpn-node`, `vpn-app`.
+ */
+class UsageSession {
+  constructor(store, prefix = '') {
+    this.store = store
+    this.prefix = prefix
     this.last = new Map()
     this.session = null
     this.captureId = null
@@ -38,7 +25,7 @@ class UsageStore {
   }
 
   start(session, nodes) {
-    this.flush()
+    this.store.flush()
     this.last.clear()
     this.captureId = null
     this.lanProxyStartedAt = null
@@ -82,10 +69,57 @@ class UsageStore {
     const receivedDelta = difference(received, before?.received)
     this.last.set(key, { sent, received })
     if (!sentDelta && !receivedDelta) return
-    const pendingKey = `${day}\0${key}`
+    this.store.add(day, `${this.prefix}${category}`, identity, label, sentDelta, receivedDelta)
+  }
+}
+
+class UsageStore {
+  constructor(directory) {
+    this.db = new DatabaseSync(path.join(directory, 'usage.sqlite'))
+    this.db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      CREATE TABLE IF NOT EXISTS usage_daily (
+        day TEXT NOT NULL,
+        category TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        label TEXT NOT NULL,
+        sent INTEGER NOT NULL DEFAULT 0,
+        received INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, category, identity)
+      );
+    `)
+    this.insert = this.db.prepare(`
+      INSERT INTO usage_daily (day, category, identity, label, sent, received)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(day, category, identity) DO UPDATE SET
+        label = excluded.label,
+        sent = sent + excluded.sent,
+        received = received + excluded.received
+    `)
+    this.pending = new Map()
+    // The game session, under the categories every earlier release wrote.
+    this.game = new UsageSession(this)
+  }
+
+  /** A separate session whose rows are kept apart by `prefix`. */
+  session(prefix) {
+    return new UsageSession(this, prefix)
+  }
+
+  start(session, nodes) {
+    this.game.start(session, nodes)
+  }
+
+  record(runtime, at = new Date()) {
+    this.game.record(runtime, at)
+  }
+
+  add(day, category, identity, label, sent, received) {
+    const pendingKey = `${day}\0${category}\0${identity}`
     const entry = this.pending.get(pendingKey) ?? { day, category, identity, label, sent: 0, received: 0 }
-    entry.sent += sentDelta
-    entry.received += receivedDelta
+    entry.sent += sent
+    entry.received += received
     this.pending.set(pendingKey, entry)
   }
 
@@ -118,15 +152,14 @@ class UsageStore {
     `,
       )
       .all(from, to)
-    const days = this.db
-      .prepare(
-        `
+    const daily = this.db.prepare(`
       SELECT day, SUM(sent) AS sent, SUM(received) AS received
-      FROM usage_daily WHERE category = 'total' AND day BETWEEN ? AND ? GROUP BY day ORDER BY day
-    `,
-      )
-      .all(from, to)
-    return { from, to, totals, days }
+      FROM usage_daily WHERE category = ? AND day BETWEEN ? AND ? GROUP BY day ORDER BY day
+    `)
+    // The game's series keeps its old name; the VPN's is reported beside it.
+    const days = daily.all('total', from, to)
+    const vpnDays = daily.all('vpn-total', from, to)
+    return { from, to, totals, days, vpnDays }
   }
 
   reset() {
@@ -141,4 +174,4 @@ class UsageStore {
   }
 }
 
-module.exports = { UsageStore, dayKey }
+module.exports = { UsageStore, UsageSession, dayKey }

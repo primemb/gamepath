@@ -170,6 +170,12 @@ impl WireGuardSessionManager {
             .unwrap_or_default()
     }
 
+    pub(crate) fn proxy_fake_ips(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|session| session.proxy_fake_ips)
+    }
+
     fn all_paths_reachable(&self) -> bool {
         self.active
             .as_ref()

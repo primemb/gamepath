@@ -1,0 +1,517 @@
+/* ---- VPN section ----
+   The VPN wears violet wherever it appears, so it can never be mistaken for
+   the cyan game session at a glance. */
+
+:root {
+  --vpn-accent: var(--violet);
+  --vpn-accent-soft: rgba(138, 124, 255, 0.12);
+  --vpn-accent-line: rgba(138, 124, 255, 0.28);
+  --vpn-warn: #ffb35c;
+  --vpn-warn-soft: rgba(255, 179, 92, 0.1);
+  --vpn-danger: #ff8a80;
+}
+
+.vpn-page {
+  display: grid;
+  gap: 14px;
+  max-width: 1100px;
+  margin: auto;
+}
+
+/* Shared controls, in the VPN's colour inside its page. */
+.vpn-page .toggle.is-on {
+  background: rgba(138, 124, 255, 0.24);
+}
+.vpn-page .toggle.is-on span {
+  background: var(--vpn-accent);
+  box-shadow: 0 0 8px rgba(138, 124, 255, 0.45);
+}
+.vpn-page .segmented-control button.active {
+  color: var(--vpn-accent);
+  border-color: var(--vpn-accent-line);
+  background: var(--vpn-accent-soft);
+}
+.vpn-page .button.primary {
+  color: #0d0a24;
+  border-color: var(--vpn-accent);
+  background: var(--vpn-accent);
+}
+.vpn-page .kind-grid button.active {
+  color: var(--vpn-accent);
+  border-color: var(--vpn-accent-line);
+  background: var(--vpn-accent-soft);
+}
+.vpn-page .toggle:focus-visible,
+.vpn-page .segmented-control button:focus-visible {
+  outline: 2px solid var(--vpn-accent);
+  outline-offset: 2px;
+}
+/* Command card: the dashboard's command bar, in the VPN's colour. */
+.vpn-command::before {
+  background: rgba(138, 124, 255, 0.14);
+}
+.vpn-command .command-core {
+  border-color: var(--vpn-accent-line);
+  color: var(--vpn-accent);
+  background: rgba(138, 124, 255, 0.09);
+  box-shadow: inset 0 0 22px rgba(138, 124, 255, 0.06);
+}
+.vpn-command.is-connected::before {
+  opacity: 1;
+}
+.vpn-command.is-connected .command-core::after {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border: 1px solid rgba(138, 124, 255, 0.35);
+  border-radius: 20px;
+  animation: command-pulse 2.4s ease-out infinite;
+}
+.vpn-command.is-degraded .command-core,
+.vpn-command.is-paused .command-core,
+.vpn-command.is-reconnecting .command-core {
+  border-color: rgba(255, 179, 92, 0.3);
+  color: var(--vpn-warn);
+  background: var(--vpn-warn-soft);
+}
+.vpn-command.is-error .command-core {
+  border-color: rgba(255, 138, 128, 0.3);
+  color: var(--vpn-danger);
+  background: rgba(255, 138, 128, 0.08);
+}
+.vpn-command .command-identity p {
+  font-size: 12px;
+  max-width: 46ch;
+}
+.vpn-rates {
+  display: grid;
+  gap: 1px;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+}
+.vpn-rates span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.vpn-connect {
+  color: #0d0a24;
+  background: var(--vpn-accent);
+  box-shadow: 0 10px 28px rgba(138, 124, 255, 0.2);
+}
+.vpn-connect:hover {
+  box-shadow: 0 13px 32px rgba(138, 124, 255, 0.3);
+}
+.vpn-connect:focus-visible {
+  outline-color: #d5d0ff;
+}
+.vpn-connect.connected {
+  color: #ebe8ff;
+  background: var(--vpn-accent-soft);
+  box-shadow: inset 0 0 0 1px rgba(138, 124, 255, 0.45);
+}
+.vpn-connect:disabled {
+  cursor: not-allowed;
+}
+.vpn-connect[aria-busy='true'] {
+  cursor: wait;
+}
+.vpn-spin {
+  animation: vpn-spin 0.9s linear infinite;
+}
+@keyframes vpn-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.vpn-status-pill {
+  align-self: center;
+  padding: 4px 9px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #8993a5;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.vpn-status-pill i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.vpn-status-pill.is-connected {
+  color: var(--vpn-accent);
+  background: var(--vpn-accent-soft);
+}
+.vpn-status-pill.is-degraded,
+.vpn-status-pill.is-paused,
+.vpn-status-pill.is-reconnecting,
+.vpn-status-pill.is-connecting {
+  color: var(--vpn-warn);
+  background: var(--vpn-warn-soft);
+}
+.vpn-status-pill.is-error {
+  color: var(--vpn-danger);
+  background: rgba(255, 138, 128, 0.08);
+}
+
+/* Coexistence with the game. */
+.vpn-banner {
+  padding: 13px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--cyan);
+  background: rgba(38, 230, 205, 0.035);
+}
+.vpn-banner > div {
+  flex: 1;
+  min-width: 0;
+}
+.vpn-banner strong {
+  display: block;
+  color: #e6ebf3;
+  font-size: 12.5px;
+}
+.vpn-banner p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.vpn-banner.is-warning {
+  border-color: rgba(255, 179, 92, 0.22);
+  color: var(--vpn-warn);
+  background: var(--vpn-warn-soft);
+}
+
+/* Cards. */
+.vpn-card {
+  margin: 0;
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.015);
+}
+.vpn-card .card-head small {
+  font-size: 11px;
+}
+.vpn-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: 14px;
+  align-items: start;
+}
+.vpn-columns .traffic-mode-card {
+  margin: 0;
+  flex-direction: column;
+  align-items: stretch;
+}
+.vpn-columns .traffic-mode-card .segmented-control {
+  width: 100%;
+}
+.vpn-columns .traffic-mode-card .segmented-control button {
+  flex: 1;
+}
+.vpn-columns .remote-dns-row p {
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* Node. */
+.vpn-kind-grid {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.vpn-kind-grid button {
+  min-height: 96px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  color: #dce2ec;
+  background: var(--panel);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    transform 0.18s ease;
+}
+.vpn-kind-grid button:hover {
+  border-color: var(--vpn-accent-line);
+  background: var(--panel-raised);
+  transform: translateY(-1px);
+}
+.vpn-kind-grid button:focus-visible {
+  outline: 2px solid var(--vpn-accent);
+  outline-offset: 2px;
+}
+.vpn-kind-grid strong {
+  font-size: 13px;
+}
+.vpn-kind-grid small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.vpn-kind-icon {
+  width: 34px;
+  height: 34px;
+  margin-bottom: 4px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  color: var(--vpn-accent);
+  background: var(--vpn-accent-soft);
+}
+.vpn-node {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.vpn-node-avatar {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  color: var(--vpn-accent);
+  background: var(--vpn-accent-soft);
+}
+.vpn-node-copy {
+  flex: 1;
+  min-width: 0;
+}
+.vpn-node-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.vpn-node-title strong {
+  overflow: hidden;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vpn-kind-pill {
+  color: var(--vpn-accent);
+  background: var(--vpn-accent-soft);
+  font-size: 9px;
+}
+.vpn-node-endpoint {
+  margin-top: 4px;
+  display: block;
+  color: var(--muted);
+  font-family: 'Cascadia Code', monospace;
+  font-size: 11px;
+}
+.vpn-node-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.vpn-replace {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.vpn-replace p {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* Targets. */
+.vpn-targets.is-inactive .vpn-target-list {
+  opacity: 0.55;
+}
+.vpn-target-actions {
+  margin-top: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.vpn-hint {
+  margin: 12px 0 0;
+  display: flex;
+  gap: 7px;
+  color: var(--vpn-warn);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.vpn-hint svg {
+  flex: none;
+  margin-top: 2px;
+}
+.vpn-target-list {
+  margin: 14px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  list-style: none;
+}
+.vpn-target {
+  min-height: 52px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  background: var(--panel);
+}
+.vpn-target.is-paused {
+  opacity: 0.6;
+}
+.vpn-target-icon {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  color: var(--vpn-accent);
+  background: var(--vpn-accent-soft);
+}
+.vpn-target-copy {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.vpn-target-copy strong {
+  overflow: hidden;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vpn-target-copy small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vpn-target-notes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.vpn-note {
+  padding: 2px 6px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+}
+.vpn-note.is-game {
+  color: var(--cyan);
+  background: var(--cyan-soft);
+}
+.vpn-note.is-warning {
+  color: var(--vpn-warn);
+  background: var(--vpn-warn-soft);
+}
+.vpn-target-kind {
+  flex: none;
+  color: #6f7b8d;
+  font-size: 10.5px;
+}
+.vpn-empty-targets {
+  margin-top: 14px;
+  padding: 26px 18px;
+  border: 1px dashed rgba(255, 255, 255, 0.1);
+  border-radius: 11px;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  color: var(--vpn-accent);
+  text-align: center;
+}
+.vpn-empty-targets strong {
+  color: #dce2ec;
+  font-size: 13px;
+}
+.vpn-empty-targets p {
+  max-width: 40ch;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.vpn-field-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.vpn-field-error svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+/* Sidebar dot and the overview card. */
+.vpn-status-card-icon {
+  color: var(--vpn-accent);
+  background: var(--vpn-accent-soft);
+}
+.vpn-status-card.is-connected {
+  border-color: var(--vpn-accent-line);
+}
+.vpn-status-card.is-degraded .vpn-status-card-icon,
+.vpn-status-card.is-paused .vpn-status-card-icon,
+.vpn-status-card.is-reconnecting .vpn-status-card-icon {
+  color: var(--vpn-warn);
+  background: var(--vpn-warn-soft);
+}
+
+@media (max-width: 1180px) {
+  .vpn-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .vpn-kind-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+html[dir='rtl'] .vpn-kind-grid button,
+html[dir='rtl'] .vpn-target {
+  text-align: right;
+}
+@media (prefers-reduced-motion: reduce) {
+  .vpn-spin,
+  .vpn-command.is-connected .command-core::after {
+    animation: none;
+  }
+  .vpn-kind-grid button {
+    transition: none;
+  }
+}
+
+/* The Statistics switch between the game's traffic and the VPN's. */
+.usage-scope button.is-vpn.active {
+  color: #0d0a24;
+  background: var(--vpn-accent);
+}

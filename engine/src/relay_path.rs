@@ -367,6 +367,15 @@ impl NodeSpec {
                     },
                 )?,
             ))),
+            // The VPN terminates captured traffic in a stack of its own and
+            // replays it through the proxy; game traffic cannot be treated so.
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Socks5 { .. } if crate::role::Role::current() == crate::role::Role::Vpn => {
+                Ok(DirectPath::Socks5(Box::new(crate::tun2socks::Socks5Stack::open(
+                    &self.socks5_config().ok_or("node is not a SOCKS5 node")?,
+                    crate::BENCHMARK_TARGET,
+                )?)))
+            }
             Self::Socks5 { .. } => Err(
                 "a SOCKS5 proxy cannot carry a direct session on its own. Use a WireGuard, \
                  OpenVPN or L2TP/IPsec node for direct mode, or set up a relay to reach this proxy through."
@@ -667,6 +676,8 @@ pub enum DirectPath {
     WireGuard(Box<DirectWireGuardPath>),
     #[cfg(feature = "openvpn")]
     OpenVpn(Box<UserSpaceOpenVpnPath>),
+    #[cfg(all(windows, feature = "socks-server"))]
+    Socks5(Box<crate::tun2socks::Socks5Stack>),
 }
 
 impl DirectPath {
@@ -675,6 +686,8 @@ impl DirectPath {
             Self::WireGuard(_) => KIND_WIREGUARD,
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(_) => KIND_OPENVPN,
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Socks5(_) => KIND_SOCKS5,
         }
     }
 
@@ -685,6 +698,8 @@ impl DirectPath {
             Self::WireGuard(path) => path.address(),
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(path) => path.address(),
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Socks5(path) => path.address(),
         }
     }
 
@@ -693,6 +708,8 @@ impl DirectPath {
             Self::WireGuard(path) => path.endpoint(),
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(path) => path.endpoint(),
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Socks5(path) => path.endpoint(),
         }
     }
 
@@ -706,6 +723,8 @@ impl DirectPath {
                 IpAddr::V4(ip) => Some(ip),
                 IpAddr::V6(_) => None,
             },
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Socks5(path) => path.bypass_ipv4(),
         }
     }
 
@@ -717,6 +736,8 @@ impl DirectPath {
             Self::WireGuard(path) => path.handshake_latency_ms(),
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(path) => path.handshake_latency_ms(),
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Socks5(path) => path.handshake_latency_ms(),
         }
     }
 
@@ -725,6 +746,8 @@ impl DirectPath {
             Self::WireGuard(path) => path.send_packet(packet),
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(path) => path.send_inner(packet),
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Socks5(path) => path.send_packet(packet),
         }
     }
 
@@ -743,6 +766,8 @@ impl DirectPath {
                 packets.retain(|packet| ipv4_destination(packet) == Some(address));
                 Ok(packets)
             }
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Socks5(path) => path.receive_packets(timeout),
         }
     }
 }

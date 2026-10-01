@@ -21,13 +21,14 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
-    DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIfEntry2,
-    GetIpForwardTable2, GetIpInterfaceEntry, GetIpInterfaceTable, GetUnicastIpAddressTable,
-    IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
-    MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
-    MIB_IPINTERFACE_TABLE, MIB_UNICASTIPADDRESS_TABLE, SetInterfaceDnsSettings,
-    SetIpInterfaceEntry,
+    CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS,
+    DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2,
+    DeleteUnicastIpAddressEntry, FreeMibTable, GetBestRoute2, GetIfEntry2, GetIpForwardTable2,
+    GetIpInterfaceEntry, GetIpInterfaceTable, GetUnicastIpAddressTable, IF_TYPE_ETHERNET_CSMACD,
+    IF_TYPE_IEEE80211, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
+    InitializeUnicastIpAddressEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+    MIB_IPINTERFACE_ROW, MIB_IPINTERFACE_TABLE, MIB_UNICASTIPADDRESS_ROW,
+    MIB_UNICASTIPADDRESS_TABLE, SetInterfaceDnsSettings, SetIpInterfaceEntry,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::Networking::WinSock::{
@@ -175,6 +176,87 @@ pub fn set_interface_mtu(interface_index: u32, mtu: u16) -> Result<u32, String> 
         ));
     }
     interface_mtu(interface_index)
+}
+
+/// Makes `address/prefix_length` the only IPv4 address on `interface_index`.
+///
+/// Replaces `netsh interface ipv4 set address`, which is what the `wintun`
+/// crate shells out to. That quoted the adapter name in a way netsh rejects
+/// once the name holds a space ("GamePath VPN"), and reported the failure with
+/// an empty message because netsh prints errors to stdout. It also cost most of
+/// a second per session start.
+///
+/// The address is created already preferred, skipping duplicate address
+/// detection: nothing else can hold a tunnel adapter's own address, and DAD
+/// would only delay the adapter becoming usable.
+pub fn set_interface_ipv4_address(
+    interface_index: u32,
+    address: Ipv4Addr,
+    prefix_length: u8,
+) -> Result<(), String> {
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    let status = unsafe { GetUnicastIpAddressTable(AF_INET, &mut table) };
+    if status != NO_ERROR {
+        return Err(format!(
+            "could not read the IPv4 address table (error {status})"
+        ));
+    }
+    let mut present = false;
+    if !table.is_null() {
+        // SAFETY: as in `interface_index_for_address`.
+        let rows = unsafe {
+            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+        };
+        // A previous session may have left a different address behind; netsh
+        // replaced it, so this does too.
+        for row in rows
+            .iter()
+            .filter(|row| row.InterfaceIndex == interface_index)
+        {
+            if ipv4_from(&row.Address) == Some(address) && row.OnLinkPrefixLength == prefix_length {
+                present = true;
+                continue;
+            }
+            let status = unsafe { DeleteUnicastIpAddressEntry(row) };
+            if status != NO_ERROR {
+                crate::log_warn!(
+                    "could not remove a stale address from interface {interface_index} (error {status})"
+                );
+            }
+        }
+        unsafe { FreeMibTable(table.cast()) };
+    }
+    if present {
+        return Ok(());
+    }
+    let mut row: MIB_UNICASTIPADDRESS_ROW = unsafe { std::mem::zeroed() };
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.Address = sockaddr_v4(address);
+    row.InterfaceIndex = interface_index;
+    row.OnLinkPrefixLength = prefix_length;
+    row.DadState = IpDadStatePreferred;
+    let status = unsafe { CreateUnicastIpAddressEntry(&row) };
+    if status != NO_ERROR && status != ERROR_OBJECT_ALREADY_EXISTS {
+        return Err(format!(
+            "could not assign {address}/{prefix_length} to interface {interface_index} (error {status})"
+        ));
+    }
+    Ok(())
+}
+
+#[link(name = "dnsapi")]
+unsafe extern "system" {
+    /// What `ipconfig /flushdns` calls. Exported by dnsapi.dll since Windows
+    /// 2000 but not in the SDK headers; WireGuard for Windows uses it the same
+    /// way.
+    fn DnsFlushResolverCache() -> i32;
+}
+
+/// Empties the DNS Client service's cache.
+pub fn flush_dns_cache() {
+    if unsafe { DnsFlushResolverCache() } == 0 {
+        crate::log_warn!("could not flush the DNS resolver cache");
+    }
 }
 
 /// How long a measured route MTU stays usable before it is read again.

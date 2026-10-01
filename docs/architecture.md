@@ -1052,6 +1052,112 @@ Each purchased configuration is parsed only in memory for the active session. Th
 
 The Electron UI remains unprivileged. `GamePathService` runs through Windows Service Control Manager and owns the native engine behind a token-authenticated loopback API on `127.0.0.1`. The installer creates a random 256-bit control token under `%ProgramData%\GamePath`, protects it for Local System, administrators, and the installing user, and installs the signed Wintun and WinDivert runtime files beside the service. A Windows Job Object with `KILL_ON_JOB_CLOSE` prevents the capture engine from surviving a service exit. The client renews a thirty-second session lease from its main process every three seconds; if the client disappears, the service closes the engine and its capture handles automatically. The renewal cannot be driven from the renderer, whose timers Chromium throttles whenever the window is hidden or occluded — see _Session lease_.
 
+## Concurrent sessions
+
+The service runs two independent session slots, `game` and `vpn`, each with its own engine child, Job Object,
+lease, rules and lock. Every session command takes an optional `"slot"`; a request without one is for the
+game, which is what every client written before the VPN meant. `status` keeps the game's fields at the top
+level and reports both slots under `slots`. Validation is pure: checking one slot never writes into the state
+of a session that is running.
+
+The slots never wait on each other's lock. A slot's lock is held for its whole start, and an L2TP dial alone
+takes several seconds, so if one slot's status request queued behind the other's start, the client would see
+three failed polls and tear a healthy session down. Instead each slot publishes a small summary (status,
+traffic mode, where its own tunnel traffic goes) under a lock held only for a copy, and cross-slot decisions
+read that. Each slot also has its own lease watchdog.
+
+**Priority is WinDivert's, not coordination.** The game's capture handles open at priority 0, as they always
+did; the VPN engine (`gamepath-engine.exe --role vpn`) opens its handles at −1000. WinDivert diverts a packet
+to higher-priority handles first, and a packet one handle reinjects is only seen by handles of lower priority.
+So the game takes what it selects before the VPN sees it, what the game reinjects falls through to the VPN,
+and what the VPN reinjects goes out normally. Nothing on the packet path crosses processes. The cost is one
+extra user-space round trip for unselected traffic when both slots run in the `all-outbound` scope; game
+packets are taken by the first handle and pay nothing.
+
+The inject handle that delivers replies runs at priority 1000 in both engines, above every capture
+priority. WinDivert diverts an injected packet only to handles below the injecting one, once per level, so a
+reply injected at the same priority as the DNS observer was invisible to it. That covered every tunnelled
+DNS answer — which is how wildcard and changing hostname targets learn their addresses — even before a
+second session existed.
+
+**Each slot keeps the other's tunnel clear.** The service passes the other slot's tunnel addresses (relay,
+node endpoint, proxy, L2TP server) as `foreignBypass`. Split capture excludes them in the kernel filter;
+all-traffic capture and a native L2TP all-traffic VPN route them around the tunnel as host routes via the
+physical gateway. When the game starts, stops or moves relay, the service pushes the new set to the VPN with
+`set-foreign-bypass`, in the background, so the game never waits for it. The game is never rebuilt because of
+the VPN; for the game the set is only an optimisation, applied at its next start.
+
+**The game wins conflicts.** A game session in all-traffic mode leaves the VPN nothing to carry, and its
+default route would swallow the VPN's tunnel, so the client stops the VPN before such a session starts and
+resumes it afterwards. The service enforces the same thing: it refuses a VPN start with
+`game-all-traffic` and stops a running VPN itself when the game takes all traffic. Both engines tunnel public
+DNS; while the game slot has remote DNS on it takes every query first, otherwise the VPN does.
+
+The VPN engine also writes its own log (`engine-vpn.log`), uses its own Wintun adapter (`GamePath VPN`, its
+own GUID) and raises its data-plane threads one step less than the game's, to `THREAD_PRIORITY_ABOVE_NORMAL`,
+so under a busy CPU the game's packets go first. Every service line about a slot is tagged `[game]` or
+`[vpn vpn-3f9a1c]`; the id is the client's and appears in `client.log` too.
+
+### SOCKS5 as the VPN's node
+
+A proxy cannot be handed captured packets, so the VPN engine puts a smoltcp stack in front of it
+(`engine/src/tun2socks`). TCP is answered there and replayed with `CONNECT`; UDP is forwarded datagram by
+datagram over one `UDP ASSOCIATE` per local socket; UDP lookups to port 53 go over TCP, one lookup at a time
+per stream with up to eight streams per resolver and one kept ready, with ids remapped so lookups from
+different apps cannot collide. Sharing one stream let a lookup the proxy never answered hold up every lookup
+behind it (measured through Throne). sing-box also closes a DNS stream when any lookup on it fails, so a lookup
+lost that way is sent once more on a fresh stream and then answered with SERVFAIL, never left to time out.
+Lookups to a LAN resolver are redirected whichever process sent them: Chromium-based apps (Chrome, Discord)
+resolve with their own DNS client, not the system's. One thread and one `mio` poll
+drive all of it.
+
+A connection is answered only once the proxy has opened its far end: the SYN is held, then fed to smoltcp
+or refused with a reset. Answering first would make every connection look open while the proxy is down, and
+the direct worker treats any packet back from the path as proof it is alive. ICMP cannot cross a proxy, so
+the worker's echo to the benchmark target is answered by a real `CONNECT` to it on port 53: the session's
+health and latency measure the proxy's actual route out.
+
+Proxy clients built on sing-box, Clash or Xray (Throne, for one) often answer DNS with **fake-IP** addresses
+from 198.18.0.0/15 and map each back to its name when a connection to it arrives. Only that proxy can reach
+them, so with a SOCKS5 node the VPN carries every packet to that range whichever app sent it, and both
+engines treat it as not globally routable. With remote DNS on, this means every app that resolves a name
+uses the proxy for it; turn fake DNS off in the proxy for a strict split tunnel.
+
+## Remote DNS and the router's resolver
+
+Windows sends a lookup to every adapter's resolvers at once and takes the first answer (smart multi-homed
+name resolution). On a filtered network the router answers first, with the filter's blackhole address
+(`10.10.34.36` for `discord.com`, measured), so giving a tunnel adapter resolvers of its own does not help.
+
+- **Split mode** sets no resolvers on any adapter. Lookups Windows sends to a LAN or ISP resolver are
+  redirected in the capture loop: rewritten to `TUNNEL_RESOLVER` (8.8.8.8), carried through the tunnel, and
+  the reply rewritten to come from the resolver Windows asked. Windows only ever sees its own resolver
+  answering, so there is no race. An earlier design pointed a resolver-only Wintun adapter at 8.8.8.8; with
+  no route on that adapter its queries never left the machine, and blocking the router to win the race then
+  left the machine with no DNS at all. The redirect stops as soon as a tunnelled lookup goes unanswered for
+  2 s, and while it is stopped one lookup a second is still sent through the tunnel, so the first answer
+  turns it back on; a dead tunnel costs a lookup about two seconds and never leaves the machine unable to
+  resolve. Handing the query to the session is no proof: with every path down it is still sent on the last
+  one. Names only the LAN can answer (single-label, `.local`, `.lan`, `.home.arpa`, reverse lookups for
+  private addresses) are never redirected: elsewhere they go unanswered, and through a proxy that resolves
+  them with the system resolver they would loop.
+- **All-traffic mode** points the adapter at the relay's resolver (or a public one), reached through the
+  tunnel's routes. Lookups to the router are not blocked: a kernel filter cannot tell GamePath's own lookups
+  from any other, and the game has to be able to re-resolve its nodes while its tunnel is down.
+
+**GamePath's own names are never redirected.** The client sends both sessions `ownHostnames`: every game
+node, relay and VPN node hostname. Lookups for them go out as they would with the other session off.
+Without this, a game node resolved while a SOCKS5 VPN was on got the proxy's fake-IP answer
+(`198.18.0.101:903`, measured), and that game route then ran through the VPN.
+
+This applies to the game and the VPN alike. The resolver cache is flushed when remote DNS starts and when it
+stops, so neither filtered nor fake-IP answers outlive the switch.
+
+A capture restart (a live rule edit, or the other session starting or stopping) hands the new capture its
+predecessor's reply table, routed-connection list and usage counters (`CarriedFlows`), under the same capture
+id. Before, every live connection's replies were dropped until it next sent something: 101 in the ten
+seconds after a game session started beside the VPN.
+
 ## WireSock option
 
 WireSock Core SDK can replace parts of tunnel lifecycle and per-application filtering for personal or licensed commercial builds. It is not the default because its free license is non-commercial and includes mandatory telemetry, and its ordinary tunnel manager does not implement the GamePath relay's multipath framing or deduplication.

@@ -5,6 +5,7 @@ import 'country-flag-icons/3x2/flags.css'
 import './styles.css'
 import './statistics.css'
 import './sharing.css'
+import './vpn.css'
 import App from './App'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(

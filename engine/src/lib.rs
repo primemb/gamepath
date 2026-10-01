@@ -27,12 +27,17 @@ pub mod policy;
 pub mod protocol;
 pub mod relay_path;
 pub mod replay;
+pub mod role;
 pub mod rtt;
 pub mod scheduler;
 pub mod socks5;
 pub mod thread_priority;
 pub mod timer;
 pub mod transport;
+/// SOCKS5 as the VPN's single hop. Needs the user-space stack, so it is only
+/// in builds that carry one.
+#[cfg(all(windows, feature = "socks-server"))]
+pub mod tun2socks;
 pub mod uplink;
 pub mod userspace_wireguard;
 pub mod wfp;

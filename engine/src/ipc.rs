@@ -140,6 +140,22 @@ pub(crate) struct PacketCaptureRequest {
     /// choosing it; someone who never heard of the setting should be protected.
     #[serde(default = "enabled")]
     pub(crate) remote_dns: bool,
+    /// Drop rule-selected traffic the session cannot carry rather than let it
+    /// out on the normal connection. Off unless asked for, which is how every
+    /// session behaved before the setting existed.
+    #[serde(default)]
+    pub(crate) kill_switch: bool,
+    /// Where the other session's tunnel traffic goes. Kept out of this
+    /// capture, and routed around this tunnel when it owns the default route,
+    /// so neither session ever carries the other.
+    #[serde(default)]
+    pub(crate) foreign_bypass: Vec<std::net::Ipv4Addr>,
+    /// GamePath's own node and relay names. Their lookups are neither
+    /// redirected nor tunnelled, so each session resolves its own servers as
+    /// if the other were off; a game node resolved through the VPN's proxy got
+    /// a fake-IP answer and its route then ran through the VPN.
+    #[serde(default)]
+    pub(crate) own_hostnames: Vec<String>,
 }
 
 const fn enabled() -> bool {
@@ -165,6 +181,25 @@ mod tests {
         let request: PacketCaptureRequest =
             serde_json::from_value(json!({ "trafficMode": "split" })).unwrap();
         assert!(request.remote_dns);
+    }
+
+    #[test]
+    fn a_request_from_before_the_vpn_keeps_its_old_behaviour() {
+        let request: PacketCaptureRequest =
+            serde_json::from_value(json!({ "trafficMode": "split" })).unwrap();
+        assert!(!request.kill_switch);
+        assert!(request.foreign_bypass.is_empty());
+        let request: PacketCaptureRequest = serde_json::from_value(json!({
+            "trafficMode": "split",
+            "killSwitch": true,
+            "foreignBypass": ["198.51.100.7"],
+        }))
+        .unwrap();
+        assert!(request.kill_switch);
+        assert_eq!(
+            request.foreign_bypass,
+            [std::net::Ipv4Addr::new(198, 51, 100, 7)]
+        );
     }
 
     #[test]

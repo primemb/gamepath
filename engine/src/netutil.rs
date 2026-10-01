@@ -88,6 +88,17 @@ pub(crate) fn is_globally_routable_ipv4(address: std::net::Ipv4Addr) -> bool {
         && !address.is_documentation()
         // 100.64.0.0/10, carrier-grade NAT.
         && !(first == 100 && (64..128).contains(&second))
+        && !is_fake_ip(address)
+}
+
+/// 198.18.0.0/15, reserved for benchmarking (RFC 2544) and so never on the
+/// Internet. Proxy clients built on sing-box, Clash or Xray answer name
+/// lookups with addresses from it ("fake IP") and map each one back to the
+/// name when a connection to it reaches the proxy, so only that proxy can
+/// reach them.
+pub(crate) fn is_fake_ip(address: std::net::Ipv4Addr) -> bool {
+    let [first, second, ..] = address.octets();
+    first == 198 && (second & 0xfe) == 18
 }
 
 /// Whether `address` is one this machine could reach the Internet from.
@@ -155,6 +166,9 @@ mod tests {
             // 100.64.0.0/10, the ISP's own interior.
             "100.64.0.1",
             "100.127.255.254",
+            // 198.18.0.0/15, a proxy's fake-IP range.
+            "198.18.0.2",
+            "198.19.255.255",
         ] {
             assert!(
                 !is_globally_routable_ipv4(address.parse::<Ipv4Addr>().unwrap()),
@@ -172,6 +186,8 @@ mod tests {
             "153.52.92.254",
             "100.63.255.255",
             "100.128.0.1",
+            "198.17.255.255",
+            "198.20.0.1",
         ] {
             assert!(
                 is_globally_routable_ipv4(address.parse::<Ipv4Addr>().unwrap()),

@@ -8,6 +8,9 @@ import type { NoticeKind } from '../components/Toast'
 
 type Period = 'today' | 'week' | 'year' | 'all' | 'custom'
 
+/** Whose traffic the screen shows. The two are counted apart and never added together. */
+type Scope = 'game' | 'vpn'
+
 function dateKey(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
@@ -25,7 +28,7 @@ function bounds(period: Period, from: string, to: string) {
   return { from, to }
 }
 
-function timeline(report: UsageReport, period: Period) {
+function timeline(report: Pick<UsageReport, 'from' | 'to' | 'days'>, period: Period) {
   const span = (new Date(`${report.to}T12:00:00`).getTime() - new Date(`${report.from}T12:00:00`).getTime()) / 86400000
   const grouping = period === 'all' || span > 730 ? 'year' : span > 90 ? 'month' : span > 31 ? 'week' : 'day'
   const groups = new Map<string, { label: string; sent: number; received: number }>()
@@ -125,6 +128,7 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
   const [report, setReport] = useState<UsageReport | null>(null)
   const [error, setError] = useState('')
   const [resetting, setResetting] = useState(false)
+  const [scope, setScope] = useState<Scope>('game')
   const range = bounds(period, customFrom, customTo)
 
   useEffect(() => {
@@ -166,17 +170,39 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
     }
   }
 
-  const total = report?.totals.find((row) => row.category === 'total')
-  const nodes = report?.totals.filter((row) => row.category === 'node') ?? []
-  const apps = report?.totals.filter((row) => row.category === 'app') ?? []
-  const devices = report?.totals.filter((row) => row.category === 'device') ?? []
-  const series = report ? timeline(report, period) : { points: [], grouping: 'day' }
+  const prefix = scope === 'vpn' ? 'vpn-' : ''
+  const rows = (category: string) => report?.totals.filter((row) => row.category === `${prefix}${category}`) ?? []
+  const total = rows('total')[0]
+  const nodes = rows('node')
+  const apps = rows('app')
+  // The LAN proxy runs inside the game session only.
+  const devices = scope === 'game' ? rows('device') : []
+  const days = (scope === 'vpn' ? report?.vpnDays : report?.days) ?? []
+  const series = report ? timeline({ ...report, days }, period) : { points: [], grouping: 'day' }
   const points = series.points
   const highest = Math.max(1, ...points.flatMap((point) => [point.sent, point.received]))
 
   return (
     <div className="usage-page">
       <div className="usage-toolbar">
+        <div className="usage-periods usage-scope" role="group" aria-label="Statistics for">
+          {(
+            [
+              ['game', 'Game'],
+              ['vpn', 'VPN'],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              className={`${scope === value ? 'active' : ''} ${value === 'vpn' ? 'is-vpn' : ''}`}
+              aria-pressed={scope === value}
+              onClick={() => setScope(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <div className="usage-periods" aria-label="Statistics period">
           {(
             [
@@ -236,7 +262,7 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
             <Database size={17} aria-hidden="true" /> Total carried
           </span>
           <strong>{formatBytes((total?.sent ?? 0) + (total?.received ?? 0))}</strong>
-          <small>Unique tunnelled IP traffic</small>
+          <small>{scope === 'vpn' ? 'Carried by the VPN' : 'Unique tunnelled IP traffic'}</small>
         </div>
         <div className="usage-summary-card">
           <span>
@@ -277,7 +303,7 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
             </span>
           </div>
         </div>
-        {report?.days.length ? (
+        {days.length ? (
           <div
             className="usage-chart"
             role="img"
@@ -306,7 +332,7 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
         ) : (
           <p className="usage-empty">No traffic recorded in this range yet.</p>
         )}
-        {!!report?.days.length && (
+        {!!days.length && (
           <details className="usage-data-table">
             <summary>View exact values</summary>
             <table>
@@ -333,15 +359,23 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
       <div className="usage-details">
         <UsageList title="Nodes" rows={nodes} />
         <UsageList title="Applications" rows={apps} />
-        <UsageList title="Devices" rows={devices} />
+        {scope === 'game' && <UsageList title="Devices" rows={devices} />}
       </div>
-      <p className="usage-note">
-        In engine-managed modes, totals count selected IPv4 packets once. Node totals include tunnel overhead and extra
-        relay copies, so they can exceed the overall total. Direct L2TP totals use Windows RAS connection counters.
-        Split-tunnel flows without a process name appear as Unattributed. All-traffic and direct L2TP sessions do not
-        provide per-application usage. Devices are the LAN proxy's clients, by address; their traffic is also part of
-        the overall total.
-      </p>
+      {scope === 'game' ? (
+        <p className="usage-note">
+          In engine-managed modes, totals count selected IPv4 packets once. Node totals include tunnel overhead and
+          extra relay copies, so they can exceed the overall total. Direct L2TP totals use Windows RAS connection
+          counters. Split-tunnel flows without a process name appear as Unattributed. All-traffic and direct L2TP
+          sessions do not provide per-application usage. Devices are the LAN proxy's clients, by address; their traffic
+          is also part of the overall total. VPN traffic is counted separately, under VPN.
+        </p>
+      ) : (
+        <p className="usage-note">
+          VPN traffic is counted separately from the game's and never added to it. Traffic the game session selects is
+          the game's, even when the VPN lists the same app. The node total includes the VPN's tunnel overhead. An L2TP
+          VPN, or a VPN in all-traffic mode, does not provide per-application usage.
+        </p>
+      )}
     </div>
   )
 }

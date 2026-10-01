@@ -1,4 +1,125 @@
 export const persian: Record<string, string> = {
+  'Statistics for': 'آمار برای',
+  Game: 'بازی',
+  'Carried by the VPN': 'منتقل‌شده از طریق VPN',
+  "In engine-managed modes, totals count selected IPv4 packets once. Node totals include tunnel overhead and extra relay copies, so they can exceed the overall total. Direct L2TP totals use Windows RAS connection counters. Split-tunnel flows without a process name appear as Unattributed. All-traffic and direct L2TP sessions do not provide per-application usage. Devices are the LAN proxy's clients, by address; their traffic is also part of the overall total. VPN traffic is counted separately, under VPN.":
+    'در حالت‌هایی که موتور مدیریت می‌کند، مجموع‌ها هر بسته IPv4 انتخاب‌شده را یک بار می‌شمارند. مجموع گره‌ها شامل سربار تونل و نسخه‌های اضافی رله است و ممکن است از مجموع کل بیشتر شود. مجموع L2TP مستقیم از شمارنده‌های اتصال RAS ویندوز است. جریان‌های تونل تفکیکی بدون نام فرایند به‌صورت نامشخص نمایش داده می‌شوند. اتصال‌های همه ترافیک و L2TP مستقیم مصرف هر برنامه را ارائه نمی‌دهند. دستگاه‌ها کاربران پراکسی شبکه محلی بر اساس نشانی هستند و ترافیک آن‌ها نیز بخشی از مجموع کل است. ترافیک VPN جداگانه و در بخش VPN شمرده می‌شود.',
+  "VPN traffic is counted separately from the game's and never added to it. Traffic the game session selects is the game's, even when the VPN lists the same app. The node total includes the VPN's tunnel overhead. An L2TP VPN, or a VPN in all-traffic mode, does not provide per-application usage.":
+    'ترافیک VPN جدا از ترافیک بازی شمرده می‌شود و هرگز به آن اضافه نمی‌شود. ترافیکی که اتصال بازی انتخاب می‌کند متعلق به بازی است، حتی اگر VPN همان برنامه را فهرست کرده باشد. مجموع گره شامل سربار تونل VPN است. VPN با L2TP یا VPN در حالت همه ترافیک مصرف هر برنامه را ارائه نمی‌دهد.',
+  'Test proxy': 'آزمایش پراکسی',
+  'The proxy works': 'پراکسی کار می‌کند',
+  VPN: 'VPN',
+  'A second connection for everyday apps, beside your game and never in its way.':
+    'اتصالی دوم برای برنامه‌های روزمره، کنار بازی شما و بدون مزاحمت برای آن.',
+  'VPN is off': 'VPN خاموش است',
+  'Connecting…': 'در حال اتصال…',
+  Connecting: 'در حال اتصال',
+  'Reconnecting…': 'در حال اتصال دوباره…',
+  Reconnecting: 'اتصال دوباره',
+  'VPN is on': 'VPN روشن است',
+  'Node not answering': 'گره پاسخ نمی‌دهد',
+  Degraded: 'ناپایدار',
+  'Paused for your game': 'به خاطر بازی شما متوقف شد',
+  'VPN could not connect': 'VPN متصل نشد',
+  'Import a .conf file': 'وارد کردن فایل .conf',
+  'Import an .ovpn file': 'وارد کردن فایل .ovpn',
+  'Proxy address and login': 'نشانی پراکسی و ورود',
+  'Server, key and login': 'سرور، کلید و ورود',
+  'VPN · one node, direct': 'VPN · یک گره، مستقیم',
+  Traffic: 'ترافیک',
+  'Connected for': 'مدت اتصال',
+  'Turn off VPN': 'خاموش کردن VPN',
+  'Turn on VPN': 'روشن کردن VPN',
+  'Add a node below to get started.': 'برای شروع، یک گره در پایین اضافه کنید.',
+  'The VPN is paused for your game': 'VPN به خاطر بازی شما متوقف شده است',
+  'Game traffic settings': 'تنظیمات ترافیک بازی',
+  'Your game session is running and takes priority': 'اتصال بازی شما فعال است و اولویت دارد',
+  'Apps you selected for the game always use the game session, even if they are also listed here. Everything else you select below uses the VPN.':
+    'برنامه‌هایی که برای بازی انتخاب کرده‌اید همیشه از اتصال بازی استفاده می‌کنند، حتی اگر اینجا هم فهرست شده باشند. هر چیز دیگری که در پایین انتخاب کنید از VPN استفاده می‌کند.',
+  'Your game session is carrying all traffic. The VPN resumes when it stops or switches to split mode.':
+    'اتصال بازی شما همه ترافیک را منتقل می‌کند. VPN پس از توقف آن یا رفتن به حالت تفکیکی ادامه می‌یابد.',
+  'Add your VPN node': 'گره VPN خود را اضافه کنید',
+  'One node, connected directly. No relay needed.': 'یک گره با اتصال مستقیم. به رله نیازی نیست.',
+  'Choose the kind of VPN node': 'نوع گره VPN را انتخاب کنید',
+  'VPN node': 'گره VPN',
+  'Carrying your selected traffic': 'در حال انتقال ترافیک انتخاب‌شده',
+  'Used the next time the VPN turns on': 'دفعه بعد که VPN روشن شود استفاده می‌شود',
+  Replace: 'جایگزینی',
+  'Confirm remove': 'تأیید حذف',
+  'Choose what uses the VPN': 'انتخاب کنید چه چیزی از VPN استفاده کند',
+  'Changing these while the VPN is on reconnects it once.':
+    'تغییر این موارد هنگام روشن بودن VPN، یک بار آن را دوباره متصل می‌کند.',
+  'VPN routing mode': 'حالت مسیریابی VPN',
+  'Selected apps': 'برنامه‌های انتخاب‌شده',
+  'Everything else stays normal': 'بقیه عادی می‌مانند',
+  'All traffic': 'همه ترافیک',
+  'Except your game': 'به جز بازی شما',
+  'Resolve names through the VPN': 'تبدیل نام‌ها از طریق VPN',
+  'Stop resolving names through the VPN': 'توقف تبدیل نام‌ها از طریق VPN',
+  'Website names are looked up through the VPN, so a filtered local resolver cannot send you to a blocked or fake address. A running game session with this on handles lookups first.':
+    'نام وب‌سایت‌ها از طریق VPN جستجو می‌شوند تا تبدیل‌کننده فیلترشده محلی نتواند شما را به نشانی مسدود یا جعلی بفرستد. اگر اتصال بازی با این گزینه فعال باشد، ابتدا آن جستجوها را انجام می‌دهد.',
+  'Lookups use the resolver this PC normally uses. Turn this on if sites fail to open while the VPN is connected.':
+    'جستجوها از تبدیل‌کننده معمول این رایانه استفاده می‌کنند. اگر سایت‌ها با VPN متصل باز نمی‌شوند، این را روشن کنید.',
+  'Kill switch': 'قطع‌کننده اضطراری',
+  'While the node is not answering, apps you selected are blocked instead of using your normal connection. Name lookups are never blocked.':
+    'تا وقتی گره پاسخ نمی‌دهد، برنامه‌های انتخاب‌شده به جای استفاده از اتصال عادی مسدود می‌شوند. جستجوی نام هرگز مسدود نمی‌شود.',
+  'While the node is not answering, apps you selected use your normal connection until it is back.':
+    'تا وقتی گره پاسخ نمی‌دهد، برنامه‌های انتخاب‌شده تا بازگشت آن از اتصال عادی استفاده می‌کنند.',
+  'Turn off the VPN kill switch': 'خاموش کردن قطع‌کننده اضطراری VPN',
+  'Turn on the VPN kill switch': 'روشن کردن قطع‌کننده اضطراری VPN',
+  'Apps and websites': 'برنامه‌ها و وب‌سایت‌ها',
+  'All traffic uses the VPN, so this list is not needed right now.':
+    'همه ترافیک از VPN عبور می‌کند، پس فعلاً به این فهرست نیازی نیست.',
+  'Add app': 'افزودن برنامه',
+  'Add folder': 'افزودن پوشه',
+  'Add website or IP': 'افزودن وب‌سایت یا IP',
+  'An L2TP/IPsec node routes by address, so it can carry websites and IP ranges but not individual apps. Use all-traffic mode, or a WireGuard, OpenVPN or SOCKS5 node, for apps.':
+    'گره L2TP/IPsec بر اساس نشانی مسیریابی می‌کند، پس می‌تواند وب‌سایت‌ها و بازه‌های IP را منتقل کند اما نه برنامه‌های جداگانه را. برای برنامه‌ها از حالت همه ترافیک یا گره WireGuard، OpenVPN یا SOCKS5 استفاده کنید.',
+  'Nothing selected yet': 'هنوز چیزی انتخاب نشده است',
+  'Add the apps and websites that should use the VPN. Everything else keeps your normal connection.':
+    'برنامه‌ها و وب‌سایت‌هایی را که باید از VPN استفاده کنند اضافه کنید. بقیه از اتصال عادی شما استفاده می‌کنند.',
+  'Game rule wins': 'قانون بازی اولویت دارد',
+  'Not routable by this node': 'این گره نمی‌تواند مسیریابی کند',
+  Folder: 'پوشه',
+  Website: 'وب‌سایت',
+  'IP range': 'بازه IP',
+  'IP address': 'نشانی IP',
+  'VPN target': 'مقصد VPN',
+  'Matching traffic goes through your VPN node. Your game session still comes first for anything it selects.':
+    'ترافیک منطبق از گره VPN شما عبور می‌کند. اتصال بازی همچنان برای هر چیزی که انتخاب کرده اولویت دارد.',
+  'Choose an application': 'یک برنامه انتخاب کنید',
+  'Choose a folder': 'یک پوشه انتخاب کنید',
+  'Select its .exe file': 'فایل .exe آن را انتخاب کنید',
+  'Every application inside will match': 'همه برنامه‌های داخل آن منطبق می‌شوند',
+  'Website or hostname': 'وب‌سایت یا نام میزبان',
+  'IP or CIDR range': 'IP یا بازه CIDR',
+  'Add target': 'افزودن مقصد',
+  'Add a VPN target': 'افزودن مقصد VPN',
+  'An L2TP/IPsec node in split mode routes by address only':
+    'گره L2TP/IPsec در حالت تفکیکی فقط بر اساس نشانی مسیریابی می‌کند',
+  'Add a node to use it beside your game': 'یک گره اضافه کنید تا کنار بازی از آن استفاده کنید',
+  'VPN connected': 'VPN متصل است',
+  'Game session on': 'اتصال بازی روشن است',
+  'Game session starting': 'اتصال بازی در حال شروع است',
+  'VPN on': 'VPN روشن است',
+  'VPN connecting': 'VPN در حال اتصال است',
+  'VPN paused for your game': 'VPN به خاطر بازی شما متوقف شده است',
+  'Everything the VPN carries is forwarded to this proxy, TCP and UDP alike. Name lookups go over TCP through it, so they work even when the proxy has no UDP support.':
+    'هر چه VPN منتقل می‌کند، چه TCP و چه UDP، به این پراکسی فرستاده می‌شود. جستجوی نام‌ها از طریق TCP و همین پراکسی انجام می‌شود، پس حتی بدون پشتیبانی UDP کار می‌کند.',
+  'The VPN uses the Windows L2TP/IPsec client. In split mode it routes websites and IP ranges; for individual apps use all-traffic mode or another kind of node.':
+    'VPN از کلاینت L2TP/IPsec ویندوز استفاده می‌کند. در حالت تفکیکی وب‌سایت‌ها و بازه‌های IP را مسیریابی می‌کند؛ برای برنامه‌های جداگانه از حالت همه ترافیک یا نوع دیگری از گره استفاده کنید.',
+  'WireGuard node saved for the VPN.': 'گره WireGuard برای VPN ذخیره شد.',
+  'Add a VPN node first.': 'ابتدا یک گره VPN اضافه کنید.',
+  'Add at least one app or website for the VPN, or switch it to all traffic.':
+    'دست‌کم یک برنامه یا وب‌سایت برای VPN اضافه کنید، یا آن را روی همه ترافیک بگذارید.',
+  'The node has stopped answering. Selected apps are blocked until it is back.':
+    'گره دیگر پاسخ نمی‌دهد. برنامه‌های انتخاب‌شده تا بازگشت آن مسدود هستند.',
+  'The node has stopped answering. Selected apps use your normal connection until it is back.':
+    'گره دیگر پاسخ نمی‌دهد. برنامه‌های انتخاب‌شده تا بازگشت آن از اتصال عادی استفاده می‌کنند.',
+  'An L2TP/IPsec VPN routes by address, so it cannot select applications or folders. Use a website or IP target, all-traffic mode, or a WireGuard/OpenVPN node.':
+    'VPN با L2TP/IPsec بر اساس نشانی مسیریابی می‌کند، پس نمی‌تواند برنامه یا پوشه انتخاب کند. از مقصد وب‌سایت یا IP، حالت همه ترافیک، یا گره WireGuard/OpenVPN استفاده کنید.',
+  'An L2TP/IPsec VPN cannot follow wildcard names. Use an exact hostname or an IP range.':
+    'VPN با L2TP/IPsec نمی‌تواند نام‌های عام را دنبال کند. از نام میزبان دقیق یا بازه IP استفاده کنید.',
   'Console sharing': 'اشتراک با کنسول',
   'Let a console or another device use this session through a proxy.':
     'اجازه دهید کنسول یا دستگاه دیگری از طریق پراکسی از این اتصال استفاده کند.',
@@ -485,6 +606,30 @@ export const persian: Record<string, string> = {
 }
 
 const dynamic: [RegExp, (...parts: string[]) => string][] = [
+  [/^(\d+) selected$/, (count) => `${count} انتخاب‌شده`],
+  [
+    /^Logged in to (.+) in (\d+) ms, and reached the Internet through it in (\d+) ms\.$/,
+    (proxy, login, reach) =>
+      `ورود به ${proxy} در ${login} میلی‌ثانیه، و دسترسی به اینترنت از طریق آن در ${reach} میلی‌ثانیه.`,
+  ],
+  [/^Stop sending (.+) through the VPN$/, (name) => `توقف ارسال ${name} از طریق VPN`],
+  [/^Send (.+) through the VPN$/, (name) => `ارسال ${name} از طریق VPN`],
+  [/^Connecting to (.+)…$/, (node) => `در حال اتصال به ${node}…`],
+  [/^Reconnecting to (.+)…$/, (node) => `در حال اتصال دوباره به ${node}…`],
+  [/^Connected through (.+)\.$/, (node) => `از طریق ${node} متصل است.`],
+  [/^Through (.+)$/, (detail) => `از طریق ${detail}`],
+  [/^(.+) is ready to connect\.?$/, (node) => `${node} آماده اتصال است`],
+  [/^(.+) node saved for the VPN\.$/, (kind) => `گره ${kind} برای VPN ذخیره شد.`],
+  [/^(.+) Retrying in (\d+) s\.$/, (reason, seconds) => `${reason} تلاش دوباره تا ${seconds} ثانیه دیگر.`],
+  [
+    /^Choose the new node\. It replaces (.+), and the VPN reconnects through it\.$/,
+    (node) => `گره جدید را انتخاب کنید. جایگزین ${node} می‌شود و VPN از طریق آن دوباره متصل می‌شود.`,
+  ],
+  [/^Choose the new node\. It replaces (.+)\.$/, (node) => `گره جدید را انتخاب کنید. جایگزین ${node} می‌شود.`],
+  [
+    /^L2TP\/IPsec works: connected in (\d+) ms, data returned in (\d+) ms\.$/,
+    (setup, data) => `L2TP/IPsec کار می‌کند: اتصال در ${setup} میلی‌ثانیه، بازگشت داده در ${data} میلی‌ثانیه.`,
+  ],
   [/^Remove (.+)$/, (name) => `حذف ${name}`],
   [/^Delete (.+)$/, (name) => `حذف ${name}`],
   [/^Rename (.+)$/, (name) => `تغییر نام ${name}`],

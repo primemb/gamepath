@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Activity, ChevronRight, CircleGauge, Power, Route, Sparkles, Waypoints, Zap } from 'lucide-react'
 import { LanProxyCard } from '../components/LanProxyCard'
+import { VpnStatusCard } from '../components/VpnStatusCard'
 import { SetupDrawer, type SetupItem } from '../components/SetupDrawer'
 import { TelemetryPanel } from '../components/TelemetryPanel'
 import type { PathHistory, PathRate } from '../lib/format'
@@ -169,6 +170,7 @@ export function DashboardView({
       />
 
       {state.lanProxy.enabled && <LanProxyCard state={state} onOpen={() => onNavigate('sharing')} />}
+      {state.vpn.node && <VpnStatusCard state={state} onOpen={() => onNavigate('vpn')} />}
 
       <TelemetryPanel state={state} histories={histories} rates={rates} />
     </div>

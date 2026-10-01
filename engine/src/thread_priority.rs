@@ -13,17 +13,26 @@
 //! run threads at 16 to 26. Every thread raised here blocks on a socket, a
 //! driver or a queue between packets, so it runs briefly and often rather than
 //! long, which is the pattern a raised priority is meant for.
+//!
+//! A VPN engine running beside the game raises its threads one step less, to
+//! `THREAD_PRIORITY_ABOVE_NORMAL`: still ahead of the game's own threads, but
+//! behind the game engine's whenever both have a packet ready.
 
 /// Raises the calling thread. Failure only costs the raise, so it is logged
 /// and the thread carries on at normal priority.
 #[cfg(windows)]
 pub fn raise_current_for_data_plane() {
     use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
+    };
+    let priority = if crate::role::Role::current().data_plane_highest() {
+        THREAD_PRIORITY_HIGHEST
+    } else {
+        THREAD_PRIORITY_ABOVE_NORMAL
     };
     // GetCurrentThread returns a pseudo-handle with full access to the calling
     // thread, so there is nothing to open or close.
-    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) } == 0 {
+    if unsafe { SetThreadPriority(GetCurrentThread(), priority) } == 0 {
         crate::log_warn!(
             "could not raise {} to high priority: {}",
             std::thread::current()

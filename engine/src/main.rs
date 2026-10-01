@@ -24,6 +24,7 @@ use commands::{
     inspect_system, prepare_session, probe_relay, probe_socks5_node, probe_wireguard_routes,
     scheduler_demo,
 };
+use gamepath_engine::role::Role;
 use gamepath_engine::{log_error, log_info};
 use ipc::{Request, Response};
 use serde_json::json;
@@ -32,15 +33,27 @@ use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
 
 fn main() {
+    let role = match Role::from_args(std::env::args()) {
+        Ok(role) => role,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    role.install();
     // stdout carries the JSON-RPC the service reads, so the log must not go
-    // there. The file is shared with the other components; stderr is off
+    // there. The directory is shared with the other components; stderr is off
     // because the service captures it and would record every line twice.
     gamepath_engine::log::init(
-        "engine",
-        Some(gamepath_engine::log::log_path("engine")),
+        role.log_component(),
+        Some(gamepath_engine::log::log_path(role.log_component())),
         false,
     );
-    log_info!("gamepath-engine {} started", env!("CARGO_PKG_VERSION"));
+    log_info!(
+        "gamepath-engine {} started as the {} engine",
+        env!("CARGO_PKG_VERSION"),
+        role.as_str()
+    );
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     let sessions = Arc::new(Mutex::new(WireGuardSessionManager::default()));
@@ -133,15 +146,23 @@ fn handle_request(
         "probe-relay" => probe_relay(request.payload),
         "probe-wireguard-routes" => probe_wireguard_routes(request.payload),
         "probe-socks5-node" => probe_socks5_node(request.payload),
+        #[cfg(all(windows, feature = "socks-server"))]
+        "probe-socks5-proxy" => commands::probe_socks5_proxy(request.payload),
         "start-wireguard-session" => {
             // Its flows live in the session being replaced.
             proxy.stop();
-            sessions.lock().unwrap().start(request.payload)
+            let mut manager = sessions.lock().unwrap();
+            // The service keeps these out of the other session's capture.
+            manager.start(request.payload).map(|mut status| {
+                status["bypassIps"] = json!(manager.bypass_ips());
+                status
+            })
         }
         "wireguard-session-status" => Ok(sessions.lock().unwrap().status()),
         "probe-data-plane" => sessions.lock().unwrap().probe_data_plane(),
         "start-packet-capture" => capture.start(request.payload, Arc::clone(sessions)),
         "update-packet-capture" => capture.update(request.payload, Arc::clone(sessions)),
+        "set-foreign-bypass" => capture.set_foreign_bypass(request.payload, Arc::clone(sessions)),
         "packet-capture-status" => Ok(capture.status()),
         "stop-packet-capture" => Ok(capture.stop()),
         "start-socks-server" => proxy.start(request.payload, sessions),

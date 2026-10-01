@@ -22,11 +22,9 @@ pub(crate) struct PacketCaptureManager {
     active: Option<WindowsPacketCapture>,
     #[cfg(windows)]
     active_split: Option<crate::split_capture::SplitPacketCapture>,
-    /// Split mode's resolver-only adapter. Held separately from the capture
-    /// because a live rule edit replaces the capture and must not disturb the
-    /// machine's name resolution.
-    #[cfg(windows)]
-    split_resolvers: Option<SplitResolverAdapter>,
+    /// The request the running capture was started with, so a change to the
+    /// other session's tunnel can be applied without the caller resending it.
+    last_request: Option<Value>,
 }
 
 #[cfg(windows)]
@@ -40,6 +38,42 @@ struct WindowsPacketCapture {
     /// teardown clears exactly what it set and leaves an adapter it never
     /// touched alone.
     dns_adapter: Option<u128>,
+    /// The physical route the bypass routes go through.
+    default_gateway: std::net::Ipv4Addr,
+    default_interface: u32,
+    /// Host routes keeping the other session's tunnel off this one, replaced
+    /// as that session comes and goes.
+    foreign_routes: Vec<InstalledRoute>,
+}
+
+#[cfg(windows)]
+impl WindowsPacketCapture {
+    fn set_foreign_bypass(&mut self, addresses: &[std::net::Ipv4Addr]) -> Result<(), String> {
+        let (keep, stale): (Vec<_>, Vec<_>) = std::mem::take(&mut self.foreign_routes)
+            .into_iter()
+            .partition(|route| addresses.contains(&route.destination));
+        for route in &stale {
+            remove_ipv4_route(route);
+        }
+        self.foreign_routes = keep;
+        for address in addresses {
+            if self
+                .foreign_routes
+                .iter()
+                .any(|route| route.destination == *address)
+            {
+                continue;
+            }
+            self.foreign_routes.push(add_ipv4_route(
+                *address,
+                32,
+                self.default_gateway,
+                self.default_interface,
+                1,
+            )?);
+        }
+        Ok(())
+    }
 }
 
 /// A route this capture added, kept so teardown can remove exactly it. The
@@ -109,17 +143,6 @@ fn configure_tunnel_dns(
     }
 }
 
-/// Whether a capture restart keeps the resolver adapter it already built.
-///
-/// A live split rule edit is delivered as a fresh capture start, because
-/// WinDivert's kernel filter is immutable and has to be reopened. The session,
-/// its relay paths and - this - must survive that, or every rule change would
-/// blank the machine's resolvers for as long as it took to build a new adapter.
-#[cfg(windows)]
-fn resolvers_survive_restart(traffic_mode: &str) -> bool {
-    traffic_mode == "split"
-}
-
 /// Says where the tunnel's resolvers sit in the order Windows will ask them.
 ///
 /// The interface metric decides this, and the metric is a fixed number that
@@ -146,135 +169,14 @@ fn log_resolver_priority(adapter_index: u32) {
     log_info!("name lookups are offered to {ahead} before the tunnel's resolvers");
 }
 
-/// The adapter split mode keeps solely so Windows has an interface to hang
-/// resolver settings on.
-///
-/// Windows chooses a resolver per interface. Split mode installs no routes, so
-/// before this the only interface with servers was the physical one, and every
-/// lookup went to whatever the router or the ISP offered - on a filtered
-/// connection, a poisoned answer while the tunnel beside it was healthy.
-///
-/// The servers are public ones rather than the relay's own `10.203.0.1`. The
-/// relay resolver lives inside the adapter's `/24` and reaching it would mean
-/// running the uplink and downlink threads here too, whose replies would then
-/// contend with WinDivert for the session's single inbound receiver. A public
-/// resolver needs none of that: it routes out the normal path and the existing
-/// port-53 capture rule carries it through the tunnel, which is the mechanism
-/// already proven in this mode.
-///
-/// The interface metric decides who wins when several VPNs are up.
-/// `configure_tunnel_interface` sets 5, which outranks a physical adapter
-/// (typically 25) and yields to another tunnel that asked for less - correct
-/// in both directions, because that tunnel's own resolver is reached through
-/// its own tunnel and is no more filtered than this one.
-#[cfg(windows)]
-struct SplitResolverAdapter {
-    stop: Arc<AtomicBool>,
-    session: Arc<wintun::Session>,
-    drain: Option<JoinHandle<()>>,
-    dns_adapter: Option<u128>,
-    servers: Vec<std::net::Ipv4Addr>,
-}
-
-#[cfg(windows)]
-impl SplitResolverAdapter {
-    fn start(
-        virtual_ipv4: std::net::Ipv4Addr,
-        effective_mtu: gamepath_engine::mtu::EffectiveMtu,
-    ) -> Result<Self, String> {
-        let adapter = open_gamepath_adapter()?;
-        let adapter_index = adapter
-            .get_adapter_index()
-            .map_err(|error| format!("could not read GamePath adapter index: {error}"))?;
-        configure_tunnel_interface(adapter_index, effective_mtu.mtu)?;
-        adapter
-            .set_network_addresses_tuple(
-                virtual_ipv4.into(),
-                std::net::Ipv4Addr::new(255, 255, 255, 0).into(),
-                None,
-            )
-            .map_err(|error| format!("could not configure GamePath adapter: {error}"))?;
-        // Wintun reports an adapter with no open session as media-disconnected,
-        // and Windows ignores a disconnected interface's resolvers. The session
-        // exists to make the interface count, not to carry traffic.
-        let session = Arc::new(
-            adapter
-                .start_session(wintun::MAX_RING_CAPACITY)
-                .map_err(|error| format!("could not start the GamePath adapter: {error}"))?,
-        );
-        let servers = gamepath_engine::dns::resolver_order(None);
-        let adapter_guid = adapter.get_guid();
-        let dns_adapter =
-            match gamepath_engine::netconfig::set_interface_dns(adapter_guid, &servers) {
-                Ok(()) => {
-                    log_info!(
-                        "split tunnel DNS: {}",
-                        servers
-                            .iter()
-                            .map(std::net::Ipv4Addr::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    Some(adapter_guid)
-                }
-                // Not fatal: name resolution falls back to the physical adapter's
-                // servers, which is exactly what every earlier release did.
-                Err(error) => {
-                    log_warn!("split-mode name resolution will not go through the tunnel: {error}");
-                    None
-                }
-            };
-        if dns_adapter.is_some() {
-            log_resolver_priority(adapter_index);
-        }
-        let stop = Arc::new(AtomicBool::new(false));
-        let drain_stop = Arc::clone(&stop);
-        let drain_session = Arc::clone(&session);
-        // Nothing should arrive: no route points here and the resolvers are
-        // off-link. This is here so that if anything ever does, the ring is
-        // emptied instead of filling and wedging the adapter.
-        let drain = std::thread::Builder::new()
-            .name("gamepath-split-resolver".into())
-            .spawn(move || {
-                while !drain_stop.load(Ordering::Acquire) {
-                    match drain_session.receive_blocking() {
-                        Ok(packet) => drop(packet),
-                        Err(_) => break,
-                    }
-                }
-            })
-            .map_err(|error| format!("could not start the GamePath adapter drain: {error}"))?;
-        Ok(Self {
-            stop,
-            session,
-            drain: Some(drain),
-            dns_adapter,
-            servers,
-        })
-    }
-}
-
-#[cfg(windows)]
-impl Drop for SplitResolverAdapter {
-    fn drop(&mut self) {
-        if let Some(adapter) = self.dns_adapter {
-            if let Err(error) = gamepath_engine::netconfig::set_interface_dns(adapter, &[]) {
-                log_warn!("could not clear the split tunnel adapter's DNS servers: {error}");
-            }
-        }
-        self.stop.store(true, Ordering::Release);
-        let _ = self.session.shutdown();
-        if let Some(drain) = self.drain.take() {
-            let _ = drain.join();
-        }
-    }
-}
-
-/// Opens the one `GamePath` Wintun adapter, creating it if this is the first
+/// Opens this engine's Wintun adapter, creating it if this is the first
 /// session since boot. Both traffic modes use the same adapter and the same
 /// GUID, so a mode change reuses the interface rather than making a second one.
+/// The game and the VPN each have their own, so neither can overwrite the
+/// other's addresses, routes or resolvers.
 #[cfg(windows)]
-fn open_gamepath_adapter() -> Result<std::sync::Arc<wintun::Adapter>, String> {
+fn open_session_adapter() -> Result<std::sync::Arc<wintun::Adapter>, String> {
+    let identity = gamepath_engine::role::Role::current().adapter();
     let executable_dir = std::env::current_exe()
         .map_err(|error| error.to_string())?
         .parent()
@@ -295,16 +197,11 @@ fn open_gamepath_adapter() -> Result<std::sync::Arc<wintun::Adapter>, String> {
     // beside the privileged engine is loaded.
     let wintun = unsafe { wintun::load_from_path(&dll) }
         .map_err(|error| format!("could not load Wintun: {error}"))?;
-    wintun::Adapter::open(&wintun, "GamePath")
+    wintun::Adapter::open(&wintun, identity.name)
         .or_else(|_| {
-            wintun::Adapter::create(
-                &wintun,
-                "GamePath",
-                "GamePath",
-                Some(0x7f0a_9828_52ef_4ddd_913d_c11f_f0d4_a58a_u128),
-            )
+            wintun::Adapter::create(&wintun, identity.name, "GamePath", Some(identity.guid))
         })
-        .map_err(|error| format!("could not create GamePath adapter: {error}"))
+        .map_err(|error| format!("could not create the {} adapter: {error}", identity.name))
 }
 
 impl PacketCaptureManager {
@@ -314,7 +211,7 @@ impl PacketCaptureManager {
         payload: Value,
         sessions: Arc<Mutex<WireGuardSessionManager>>,
     ) -> Result<Value, String> {
-        let input: PacketCaptureRequest = serde_json::from_value(payload)
+        let input: PacketCaptureRequest = serde_json::from_value(payload.clone())
             .map_err(|error| format!("invalid packet capture request: {error}"))?;
         match input.traffic_mode.as_str() {
             // Validate before dropping a live capture. This makes a rejected
@@ -325,19 +222,16 @@ impl PacketCaptureManager {
             "all" => {}
             _ => return Err("traffic mode must be all or split".into()),
         }
-        // Not `stop()`: that clears the resolver adapter too, and a live split
-        // rule edit comes back through here. Rebuilding the adapter would drop
-        // the machine's resolvers for as long as it took to recreate them,
-        // every time a rule changed, which is precisely the kind of restart
-        // `commitRuleChange` exists to avoid.
         #[cfg(windows)]
-        {
+        let was_redirecting = self.redirects_dns();
+        #[cfg(windows)]
+        let carried = {
             drop(self.active.take());
-            drop(self.active_split.take());
-            if !resolvers_survive_restart(&input.traffic_mode) {
-                drop(self.split_resolvers.take());
-            }
-        }
+            self.active_split
+                .take()
+                .map(crate::split_capture::SplitPacketCapture::into_carried)
+        };
+        self.last_request = Some(payload);
         let (virtual_ipv4, bypass_ips, data_receiver, effective_mtu) = {
             let manager = sessions.lock().unwrap();
             (
@@ -354,33 +248,36 @@ impl PacketCaptureManager {
             )
         };
         if input.traffic_mode == "split" {
+            let mut excluded = bypass_ips;
+            excluded.extend(&input.foreign_bypass);
             let split = crate::split_capture::SplitPacketCapture::start(
                 &input.rules,
                 virtual_ipv4,
-                &bypass_ips,
+                &excluded,
                 sessions,
                 data_receiver,
                 effective_mtu,
+                crate::split_capture::SplitOptions {
+                    kill_switch: input.kill_switch,
+                    own_hostnames: input.own_hostnames.clone(),
+                    carried,
+                },
             )?;
             let target_count = split.target_count();
+            split.set_redirect_dns(input.remote_dns);
             self.active_split = Some(split);
-            // After the capture, so the rule that carries name lookups exists
-            // before Windows is pointed at a resolver that depends on it.
-            if !input.remote_dns {
-                drop(self.split_resolvers.take());
+            // Answers cached before the switch would outlive it: the router's
+            // filtered ones going in, a proxy's fake-IP ones coming out.
+            if input.remote_dns != was_redirecting {
+                gamepath_engine::netconfig::flush_dns_cache();
             }
-            if input.remote_dns && self.split_resolvers.is_none() {
-                match SplitResolverAdapter::start(virtual_ipv4, effective_mtu) {
-                    Ok(resolvers) => self.split_resolvers = Some(resolvers),
-                    // A session that carries traffic is worth more than this.
-                    Err(error) => log_warn!("split-mode DNS adapter unavailable: {error}"),
-                }
+            if input.remote_dns && !was_redirecting {
+                log_info!(
+                    "split tunnel DNS: lookups to LAN resolvers are answered by {} through the tunnel",
+                    crate::split_capture::TUNNEL_RESOLVER
+                );
             }
-            let dns_servers = self
-                .split_resolvers
-                .as_ref()
-                .map(|resolvers| resolvers.servers.clone())
-                .unwrap_or_default();
+            let dns_servers = self.split_dns_servers();
             return Ok(json!({
                 "state": "capturing",
                 "backend": "windivert",
@@ -388,7 +285,7 @@ impl PacketCaptureManager {
                 "targetCount": target_count,
                 "effectiveMtu": effective_mtu.mtu,
                 "tcpMss": effective_mtu.tcp_mss(),
-                "dnsServers": dns_servers.iter().map(std::net::Ipv4Addr::to_string).collect::<Vec<_>>(),
+                "dnsServers": dns_servers,
                 // Selected targets are matched as IPv4. A game reaching the
                 // same server over IPv6 is not captured at all, so the
                 // exposure is worth reporting in split mode too.
@@ -397,17 +294,12 @@ impl PacketCaptureManager {
         }
         let (default_gateway, default_interface) =
             gamepath_engine::netconfig::default_ipv4_route()?;
-        let adapter = open_gamepath_adapter()?;
+        let adapter = open_session_adapter()?;
         let adapter_index = adapter
             .get_adapter_index()
             .map_err(|error| format!("could not read GamePath adapter index: {error}"))?;
         configure_tunnel_interface(adapter_index, effective_mtu.mtu)?;
-        adapter
-            .set_network_addresses_tuple(
-                virtual_ipv4.into(),
-                std::net::Ipv4Addr::new(255, 255, 255, 0).into(),
-                None,
-            )
+        gamepath_engine::netconfig::set_interface_ipv4_address(adapter_index, virtual_ipv4, 24)
             .map_err(|error| format!("could not configure GamePath adapter: {error}"))?;
         // Sized from what the selected transports actually add to a packet, so
         // a full-size packet still fits the physical link once it is wrapped.
@@ -447,7 +339,11 @@ impl PacketCaptureManager {
             routes: Vec::new(),
             adapter_index,
             dns_adapter: None,
+            default_gateway,
+            default_interface,
+            foreign_routes: Vec::new(),
         };
+        capture.set_foreign_bypass(&input.foreign_bypass)?;
         for address in bypass_ips {
             capture.routes.push(add_ipv4_route(
                 address,
@@ -494,6 +390,7 @@ impl PacketCaptureManager {
         };
         capture.dns_adapter = (!resolvers.is_empty()).then_some(adapter_guid);
         if capture.dns_adapter.is_some() {
+            gamepath_engine::netconfig::flush_dns_cache();
             log_resolver_priority(adapter_index);
         }
         self.active = Some(capture);
@@ -546,6 +443,53 @@ impl PacketCaptureManager {
         Err("packet capture is available only on Windows".into())
     }
 
+    /// Keeps the other session's tunnel clear of this capture after that
+    /// session started, stopped or moved. All-traffic mode only swaps host
+    /// routes; split mode has to reopen its kernel filter, which keeps the
+    /// session and its paths exactly as a live rule edit does.
+    #[cfg(windows)]
+    pub(crate) fn set_foreign_bypass(
+        &mut self,
+        payload: Value,
+        sessions: Arc<Mutex<WireGuardSessionManager>>,
+    ) -> Result<Value, String> {
+        let addresses: Vec<std::net::Ipv4Addr> =
+            serde_json::from_value(payload["addresses"].clone())
+                .map_err(|error| format!("invalid bypass addresses: {error}"))?;
+        let Some(mut request) = self.last_request.clone() else {
+            return Ok(json!({ "state": "idle" }));
+        };
+        request["foreignBypass"] = json!(addresses);
+        if let Some(capture) = self.active.as_mut() {
+            capture.set_foreign_bypass(&addresses)?;
+            self.last_request = Some(request);
+            log_info!(
+                "other session's tunnel routed around this one: {} address(es)",
+                addresses.len()
+            );
+            return Ok(self.status());
+        }
+        if self.active_split.is_some() {
+            let result = self.start(request, sessions)?;
+            log_info!(
+                "other session's tunnel kept out of this capture: {} address(es)",
+                addresses.len()
+            );
+            return Ok(result);
+        }
+        self.last_request = Some(request);
+        Ok(json!({ "state": "idle" }))
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn set_foreign_bypass(
+        &mut self,
+        _payload: Value,
+        _sessions: Arc<Mutex<WireGuardSessionManager>>,
+    ) -> Result<Value, String> {
+        Err("packet capture is available only on Windows".into())
+    }
+
     pub(crate) fn status(&self) -> Value {
         #[cfg(windows)]
         if let Some(capture) = &self.active {
@@ -563,17 +507,7 @@ impl PacketCaptureManager {
                 "backend": "windivert",
                 "trafficMode": "split",
                 "targetCount": capture.target_count(),
-                "dnsServers": self
-                    .split_resolvers
-                    .as_ref()
-                    .map(|resolvers| {
-                        resolvers
-                            .servers
-                            .iter()
-                            .map(std::net::Ipv4Addr::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
+                "dnsServers": self.split_dns_servers(),
                 "diagnostics": diagnostics,
             });
         }
@@ -581,13 +515,33 @@ impl PacketCaptureManager {
     }
 
     pub(crate) fn stop(&mut self) -> Value {
+        self.last_request = None;
         #[cfg(windows)]
         {
+            let was_redirecting = self.redirects_dns();
             drop(self.active.take());
             drop(self.active_split.take());
-            drop(self.split_resolvers.take());
+            if was_redirecting {
+                gamepath_engine::netconfig::flush_dns_cache();
+            }
         }
         json!({ "state": "idle" })
+    }
+
+    #[cfg(windows)]
+    fn redirects_dns(&self) -> bool {
+        self.active_split
+            .as_ref()
+            .is_some_and(crate::split_capture::SplitPacketCapture::redirects_dns)
+    }
+
+    #[cfg(windows)]
+    fn split_dns_servers(&self) -> Vec<String> {
+        if self.redirects_dns() {
+            vec![crate::split_capture::TUNNEL_RESOLVER.to_string()]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -611,8 +565,9 @@ impl Drop for WindowsPacketCapture {
             if let Err(error) = gamepath_engine::netconfig::set_interface_dns(adapter, &[]) {
                 log_warn!("could not clear the tunnel adapter's DNS servers: {error}");
             }
+            gamepath_engine::netconfig::flush_dns_cache();
         }
-        for route in self.routes.iter().rev() {
+        for route in self.foreign_routes.iter().chain(self.routes.iter()).rev() {
             remove_ipv4_route(route);
         }
     }
@@ -712,25 +667,4 @@ fn ipv4_source_address(packet: &[u8]) -> Option<std::net::Ipv4Addr> {
     Some(std::net::Ipv4Addr::new(
         packet[12], packet[13], packet[14], packet[15],
     ))
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-
-    /// `commitRuleChange` reapplies split rules without restarting the session.
-    /// The resolver adapter has to sit on the surviving side of that line.
-    #[test]
-    fn a_live_split_rule_edit_keeps_the_resolver_adapter() {
-        assert!(resolvers_survive_restart("split"));
-    }
-
-    /// Leaving split mode must take the adapter with it: all-traffic mode
-    /// builds its own with routes and the relay's resolver, and two adapters
-    /// configuring DNS would leave whichever lost the race pointing at a
-    /// resolver nothing routes to.
-    #[test]
-    fn leaving_split_mode_releases_the_resolver_adapter() {
-        assert!(!resolvers_survive_restart("all"));
-    }
 }

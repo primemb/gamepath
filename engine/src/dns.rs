@@ -198,9 +198,116 @@ pub fn resolver_order(relay: Option<Ipv4Addr>) -> Vec<Ipv4Addr> {
     }
 }
 
+/// The question's name, lowercased, from a query message. `None` when the
+/// message is too short or the name is malformed.
+pub fn question_name(message: &[u8]) -> Option<String> {
+    let mut name = String::new();
+    let mut offset = HEADER_LEN;
+    loop {
+        let length = usize::from(*message.get(offset)?);
+        if length == 0 {
+            return Some(name);
+        }
+        // A question never uses compression; anything else is not one.
+        if length > 63 || name.len() + length > 255 {
+            return None;
+        }
+        let label = message.get(offset + 1..offset + 1 + length)?;
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(&String::from_utf8_lossy(label).to_ascii_lowercase());
+        offset += 1 + length;
+    }
+}
+
+/// Whether only the local network's own resolver can answer this query: a
+/// single-label or LAN-only name, or a reverse lookup for a private address.
+/// Sent anywhere else it goes unanswered, and through a proxy that resolves
+/// such names with the system resolver it loops back to itself.
+pub fn is_local_only_name(name: &str) -> bool {
+    if name.is_empty() || !name.contains('.') {
+        return true;
+    }
+    const LOCAL_SUFFIXES: [&str; 5] = ["local", "lan", "home.arpa", "localdomain", "localhost"];
+    if LOCAL_SUFFIXES
+        .iter()
+        .any(|suffix| name == *suffix || name.ends_with(&format!(".{suffix}")))
+    {
+        return true;
+    }
+    let Some(reversed) = name.strip_suffix(".in-addr.arpa") else {
+        return false;
+    };
+    // A partial name (`168.192.in-addr.arpa`) is a zone, padded with zeros.
+    let mut octets: Vec<u8> = reversed
+        .split('.')
+        .rev()
+        .map_while(|part| part.parse().ok())
+        .collect();
+    if octets.is_empty() || octets.len() > 4 {
+        return false;
+    }
+    octets.resize(4, 0);
+    let address = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+    address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || (octets[0] == 100 && (64..128).contains(&octets[1]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_local_only_query(message: &[u8]) -> bool {
+        question_name(message).is_some_and(|name| is_local_only_name(&name))
+    }
+
+    fn question(name: &str) -> Vec<u8> {
+        query(7, name).expect("encodable")
+    }
+
+    #[test]
+    fn the_question_name_is_read_lowercased() {
+        assert_eq!(
+            question_name(&question("Turkey1.Pingkhor.XYZ")).as_deref(),
+            Some("turkey1.pingkhor.xyz")
+        );
+    }
+
+    #[test]
+    fn names_only_the_lan_can_answer_are_recognised() {
+        for name in [
+            "desktop-abc",
+            "printer.local",
+            "router.lan",
+            "nas.home.arpa",
+            "1.1.168.192.in-addr.arpa",
+            "5.0.0.10.in-addr.arpa",
+            "168.192.in-addr.arpa",
+            "1.0.0.127.in-addr.arpa",
+        ] {
+            assert!(is_local_only_query(&question(name)), "{name}");
+        }
+        for name in [
+            "discord.com",
+            "gateway.discord.gg",
+            "8.8.8.8.in-addr.arpa",
+            "local.example.com",
+            "_ldap._tcp.example.com",
+        ] {
+            assert!(!is_local_only_query(&question(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_query_is_not_kept_local() {
+        assert!(!is_local_only_query(&[0; 4]));
+        let mut truncated = question("discord.com");
+        truncated.truncate(HEADER_LEN + 4);
+        assert!(!is_local_only_query(&truncated));
+    }
 
     fn encoded_name(message: &[u8]) -> Vec<u8> {
         message[HEADER_LEN..message.len() - 4].to_vec()

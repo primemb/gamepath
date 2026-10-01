@@ -354,6 +354,39 @@ pub(crate) fn scheduler_demo() -> Value {
     json!({ "decision": decision })
 }
 
+/// Tests a SOCKS5 proxy for the VPN: a login, then a connection through it to
+/// the benchmark resolver. Needs no relay, unlike the game's proxy test.
+#[cfg(all(windows, feature = "socks-server"))]
+pub(crate) fn probe_socks5_proxy(payload: Value) -> Result<Value, String> {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        host: String,
+        port: u16,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+    }
+    let input: Request =
+        serde_json::from_value(payload).map_err(|error| format!("invalid SOCKS5 test: {error}"))?;
+    let config = Socks5NodeConfig {
+        host: input.host,
+        port: input.port,
+        username: input.username,
+        password: input.password,
+    };
+    let result = gamepath_engine::tun2socks::probe(
+        &config,
+        SocketAddrV4::new(gamepath_engine::BENCHMARK_TARGET, 53),
+    )?;
+    Ok(json!({
+        "reachable": true,
+        "proxy": result.proxy.to_string(),
+        "setupLatencyMs": result.setup_latency_ms,
+        "latencyMs": result.connect_latency_ms,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

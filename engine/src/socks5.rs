@@ -52,7 +52,7 @@ impl Socks5NodeConfig {
         Ok(())
     }
 
-    fn credentials(&self) -> Option<(&str, &str)> {
+    pub(crate) fn credentials(&self) -> Option<(&str, &str)> {
         let username = self.username.as_deref().filter(|value| !value.is_empty())?;
         let password = self.password.as_deref().filter(|value| !value.is_empty())?;
         Some((username, password))
@@ -245,7 +245,7 @@ impl Socks5UdpPath {
     }
 }
 
-fn resolve_proxy(host: &str, port: u16) -> Result<SocketAddr, String> {
+pub(crate) fn resolve_proxy(host: &str, port: u16) -> Result<SocketAddr, String> {
     let host = host.trim();
     let addresses: Vec<SocketAddr> = format!("{host}:{port}")
         .to_socket_addrs()
@@ -259,7 +259,10 @@ fn resolve_proxy(host: &str, port: u16) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("SOCKS5 proxy {host} did not resolve"))
 }
 
-fn negotiate_method(control: &mut TcpStream, config: &Socks5NodeConfig) -> Result<(), String> {
+pub(crate) fn negotiate_method(
+    control: &mut TcpStream,
+    config: &Socks5NodeConfig,
+) -> Result<(), String> {
     let offered: &[u8] = match config.credentials() {
         Some(_) => &[METHOD_NONE, METHOD_USERPASS],
         None => &[METHOD_NONE],

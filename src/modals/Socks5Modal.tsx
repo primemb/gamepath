@@ -1,16 +1,33 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Check, Info, X, Zap } from 'lucide-react'
 import { errorMessage } from '../components/Toast'
 import type { Socks5NodeInput, Socks5ProbeResult } from '../types'
 
-export function Socks5Modal({
+/** The game's test: a relay answering through the proxy's UDP association. */
+const describeRelayProbe = (probe: Socks5ProbeResult) =>
+  `UDP works through ${probe.proxy}: relay answered in ${Math.round(probe.latencyMs)} ms ` +
+  `(${Math.round(probe.setupLatencyMs)} ms to open the association).`
+
+/**
+ * Adds a SOCKS5 node. The game tests it against the relay; the VPN, which has
+ * none, passes its own test and describes the result itself.
+ */
+export function Socks5Modal<Probe = Socks5ProbeResult>({
   onClose,
   onAdd,
   onTest,
+  intro,
+  testLabel = 'Test UDP',
+  describeResult = describeRelayProbe as (probe: Probe) => string,
+  resultTitle = 'This proxy can carry GamePath traffic',
 }: {
   onClose: () => void
   onAdd: (input: Socks5NodeInput) => Promise<void>
-  onTest: (input: Socks5NodeInput) => Promise<Socks5ProbeResult>
+  onTest?: (input: Socks5NodeInput) => Promise<Probe>
+  intro?: ReactNode
+  testLabel?: string
+  describeResult?: (probe: Probe) => string
+  resultTitle?: string
 }) {
   const [address, setAddress] = useState('')
   const [label, setLabel] = useState('')
@@ -32,11 +49,7 @@ export function Socks5Modal({
     setResult(null)
     setFailure(null)
     try {
-      const probe = await onTest(input())
-      setResult(
-        `UDP works through ${probe.proxy}: relay answered in ${Math.round(probe.latencyMs)} ms ` +
-          `(${Math.round(probe.setupLatencyMs)} ms to open the association).`,
-      )
+      setResult(describeResult(await onTest!(input())))
     } catch (error) {
       setFailure(errorMessage(error))
     } finally {
@@ -74,8 +87,12 @@ export function Socks5Modal({
           </button>
         </div>
         <p className="modal-intro">
-          GamePath carries game traffic as UDP, so the proxy has to support <strong>UDP ASSOCIATE</strong>. Test the
-          node before saving: some proxies accept the association and then never forward a datagram.
+          {intro ?? (
+            <>
+              GamePath carries game traffic as UDP, so the proxy has to support <strong>UDP ASSOCIATE</strong>. Test the
+              node before saving: some proxies accept the association and then never forward a datagram.
+            </>
+          )}
         </p>
         <label className="field-label">
           Proxy address
@@ -109,7 +126,7 @@ export function Socks5Modal({
           <div className="info-banner">
             <Check size={18} />
             <div>
-              <strong>This proxy can carry GamePath traffic</strong>
+              <strong>{resultTitle}</strong>
               <p>{result}</p>
             </div>
           </div>
@@ -127,10 +144,12 @@ export function Socks5Modal({
           <button className="button secondary" onClick={onClose}>
             Cancel
           </button>
-          <button className="button secondary" disabled={!address.trim() || busy !== 'idle'} onClick={runTest}>
-            <Zap size={16} />
-            {busy === 'testing' ? 'Testing…' : 'Test UDP'}
-          </button>
+          {onTest && (
+            <button className="button secondary" disabled={!address.trim() || busy !== 'idle'} onClick={runTest}>
+              <Zap size={16} />
+              {busy === 'testing' ? 'Testing…' : testLabel}
+            </button>
+          )}
           <button className="button primary" disabled={!address.trim() || busy !== 'idle'} onClick={save}>
             <Check size={16} />
             {busy === 'saving' ? 'Saving…' : 'Add node'}

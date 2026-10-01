@@ -308,6 +308,7 @@ impl WireGuardSessionManager {
             scheduler_metrics,
             effective_mtu,
             bypass_ips,
+            proxy_fake_ips: false,
             local_tap,
             timer,
         });
@@ -429,6 +430,7 @@ impl WireGuardSessionManager {
             scheduler_metrics,
             effective_mtu,
             bypass_ips,
+            proxy_fake_ips: kind == gamepath_engine::relay_path::KIND_SOCKS5,
             local_tap,
             timer,
         });

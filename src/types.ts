@@ -240,6 +240,92 @@ export type LanProxyStatus = {
   clients?: LanProxyDevice[]
 }
 
+/** The VPN's one node. Same public shape as a game node, without groups. */
+export type VpnNode = Omit<Tunnel, 'groupId'>
+
+export type VpnRule = {
+  id: string
+  kind: RuleKind
+  value: string
+  label: string
+  enabled: boolean
+}
+
+export type VpnSessionStatus = 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'degraded' | 'paused' | 'error'
+
+export type VpnSession = {
+  status: VpnSessionStatus
+  message?: string
+  /** Why the VPN is waiting: the game session needs what it holds. */
+  pauseReason?: 'game-all-traffic'
+  /** Tags this session's lines in every log file. */
+  sessionId?: string
+  node?: { id: string; name: string; kind: NodeKind }
+  startedAt?: number
+  /** When the next reconnect attempt runs. */
+  retryAt?: number
+  trafficMode?: 'all' | 'split'
+  killSwitch?: boolean
+  pathMetrics?: PathMetric[]
+  capture?: AppState['session']['capture']
+  metrics?: {
+    latencyMs: number | null
+    lossPercent: number | null
+    bytesSent: number
+    bytesReceived: number
+    /** When the counters were read, in milliseconds since the epoch. */
+    sampledAt?: number
+  }
+}
+
+/**
+ * The VPN beside the game session: one node connected directly, its own
+ * split rules, and a session of its own. The game always takes priority.
+ */
+export type VpnState = {
+  node: VpnNode | null
+  trafficMode: 'all' | 'split'
+  remoteDns: boolean
+  /** Block selected apps while the VPN is down instead of using the normal connection. */
+  killSwitch: boolean
+  rules: VpnRule[]
+  wantConnected: boolean
+  session: VpnSession
+  /** VPN rules the game also selects, which the game therefore takes. */
+  conflicts: string[]
+  /** Rules this node cannot route, by rule id, with the reason. */
+  limitations: Record<string, string>
+  /** False for an L2TP node in split mode, which routes by address only. */
+  canSelectApps: boolean
+}
+
+export type VpnProxyProbe = { reachable: boolean; proxy: string; setupLatencyMs: number; latencyMs: number }
+
+export type VpnApi = {
+  importWireGuard: () => Promise<{ canceled: boolean; state?: AppState }>
+  chooseOpenVpn: () => Promise<{ canceled: boolean; file?: OpenVpnCandidate }>
+  addOpenVpn: (input: { filePath: string; username?: string; password?: string }) => Promise<AppState>
+  addSocks5: (input: Socks5NodeInput) => Promise<AppState>
+  addL2tp: (input: L2tpNodeInput) => Promise<AppState>
+  /** Tests the given login, or the saved node's when called without one. */
+  testL2tp: (input?: L2tpNodeInput) => Promise<L2tpProbeResult>
+  /** Logs in to the proxy and opens a connection out through it. */
+  testSocks5: (input?: Socks5NodeInput) => Promise<VpnProxyProbe>
+  removeNode: () => Promise<AppState>
+  setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
+  setRemoteDns: (enabled: boolean) => Promise<AppState>
+  setKillSwitch: (enabled: boolean) => Promise<AppState>
+  browseTarget: (kind: RuleKind) => Promise<{ canceled: boolean; value?: string; label?: string }>
+  addRule: (input: Pick<VpnRule, 'kind' | 'value' | 'label'>) => Promise<AppState>
+  setRuleEnabled: (id: string, enabled: boolean) => Promise<AppState>
+  removeRule: (id: string) => Promise<AppState>
+  connect: () => Promise<AppState>
+  disconnect: () => Promise<AppState>
+  status: () => Promise<AppState>
+  /** Called whenever the VPN's state changes in the main process. */
+  onChanged: (callback: (vpn: VpnState) => void) => () => void
+}
+
 export type AppState = {
   clientVersion?: string
   tunnels: Tunnel[]
@@ -258,6 +344,7 @@ export type AppState = {
   activeRelayId: string | null
   /** Off by default. A move changes the session's public address, so the game rejoins. */
   relayFailover: RelayFailoverSettings
+  vpn: VpnState
   session: {
     status: 'idle' | 'starting' | 'prepared' | 'connected' | 'error'
     mode?: ConnectionMode
@@ -387,7 +474,7 @@ export type AppState = {
 }
 
 export type UsageRow = {
-  category: 'total' | 'node' | 'app' | 'device'
+  category: 'total' | 'node' | 'app' | 'device' | 'vpn-total' | 'vpn-node' | 'vpn-app'
   identity: string
   label: string
   sent: number
@@ -399,6 +486,8 @@ export type UsageReport = {
   to: string
   totals: UsageRow[]
   days: Array<{ day: string; sent: number; received: number }>
+  /** The VPN's daily totals, kept apart from the game's. */
+  vpnDays: Array<{ day: string; sent: number; received: number }>
 }
 
 export type AddRuleInput = Pick<SplitRule, 'kind' | 'value' | 'label' | 'groupId'>
@@ -460,6 +549,7 @@ export type GamePathApi = {
   startSession: () => Promise<AppState>
   stopSession: () => Promise<AppState>
   refreshSession: () => Promise<AppState>
+  vpn: VpnApi
 }
 
 export type VpsCredentials = { host: string; sshPort: number; username: string; password: string }

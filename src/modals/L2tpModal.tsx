@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Check, Info, X, Zap } from 'lucide-react'
 import { errorMessage } from '../components/Toast'
 import type { L2tpNodeInput, L2tpProbeResult } from '../types'
@@ -7,10 +7,12 @@ export function L2tpModal({
   onClose,
   onAdd,
   onTest,
+  intro,
 }: {
   onClose: () => void
   onAdd: (input: L2tpNodeInput) => Promise<void>
   onTest: (input: L2tpNodeInput) => Promise<L2tpProbeResult>
+  intro?: ReactNode
 }) {
   const [server, setServer] = useState('')
   const [label, setLabel] = useState('')
@@ -76,8 +78,8 @@ export function L2tpModal({
           </button>
         </div>
         <p className="modal-intro">
-          This uses the Windows L2TP/IPsec client in both relay and direct mode. The temporary Windows profile is
-          removed whenever GamePath disconnects. Direct split routing supports IPv4 ranges and exact hostnames.
+          {intro ??
+            'This uses the Windows L2TP/IPsec client in both relay and direct mode. The temporary Windows profile is removed whenever GamePath disconnects. Direct split routing supports IPv4 ranges and exact hostnames.'}
         </p>
         <label className="field-label">
           Server hostname or IPv4 address

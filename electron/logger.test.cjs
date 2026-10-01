@@ -81,3 +81,15 @@ test('the client and the Rust components agree on the log directory', () => {
     assert.match(logger.defaultLogPath(), /GamePath[\\/]logs[\\/]client\.log$/)
   }
 })
+
+test('a scoped logger tags every line with its prefix', (context) => {
+  const file = scratch(context)
+  logger.init(file, { stderr: false })
+  const vpn = logger.scope('vpn vpn-3f9a1c')
+  vpn.info('connected')
+  vpn.error('node stopped answering')
+  logger.flush()
+  const written = lines(file)
+  assert.match(written[0], /INFO {2}client \[vpn vpn-3f9a1c\] connected$/)
+  assert.match(written[1], /ERROR client \[vpn vpn-3f9a1c\] node stopped answering$/)
+})

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell, Tray } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, Menu, powerMonitor, safeStorage, shell, Tray } = require('electron')
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -19,6 +19,11 @@ const { enrollExistingRelay, provisionRelay, removeRelay } = require('./vps.cjs'
 const { createIpCountryLookup } = require('./ip-country.cjs')
 const { createFileIconLookup } = require('./file-icon.cjs')
 const { UsageStore } = require('./usage.cjs')
+const { withoutSecrets } = require('./public-state.cjs')
+const { nodeSpec } = require('./node-spec.cjs')
+const { ownHostnames } = require('./own-hostnames.cjs')
+const { defaultVpn, normalizeVpn } = require('./vpn-state.cjs')
+const { createVpnFeature } = require('./vpn-ipc.cjs')
 const { RelayFailoverController, normalizeRelayFailover, standbyRelayFor } = require('./relay-failover.cjs')
 const {
   defaultLanProxy,
@@ -62,6 +67,7 @@ const defaultState = () => ({
   // Off unless the user asks: moving a session changes its public address.
   relayFailover: normalizeRelayFailover(null),
   session: { status: 'idle' },
+  vpn: defaultVpn(),
 })
 
 let state
@@ -75,6 +81,8 @@ let closePromptOpen = false
 let usageStore = null
 let usageError = null
 let usageFlushTimer = null
+// The VPN section; created once the bridges exist. See vpn-ipc.cjs.
+let vpnFeature = null
 // This PC's LAN addresses, as the engine sees them. Node's own interface list
 // cannot tell a VPN adapter from a network card, so it is not used for this.
 let lanAddresses = []
@@ -104,11 +112,11 @@ function statePath() {
 }
 
 function publicState() {
-  const { encryptedConfigs, encryptedRelayTokens, encryptedLanProxyPassword, ...safeState } = state
   return structuredClone({
-    ...safeState,
-    lanProxy: publicLanProxy(state.lanProxy, Boolean(encryptedLanProxyPassword)),
+    ...withoutSecrets(state),
+    lanProxy: publicLanProxy(state.lanProxy, Boolean(state.encryptedLanProxyPassword)),
     lanAddresses,
+    vpn: vpnFeature?.publicVpn() ?? { ...state.vpn, session: { status: 'idle' } },
     clientVersion: app.getVersion(),
     engine: engineBridge?.status ?? {
       status: 'offline',
@@ -141,6 +149,7 @@ function loadState() {
     if (state.routingStrategy !== 'manual') state.routingStrategy = 'smart'
     state.lanProxy = normalizeLanProxy(state.lanProxy)
     state.relayFailover = normalizeRelayFailover(state.relayFailover)
+    state.vpn = normalizeVpn(state.vpn)
     state.nodeGroups = Array.isArray(state.nodeGroups) ? state.nodeGroups : []
     const nodeGroupIds = new Set(state.nodeGroups.map((group) => group.id))
     // Nodes imported before SOCKS5 support existed are all WireGuard routes,
@@ -156,8 +165,18 @@ function loadState() {
       normalized.status = normalized.address && hasEnrollmentToken ? 'ready' : 'setup-required'
       return normalized
     })
-  } catch {
+  } catch (error) {
     state = defaultState()
+    if (error.code === 'ENOENT') return
+    // The next saveState() would overwrite the user's nodes and encrypted
+    // configs with defaults, so keep the unreadable file for recovery.
+    const preserved = `${statePath()}.corrupt-${Date.now()}`
+    try {
+      fs.renameSync(statePath(), preserved)
+      logger.error(`saved state could not be loaded (${error.message}); kept it as ${path.basename(preserved)}`)
+    } catch (renameError) {
+      logger.error(`saved state could not be loaded (${error.message}) or preserved: ${renameError.message}`)
+    }
   }
 }
 
@@ -357,52 +376,14 @@ function updateSessionMetrics(runtime, dataPlane) {
   }
 }
 
-/**
- * Decrypts each enabled node into the tagged list the engine expects. Secrets
- * live in Windows secure storage until this moment and never reach the
- * renderer: a WireGuard node yields its configuration body, a SOCKS5 node its
- * stored credentials, and an OpenVPN node both its file and its credentials.
- */
+/** Decrypts each enabled node into the tagged list the engine expects. */
 function sessionNodes(enabledTunnels) {
   return enabledTunnels.map((tunnel) => {
     const stored = state.encryptedConfigs[tunnel.id]
     if (!stored) {
       throw new Error(`${tunnel.name} is missing its stored secret. Remove the node and add it again.`)
     }
-    const secret = safeStorage.decryptString(Buffer.from(stored, 'base64'))
-    if (tunnel.kind === 'socks5') {
-      const { username, password } = JSON.parse(secret)
-      return {
-        kind: 'socks5',
-        host: tunnel.host,
-        port: tunnel.port,
-        username: username || null,
-        password: password || null,
-        label: tunnel.name,
-      }
-    }
-    if (tunnel.kind === 'openvpn') {
-      const { config, username, password } = JSON.parse(secret)
-      return {
-        kind: 'openvpn',
-        config,
-        username: username || null,
-        password: password || null,
-        label: tunnel.name,
-      }
-    }
-    if (tunnel.kind === 'l2tp') {
-      const { server, username, password, preSharedKey } = JSON.parse(secret)
-      return {
-        kind: 'l2tp',
-        server,
-        username,
-        password,
-        preSharedKey,
-        label: tunnel.name,
-      }
-    }
-    return { kind: 'wireguard', config: secret, label: tunnel.name }
+    return nodeSpec(tunnel, safeStorage.decryptString(Buffer.from(stored, 'base64')))
   })
 }
 
@@ -1108,7 +1089,13 @@ let sessionQueue = Promise.resolve()
 function sessionExclusive(work) {
   const run = sessionQueue.then(work, work)
   sessionQueue = run.catch(() => {})
+  run.then(notifyVpnOfGame, notifyVpnOfGame)
   return run
+}
+
+/** The game session moved; the VPN steps aside for it or comes back. */
+function notifyVpnOfGame() {
+  vpnFeature?.gameChanged().catch((error) => logger.warn(`VPN could not follow the game session: ${error.message}`))
 }
 
 async function stopRunningSession() {
@@ -1191,6 +1178,8 @@ const relayFailover = new RelayFailoverController({
  */
 async function startSession({ relay: relayOverride = null, movedFrom = null, watchForFailover = true } = {}) {
   relayFailover.end()
+  // A game about to carry all traffic needs the VPN out of the way first.
+  await vpnFeature?.beforeGameStart()
   const mode = state.connectionMode === 'direct' ? 'direct' : 'relay'
   const strategy = state.routingStrategy === 'manual' ? 'all-paths' : 'adaptive'
   // A node only joins the session when its own switch and its group's are
@@ -1266,6 +1255,7 @@ async function startSession({ relay: relayOverride = null, movedFrom = null, wat
           nodes,
           trafficMode: state.trafficMode,
           remoteDns: state.remoteDns !== false,
+          ownHostnames: ownHostnames(state),
           rules,
           lanProxy: lanProxyPayload(),
         },
@@ -1381,6 +1371,7 @@ async function pollSessionStatus() {
     stopSessionKeepAlive()
     relayFailover.end()
     logger.error(`session lost after ${sessionPollFailures} failed status requests: ${error.message}`)
+    notifyVpnOfGame()
   } finally {
     sessionPollInFlight = false
   }
@@ -1425,13 +1416,29 @@ function showMainWindow() {
   mainWindow.focus()
 }
 
-function createTray() {
-  if (tray) return
-  tray = new Tray(appIconPath())
-  tray.setToolTip('GamePath')
+let trayVpnLabel = null
+
+function trayVpnItem() {
+  const status = vpnFeature?.controller.snapshot().status ?? 'idle'
+  const on = state?.vpn.wantConnected && status !== 'idle'
+  return {
+    label: on ? 'Disconnect VPN' : 'Connect VPN',
+    enabled: Boolean(state?.vpn.node),
+    click: () => {
+      void vpnFeature.setWanted(!on).catch((error) => logger.warn(`VPN tray action failed: ${error.message}`))
+    },
+  }
+}
+
+function refreshTrayMenu() {
+  if (!tray) return
+  const vpnItem = trayVpnItem()
+  if (vpnItem.label === trayVpnLabel) return
+  trayVpnLabel = vpnItem.label
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: 'Open GamePath', click: showMainWindow },
+      vpnItem,
       { type: 'separator' },
       {
         label: 'Quit GamePath',
@@ -1442,7 +1449,20 @@ function createTray() {
       },
     ]),
   )
+}
+
+function createTray() {
+  if (tray) return
+  tray = new Tray(appIconPath())
+  tray.setToolTip('GamePath')
+  refreshTrayMenu()
   tray.on('click', showMainWindow)
+}
+
+/** Pushes VPN changes to the window, which has no timer of its own for them. */
+function vpnChanged() {
+  refreshTrayMenu()
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:changed', vpnFeature.publicVpn())
 }
 
 function createWindow() {
@@ -1549,15 +1569,73 @@ app.whenReady().then(async () => {
   setInterval(refreshLanAddresses, 15000).unref?.()
   await serviceBridge.inspect()
   registerIpc()
+  vpnFeature = createVpnFeature({
+    ipcMain,
+    dialog,
+    getState: () => state,
+    saveState,
+    publicState,
+    encrypt: encryptConfig,
+    decrypt: (stored) => safeStorage.decryptString(Buffer.from(stored, 'base64')),
+    service: {
+      ready: () => serviceBridge?.status.status === 'ready',
+      request: (command, payload, timeout) => serviceBridge.request(command, payload, timeout),
+    },
+    engine: {
+      ready: () => engineBridge?.status.status === 'ready',
+      request: (command, payload, timeout) => engineBridge.request(command, payload, timeout),
+    },
+    logger,
+    usage: usageStore?.session('vpn-') ?? null,
+    onChange: vpnChanged,
+  })
+  vpnFeature.register()
   createWindow()
   createTray()
+  // Sleep drops every tunnel; the VPN retries at once rather than on backoff.
+  powerMonitor.on('resume', () => {
+    logger.info('system resumed from sleep')
+    void vpnFeature.onPowerResume()
+  })
+  void vpnFeature.resume()
   app.on('activate', () => {
     showMainWindow()
   })
 })
 
-app.on('before-quit', () => {
+/**
+ * The service lease would tear a session down 30 s after the client is gone,
+ * but until then selected traffic keeps flowing through a tunnel nobody is
+ * watching. Quitting stops it now; the cap keeps a hung service from holding
+ * the quit, and the lease stays the safety net.
+ */
+const QUIT_STOP_TIMEOUT_MS = 3000
+let quitSessionsStopped = false
+
+function stopSessionsForQuit() {
+  const stopVpn = vpnFeature?.shutdown() ?? Promise.resolve()
+  const stopGame = sessionExclusive(async () => {
+    if (state.session.status !== 'connected' && state.session.status !== 'starting') return
+    logger.info('stopping the session because the app is quitting')
+    relayFailover.end()
+    await stopRunningSession()
+    state.session = { status: 'idle' }
+    saveState()
+  })
+  const timeout = new Promise((resolve) => setTimeout(resolve, QUIT_STOP_TIMEOUT_MS))
+  return Promise.race([Promise.all([stopGame, stopVpn]), timeout]).catch((error) => {
+    logger.warn(`session stop at quit failed: ${error.message}`)
+  })
+}
+
+app.on('before-quit', (event) => {
   isQuitting = true
+  if (!quitSessionsStopped && state) {
+    quitSessionsStopped = true
+    event.preventDefault()
+    void stopSessionsForQuit().finally(() => app.quit())
+    return
+  }
   if (usageFlushTimer) clearInterval(usageFlushTimer)
   try {
     usageStore?.close()

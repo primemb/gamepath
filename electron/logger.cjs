@@ -106,8 +106,23 @@ function flush() {
   flushRepeat()
 }
 
+/**
+ * The same logger with every line prefixed `[prefix]`, so the lines of one
+ * session can be picked out of a log shared with another.
+ */
+function scope(prefix) {
+  const tag = `[${prefix}] `
+  return {
+    error: (message) => write('error', tag + message),
+    warn: (message) => write('warn', tag + message),
+    info: (message) => write('info', tag + message),
+    debug: (message) => write('debug', tag + message),
+  }
+}
+
 module.exports = {
   init,
+  scope,
   flush,
   defaultLogPath,
   path: () => logPath,

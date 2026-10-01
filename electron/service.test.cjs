@@ -6,6 +6,21 @@ const path = require('node:path')
 const test = require('node:test')
 const { ServiceBridge } = require('./service.cjs')
 
+const serviceDirectory = path.join(__dirname, '..', 'service', 'src')
+const serviceFile = (name) => fs.readFileSync(path.join(serviceDirectory, name), 'utf8')
+/** Every service source file, for invariants that do not care which module holds them. */
+const serviceSource = () =>
+  fs
+    .readdirSync(serviceDirectory)
+    .filter((name) => name.endsWith('.rs'))
+    .map(serviceFile)
+    .join('\n')
+/** The live rule-update handler, from its signature to the function after it. */
+const updateHandlerSource = () => {
+  const session = serviceFile('session.rs')
+  return session.slice(session.indexOf('fn update_session_rules'), session.indexOf('fn set_foreign_bypass'))
+}
+
 test('authenticates and parses a network service response', async (context) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gamepath-service-test-'))
   context.after(() => fs.rmSync(directory, { recursive: true, force: true }))
@@ -34,7 +49,7 @@ test('authenticates and parses a network service response', async (context) => {
 
 test('the session lease is renewed from the main process, well inside its window', () => {
   const main = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8')
-  const service = fs.readFileSync(path.join(__dirname, '..', 'service', 'src', 'main.rs'), 'utf8')
+  const service = serviceFile('slot.rs')
 
   const pollMs = Number(main.match(/const SESSION_POLL_MS = (\d+)/)[1])
   const leaseSeconds = Number(service.match(/const SESSION_LEASE: Duration = Duration::from_secs\((\d+)\)/)[1])
@@ -56,7 +71,7 @@ test('the session lease is renewed from the main process, well inside its window
 
 test('split targets are reapplied without restarting the network session', () => {
   const main = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8')
-  const service = fs.readFileSync(path.join(__dirname, '..', 'service', 'src', 'main.rs'), 'utf8')
+  const service = serviceSource()
   const engine = fs.readFileSync(path.join(__dirname, '..', 'engine', 'src', 'main.rs'), 'utf8')
 
   // Every layer has a dedicated live-update command. The privileged service
@@ -67,14 +82,15 @@ test('split targets are reapplied without restarting the network session', () =>
   assert.match(service, /engine\.request\(command, update\)/)
   assert.match(engine, /"update-packet-capture" => capture\.update/)
 
-  const updateHandler = service.slice(service.indexOf('fn update_session_rules'), service.indexOf('fn log_event'))
+  const updateHandler = updateHandlerSource()
+  assert.ok(updateHandler.length > 0, 'the live update handler was not found')
   assert.doesNotMatch(updateHandler, /start-wireguard-session|stop-wireguard-session/)
   assert.match(updateHandler, /"start-packet-capture"/)
 })
 
 test('the remote DNS setting reaches packet capture in both traffic modes', () => {
   const main = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8')
-  const service = fs.readFileSync(path.join(__dirname, '..', 'service', 'src', 'main.rs'), 'utf8')
+  const service = serviceSource()
   const capture = fs.readFileSync(path.join(__dirname, '..', 'engine', 'src', 'capture.rs'), 'utf8')
 
   // The setting is the user's, so it has to survive every hop. A layer that
@@ -87,13 +103,15 @@ test('the remote DNS setting reaches packet capture in both traffic modes', () =
 
   // And a live split rule edit has to reapply the session's choice rather
   // than rebuild the payload from the default.
-  const updateHandler = service.slice(service.indexOf('fn update_session_rules'), service.indexOf('fn log_event'))
-  assert.match(updateHandler, /runtime\.remote_dns/)
+  // The handler builds its capture payload from the running slot, which is
+  // where the session's own choice is kept.
+  assert.match(updateHandlerSource(), /capture_request\(&runtime,/)
+  assert.match(service, /let remote_dns = slot\.remote_dns;/)
 
   // Both capture backends consult it: all-traffic mode gates the adapter's
-  // resolvers, split mode gates the adapter it keeps to hold them.
+  // resolvers, split mode gates redirecting the router's lookups.
   assert.match(capture, /input\.remote_dns \{[\s\S]{0,120}configure_tunnel_dns/)
-  assert.match(capture, /if !input\.remote_dns \{/)
+  assert.match(capture, /split\.set_redirect_dns\(input\.remote_dns\)/)
 })
 
 test('the declared MSRV matches the toolchain the relay is built with', () => {
