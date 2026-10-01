@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Activity, Link2, MessageCircle, Network, Server, ShieldCheck, Zap } from 'lucide-react'
+import { Activity, ArrowLeftRight, Link2, MessageCircle, Network, Server, ShieldCheck, Zap } from 'lucide-react'
 import { api } from '../api'
 import { Toggle } from '../components/Toggle'
 import { errorMessage, type Notify } from '../components/Toast'
@@ -32,6 +32,16 @@ export function SettingsView({
       notify(errorMessage(error), 'error')
     }
   }
+
+  const failover = state.relayFailover ?? { enabled: false, standbyRelayId: null }
+  const standbyCandidates = state.relays.filter((relay) => relay.status === 'ready' && relay.id !== state.activeRelayId)
+  const failoverDetail = direct
+    ? 'Available in relay mode.'
+    : !standbyCandidates.length
+      ? 'Set up a second relay to use as a standby.'
+      : 'If your relay stops answering through every node for 30 seconds while your internet works, this session moves to the standby relay. It never moves back by itself. Applies from the next session.'
+  const configureFailover = (next: typeof failover) =>
+    guard(async () => setState(await api.configureRelayFailover(next)))
 
   const installService = () =>
     guard(async () => {
@@ -113,6 +123,41 @@ export function SettingsView({
               </span>
             </button>
           ))}
+        </div>
+      </div>
+
+      <div className="settings-card">
+        <div>
+          <span className="setting-icon">
+            <ArrowLeftRight size={18} />
+          </span>
+          <div>
+            <strong>Automatic relay failover</strong>
+            <p>{failoverDetail}</p>
+          </div>
+        </div>
+        <div className="failover-controls">
+          <label className="failover-standby">
+            <span className="sr-only">Standby relay</span>
+            <select
+              value={failover.standbyRelayId ?? ''}
+              disabled={direct || !failover.enabled || !standbyCandidates.length}
+              onChange={(event) => configureFailover({ ...failover, standbyRelayId: event.target.value || null })}
+            >
+              <option value="">First other ready relay</option>
+              {standbyCandidates.map((relay) => (
+                <option key={relay.id} value={relay.id}>
+                  {relay.city}
+                </option>
+              ))}
+            </select>
+          </label>
+          <Toggle
+            checked={failover.enabled}
+            disabled={direct || (!failover.enabled && !standbyCandidates.length)}
+            onChange={(enabled) => configureFailover({ ...failover, enabled })}
+            label="Automatic relay failover"
+          />
         </div>
       </div>
 

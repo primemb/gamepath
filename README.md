@@ -163,6 +163,17 @@ still depends on a usable alternative: a slower backup can increase ping, and
 paths sharing an ISP bottleneck or the same relay cannot bypass failure of that
 shared segment. Direct mode does not provide multipath failover.
 
+**Automatic relay failover** covers that last case, the relay itself. It is off
+by default; turn it on in Settings and pick a standby relay, ideally on a
+different provider. A session moves to the standby only when GamePath is sure
+the relay is gone: every node has been unable to reach it for 30 seconds while
+your own internet is up, and, where this PC can reach the relay directly,
+direct probes go unanswered too. Without that direct check the wait is 60
+seconds. A relay that freezes and comes back within that time keeps its
+session. Moving restarts the session on the standby, so the game sees a new
+address and rejoins. The session never moves back by itself: the next session
+starts on your selected relay again.
+
 **Direct mode** is for people who have no server to run a relay on. Selected
 traffic goes through one WireGuard, OpenVPN or L2TP/IPsec node, which routes it
 onward as a normal VPN would. Nothing is duplicated and there is no second path

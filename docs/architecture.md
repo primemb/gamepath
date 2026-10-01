@@ -801,6 +801,72 @@ message about a datagram already sent: the socket is fine, the next send may
 well succeed, and tearing the path down for one is the more expensive mistake —
 the same reasoning that makes the SOCKS5 transport swallow them on receive.
 
+## Relay failover
+
+Multipath survives any path failing, but every path ends at one relay, so the
+relay is the one failure it cannot route around. `electron/relay-failover.cjs`
+moves a session to a standby relay when that relay is gone. It is off unless
+the user turns it on, because a move is not free: every node redials and the
+game sees a new public address.
+
+It exists because of a measured failure: a relay VPS on an overloaded host
+stopped answering from everywhere — through every node, and to direct pings
+from the client — for 3 to 21 seconds at a time, several times an hour, while
+the client's own Internet and every node stayed up. Each freeze ended by
+itself. So silence is not enough; a move needs every independent witness to
+agree, and `RelayFailoverWatch` checks them from the main process's session
+poll:
+
+- the session carried traffic first, so a slow start is not a dead relay;
+- every path has been down without a break;
+- the uplink monitor, which probes outside every node, reported `up` on every
+  poll; `down` or `unknown` means the cause may be local and restarts the clock;
+- where this machine can reach the relay directly — learned from a direct
+  `probe-relay` while the session was healthy, repeated every ten minutes —
+  direct probes every 5 s fail at least `DIRECT_FAILURES_REQUIRED` (3) times
+  with no answer between. One answer proves the relay alive and restarts the
+  clock, since a different relay would not fix the paths to it.
+
+With the direct witness the silence has to last `OUTAGE_WITH_WITNESS_MS` (30 s);
+on a network that filters direct traffic to the relay, `OUTAGE_WITHOUT_WITNESS_MS`
+(60 s). Both are well past the longest freeze measured.
+
+The standby is the relay the user picked, or the first other relay that is set
+up, never one on the main relay's own address. In split mode it must answer a
+direct probe first; if it does not, the session stays and the whole wait starts
+again. In all-traffic mode only the active relay is routed around the tunnel,
+so a direct probe to the standby would enter the dead session and prove
+nothing; there the start itself is the check, and a standby that fails to start
+sends the session straight back to the main relay, which beats no session at
+all.
+
+The move runs through the same `startSession` path as the Start button,
+serialised with Start and Stop so they cannot interleave. It happens at most
+once per session and never back: the moved session, and a session returning
+from a failed move, do not watch for failover. `activeRelayId` is not changed,
+so the next session starts on the user's relay again.
+
+A direct answer during an outage settles it for `RELAY_ALIVE_HOLD_MS` (60 s):
+the relay is up, nothing is left to decide, and probing on would only add load.
+
+Building this exposed two relay bugs, both fixed in `relay/src/main.rs`:
+
+- **Probe sessions displaced the real one.** `probe-relay` uses a one-off
+  session id, and the relay admitted every one as a session. The per-client cap
+  evicts the least recently used session, which during an outage is the real
+  one, silent while its paths are down; replies also go to the newest session,
+  which a probe briefly became. A probe from a session the relay holds no state
+  for is now answered without creating any.
+- **A re-created session repeated nonces.** A session's key depends only on the
+  enrolment key and its id, and the AEAD nonce is the sequence. When the relay
+  forgot a session and re-created it for the same id — evicted, expired after
+  `SESSION_TTL`, or lost to a relay restart while the client kept going — its
+  reply sequence started from zero again. That reused every nonce of the
+  previous incarnation under the same key, and the client's replay window, far
+  ahead, discarded every reply as stale: connected, and delivering nothing. A
+  new session's reply sequence now starts from the wall clock in microseconds,
+  which moves faster than any session sends.
+
 ## Common-mode failure
 
 Independent providers do not fail in the same second. When every path stops

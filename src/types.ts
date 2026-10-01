@@ -138,6 +138,12 @@ export type Relay = {
   sshFingerprint?: string
 }
 
+export type RelayFailoverSettings = {
+  enabled: boolean
+  /** `null` picks the first other relay that is set up. */
+  standbyRelayId: string | null
+}
+
 export type PathMetric = {
   route: number
   pathKind: string
@@ -250,10 +256,16 @@ export type AppState = {
   lanAddresses?: string[]
   relays: Relay[]
   activeRelayId: string | null
+  /** Off by default. A move changes the session's public address, so the game rejoins. */
+  relayFailover: RelayFailoverSettings
   session: {
     status: 'idle' | 'starting' | 'prepared' | 'connected' | 'error'
     mode?: ConnectionMode
     message?: string
+    /** The relay this session is actually running on, which a failover can change. */
+    relayId?: string | null
+    /** Set when this session moved off its relay; it never moves back by itself. */
+    failover?: { fromRelayId: string; fromCity: string; toCity: string; at: number }
     routeLatencies?: number[]
     strategy?: 'adaptive' | 'all-paths' | 'fastest-path' | 'duplicate' | 'single-path'
     selectedRoutes?: number[]
@@ -429,6 +441,7 @@ export type GamePathApi = {
   setConnectionMode: (mode: ConnectionMode) => Promise<AppState>
   setRoutingStrategy: (strategy: 'smart' | 'manual') => Promise<AppState>
   setRelay: (id: string) => Promise<AppState>
+  configureRelayFailover: (input: RelayFailoverSettings) => Promise<AppState>
   addRelay: (input: { city: string; country: string }) => Promise<{ state: AppState; relayId: string }>
   removeRelayLocal: (id: string) => Promise<AppState>
   configureRelay: (id: string, input: { address: string; port: number; enrollmentToken?: string }) => Promise<AppState>

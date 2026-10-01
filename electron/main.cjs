@@ -19,6 +19,7 @@ const { enrollExistingRelay, provisionRelay, removeRelay } = require('./vps.cjs'
 const { createIpCountryLookup } = require('./ip-country.cjs')
 const { createFileIconLookup } = require('./file-icon.cjs')
 const { UsageStore } = require('./usage.cjs')
+const { RelayFailoverController, normalizeRelayFailover, standbyRelayFor } = require('./relay-failover.cjs')
 const {
   defaultLanProxy,
   normalizeLanProxy,
@@ -58,6 +59,8 @@ const defaultState = () => ({
     },
   ],
   activeRelayId: 'tr-istanbul-01',
+  // Off unless the user asks: moving a session changes its public address.
+  relayFailover: normalizeRelayFailover(null),
   session: { status: 'idle' },
 })
 
@@ -137,6 +140,7 @@ function loadState() {
     if (state.connectionMode !== 'direct') state.connectionMode = 'relay'
     if (state.routingStrategy !== 'manual') state.routingStrategy = 'smart'
     state.lanProxy = normalizeLanProxy(state.lanProxy)
+    state.relayFailover = normalizeRelayFailover(state.relayFailover)
     state.nodeGroups = Array.isArray(state.nodeGroups) ? state.nodeGroups : []
     const nodeGroupIds = new Set(state.nodeGroups.map((group) => group.id))
     // Nodes imported before SOCKS5 support existed are all WireGuard routes,
@@ -868,6 +872,17 @@ function registerIpc() {
     return publicState()
   })
 
+  ipcMain.handle('relay-failover:configure', (_event, input) => {
+    const next = normalizeRelayFailover(input)
+    if (next.standbyRelayId && !state.relays.some((relay) => relay.id === next.standbyRelayId)) {
+      throw new Error('That standby relay no longer exists')
+    }
+    // Takes effect from the next session: a running one keeps what it started with.
+    state.relayFailover = next
+    saveState()
+    return publicState()
+  })
+
   ipcMain.handle('relay:add', (_event, input) => {
     const city = String(input?.city ?? '').trim() || 'Custom relay'
     const country = String(input?.country ?? '').trim() || 'Custom'
@@ -891,6 +906,7 @@ function registerIpc() {
     state.relays = state.relays.filter((relay) => relay.id !== id)
     delete state.encryptedRelayTokens[id]
     if (state.activeRelayId === id) state.activeRelayId = null
+    if (state.relayFailover.standbyRelayId === id) state.relayFailover.standbyRelayId = null
     saveState()
     return publicState()
   })
@@ -1052,151 +1068,27 @@ function registerIpc() {
     return publicState()
   })
 
-  ipcMain.handle('engine:start', async () => {
-    const mode = state.connectionMode === 'direct' ? 'direct' : 'relay'
-    const strategy = state.routingStrategy === 'manual' ? 'all-paths' : 'adaptive'
-    // A node only joins the session when its own switch and its group's are
-    // both on, so a switched-off group takes every node inside it out.
-    const enabledTunnels = activeTunnels(state.tunnels, state.nodeGroups)
-    const enabledRules = enabledRuleSpecs()
-    const relay = state.relays.find((item) => item.id === state.activeRelayId)
-    const encryptedRelayToken = relay && state.encryptedRelayTokens[relay.id]
-    const direct = mode === 'direct'
-    const selection = direct ? directNodeSelection(enabledTunnels) : { node: null, error: null }
-    // Nodes switched on but held back by their group: without naming this, the
-    // user sees switches that are on and a message saying to switch one on.
-    const heldByGroup = state.tunnels.some((tunnel) => tunnel.enabled) && enabledTunnels.length < 1
-    const groupBlocker =
-      'Every node you enabled is in a switched-off group. Switch its group back on, or enable an ungrouped node.'
-    const blocker = direct
-      ? heldByGroup
-        ? groupBlocker
-        : selection.error
-      : enabledTunnels.length < 1
-        ? heldByGroup
-          ? groupBlocker
-          : 'Enable at least one WireGuard, OpenVPN, L2TP/IPsec or SOCKS5 node.'
-        : !relay || relay.status !== 'ready' || !encryptedRelayToken
-          ? 'The Istanbul relay needs its address and enrollment token.'
-          : null
-    if (blocker) {
-      state.session = { status: 'error', message: blocker }
-    } else if (state.trafficMode === 'split' && !enabledRules.length) {
-      state.session = { status: 'error', message: 'Add at least one split-tunnel target.' }
-    } else if (engineBridge?.status.status !== 'ready') {
-      state.session = { status: 'error', message: 'The native routing engine is unavailable.' }
-    } else if (serviceBridge?.status.status !== 'ready') {
-      state.session = { status: 'error', message: 'Install and start the GamePath Network Service in Settings.' }
-    } else {
-      try {
-        const rules = enabledRules
-        const nodes = sessionNodes(enabledTunnels)
-        // A relay session addresses and authenticates itself to the relay; a
-        // direct session has neither, so it sends neither.
-        const relayCredentials = direct
-          ? {}
-          : {
-              relayHost: relay.address,
-              relayPort: relay.port,
-              enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedRelayToken, 'base64')),
-            }
-        const plan = await engineBridge.request('prepare-session', {
-          mode,
-          routeIds: enabledTunnels.map((tunnel) => tunnel.id),
-          trafficMode: state.trafficMode,
-          rules,
-          ...relayCredentials,
-        })
-        let relayIp
-        if (!direct) {
-          const relayAddresses = await require('node:dns').promises.lookup(relay.address, { all: true })
-          relayIp = relayAddresses.find((entry) => entry.family === 4)?.address ?? relayAddresses[0]?.address
-          if (!relayIp) throw new Error('The relay hostname did not resolve')
-        }
-        await serviceBridge.request('validate-runtime', {
-          mode,
-          relayIp,
-          trafficMode: state.trafficMode,
-          nodes,
-        })
-        const serviceSession = await serviceBridge.request(
-          'start-session',
-          {
-            mode,
-            strategy,
-            ...relayCredentials,
-            nodes,
-            trafficMode: state.trafficMode,
-            remoteDns: state.remoteDns !== false,
-            rules,
-            lanProxy: lanProxyPayload(),
-          },
-          nodes.some((node) => node.kind === 'l2tp') ? 60000 : 30000,
-        )
-        const paths = serviceSession.paths
-        const dataPlane = serviceSession.dataPlane
-        state.session = {
-          status: 'connected',
-          mode,
-          message: direct
-            ? directSessionMessage(plan, selection.node, dataPlane)
-            : relaySessionMessage(plan, paths, dataPlane),
-        }
-        state.session.capture = serviceSession.capture
-        state.session.lanProxy = serviceSession.lanProxy ?? { state: 'stopped' }
-        if (usageStore) {
-          try {
-            usageStore.start(
-              paths.sessionId ?? crypto.randomUUID(),
-              enabledTunnels.map(({ id, name }) => ({ id, name })),
-            )
-            recordUsage({ ...paths, capture: serviceSession.capture, lanProxy: serviceSession.lanProxy })
-          } catch (error) {
-            usageError = error.message
-            logger.warn(`usage accounting failed: ${error.message}`)
-          }
-        }
-        updateSessionMetrics(paths, dataPlane)
-        startSessionKeepAlive()
-        logger.info(
-          `session started: mode=${mode} traffic=${state.trafficMode} ` +
-            `dns=${state.remoteDns !== false ? 'remote' : 'local'} ` +
-            `routes=${paths.paths.length} skipped=${(paths.skippedRoutes ?? []).length} ` +
-            `mtu=${serviceSession.capture?.effectiveMtu ?? 'unknown'} ` +
-            `lanProxy=${serviceSession.lanProxy?.state === 'listening' ? serviceSession.lanProxy.port : (serviceSession.lanProxy?.state ?? 'off')}`,
-        )
-        if (serviceSession.lanProxy?.state === 'error') {
-          logger.warn(`LAN proxy did not start: ${serviceSession.lanProxy.error}`)
-        }
-        for (const route of paths.skippedRoutes ?? []) {
-          logger.warn(`route ${route.route} (${route.label}) did not join: ${route.reason}`)
-        }
-      } catch (error) {
-        try {
-          await serviceBridge.request('stop-session')
-        } catch {}
-        state.session = { status: 'error', message: error.message }
-        stopSessionKeepAlive()
-        logger.error(`session failed to start: ${error.message}`)
-      }
-    }
-    saveState()
-    return publicState()
-  })
+  ipcMain.handle('engine:start', () =>
+    sessionExclusive(async () => {
+      await startSession()
+      return publicState()
+    }),
+  )
 
-  ipcMain.handle('engine:stop', async () => {
-    stopSessionKeepAlive()
-    logger.info('session stop requested')
-    try {
-      if (engineBridge?.status.status === 'ready') await engineBridge.request('stop-wireguard-session')
-      if (serviceBridge?.status.status === 'ready') await serviceBridge.request('stop-session')
-      state.session = { status: 'idle' }
-    } catch (error) {
-      state.session = { status: 'error', message: error.message }
-    }
-    saveState()
-    return publicState()
-  })
+  ipcMain.handle('engine:stop', () =>
+    sessionExclusive(async () => {
+      logger.info('session stop requested')
+      relayFailover.end()
+      try {
+        await stopRunningSession()
+        state.session = { status: 'idle' }
+      } catch (error) {
+        state.session = { status: 'error', message: error.message }
+      }
+      saveState()
+      return publicState()
+    }),
+  )
 
   ipcMain.handle('engine:session-status', async () => {
     // The keep-alive below already refreshes this every SESSION_POLL_MS, so the
@@ -1205,6 +1097,241 @@ function registerIpc() {
     if (!sessionKeepAlive) await pollSessionStatus()
     return publicState()
   })
+}
+
+/**
+ * Runs session transitions one at a time. A failover restarts the session from
+ * the status poll, and must not interleave with the user pressing Start or
+ * Stop while it does.
+ */
+let sessionQueue = Promise.resolve()
+function sessionExclusive(work) {
+  const run = sessionQueue.then(work, work)
+  sessionQueue = run.catch(() => {})
+  return run
+}
+
+async function stopRunningSession() {
+  stopSessionKeepAlive()
+  if (engineBridge?.status.status === 'ready') await engineBridge.request('stop-wireguard-session')
+  if (serviceBridge?.status.status === 'ready') await serviceBridge.request('stop-session')
+}
+
+/** Whether `relay` answers an authenticated probe sent straight to it, outside every node. */
+async function probeRelayDirect(relay) {
+  const encryptedToken = relay && state.encryptedRelayTokens[relay.id]
+  if (!relay?.address || !encryptedToken || engineBridge?.status.status !== 'ready') return false
+  try {
+    const result = await engineBridge.request(
+      'probe-relay',
+      {
+        relayHost: relay.address,
+        relayPort: relay.port,
+        enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedToken, 'base64')),
+      },
+      5000,
+    )
+    return result?.reachable !== false
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Moves the running session to its standby relay, once `RelayFailoverWatch`
+ * is sure the relay it is on has gone.
+ */
+async function moveToStandby({ silentMs, directWitness }) {
+  const main = state.relays.find((relay) => relay.id === state.session.relayId)
+  const standby = standbyRelayFor(
+    state.relays,
+    (id) => Boolean(state.encryptedRelayTokens[id]),
+    main?.id,
+    state.relayFailover.standbyRelayId,
+  )
+  const silent = Math.round(silentMs / 1000)
+  if (!main || !standby) {
+    logger.warn(`relay failover: ${main?.city ?? 'the relay'} silent for ${silent} s, but no standby relay is set up`)
+    return 'no-standby'
+  }
+  // Only the active relay is routed around the tunnel, so in all-traffic mode a
+  // probe to the standby would go into the dead session and prove nothing.
+  // There the start itself is the check, with the way back below.
+  if (directWitness && state.trafficMode === 'split' && !(await probeRelayDirect(standby))) {
+    logger.warn(`relay failover: ${main.city} is gone but standby ${standby.city} does not answer either; staying`)
+    return 'standby-down'
+  }
+  logger.warn(
+    `relay failover: ${main.city} silent on every path for ${silent} s with the uplink up` +
+      `${directWitness ? ' and direct probes unanswered' : ''}; moving this session to ${standby.city}`,
+  )
+  await sessionExclusive(async () => {
+    if (state.session.status !== 'connected' || state.session.relayId !== main.id) return
+    await stopRunningSession().catch(() => {})
+    state.session = { status: 'starting', mode: 'relay', message: `Moving to ${standby.city}…` }
+    await startSession({ relay: standby, movedFrom: main })
+    if (state.session.status === 'connected') return
+    // The standby failed to start. Paths on the old relay recover by
+    // themselves if it comes back, which beats no session at all.
+    logger.error(`relay failover: ${standby.city} did not start (${state.session.message}); returning to ${main.city}`)
+    await startSession({ relay: main, watchForFailover: false })
+  })
+  return 'moved'
+}
+
+const relayFailover = new RelayFailoverController({
+  probeMainRelay: () => probeRelayDirect(state.relays.find((relay) => relay.id === state.session.relayId)),
+  moveToStandby,
+  logger,
+})
+
+/**
+ * Starts a session on the active relay, or on `relay` when a failover moves an
+ * existing session there. `movedFrom` names the relay it moved away from.
+ */
+async function startSession({ relay: relayOverride = null, movedFrom = null, watchForFailover = true } = {}) {
+  relayFailover.end()
+  const mode = state.connectionMode === 'direct' ? 'direct' : 'relay'
+  const strategy = state.routingStrategy === 'manual' ? 'all-paths' : 'adaptive'
+  // A node only joins the session when its own switch and its group's are
+  // both on, so a switched-off group takes every node inside it out.
+  const enabledTunnels = activeTunnels(state.tunnels, state.nodeGroups)
+  const enabledRules = enabledRuleSpecs()
+  const relay = relayOverride ?? state.relays.find((item) => item.id === state.activeRelayId)
+  const encryptedRelayToken = relay && state.encryptedRelayTokens[relay.id]
+  const direct = mode === 'direct'
+  const selection = direct ? directNodeSelection(enabledTunnels) : { node: null, error: null }
+  // Nodes switched on but held back by their group: without naming this, the
+  // user sees switches that are on and a message saying to switch one on.
+  const heldByGroup = state.tunnels.some((tunnel) => tunnel.enabled) && enabledTunnels.length < 1
+  const groupBlocker =
+    'Every node you enabled is in a switched-off group. Switch its group back on, or enable an ungrouped node.'
+  const blocker = direct
+    ? heldByGroup
+      ? groupBlocker
+      : selection.error
+    : enabledTunnels.length < 1
+      ? heldByGroup
+        ? groupBlocker
+        : 'Enable at least one WireGuard, OpenVPN, L2TP/IPsec or SOCKS5 node.'
+      : !relay || relay.status !== 'ready' || !encryptedRelayToken
+        ? `The ${relay?.city ?? 'selected'} relay needs its address and enrollment token.`
+        : null
+  if (blocker) {
+    state.session = { status: 'error', message: blocker }
+  } else if (state.trafficMode === 'split' && !enabledRules.length) {
+    state.session = { status: 'error', message: 'Add at least one split-tunnel target.' }
+  } else if (engineBridge?.status.status !== 'ready') {
+    state.session = { status: 'error', message: 'The native routing engine is unavailable.' }
+  } else if (serviceBridge?.status.status !== 'ready') {
+    state.session = { status: 'error', message: 'Install and start the GamePath Network Service in Settings.' }
+  } else {
+    try {
+      const rules = enabledRules
+      const nodes = sessionNodes(enabledTunnels)
+      // A relay session addresses and authenticates itself to the relay; a
+      // direct session has neither, so it sends neither.
+      const relayCredentials = direct
+        ? {}
+        : {
+            relayHost: relay.address,
+            relayPort: relay.port,
+            enrollmentToken: safeStorage.decryptString(Buffer.from(encryptedRelayToken, 'base64')),
+          }
+      const plan = await engineBridge.request('prepare-session', {
+        mode,
+        routeIds: enabledTunnels.map((tunnel) => tunnel.id),
+        trafficMode: state.trafficMode,
+        rules,
+        ...relayCredentials,
+      })
+      let relayIp
+      if (!direct) {
+        const relayAddresses = await require('node:dns').promises.lookup(relay.address, { all: true })
+        relayIp = relayAddresses.find((entry) => entry.family === 4)?.address ?? relayAddresses[0]?.address
+        if (!relayIp) throw new Error('The relay hostname did not resolve')
+      }
+      await serviceBridge.request('validate-runtime', {
+        mode,
+        relayIp,
+        trafficMode: state.trafficMode,
+        nodes,
+      })
+      const serviceSession = await serviceBridge.request(
+        'start-session',
+        {
+          mode,
+          strategy,
+          ...relayCredentials,
+          nodes,
+          trafficMode: state.trafficMode,
+          remoteDns: state.remoteDns !== false,
+          rules,
+          lanProxy: lanProxyPayload(),
+        },
+        nodes.some((node) => node.kind === 'l2tp') ? 60000 : 30000,
+      )
+      const paths = serviceSession.paths
+      const dataPlane = serviceSession.dataPlane
+      state.session = {
+        status: 'connected',
+        mode,
+        relayId: direct ? null : relay.id,
+        message: direct
+          ? directSessionMessage(plan, selection.node, dataPlane)
+          : relaySessionMessage(plan, paths, dataPlane),
+      }
+      if (movedFrom) {
+        state.session.failover = {
+          fromRelayId: movedFrom.id,
+          fromCity: movedFrom.city,
+          toCity: relay.city,
+          at: Date.now(),
+        }
+        state.session.message = `${movedFrom.city} stopped answering, so this session moved to ${relay.city}. It stays there until you start a new session.`
+      }
+      state.session.capture = serviceSession.capture
+      state.session.lanProxy = serviceSession.lanProxy ?? { state: 'stopped' }
+      if (usageStore) {
+        try {
+          usageStore.start(
+            paths.sessionId ?? crypto.randomUUID(),
+            enabledTunnels.map(({ id, name }) => ({ id, name })),
+          )
+          recordUsage({ ...paths, capture: serviceSession.capture, lanProxy: serviceSession.lanProxy })
+        } catch (error) {
+          usageError = error.message
+          logger.warn(`usage accounting failed: ${error.message}`)
+        }
+      }
+      updateSessionMetrics(paths, dataPlane)
+      startSessionKeepAlive()
+      // A session that is already the move, or one returning from a move that
+      // failed, never moves again: one switch per session, and never back.
+      relayFailover.begin(!direct && state.relayFailover.enabled && !movedFrom && watchForFailover)
+      logger.info(
+        `session started: mode=${mode} traffic=${state.trafficMode} ` +
+          `dns=${state.remoteDns !== false ? 'remote' : 'local'} ` +
+          `routes=${paths.paths.length} skipped=${(paths.skippedRoutes ?? []).length} ` +
+          `mtu=${serviceSession.capture?.effectiveMtu ?? 'unknown'} ` +
+          `lanProxy=${serviceSession.lanProxy?.state === 'listening' ? serviceSession.lanProxy.port : (serviceSession.lanProxy?.state ?? 'off')}`,
+      )
+      if (serviceSession.lanProxy?.state === 'error') {
+        logger.warn(`LAN proxy did not start: ${serviceSession.lanProxy.error}`)
+      }
+      for (const route of paths.skippedRoutes ?? []) {
+        logger.warn(`route ${route.route} (${route.label}) did not join: ${route.reason}`)
+      }
+    } catch (error) {
+      try {
+        await serviceBridge.request('stop-session')
+      } catch {}
+      state.session = { status: 'error', message: error.message }
+      stopSessionKeepAlive()
+      logger.error(`session failed to start: ${error.message}`)
+    }
+  }
+  saveState()
 }
 
 /**
@@ -1222,6 +1349,7 @@ async function pollSessionStatus() {
     const runtime = await serviceBridge.request('session-status')
     updateSessionMetrics(runtime)
     recordUsage(runtime)
+    if (runtime.mode !== 'direct') relayFailover.observe(runtime)
     // Selected traffic keeps going into the tunnel while the workers are
     // alive, so it is not quietly falling back to the normal connection:
     // it is not getting through, and stopping the session is what fixes it.
@@ -1251,6 +1379,7 @@ async function pollSessionStatus() {
     } catch {}
     state.session = { status: 'error', message: error.message }
     stopSessionKeepAlive()
+    relayFailover.end()
     logger.error(`session lost after ${sessionPollFailures} failed status requests: ${error.message}`)
   } finally {
     sessionPollInFlight = false

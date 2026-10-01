@@ -98,6 +98,7 @@ let state: AppState = {
   ruleGroups: [{ id: 'group-competitive', name: 'Competitive games', enabled: true }],
   trafficMode: 'split',
   remoteDns: true,
+  relayFailover: { enabled: false, standbyRelayId: null },
   connectionMode: 'relay',
   routingStrategy: 'smart',
   lanProxy: { enabled: true, port: 1080, username: '', hasPassword: false },
@@ -304,6 +305,10 @@ export const mockApi: GamePathApi = {
   },
   setTrafficMode: async (mode) => {
     state.trafficMode = mode
+    return snapshot()
+  },
+  configureRelayFailover: async (input) => {
+    state.relayFailover = { enabled: input.enabled, standbyRelayId: input.standbyRelayId }
     return snapshot()
   },
   setRemoteDns: async (enabled) => {

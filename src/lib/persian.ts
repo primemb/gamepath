@@ -122,6 +122,13 @@ export const persian: Record<string, string> = {
   'Best route': 'بهترین مسیر',
   'Packet loss': 'افت بسته',
   'Loss repair': 'ترمیم افت بسته',
+  'Automatic relay failover': 'جابه‌جایی خودکار رله',
+  'Standby relay': 'رله پشتیبان',
+  'First other ready relay': 'اولین رله آماده دیگر',
+  'Available in relay mode.': 'در حالت رله در دسترس است.',
+  'Set up a second relay to use as a standby.': 'برای استفاده به‌عنوان پشتیبان، یک رله دوم راه‌اندازی کنید.',
+  'If your relay stops answering through every node for 30 seconds while your internet works, this session moves to the standby relay. It never moves back by itself. Applies from the next session.':
+    'اگر رله شما در حالی که اینترنتتان کار می‌کند، ۳۰ ثانیه از هیچ گرهی پاسخ ندهد، این اتصال به رله پشتیبان منتقل می‌شود. هرگز خودکار برنمی‌گردد. از اتصال بعدی اعمال می‌شود.',
   'Rebuilds a packet lost on every path from a small repair packet':
     'بسته‌ای را که در همه مسیرها از دست رفته، با یک بسته ترمیم کوچک بازسازی می‌کند',
   'Relay mode only': 'فقط در حالت رله',
@@ -516,6 +523,16 @@ const dynamic: [RegExp, (...parts: string[]) => string][] = [
   [/^(\d+) active routes?$/, (count) => `${count} مسیر فعال`],
   [/^(\d+) of (\d+) routes carrying traffic$/, (active, total) => `${active} از ${total} مسیر در حال انتقال ترافیک`],
   [/^(\d+) game packets routed$/, (count) => `${count} بسته بازی مسیریابی شد`],
+  [
+    /^The (.+) relay needs its address and enrollment token\.$/,
+    (city) => `رله ${city} به نشانی و توکن ثبت‌نام نیاز دارد.`,
+  ],
+  [
+    /^(.+) stopped answering, so this session moved to (.+)\. It stays there until you start a new session\.$/,
+    (from, to) => `${from} پاسخ نداد، پس این اتصال به ${to} منتقل شد. تا شروع اتصال بعدی همان‌جا می‌ماند.`,
+  ],
+  [/^Moving to (.+)…$/, (city) => `در حال انتقال به ${city}…`],
+  [/^Moved to (.+) after (.+) stopped answering\.$/, (to, from) => `پس از پاسخ ندادن ${from}، به ${to} منتقل شد.`],
   [
     /^1 repair per (\d+) packets · (\d+) rebuilt$/,
     (group, rebuilt) => `یک بسته ترمیم برای هر ${group} بسته · ${rebuilt} بازسازی‌شده`,

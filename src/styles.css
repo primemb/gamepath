@@ -2454,6 +2454,26 @@ html[dir='rtl'] .toggle.is-on span {
   color: #697486;
   font-size: 9px;
 }
+.settings-card > div.failover-controls {
+  flex-shrink: 0;
+  gap: 12px;
+}
+.failover-standby select {
+  width: 170px;
+  height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: none;
+  color: #abb4c2;
+  background: #0b1018;
+  cursor: pointer;
+  font-size: 9px;
+}
+.failover-standby select:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 
 .modal-backdrop {
   position: fixed;

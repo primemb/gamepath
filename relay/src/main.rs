@@ -168,7 +168,7 @@ impl SessionState {
         Self {
             replay: ReplayWindow::default(),
             endpoints: Vec::new(),
-            outbound_sequence: 0,
+            outbound_sequence: fresh_outbound_sequence(),
             last_seen: Instant::now(),
             rejected_frames: 0,
             repair: None,
@@ -226,6 +226,50 @@ impl SessionState {
         }
         self.last_seen = now;
     }
+}
+
+/// Where a new session's reply sequence starts: the wall clock in microseconds.
+///
+/// A session's key comes from the enrolment key and its id alone, and the AEAD
+/// nonce is the sequence, so a session the relay forgets and re-creates for the
+/// same id - evicted, expired, or lost to a relay restart while the client kept
+/// going - must not count from zero again. That reused every nonce of its
+/// previous life under the same key, and the client's replay window, already
+/// far ahead, discarded every reply as stale: a session that looked connected
+/// and delivered nothing. The clock moves a million steps a second, faster than
+/// any session sends, so a new start is past everything an earlier one used.
+fn fresh_outbound_sequence() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_micros() as u64)
+}
+
+/// The answer to a reachability probe from a session this relay holds no state
+/// for, sent without creating any.
+///
+/// Clients test a relay with a one-off session id per probe. Admitting each one
+/// filled the per-client session cap with probes, and during an outage the real
+/// session, silent while its paths were down, was the least recently used and
+/// the one evicted. It also briefly became the newest session, which is where
+/// replies are sent. A probe needs nothing kept to be answered, and its id is
+/// never used again, so its fresh-sequence reply cannot repeat a nonce either.
+fn stateless_probe_reply(
+    client: &RelayClient,
+    crypto: &SessionCrypto,
+    header: &FrameHeader,
+    plaintext: &[u8],
+) -> Option<Vec<u8>> {
+    if header.flags & FLAG_CONTROL == 0 || client.sessions.contains_key(&header.session_id) {
+        return None;
+    }
+    let response = gamepath_engine::protocol::probe_response(plaintext)?;
+    let response_header = FrameHeader {
+        flags: FLAG_CONTROL | FLAG_SERVER_TO_CLIENT,
+        client_id: client.client_id,
+        session_id: header.session_id,
+        sequence: fresh_outbound_sequence(),
+    };
+    crypto.seal_server(response_header, &response).ok()
 }
 
 fn main() {
@@ -450,6 +494,10 @@ fn serve(
         let Ok((verified_header, plaintext)) = crypto.open_client(&frame[..length]) else {
             continue;
         };
+        if let Some(reply) = stateless_probe_reply(client, &crypto, &verified_header, &plaintext) {
+            let _ = socket.send_to(&reply, endpoint);
+            continue;
+        }
         // Read before the session borrow, which holds `client` mutably.
         let client_id = client.client_id;
         let virtual_ipv4 = client.record.virtual_ipv4;
@@ -927,6 +975,58 @@ mod tests {
         let now = Instant::now();
         assert!(repair.encoder.push(1, &[0x45; 1201], now).is_none());
         assert!(repair.encoder.deadline().is_none());
+    }
+
+    fn probe(session_id: u64, payload: &[u8]) -> (SessionCrypto, FrameHeader, Vec<u8>) {
+        let crypto = SessionCrypto::new(&[0; 32], session_id).unwrap();
+        let header = FrameHeader {
+            flags: FLAG_CONTROL,
+            client_id: [0; 16],
+            session_id,
+            sequence: 1,
+        };
+        (crypto, header, payload.to_vec())
+    }
+
+    #[test]
+    fn a_probe_from_an_unknown_session_is_answered_without_admitting_it() {
+        let mut client = relay_client();
+        client.admit_session(1, Instant::now());
+        let (crypto, header, payload) = probe(99, b"ping");
+        let reply = stateless_probe_reply(&client, &crypto, &header, &payload).unwrap();
+        let (reply_header, plaintext) = crypto.open_server(&reply).unwrap();
+        assert_eq!(plaintext, b"pong");
+        assert_eq!(reply_header.session_id, 99);
+        assert_eq!(client.sessions.len(), 1);
+    }
+
+    #[test]
+    fn a_live_session_and_anything_but_a_probe_go_through_the_session() {
+        let mut client = relay_client();
+        client.admit_session(1, Instant::now());
+        let (crypto, header, payload) = probe(1, b"ping");
+        assert!(stateless_probe_reply(&client, &crypto, &header, &payload).is_none());
+        // An unknown session's loss-repair offer is a real session coming back.
+        let offer = fec::offer(Offer {
+            group_size: fec::MULTIPATH_GROUP,
+            mtu: 1341,
+        });
+        let (crypto, header, payload) = probe(2, &offer);
+        assert!(stateless_probe_reply(&client, &crypto, &header, &payload).is_none());
+        let (crypto, mut header, payload) = probe(3, b"ping");
+        header.flags = 0;
+        assert!(stateless_probe_reply(&client, &crypto, &header, &payload).is_none());
+    }
+
+    #[test]
+    fn a_re_created_session_never_repeats_an_earlier_reply_sequence() {
+        let mut first = SessionState::new();
+        for _ in 0..10_000 {
+            first.outbound_sequence = first.outbound_sequence.wrapping_add(1);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let second = SessionState::new();
+        assert!(second.outbound_sequence > first.outbound_sequence);
     }
 
     #[test]

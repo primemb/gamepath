@@ -31,6 +31,9 @@ export function DashboardView({
   const routingNodes = state.tunnels.filter((item) => item.kind !== 'socks5').length
   const bestRouteLatency = state.session.routeLatencies?.length ? Math.min(...state.session.routeLatencies) : null
   const connected = state.session.status === 'connected'
+  // A failover can move a running session off the active relay.
+  const sessionRelay = (connected && state.relays.find((item) => item.id === state.session.relayId)) || relay
+  const failover = connected ? state.session.failover : undefined
   const complete = readyCount === stepCount
 
   const setupSteps: SetupItem[] = [
@@ -81,7 +84,9 @@ export function DashboardView({
   const subline = connected
     ? direct
       ? `Selected traffic is going through ${directNode?.name ?? 'your node'}.`
-      : `${carrying.length} encrypted paths active through ${relay?.city ?? 'the relay'}.`
+      : failover
+        ? `Moved to ${failover.toCity} after ${failover.fromCity} stopped answering.`
+        : `${carrying.length} encrypted paths active through ${sessionRelay?.city ?? 'the relay'}.`
     : complete
       ? direct
         ? `${directNode?.name ?? 'Your node'} will carry your selected traffic.`
@@ -158,7 +163,7 @@ export function DashboardView({
         onToggle={() => setSetupOpen(!(setupOpen ?? !complete))}
         steps={setupSteps}
         routes={carrying.map((tunnel) => tunnel.name)}
-        destination={direct ? 'Game server' : (relay?.city ?? 'Relay')}
+        destination={direct ? 'Game server' : (sessionRelay?.city ?? 'Relay')}
         direct={direct}
         onManageRoutes={() => onNavigate('routes')}
       />
