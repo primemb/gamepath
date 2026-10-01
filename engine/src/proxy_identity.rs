@@ -48,8 +48,9 @@ unsafe extern "system" {
 
 pub(crate) struct ProxyIdentity {
     port: u16,
-    /// The image path of the process listening on the proxy port.
-    process: Mutex<(Option<String>, Option<Instant>)>,
+    /// The process listening on the proxy port, and when that was checked.
+    /// Compared by id, so a lookup never has to open a process.
+    process: Mutex<(Option<u32>, Option<Instant>)>,
     owners: Mutex<HashMap<u16, (bool, Instant)>>,
 }
 
@@ -63,21 +64,21 @@ impl ProxyIdentity {
         })
     }
 
-    /// The proxy's image path, looked up again every [`PROCESS_TTL`].
-    pub(crate) fn process(&self) -> Option<String> {
+    /// The proxy's process id, looked up again every [`PROCESS_TTL`].
+    fn process_id(&self) -> Option<u32> {
         let mut process = self.process.lock().unwrap();
         if process.1.is_none_or(|at| at.elapsed() >= PROCESS_TTL) {
-            let found = listener_owner(self.port).and_then(crate::split_capture::process_path);
-            if found.is_some() && found != process.0 {
+            let found = listener_owner(self.port);
+            if let Some(id) = found.filter(|id| Some(*id) != process.0) {
                 gamepath_engine::log_info!(
-                    "the SOCKS5 proxy on port {} is {}; its own name lookups are never redirected",
+                    "the SOCKS5 proxy on port {} is {} (pid {id}); its own name lookups are never redirected",
                     self.port,
-                    found.as_deref().unwrap_or_default()
+                    crate::split_capture::process_path(id).unwrap_or_default()
                 );
             }
             *process = (found, Some(Instant::now()));
         }
-        process.0.clone()
+        process.0
     }
 
     /// Whether the UDP socket on `local_port` belongs to the proxy's process.
@@ -87,11 +88,9 @@ impl ProxyIdentity {
                 return *owned;
             }
         }
-        let owned = self.process().is_some_and(|proxy| {
-            udp_owner(local_port)
-                .and_then(crate::split_capture::process_path)
-                .is_some_and(|path| path == proxy)
-        });
+        let owned = self
+            .process_id()
+            .is_some_and(|proxy| udp_owner(local_port) == Some(proxy));
         let mut owners = self.owners.lock().unwrap();
         owners.retain(|_, (_, at)| at.elapsed() < OWNER_TTL);
         owners.insert(local_port, (owned, Instant::now()));

@@ -603,6 +603,9 @@ struct Registry {
     return_not_ipv4: AtomicU64,
     return_wrong_destination: AtomicU64,
     return_without_flow: AtomicU64,
+    /// A few of the replies counted in `return_without_flow`, described, for
+    /// the next anomaly line: the count alone cannot say what they were.
+    no_flow_samples: Mutex<Vec<String>>,
     unmatched_return_packets: AtomicU64,
     return_injection_errors: AtomicU64,
 }
@@ -847,6 +850,7 @@ impl SplitPacketCapture {
             return_not_ipv4: AtomicU64::new(0),
             return_wrong_destination: AtomicU64::new(0),
             return_without_flow: AtomicU64::new(0),
+            no_flow_samples: Mutex::new(Vec::new()),
             unmatched_return_packets: AtomicU64::new(0),
             return_injection_errors: AtomicU64::new(0),
             tcp_mss: effective_mtu.tcp_mss(),
@@ -2435,6 +2439,11 @@ fn run_reply_injector(
             let mut paths = return_paths.lock().unwrap();
             let Some(path) = paths.get_mut(&ReturnKey::inbound(fields)) else {
                 registry.return_without_flow.fetch_add(1, Ordering::Relaxed);
+                let mut samples = registry.no_flow_samples.lock().unwrap();
+                if samples.len() < NO_FLOW_SAMPLES {
+                    samples.push(describe_reply(&packet, fields));
+                }
+                drop(samples);
                 registry
                     .unmatched_return_packets
                     .fetch_add(1, Ordering::Relaxed);
@@ -2529,9 +2538,44 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
             delta[9],
             registry.capture_loop_peak_us.load(Ordering::Relaxed),
         );
+        let samples = std::mem::take(&mut *registry.no_flow_samples.lock().unwrap());
+        if !samples.is_empty() {
+            gamepath_engine::log_info!("replies with no flow, for example: {}", samples.join(", "));
+        }
         reported = current;
         last_log = Some(observed_at);
     }
+}
+
+const NO_FLOW_SAMPLES: usize = 4;
+
+/// `TCP 162.159.1.2:443 -> :51234 [RST]`: enough to tell a connection's
+/// teardown from data it is still waiting for.
+fn describe_reply(packet: &[u8], fields: Ipv4Fields) -> String {
+    let protocol = match fields.protocol {
+        6 => "TCP",
+        17 => "UDP",
+        1 => "ICMP",
+        _ => "IP",
+    };
+    let mut description = format!(
+        "{protocol} {}:{} -> :{}",
+        fields.source, fields.source_port, fields.destination_port
+    );
+    let header = usize::from(packet[0] & 0x0f) * 4;
+    if let Some(flags) = (fields.protocol == 6)
+        .then(|| packet.get(header + 13))
+        .flatten()
+    {
+        let names = [(0x04, "RST"), (0x01, "FIN"), (0x02, "SYN"), (0x10, "ACK")]
+            .iter()
+            .filter(|(bit, _)| flags & bit != 0)
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join("+");
+        description.push_str(&format!(" [{names}]"));
+    }
+    description
 }
 
 fn clamp_tcp_mss(packet: &mut [u8], maximum: u16) {
