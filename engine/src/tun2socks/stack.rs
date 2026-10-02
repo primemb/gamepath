@@ -1133,7 +1133,6 @@ impl Stack {
     }
 
     /// One turn of the stack: smoltcp, then every connection's two directions.
-    /// One pass over every flow and timer.
     fn turn(&mut self) {
         self.turns += 1;
         self.shared.counters.turns.fetch_add(1, Ordering::Relaxed);

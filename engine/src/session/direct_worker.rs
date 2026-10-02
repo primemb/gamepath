@@ -32,6 +32,13 @@ const DIRECT_LOSS_LIMIT: u64 = 3;
 /// count as carrying traffic regardless of what the ICMP probes say.
 const DIRECT_LIVENESS_WINDOW: Duration = Duration::from_secs(5);
 
+/// Probe interval through a SOCKS5 proxy. Each probe is a real connection the
+/// proxy opens to the probe target, so once a second cost about 86,000
+/// connections a day through the user's own proxy server, and measured nothing
+/// a slower probe misses: a proxy on this machine grants a connection before
+/// it reaches anything, and traffic it carries proves the path alive anyway.
+const SOCKS5_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Probe interval once a node has shown it will not answer ICMP. Slow enough
 /// to be free, frequent enough that a node which starts answering is noticed.
 const DIRECT_QUIET_PROBE_INTERVAL: Duration = Duration::from_secs(15);
@@ -67,6 +74,11 @@ pub(crate) fn run_direct_path(
     // `drain_send_queue`.
     let max_age = (path.kind() != gamepath_engine::relay_path::KIND_SOCKS5)
         .then_some(super::worker::PATH_QUEUE_MAX_AGE);
+    let probe_interval = if path.kind() == gamepath_engine::relay_path::KIND_SOCKS5 {
+        SOCKS5_PROBE_INTERVAL
+    } else {
+        PROBE_INTERVAL
+    };
     let mut probe_sequence = 0_u16;
     let mut next_probe = Instant::now();
     let mut pending_probe: Option<Instant> = None;
@@ -185,7 +197,7 @@ pub(crate) fn run_direct_path(
                     }
                 }
             }
-            next_probe = Instant::now() + PROBE_INTERVAL;
+            next_probe = Instant::now() + probe_interval;
         }
         match path.receive_packets(WORKER_RECEIVE_TIMEOUT) {
             Ok(packets) => {
