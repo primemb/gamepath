@@ -12,4 +12,7 @@
   DetailPrint "Stopping and removing the GamePath network service..."
   nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\deploy\uninstall-windows-service.ps1"'
   Pop $0
+  ; "Start with Windows" (electron/startup.cjs), and Task Manager's switch for it.
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "GamePath"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "GamePath"
 !macroend

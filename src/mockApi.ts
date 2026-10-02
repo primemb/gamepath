@@ -51,6 +51,7 @@ function mockLanProxy(): LanProxyStatus {
 
 let state: AppState = {
   clientVersion: '0.1.14',
+  startWithWindows: { available: true, enabled: false },
   tunnels: [
     {
       id: 'demo-1',
@@ -315,6 +316,10 @@ export const mockApi: GamePathApi = {
   },
   setRemoteDns: async (enabled) => {
     state.remoteDns = enabled
+    return snapshot()
+  },
+  setStartWithWindows: async (enabled) => {
+    state.startWithWindows = { available: true, enabled }
     return snapshot()
   },
   configureLanProxy: async (input) => {

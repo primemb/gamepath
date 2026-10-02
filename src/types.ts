@@ -328,6 +328,8 @@ export type VpnApi = {
 
 export type AppState = {
   clientVersion?: string
+  /** Read from Windows each time; unavailable outside the installed app. */
+  startWithWindows?: { available: boolean; enabled: boolean }
   tunnels: Tunnel[]
   nodeGroups: NodeGroup[]
   rules: SplitRule[]
@@ -526,6 +528,7 @@ export type GamePathApi = {
   removeRuleGroup: (id: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
   setRemoteDns: (enabled: boolean) => Promise<AppState>
+  setStartWithWindows: (enabled: boolean) => Promise<AppState>
   configureLanProxy: (input: LanProxySettingsInput) => Promise<AppState>
   setConnectionMode: (mode: ConnectionMode) => Promise<AppState>
   setRoutingStrategy: (strategy: 'smart' | 'manual') => Promise<AppState>

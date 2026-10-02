@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld('gamepath', {
   removeRuleGroup: (id) => ipcRenderer.invoke('rule-group:remove', id),
   setTrafficMode: (mode) => ipcRenderer.invoke('traffic:set-mode', mode),
   setRemoteDns: (enabled) => ipcRenderer.invoke('traffic:set-remote-dns', enabled),
+  setStartWithWindows: (enabled) => ipcRenderer.invoke('app:set-start-with-windows', enabled),
   configureRelayFailover: (input) => ipcRenderer.invoke('relay-failover:configure', input),
   configureLanProxy: (input) => ipcRenderer.invoke('lan-proxy:configure', input),
   setConnectionMode: (mode) => ipcRenderer.invoke('connection:set-mode', mode),

@@ -22,6 +22,7 @@ const { UsageStore } = require('./usage.cjs')
 const { withoutSecrets } = require('./public-state.cjs')
 const { nodeSpec } = require('./node-spec.cjs')
 const { ownHostnames } = require('./own-hostnames.cjs')
+const { startWithWindows, setStartWithWindows, launchedAtLogin } = require('./startup.cjs')
 const { defaultVpn, normalizeVpn } = require('./vpn-state.cjs')
 const { createVpnFeature } = require('./vpn-ipc.cjs')
 const { RelayFailoverController, normalizeRelayFailover, standbyRelayFor } = require('./relay-failover.cjs')
@@ -118,6 +119,7 @@ function publicState() {
     lanAddresses,
     vpn: vpnFeature?.publicVpn() ?? { ...state.vpn, session: { status: 'idle' } },
     clientVersion: app.getVersion(),
+    startWithWindows: startWithWindows(app),
     engine: engineBridge?.status ?? {
       status: 'offline',
       version: '',
@@ -841,6 +843,12 @@ function registerIpc() {
     return publicState()
   })
 
+  ipcMain.handle('app:set-start-with-windows', (_event, enabled) => {
+    const result = setStartWithWindows(app, enabled)
+    logger.info(`start with Windows ${result.enabled ? 'on' : 'off'}`)
+    return publicState()
+  })
+
   ipcMain.handle('traffic:set-remote-dns', (_event, enabled) => {
     state.remoteDns = Boolean(enabled)
     saveState()
@@ -1465,9 +1473,13 @@ function vpnChanged() {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:changed', vpnFeature.publicVpn())
 }
 
+/** Started by the Run entry at sign-in: the first window waits in the tray. */
+let startInBackground = launchedAtLogin(process.argv)
+
 function createWindow() {
   const icon = appIconPath()
   const window = new BrowserWindow({
+    show: !startInBackground,
     width: 1360,
     height: 860,
     minWidth: 1050,
@@ -1491,6 +1503,7 @@ function createWindow() {
     },
   })
   mainWindow = window
+  startInBackground = false
 
   window.on('close', async (event) => {
     if (isQuitting) return
@@ -1538,9 +1551,19 @@ function createWindow() {
   }
 }
 
+// One client per user. A second copy would drive the same sessions as the first,
+// which is what opening GamePath while it already ran from sign-in used to do.
+const singleInstance = app.requestSingleInstanceLock()
+if (!singleInstance) app.quit()
+else app.on('second-instance', () => showMainWindow())
+
 app.whenReady().then(async () => {
+  if (!singleInstance) return
   logger.init()
-  logger.info(`gamepath-client ${app.getVersion()} starting on ${process.platform}`)
+  logger.info(
+    `gamepath-client ${app.getVersion()} starting on ${process.platform}` +
+      (startInBackground ? ' at sign-in, in the background' : ''),
+  )
   app.on('will-quit', () => {
     logger.info('client shutting down')
     logger.flush()

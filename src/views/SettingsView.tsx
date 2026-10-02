@@ -43,6 +43,9 @@ export function SettingsView({
   const configureFailover = (next: typeof failover) =>
     guard(async () => setState(await api.configureRelayFailover(next)))
 
+  const startup = state.startWithWindows ?? { available: false, enabled: false }
+  const setStartWithWindows = (enabled: boolean) => guard(async () => setState(await api.setStartWithWindows(enabled)))
+
   const installService = () =>
     guard(async () => {
       setInstalling(true)
@@ -168,10 +171,19 @@ export function SettingsView({
           </span>
           <div>
             <strong>Start with Windows</strong>
-            <p>Open GamePath in the background after signing in.</p>
+            <p>
+              {startup.available
+                ? 'Open GamePath in the background after signing in.'
+                : 'Available in the installed app.'}
+            </p>
           </div>
         </div>
-        <Toggle checked={false} onChange={() => undefined} label="Start with Windows" />
+        <Toggle
+          checked={startup.enabled}
+          disabled={!startup.available}
+          onChange={setStartWithWindows}
+          label="Start with Windows"
+        />
       </div>
 
       <div className="settings-card">

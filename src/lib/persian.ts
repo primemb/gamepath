@@ -99,6 +99,7 @@ export const persian: Record<string, string> = {
     'گره L2TP/IPsec در حالت تفکیکی فقط بر اساس نشانی مسیریابی می‌کند',
   'Add a node to use it beside your game': 'یک گره اضافه کنید تا کنار بازی از آن استفاده کنید',
   'VPN connected': 'VPN متصل است',
+  'Available in the installed app.': 'در نسخه نصب‌شده در دسترس است.',
   'Game session on': 'اتصال بازی روشن است',
   'Game session starting': 'اتصال بازی در حال شروع است',
   'VPN on': 'VPN روشن است',
