@@ -280,6 +280,34 @@ fn a_connection_the_proxy_refuses_is_refused_to_the_application() {
 }
 
 #[test]
+fn a_datagram_windows_fragmented_is_rebuilt_and_relayed_whole() {
+    let mut app = App::new(spawn_proxy(true));
+    let server = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 27_015);
+    let client = SocketAddrV4::new(CLIENT_ADDRESS, 41_001);
+    let payload = (0..2000).map(|index| index as u8).collect::<Vec<_>>();
+    let whole = build_udp(client, server, &payload);
+    // Split as Windows would at a 1500-byte MTU: 1480 bytes, then the rest.
+    let mut first = whole[..20 + 1480].to_vec();
+    let length = first.len() as u16;
+    first[2..4].copy_from_slice(&length.to_be_bytes());
+    first[6..8].copy_from_slice(&0x2000_u16.to_be_bytes());
+    let mut last = whole[..20].to_vec();
+    last.extend_from_slice(&whole[20 + 1480..]);
+    let length = last.len() as u16;
+    last[2..4].copy_from_slice(&length.to_be_bytes());
+    last[6..8].copy_from_slice(&(1480_u16 / 8).to_be_bytes());
+    app.stack.send_packet(&last).unwrap();
+    app.stack.send_packet(&first).unwrap();
+    assert!(app.until(|app| {
+        app.other.iter().any(|packet| {
+            let ip = parse_ipv4(packet).unwrap();
+            parse_udp(ip.payload)
+                .is_some_and(|udp| udp.destination_port == client.port() && udp.payload == payload)
+        })
+    }));
+}
+
+#[test]
 fn a_datagram_goes_through_a_udp_association_and_back() {
     let mut app = App::new(spawn_proxy(true));
     let server = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 27_015);

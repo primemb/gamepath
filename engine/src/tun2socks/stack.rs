@@ -407,6 +407,8 @@ pub(crate) struct Stack {
     last_summary: Instant,
     /// Loop iterations since the last summary, to show an idle loop is idle.
     turns: u64,
+    /// UDP datagrams Windows fragmented, rebuilt before they are relayed.
+    fragments: crate::ipv4_fragments::Reassembler,
 }
 
 impl Stack {
@@ -454,6 +456,7 @@ impl Stack {
             dns_close_logged: false,
             last_summary: Instant::now(),
             turns: 0,
+            fragments: crate::ipv4_fragments::Reassembler::default(),
         }
     }
 
@@ -542,7 +545,14 @@ impl Stack {
                     None => {}
                 }
             }
-            PROTOCOL_UDP if !ip.fragmented => {
+            // A SOCKS5 relay carries whole datagrams only (RFC 1928 lets it
+            // refuse fragments), so a datagram Windows split is rebuilt here.
+            PROTOCOL_UDP if ip.fragmented => {
+                if let Some(datagram) = self.fragments.push(&packet, Instant::now()) {
+                    self.on_app_packet(datagram);
+                }
+            }
+            PROTOCOL_UDP => {
                 let Some(udp) = parse_udp(ip.payload) else {
                     return;
                 };

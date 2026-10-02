@@ -61,7 +61,53 @@ pub(crate) fn icmp_reply_sequence(
         .then(|| u16::from_be_bytes([echo[6], echo[7]]))
 }
 
-fn internet_checksum(bytes: &[u8]) -> u16 {
+/// The ICMP "fragmentation needed" a router would return for `packet`, a
+/// Don't Fragment datagram larger than `mtu`, built as WinDivert's driver
+/// builds its own (`windivert_inject_packet_too_big`): from the original
+/// destination, carrying the original header and its first eight bytes.
+///
+/// Split mode takes such a packet before any interface sees it, so without
+/// this the sender learns nothing and its packets simply vanish (WinDivert
+/// issue #278). With it, Windows lowers its path MTU for that destination and
+/// the next oversized send fails with `WSAEMSGSIZE`, which is how RakNet's
+/// MTU discovery moves straight to its next size.
+pub(crate) fn fragmentation_needed(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    let header_length = usize::from(*packet.first()? & 0x0f) * 4;
+    let total_length = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
+    let flags = u16::from_be_bytes([*packet.get(6)?, *packet.get(7)?]);
+    if packet[0] >> 4 != 4
+        || header_length < 20
+        || total_length > packet.len()
+        || total_length <= usize::from(mtu)
+        || flags & 0x4000 == 0
+        || flags & 0x3fff != 0
+        // Never an ICMP error about an ICMP error (RFC 1122 3.2.2).
+        || (packet[9] == 1 && !matches!(packet.get(header_length), Some(0 | 8)))
+    {
+        return None;
+    }
+    let quoted = &packet[..(header_length + 8).min(total_length)];
+    let length = 20 + 8 + quoted.len();
+    let mut reply = vec![0_u8; length];
+    reply[0] = 0x45;
+    reply[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+    reply[6..8].copy_from_slice(&0x4000_u16.to_be_bytes());
+    reply[8] = 64;
+    reply[9] = 1;
+    reply[12..16].copy_from_slice(&packet[16..20]);
+    reply[16..20].copy_from_slice(&packet[12..16]);
+    let header_checksum = internet_checksum(&reply[..20]);
+    reply[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+    reply[20] = 3;
+    reply[21] = 4;
+    reply[26..28].copy_from_slice(&mtu.to_be_bytes());
+    reply[28..].copy_from_slice(quoted);
+    let icmp_checksum = internet_checksum(&reply[20..]);
+    reply[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
+    Some(reply)
+}
+
+pub(crate) fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0_u32;
     let mut chunks = bytes.chunks_exact(2);
     for chunk in &mut chunks {
@@ -79,6 +125,56 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RakNet's first MTU probe: 1492 bytes with Don't Fragment set.
+    fn raknet_probe() -> Vec<u8> {
+        let mut packet = vec![0_u8; 1492];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&1492_u16.to_be_bytes());
+        packet[6..8].copy_from_slice(&0x4000_u16.to_be_bytes());
+        packet[8] = 128;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[192, 168, 1, 20]);
+        packet[16..20].copy_from_slice(&[79, 137, 98, 19]);
+        packet[20..24].copy_from_slice(&[0xc3, 0x50, 0x6d, 0x60]);
+        packet
+    }
+
+    #[test]
+    fn an_oversized_dont_fragment_packet_gets_what_a_router_would_send() {
+        let probe = raknet_probe();
+        let reply = fragmentation_needed(&probe, 1280).unwrap();
+        assert_eq!(reply.len(), 20 + 8 + 28);
+        assert_eq!(internet_checksum(&reply[..20]), 0);
+        assert_eq!(internet_checksum(&reply[20..]), 0);
+        assert_eq!(&reply[12..16], &[79, 137, 98, 19], "from the destination");
+        assert_eq!(&reply[16..20], &[192, 168, 1, 20], "to the sender");
+        assert_eq!((reply[20], reply[21]), (3, 4));
+        assert_eq!(u16::from_be_bytes([reply[26], reply[27]]), 1280);
+        assert_eq!(&reply[28..], &probe[..28], "quotes the header and ports");
+    }
+
+    #[test]
+    fn only_oversized_unfragmented_dont_fragment_packets_are_refused() {
+        let probe = raknet_probe();
+        assert!(fragmentation_needed(&probe, 1492).is_none(), "it fits");
+        let mut fragmentable = probe.clone();
+        fragmentable[6..8].fill(0);
+        assert!(fragmentation_needed(&fragmentable, 1280).is_none());
+        let mut fragment = probe.clone();
+        fragment[6..8].copy_from_slice(&0x6000_u16.to_be_bytes());
+        assert!(fragmentation_needed(&fragment, 1280).is_none());
+        let mut icmp_error = probe.clone();
+        icmp_error[9] = 1;
+        icmp_error[20] = 3;
+        assert!(fragmentation_needed(&icmp_error, 1280).is_none());
+        icmp_error[20] = 8;
+        assert!(
+            fragmentation_needed(&icmp_error, 1280).is_some(),
+            "an echo is"
+        );
+        assert!(fragmentation_needed(&probe[..100], 1280).is_none());
+    }
 
     #[test]
     fn icmp_probe_packet_has_valid_checksums() {

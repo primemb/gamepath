@@ -119,8 +119,8 @@ impl WireGuardSessionManager {
             "workerGapPeakMs": session.telemetry.worker_gap_peak_ms.iter()
                 .map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             "queueCapacity": PATH_QUEUE_DEPTH,
-            "effectiveMtu": session.effective_mtu.mtu,
-            "transportOverhead": session.effective_mtu.overhead,
+            "effectiveMtu": session.mtu.current().mtu,
+            "transportOverhead": session.mtu.current().overhead,
             "uplink": match session.telemetry.uplink.state() {
                 UplinkState::Up => "up",
                 UplinkState::Down => "down",

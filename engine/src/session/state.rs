@@ -4,11 +4,11 @@
 
 use super::dispatch::Dispatch;
 use super::local_tap::{InboundQueue, LocalTap};
+use super::path_mtu::SessionMtu;
 use super::repair::LossRepair;
 use super::worker::PathTelemetry;
 use gamepath_engine::auth::SessionCrypto;
 use gamepath_engine::fec::Decoder;
-use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader};
 use gamepath_engine::relay_path::SessionMode;
 use gamepath_engine::replay::ReplayWindow;
@@ -128,7 +128,7 @@ pub(crate) struct ActiveWireGuardSession {
     pub(crate) decision_mask: Arc<AtomicU64>,
     pub(crate) telemetry: PathTelemetry,
     pub(crate) scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
-    pub(crate) effective_mtu: EffectiveMtu,
+    pub(crate) mtu: SessionMtu,
     pub(crate) bypass_ips: Vec<std::net::Ipv4Addr>,
     /// The SOCKS5 proxy a direct VPN session runs through. Such a proxy may
     /// answer name lookups with fake-IP addresses only it can reach.

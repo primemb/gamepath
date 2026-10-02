@@ -12,6 +12,7 @@ use super::direct_worker::run_direct_path;
 use super::dispatch::Dispatch;
 use super::local_tap::{InboundSink, LocalTap};
 use super::monitors::{spawn_session_summary, spawn_uplink_monitor};
+use super::path_mtu::SessionMtu;
 use super::relay_worker::run_path;
 use super::repair::{LossRepair, spawn_flusher};
 use super::state::{
@@ -126,12 +127,25 @@ impl WireGuardSessionManager {
             .iter()
             .filter_map(|(_, _, node, _)| node.configured_tunnel_mtu())
             .min();
-        let effective_mtu = EffectiveMtu::for_session(
-            SessionMode::Relay,
-            paths.iter().map(|(_, _, _, path)| path.kind()),
+        let kinds = paths
+            .iter()
+            .map(|(_, _, _, path)| path.kind())
+            .collect::<Vec<_>>();
+        let effective_mtu =
+            EffectiveMtu::for_session(SessionMode::Relay, kinds.iter().copied(), link_mtu)
+                .with_tunnel_limit(provider_mtu);
+        let session_mtu = SessionMtu::measure(
+            effective_mtu,
             link_mtu,
-        )
-        .with_tunnel_limit(provider_mtu);
+            paths
+                .iter()
+                .filter(|(_, _, _, path)| !path.carried_by_stream())
+                .filter_map(|(_, _, _, path)| path.bypass_ipv4()),
+            move |link_mtu| {
+                EffectiveMtu::for_session(SessionMode::Relay, kinds, link_mtu)
+                    .with_tunnel_limit(provider_mtu)
+            },
+        );
         let route_summary = paths
             .iter()
             .map(|(route, label, _, path)| format!("{route}:{label}/{}", path.kind()))
@@ -306,7 +320,7 @@ impl WireGuardSessionManager {
             decision_mask,
             telemetry,
             scheduler_metrics,
-            effective_mtu,
+            mtu: session_mtu,
             bypass_ips,
             socks_proxy: None,
             local_tap,
@@ -344,8 +358,18 @@ impl WireGuardSessionManager {
             (kind == gamepath_engine::relay_path::KIND_SOCKS5).then(|| path.endpoint());
         let label_for_log = label.clone();
         let link_mtu = link_mtu_for_endpoints(path.bypass_ipv4());
+        let provider_mtu = node.configured_tunnel_mtu();
         let effective_mtu = EffectiveMtu::for_session(SessionMode::Direct, [kind], link_mtu)
-            .with_tunnel_limit(node.configured_tunnel_mtu());
+            .with_tunnel_limit(provider_mtu);
+        let session_mtu = SessionMtu::measure(
+            effective_mtu,
+            link_mtu,
+            path.bypass_ipv4().filter(|_| !path.carried_by_stream()),
+            move |link_mtu| {
+                EffectiveMtu::for_session(SessionMode::Direct, [kind], link_mtu)
+                    .with_tunnel_limit(provider_mtu)
+            },
+        );
         let statuses = Arc::new(Mutex::new(vec![initial_status(1, kind, label, endpoint)]));
         let scheduler_metrics = Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())]));
         let (command_tx, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
@@ -430,7 +454,7 @@ impl WireGuardSessionManager {
             decision_mask: Arc::new(AtomicU64::new(1)),
             telemetry,
             scheduler_metrics,
-            effective_mtu,
+            mtu: session_mtu,
             bypass_ips,
             socks_proxy,
             local_tap,

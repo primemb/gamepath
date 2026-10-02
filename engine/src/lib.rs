@@ -14,6 +14,7 @@ pub mod adapter;
 pub mod auth;
 pub mod dns;
 pub mod fec;
+pub mod ipv4_fragments;
 pub mod l2tp;
 pub mod log;
 pub mod mtu;
@@ -23,6 +24,7 @@ pub mod mtu;
 pub mod netconfig;
 #[cfg(feature = "openvpn")]
 pub mod openvpn;
+pub mod path_mtu;
 pub mod policy;
 pub mod protocol;
 pub mod relay_path;

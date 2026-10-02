@@ -14,6 +14,7 @@ mod health;
 mod latency;
 mod local_tap;
 mod monitors;
+mod path_mtu;
 mod relay_worker;
 mod repair;
 mod start;
@@ -149,7 +150,7 @@ impl WireGuardSessionManager {
     }
 
     pub(crate) fn effective_mtu(&self) -> Option<EffectiveMtu> {
-        self.active.as_ref().map(|session| session.effective_mtu)
+        self.active.as_ref().map(|session| session.mtu.current())
     }
 
     /// What the LAN proxy needs to open flows of its own through this session.
@@ -157,7 +158,7 @@ impl WireGuardSessionManager {
         self.active.as_ref().map(|session| LocalStackBinding {
             tap: Arc::clone(&session.local_tap),
             address: session.virtual_ipv4,
-            mtu: session.effective_mtu.mtu,
+            mtu: session.mtu.current().mtu,
             mode: session.mode,
             data_receiver: Arc::clone(&session.data_receiver),
         })

@@ -236,8 +236,29 @@ impl Handle {
     }
 
     fn checksums(&self, packet: &mut [u8], address: &mut Address) -> Result<(), String> {
+        self.checksums_with(packet, address, 0)
+    }
+
+    /// The IPv4 header checksum alone, for a fragment: the helper refuses to
+    /// compute a transport checksum over a datagram it only has part of.
+    fn ip_checksum(&self, packet: &mut [u8], address: &mut Address) -> Result<(), String> {
+        // WINDIVERT_HELPER_NO_ICMP_CHECKSUM | NO_TCP_CHECKSUM | NO_UDP_CHECKSUM
+        self.checksums_with(packet, address, 2 | 8 | 16)
+    }
+
+    fn checksums_with(
+        &self,
+        packet: &mut [u8],
+        address: &mut Address,
+        flags: u64,
+    ) -> Result<(), String> {
         if unsafe {
-            (self.api.checksums)(packet.as_mut_ptr().cast(), packet.len() as u32, address, 0)
+            (self.api.checksums)(
+                packet.as_mut_ptr().cast(),
+                packet.len() as u32,
+                address,
+                flags,
+            )
         } == 0
         {
             Err(std::io::Error::last_os_error().to_string())
@@ -590,6 +611,18 @@ struct Registry {
     /// MSS advertised on captured TCP handshakes, derived from what the chosen
     /// transports add to a packet rather than fixed at a guess.
     tcp_mss: u16,
+    /// The largest packet that crosses the session unfragmented.
+    tunnel_mtu: u16,
+    /// Oversized Don't Fragment packets answered with "fragmentation needed".
+    fragmentation_needed_sent: AtomicU64,
+    /// Answers that could not be injected; those packets were carried instead.
+    fragmentation_needed_failed: AtomicU64,
+    /// Fragmented datagrams given up on, in either direction.
+    fragments_discarded: AtomicU64,
+    /// ICMP errors about a tunnelled packet, delivered to its sender.
+    icmp_errors_delivered: AtomicU64,
+    /// Later fragments sent into the tunnel after their first fragment.
+    outbound_fragments_followed: AtomicU64,
     captured_packets: AtomicU64,
     captured_bytes: AtomicU64,
     relayed_packets: AtomicU64,
@@ -605,6 +638,8 @@ struct Registry {
     /// means a selected application is talking to something on the LAN.
     local_destinations: AtomicU64,
     injected_return_packets: AtomicU64,
+    /// Replies the relay delivered in fragments and that were rebuilt whole.
+    reassembled_return_packets: AtomicU64,
     /// Return packets that could not be delivered, split by why. They sum to
     /// [`Registry::unmatched_return_packets`], and exist because the three
     /// causes want different answers: a malformed packet is a bug here, a
@@ -860,13 +895,22 @@ impl SplitPacketCapture {
             tunnelled_dns: AtomicU64::new(0),
             local_destinations: AtomicU64::new(0),
             injected_return_packets: AtomicU64::new(0),
+            reassembled_return_packets: AtomicU64::new(0),
             return_not_ipv4: AtomicU64::new(0),
             return_wrong_destination: AtomicU64::new(0),
             return_without_flow: AtomicU64::new(0),
             no_flow_samples: Mutex::new(Vec::new()),
             unmatched_return_packets: AtomicU64::new(0),
             return_injection_errors: AtomicU64::new(0),
-            tcp_mss: effective_mtu.tcp_mss(),
+            // Clamped to what crosses unfragmented, which on a narrow link is
+            // under the floored tunnel MTU.
+            tcp_mss: effective_mtu.unfragmented() - 40,
+            tunnel_mtu: effective_mtu.unfragmented(),
+            fragmentation_needed_sent: AtomicU64::new(0),
+            fragmentation_needed_failed: AtomicU64::new(0),
+            fragments_discarded: AtomicU64::new(0),
+            icmp_errors_delivered: AtomicU64::new(0),
+            outbound_fragments_followed: AtomicU64::new(0),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let return_paths = Arc::new(Mutex::new(carried_paths));
@@ -1157,7 +1201,7 @@ impl SplitPacketCapture {
                 })
             })
             .collect::<Vec<_>>();
-        serde_json::json!({
+        let mut status = serde_json::json!({
             "captureId": self.registry.capture_id,
             "matchedSockets": self.registry.matched_sockets.load(Ordering::Relaxed),
             "captureFilterCount": selector_table(&self.registry).len,
@@ -1197,7 +1241,16 @@ impl SplitPacketCapture {
             "localDestinationsLeftUntunnelled": self.registry.local_destinations.load(Ordering::Relaxed),
             "returnInjectionErrors": self.registry.return_injection_errors.load(Ordering::Relaxed),
             "driverQueueTimeMs": 100,
-        })
+        });
+        status["fragments"] = serde_json::json!({
+            "reassembledReturns": self.registry.reassembled_return_packets.load(Ordering::Relaxed),
+            "fragmentationNeededSent": self.registry.fragmentation_needed_sent.load(Ordering::Relaxed),
+            "fragmentationNeededFailed": self.registry.fragmentation_needed_failed.load(Ordering::Relaxed),
+            "outboundFollowed": self.registry.outbound_fragments_followed.load(Ordering::Relaxed),
+            "discarded": self.registry.fragments_discarded.load(Ordering::Relaxed),
+            "icmpErrorsDelivered": self.registry.icmp_errors_delivered.load(Ordering::Relaxed),
+        });
+        status
     }
 }
 
@@ -1370,6 +1423,7 @@ fn run_selected_capture(
     // keeps its own copy and touches the lock on the versions that change.
     let mut table_version = registry.table_version.load(Ordering::Acquire);
     let mut table = selector_table(&registry);
+    let mut fragments = gamepath_engine::ipv4_fragments::FragmentTrail::default();
     while !stop.load(Ordering::Acquire) {
         let (packet_length, address) = match handle.recv_into(&mut packet_buffer) {
             Ok(packet) => packet,
@@ -1396,6 +1450,25 @@ fn run_selected_capture(
             table_version = current_version;
         }
         let packet = &packet_buffer[..packet_length];
+        // Its bytes where the ports would be are payload, so it can only go
+        // wherever its first fragment went. Checked before the fields are
+        // read, because a final fragment can be shorter than a port pair.
+        if gamepath_engine::ipv4_fragments::is_later_fragment(packet) {
+            match fragments.lookup(packet, Instant::now()) {
+                Some(redirect) => route_later_fragment(
+                    &handle,
+                    &sessions,
+                    virtual_ipv4,
+                    &registry,
+                    packet,
+                    address,
+                    &mut tunnel_buffer,
+                    redirect,
+                ),
+                None => reinject(&handle, &bypass, &registry, packet, address),
+            }
+            continue;
+        }
         let Some(fields) = ipv4_fields(packet) else {
             reinject(&handle, &bypass, &registry, packet, address);
             continue;
@@ -1569,9 +1642,13 @@ fn run_selected_capture(
             registry.local_destinations.fetch_add(1, Ordering::Relaxed);
         }
         if !selected {
+            if gamepath_engine::ipv4_fragments::is_first_fragment(packet) {
+                fragments.record(packet, None, Instant::now());
+            }
             reinject(&handle, &bypass, &registry, packet, address);
             continue;
         }
+        let hold_on_failure = registry.kill_switch && !implicit_dns;
         let carried = route_selected_packet(
             &handle,
             &sessions,
@@ -1584,13 +1661,81 @@ fn run_selected_capture(
             application.as_deref(),
             process_id,
             &mut tunnel_buffer,
-            registry.kill_switch && !implicit_dns,
+            hold_on_failure,
             redirect,
         );
+        // A held first fragment counts as tunnelled: its later fragments are
+        // then dropped with it rather than leaving on their own.
+        if gamepath_engine::ipv4_fragments::is_first_fragment(packet) {
+            let tunnelled = (carried || hold_on_failure).then_some(redirect);
+            fragments.record(packet, tunnelled, Instant::now());
+        }
         if implicit_dns {
             registry.dns_sent(carried);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_later_fragment(
+    handle: &Handle,
+    sessions: &Mutex<WireGuardSessionManager>,
+    virtual_ipv4: Ipv4Addr,
+    registry: &Registry,
+    packet: &[u8],
+    address: Address,
+    tunnel_buffer: &mut Vec<u8>,
+    redirect: Option<Ipv4Addr>,
+) {
+    tunnel_buffer.clear();
+    tunnel_buffer.extend_from_slice(packet);
+    tunnel_buffer[12..16].copy_from_slice(&virtual_ipv4.octets());
+    if redirect.is_some() {
+        tunnel_buffer[16..20].copy_from_slice(&TUNNEL_RESOLVER.octets());
+    }
+    let mut checksum_address = address;
+    let forwarded = handle
+        .ip_checksum(tunnel_buffer, &mut checksum_address)
+        .is_ok()
+        && sessions
+            .lock()
+            .unwrap()
+            .enqueue_data_packet(tunnel_buffer)
+            .is_ok();
+    // Never fails open: the first fragment is already in the tunnel, and half
+    // a datagram on each path reassembles nowhere.
+    if forwarded {
+        registry
+            .outbound_fragments_followed
+            .fetch_add(1, Ordering::Relaxed);
+        registry.relayed_packets.fetch_add(1, Ordering::Relaxed);
+    } else {
+        registry.fragments_discarded.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Answers a packet the tunnel cannot carry whole as a router on the path
+/// would, so the sender's path MTU discovery learns the tunnel's size.
+///
+/// False when the answer could not be injected. The packet is then carried
+/// after all: dropping it with nobody told is the black hole this prevents.
+fn signal_fragmentation_needed(
+    handle: &Handle,
+    registry: &Registry,
+    mut reply: Vec<u8>,
+    address: Address,
+) -> bool {
+    let network = address.network_data();
+    let mut inbound = Address::inbound(network.interface_index, network.subinterface_index);
+    let sent =
+        handle.checksums(&mut reply, &mut inbound).is_ok() && handle.send(&reply, &inbound).is_ok();
+    let counter = if sent {
+        &registry.fragmentation_needed_sent
+    } else {
+        &registry.fragmentation_needed_failed
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    sent
 }
 
 #[derive(Default)]
@@ -1875,6 +2020,11 @@ fn route_selected_packet(
     registry
         .captured_bytes
         .fetch_add(packet.len() as u64, Ordering::Relaxed);
+    if let Some(reply) = crate::icmp::fragmentation_needed(packet, registry.tunnel_mtu) {
+        if signal_fragmentation_needed(handle, registry, reply, address) {
+            return true;
+        }
+    }
     tunnel_buffer.clear();
     tunnel_buffer.extend_from_slice(packet);
     let tunneled = &mut tunnel_buffer[..];
@@ -1882,9 +2032,19 @@ fn route_selected_packet(
     if redirect.is_some() {
         tunneled[16..20].copy_from_slice(&TUNNEL_RESOLVER.octets());
     }
-    clamp_tcp_mss(tunneled, registry.tcp_mss);
     let mut checksum_address = address;
-    let forwarded = if handle.checksums(tunneled, &mut checksum_address).is_err() {
+    let checksummed = if gamepath_engine::ipv4_fragments::is_first_fragment(packet) {
+        // A handshake is never fragmented, so there is no MSS to clamp here.
+        if gamepath_engine::ipv4_fragments::readdress_transport_checksum(tunneled, packet) {
+            handle.ip_checksum(tunneled, &mut checksum_address)
+        } else {
+            Err("the first fragment is too short to hold its checksum".to_owned())
+        }
+    } else {
+        clamp_tcp_mss(tunneled, registry.tcp_mss);
+        handle.checksums(tunneled, &mut checksum_address)
+    };
+    let forwarded = if checksummed.is_err() {
         Err("could not update packet checksums".to_owned())
     } else {
         sessions.lock().unwrap().enqueue_data_packet(tunneled)
@@ -2488,6 +2648,7 @@ fn run_reply_injector(
     virtual_ipv4: Ipv4Addr,
     registry: Arc<Registry>,
 ) {
+    let mut fragments = gamepath_engine::ipv4_fragments::Reassembler::default();
     while !stop.load(Ordering::Acquire) {
         let received = data_receiver.receive(Duration::from_millis(20));
         let mut packet = match received {
@@ -2503,6 +2664,19 @@ fn run_reply_injector(
                 continue;
             }
         };
+        if gamepath_engine::ipv4_fragments::is_fragment(&packet) {
+            let rebuilt = fragments.push(&packet, Instant::now());
+            registry
+                .fragments_discarded
+                .fetch_add(fragments.take_discarded(), Ordering::Relaxed);
+            let Some(datagram) = rebuilt else {
+                continue;
+            };
+            registry
+                .reassembled_return_packets
+                .fetch_add(1, Ordering::Relaxed);
+            packet = datagram;
+        }
         let Some(fields) = ipv4_fields(&packet) else {
             registry.return_not_ipv4.fetch_add(1, Ordering::Relaxed);
             registry
@@ -2517,6 +2691,9 @@ fn run_reply_injector(
             registry
                 .unmatched_return_packets
                 .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if deliver_icmp_error(&handle, &return_paths, &registry, &mut packet, virtual_ipv4) {
             continue;
         }
         let path = {
@@ -2543,7 +2720,7 @@ fn run_reply_injector(
         if let Some(resolver) = path.resolver {
             packet[12..16].copy_from_slice(&resolver.octets());
         }
-        clamp_tcp_mss(&mut packet, 1000);
+        clamp_tcp_mss(&mut packet, registry.tcp_mss);
         let mut address = Address::inbound(path.interface_index, path.subinterface_index);
         if handle.checksums(&mut packet, &mut address).is_ok()
             && handle.send(&packet, &address).is_ok()
@@ -2560,6 +2737,75 @@ fn run_reply_injector(
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// An ICMP error names the packet it is about in the header it quotes, not in
+/// its own: a router's "unreachable", "time exceeded" or "fragmentation
+/// needed" for a tunnelled packet is addressed to the virtual address and
+/// quotes that packet. Matched by the quote, rewritten back to the local
+/// address and delivered, the sender learns of an unreachable port or a
+/// narrower path beyond the relay. Matched by its own header, as an echo
+/// reply is, it fits no flow and is dropped. True when `packet` was one.
+fn deliver_icmp_error(
+    handle: &Handle,
+    return_paths: &Mutex<HashMap<ReturnKey, ReturnPath>>,
+    registry: &Registry,
+    packet: &mut [u8],
+    virtual_ipv4: Ipv4Addr,
+) -> bool {
+    let Some(quoted) = icmp_error_quote(packet) else {
+        return false;
+    };
+    let Some(flow) = quoted.filter(|flow| flow.source == virtual_ipv4) else {
+        return true;
+    };
+    let Some(path) = return_paths
+        .lock()
+        .unwrap()
+        .get(&ReturnKey::outbound(flow))
+        .cloned()
+    else {
+        return true;
+    };
+    readdress_icmp_error(packet, path.local_ip, path.resolver);
+    let mut address = Address::inbound(path.interface_index, path.subinterface_index);
+    if handle.checksums(packet, &mut address).is_ok() && handle.send(packet, &address).is_ok() {
+        registry
+            .icmp_errors_delivered
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    true
+}
+
+/// `Some` for an ICMP unreachable, time exceeded or parameter problem, with
+/// the flow of the packet it quotes when that quote is readable.
+fn icmp_error_quote(packet: &[u8]) -> Option<Option<Ipv4Fields>> {
+    let header = usize::from(packet[0] & 0x0f) * 4;
+    if packet[9] != 1 || !matches!(packet.get(header), Some(3 | 11 | 12)) {
+        return None;
+    }
+    Some(packet.get(header + 8..).and_then(ipv4_fields))
+}
+
+/// Points an ICMP error, and the packet it quotes, back at the local sender.
+fn readdress_icmp_error(packet: &mut [u8], local_ip: Ipv4Addr, resolver: Option<Ipv4Addr>) {
+    let quote = usize::from(packet[0] & 0x0f) * 4 + 8;
+    let original = packet[quote..].to_vec();
+    packet[16..20].copy_from_slice(&local_ip.octets());
+    let quoted = &mut packet[quote..];
+    quoted[12..16].copy_from_slice(&local_ip.octets());
+    if let Some(resolver) = resolver {
+        quoted[16..20].copy_from_slice(&resolver.octets());
+    }
+    let quoted_header = usize::from(quoted[0] & 0x0f) * 4;
+    if quoted.len() >= quoted_header {
+        quoted[10..12].fill(0);
+        let checksum = crate::icmp::internet_checksum(&quoted[..quoted_header]);
+        quoted[10..12].copy_from_slice(&checksum.to_be_bytes());
+    }
+    // Only a UDP checksum fits in the eight quoted bytes; nothing checks it,
+    // but it is kept consistent with the rewritten addresses.
+    gamepath_engine::ipv4_fragments::readdress_transport_checksum(quoted, &original);
 }
 
 /// Watches counters outside the packet path and writes one combined incident
@@ -3110,6 +3356,37 @@ mod tests {
     /// An ICMP error carries no ports, so it keys as port 0 in both directions
     /// and can never match a TCP or UDP flow. Whatever else is behind the
     /// unmatched count, this part of it is structural.
+    #[test]
+    fn an_icmp_error_from_beyond_the_relay_reaches_the_flow_it_quotes() {
+        let virtual_ipv4 = Ipv4Addr::new(10, 203, 0, 5);
+        let local = Ipv4Addr::new(192, 168, 1, 20);
+        let server = Ipv4Addr::new(79, 137, 98, 19);
+        // The tunnelled packet as the relay sent it on, Don't Fragment set.
+        let mut sent = vec![0_u8; 1400];
+        sent[0] = 0x45;
+        sent[2..4].copy_from_slice(&1400_u16.to_be_bytes());
+        sent[6..8].copy_from_slice(&0x4000_u16.to_be_bytes());
+        sent[9] = 17;
+        sent[12..16].copy_from_slice(&virtual_ipv4.octets());
+        sent[16..20].copy_from_slice(&server.octets());
+        sent[20..24].copy_from_slice(&[0xc3, 0x50, 0x6d, 0x60]);
+        // A router past the relay answers it as GamePath itself would.
+        let mut error = crate::icmp::fragmentation_needed(&sent, 1300).unwrap();
+        let flow = icmp_error_quote(&error).unwrap().unwrap();
+        assert_eq!(flow.source, virtual_ipv4);
+        assert_eq!(
+            ReturnKey::outbound(flow),
+            ReturnKey::outbound(ipv4_fields(&sent).unwrap())
+        );
+        readdress_icmp_error(&mut error, local, None);
+        assert_eq!(&error[16..20], &local.octets());
+        assert_eq!(&error[28 + 12..28 + 16], &local.octets(), "the quote too");
+        assert_eq!(crate::icmp::internet_checksum(&error[28..48]), 0);
+        // An echo reply is not an error and keeps its own matching.
+        let echo = crate::icmp::icmp_echo_packet(server, virtual_ipv4, 7, 1, true);
+        assert!(icmp_error_quote(&echo).is_none());
+    }
+
     #[test]
     fn an_icmp_return_cannot_key_to_a_tcp_or_udp_flow() {
         let game = Ipv4Fields {

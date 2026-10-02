@@ -28,6 +28,11 @@ pub const LINK_MTU: u16 = 1500;
 /// [`EffectiveMtu::below_link_budget`] records that so it can be logged.
 pub const MIN_TUNNEL_MTU: u16 = 1280;
 
+/// The smallest packet split mode ever asks a sender to fit: QUIC's mandatory
+/// 1200 bytes of UDP payload plus the IPv4 and UDP headers (RFC 9000 §14).
+/// RakNet's 1200-byte MTU probe counts its headers, so it fits as well.
+pub const MIN_SIGNALLED_MTU: u16 = 1228;
+
 /// Makes an OS-reported link MTU safe to use as an Internet packet budget.
 /// Jumbo frames do not help the Internet path, and a missing or implausibly
 /// small report must never make connection startup fail.
@@ -134,6 +139,8 @@ pub struct EffectiveMtu {
     /// unexplained loss, so the decision is recorded here instead of being
     /// silently absorbed by the clamp.
     pub below_link_budget: bool,
+    /// What the link carries after encapsulation, before the floor is applied.
+    pub budget: u16,
 }
 
 impl EffectiveMtu {
@@ -162,6 +169,7 @@ impl EffectiveMtu {
             mtu,
             overhead,
             below_link_budget: mtu > budget,
+            budget,
         }
     }
 
@@ -172,10 +180,25 @@ impl EffectiveMtu {
         // `configured_tunnel_mtu` already rejects anything under the floor;
         // the clamp restates it so the invariant holds at the one place that
         // can otherwise lower `mtu` after construction.
-        let mtu = configured_tunnel_mtu(configured.unwrap_or(LINK_MTU))
+        let limit = configured_tunnel_mtu(configured.unwrap_or(LINK_MTU));
+        let mtu = limit
             .map_or(self.mtu, |limit| self.mtu.min(limit))
             .max(MIN_TUNNEL_MTU);
-        Self { mtu, ..self }
+        let budget = limit.map_or(self.budget, |limit| self.budget.min(limit));
+        Self {
+            mtu,
+            budget,
+            ..self
+        }
+    }
+
+    /// The largest packet that crosses the session without fragmenting
+    /// anywhere: what split mode tells senders through "fragmentation
+    /// needed" and clamps TCP to. Unlike [`Self::mtu`] it goes under the
+    /// floor when the link is that narrow, because a packet the floor lets
+    /// through would only fragment on the way out.
+    pub fn unfragmented(self) -> u16 {
+        self.budget.clamp(MIN_SIGNALLED_MTU, self.mtu)
     }
 
     /// MSS for a clamped TCP handshake: the tunnel MTU less the IPv4 and TCP
@@ -193,6 +216,19 @@ impl EffectiveMtu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_narrow_link_signals_its_real_budget_but_never_under_quic() {
+        // Measured live: a 1445-byte path carrying L2TP routes (215 bytes).
+        let mtu = EffectiveMtu::for_session(SessionMode::Relay, ["l2tp"], 1445);
+        assert_eq!(mtu.overhead, 215);
+        assert_eq!((mtu.mtu, mtu.unfragmented()), (MIN_TUNNEL_MTU, 1230));
+        let narrower = EffectiveMtu::for_session(SessionMode::Relay, ["l2tp"], 1400);
+        assert_eq!(narrower.unfragmented(), MIN_SIGNALLED_MTU);
+        let wide = EffectiveMtu::for_session(SessionMode::Relay, ["wireguard"], LINK_MTU);
+        assert_eq!(wide.unfragmented(), wide.mtu);
+        assert_eq!(wide.with_tunnel_limit(Some(1300)).unfragmented(), 1300);
+    }
 
     #[test]
     fn relay_over_wireguard_fits_a_1500_byte_link() {

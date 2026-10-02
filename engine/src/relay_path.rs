@@ -500,6 +500,13 @@ pub trait RelayPath: Send {
         crate::rtt::MIN_TIMEOUT
     }
 
+    /// Whether the outer transport is a byte stream. A stream sizes its own
+    /// segments, so the path MTU to its endpoint never fragments what it
+    /// carries, and measuring it would only shrink the tunnel for nothing.
+    fn carried_by_stream(&self) -> bool {
+        false
+    }
+
     /// Whether this transport has established that it can no longer carry
     /// anything, so the worker should stop waiting for probes to prove it.
     ///
@@ -690,6 +697,15 @@ impl DirectPath {
             };
         }
         crate::rtt::MIN_TIMEOUT
+    }
+
+    /// See [`RelayPath::carried_by_stream`].
+    pub fn carried_by_stream(&self) -> bool {
+        #[cfg(feature = "openvpn")]
+        if let Self::OpenVpn(path) = self {
+            return path.protocol() == Protocol::Tcp;
+        }
+        false
     }
 
     /// Health probes must survive the stream queue's realtime shedding.
@@ -916,6 +932,10 @@ impl RelayPath for OpenVpnRelayPath {
             Protocol::Udp => crate::rtt::MIN_TIMEOUT,
             Protocol::Tcp => crate::rtt::STREAMED_MIN_TIMEOUT,
         }
+    }
+
+    fn carried_by_stream(&self) -> bool {
+        self.path.protocol() == Protocol::Tcp
     }
 }
 
