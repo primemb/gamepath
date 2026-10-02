@@ -1116,9 +1116,18 @@ mod tests {
         let poll = Poll::new().unwrap();
         let egress =
             InterfaceEgress::new(poll.registry().try_clone().unwrap(), loopback, interface);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // The proxy listens for TCP and UDP on one port number. A free TCP port
+        // can be taken for UDP, which failed this test now and then, so a
+        // pair that is free for both is looked for.
+        let (listener, udp) = (0..32)
+            .find_map(|_| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+                let port = listener.local_addr().ok()?.port();
+                let udp = std::net::UdpSocket::bind(("127.0.0.1", port)).ok()?;
+                Some((listener, udp))
+            })
+            .expect("a port free for both TCP and UDP");
         let port = listener.local_addr().unwrap().port();
-        let udp = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
         listener.set_nonblocking(true).unwrap();
         udp.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));

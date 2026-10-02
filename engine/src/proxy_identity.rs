@@ -112,7 +112,7 @@ fn listener_owner(port: u16) -> Option<u32> {
 }
 
 /// The process owning the UDP socket on `port`.
-fn udp_owner(port: u16) -> Option<u32> {
+pub(crate) fn udp_owner(port: u16) -> Option<u32> {
     let buffer = crate::split_capture::ip_table(|table, size| unsafe {
         GetExtendedUdpTable(table, size, 0, AF_INET, UDP_OWNER_PID, 0)
     })?;

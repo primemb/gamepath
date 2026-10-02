@@ -1156,6 +1156,15 @@ name resolution). On a filtered network the router answers first, with the filte
   tunnel's routes. Lookups to the router are not blocked: a kernel filter cannot tell GamePath's own lookups
   from any other, and the game has to be able to re-resolve its nodes while its tunnel is down.
 
+**While both sessions run, applications' own lookups go to their own session.** Windows' resolver (svchost)
+answers for most applications and games and cannot be split by application, so it stays with the game. But
+Chromium-based applications (Chrome, Discord) send their own lookups, and the game's capture now leaves those
+alone when the sender is installed outside Windows' folder and is not in the game's rules; the VPN then
+resolves them if they are its applications, or they go to the local resolver. Without this, a VPN app's names
+were resolved from the game route's country, and a route through Turkey, which blocks Discord, could not
+resolve Discord at all. The service tells the game when the VPN starts or stops (`set-other-session-active`)
+without reopening the game's capture, so the game's traffic is never interrupted for it.
+
 **GamePath's own names are never redirected.** The client sends both sessions `ownHostnames`: every game
 node, relay and VPN node hostname. Lookups for them go out as they would with the other session off.
 Without this, a game node resolved while a SOCKS5 VPN was on got the proxy's fake-IP answer

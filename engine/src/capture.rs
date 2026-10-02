@@ -169,6 +169,15 @@ fn log_resolver_priority(adapter_index: u32) {
     log_info!("name lookups are offered to {ahead} before the tunnel's resolvers");
 }
 
+/// Whether the game's capture leaves other applications' own name lookups
+/// alone because the VPN is running. With the VPN off the game resolves
+/// everything, as it always did.
+#[cfg(windows)]
+fn yields_foreign_lookups(other_session_active: bool) -> bool {
+    gamepath_engine::role::Role::current() == gamepath_engine::role::Role::Game
+        && other_session_active
+}
+
 /// Opens this engine's Wintun adapter, creating it if this is the first
 /// session since boot. Both traffic modes use the same adapter and the same
 /// GUID, so a mode change reuses the interface rather than making a second one.
@@ -278,6 +287,7 @@ impl PacketCaptureManager {
                 == gamepath_engine::role::Role::Vpn
                 && input.other_session_active;
             split.set_redirect_dns(input.remote_dns, own_apps_only);
+            split.set_yield_foreign_lookups(yields_foreign_lookups(input.other_session_active));
             self.active_split = Some(split);
             let dns = self.dns_mode();
             // Answers cached before the switch would outlive it: the router's
@@ -549,6 +559,26 @@ impl PacketCaptureManager {
 
     /// How the split capture redirects lookups: `None` not at all, else
     /// whether only its own apps' lookups.
+    /// The other session started or stopped. Only the game acts on it, by
+    /// leaving other applications' own name lookups to the VPN; the capture
+    /// is not reopened, so the game's traffic is never interrupted for it.
+    #[cfg(windows)]
+    pub(crate) fn set_other_session_active(&mut self, payload: &Value) -> Value {
+        let active = payload["active"] == json!(true);
+        if let Some(request) = self.last_request.as_mut() {
+            request["otherSessionActive"] = json!(active);
+        }
+        if let Some(split) = &self.active_split {
+            split.set_yield_foreign_lookups(yields_foreign_lookups(active));
+        }
+        json!({ "otherSessionActive": active })
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn set_other_session_active(&mut self, _payload: &Value) -> Value {
+        json!({ "state": "idle" })
+    }
+
     #[cfg(windows)]
     fn dns_mode(&self) -> Option<bool> {
         self.active_split

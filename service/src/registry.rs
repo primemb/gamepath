@@ -95,7 +95,16 @@ impl Registry {
             let mut summaries = self.summaries.lock().unwrap();
             std::mem::replace(&mut summaries[index(id)], summary.clone())
         };
-        if id != SlotId::Game || previous == summary {
+        if previous == summary {
+            return;
+        }
+        if id == SlotId::Vpn {
+            if previous.is_active() != summary.is_active() {
+                let active = summary.is_active();
+                self.in_background(move |registry| {
+                    crate::session::set_other_session_active(SlotId::Game, &registry, active);
+                });
+            }
             return;
         }
         if summary.owns_all_traffic() {

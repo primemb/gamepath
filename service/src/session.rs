@@ -546,6 +546,24 @@ pub(crate) fn update_session_rules(
 
 /// Keeps `id`'s capture and routes clear of the other slot's tunnel after
 /// that slot started, stopped or moved relay.
+/// Tells a running slot's capture whether the other slot is running, without
+/// reopening it: the game learns the VPN is up and leaves the VPN's apps'
+/// own name lookups to it. Nothing about the game's traffic is touched.
+pub(crate) fn set_other_session_active(id: SlotId, registry: &Arc<Registry>, active: bool) {
+    let mut runtime = registry.slot(id).lock().unwrap();
+    if !runtime.is_connected() {
+        return;
+    }
+    let Some(engine) = runtime.engine.as_mut() else {
+        return;
+    };
+    if let Err(error) = engine.request("set-other-session-active", json!({ "active": active })) {
+        runtime.warn(&format!(
+            "could not tell the capture the other session changed: {error}"
+        ));
+    }
+}
+
 pub(crate) fn set_foreign_bypass(id: SlotId, registry: &Arc<Registry>, foreign: &SlotSummary) {
     let addresses = foreign.bypass.as_slice();
     let mut runtime = registry.slot(id).lock().unwrap();

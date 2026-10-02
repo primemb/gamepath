@@ -167,6 +167,7 @@ fn handle_request(
         "start-packet-capture" => capture.start(request.payload, Arc::clone(sessions)),
         "update-packet-capture" => capture.update(request.payload, Arc::clone(sessions)),
         "set-foreign-bypass" => capture.set_foreign_bypass(request.payload, Arc::clone(sessions)),
+        "set-other-session-active" => Ok(capture.set_other_session_active(&request.payload)),
         "packet-capture-status" => Ok(capture.status()),
         "stop-packet-capture" => Ok(capture.stop()),
         "start-socks-server" => proxy.start(request.payload, sessions),

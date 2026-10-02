@@ -525,6 +525,12 @@ struct Registry {
     /// Redirect only lookups this session's rules select: the other session
     /// owns the rest. See `PacketCaptureRequest::other_session_active`.
     dns_own_apps_only: AtomicBool,
+    /// The game, while the VPN runs: leave alone the name lookups an ordinary
+    /// application sends itself, so the VPN resolves its own apps' names.
+    yield_foreign_lookups: AtomicBool,
+    /// Whether each recently seen lookup socket belongs to an ordinary
+    /// application, by local port, and each process by id.
+    lookup_owners: Mutex<LookupOwners>,
     /// When the oldest tunnelled name lookup still waiting for an answer was
     /// sent, in [`Registry::clock_ms`] (0: none waiting). Lookups are only
     /// redirected while the tunnel answers, so a dead tunnel never leaves the
@@ -810,6 +816,8 @@ impl SplitPacketCapture {
             held_packets: AtomicU64::new(0),
             redirect_dns: AtomicBool::new(false),
             dns_own_apps_only: AtomicBool::new(false),
+            yield_foreign_lookups: AtomicBool::new(false),
+            lookup_owners: Mutex::new(LookupOwners::default()),
             unanswered_dns_since: AtomicU64::new(0),
             dns_fallback: AtomicBool::new(false),
             last_dns_probe: AtomicU64::new(0),
@@ -1049,6 +1057,24 @@ impl SplitPacketCapture {
         self.registry
             .redirect_dns
             .store(redirect, Ordering::Relaxed);
+    }
+
+    pub fn set_yield_foreign_lookups(&self, yield_lookups: bool) {
+        if self
+            .registry
+            .yield_foreign_lookups
+            .swap(yield_lookups, Ordering::Relaxed)
+            != yield_lookups
+        {
+            gamepath_engine::log_info!(
+                "{}",
+                if yield_lookups {
+                    "the VPN is running: name lookups apps outside this session send themselves go to it"
+                } else {
+                    "the VPN stopped: this session resolves every name lookup again"
+                }
+            );
+        }
     }
 
     /// `None` when lookups are not redirected, else whether only this
@@ -1411,6 +1437,16 @@ fn run_selected_capture(
                     .is_some_and(|proxy| proxy.owns_udp_port(fields.source_port))
         });
         let rule_selected = selected;
+        // Discord and Chrome resolve with their own DNS client. Taken here, a
+        // VPN app's lookups went out through the game's tunnel, and a game
+        // route in a country that blocks the app (Turkey blocks Discord)
+        // answered with nothing usable. Windows' own resolver, which most
+        // applications and games use, still resolves through the game.
+        let own_lookup = own_lookup
+            || (question.is_some()
+                && !rule_selected
+                && registry.yield_foreign_lookups.load(Ordering::Relaxed)
+                && registry.lookup_is_from_an_application(fields.source_port));
         let own_apps_only = registry.dns_own_apps_only.load(Ordering::Relaxed);
         let mut implicit_dns = false;
         if !selected && !own_apps_only && !own_lookup && is_name_resolution(fields) {
@@ -1555,6 +1591,60 @@ fn run_selected_capture(
             registry.dns_sent(carried);
         }
     }
+}
+
+#[derive(Default)]
+struct LookupOwners {
+    ports: HashMap<u16, (bool, Instant)>,
+    processes: HashMap<u32, (bool, Instant)>,
+}
+
+/// How long a lookup socket's owner, or a process's verdict, is trusted.
+/// Short for ports, which are reused; longer for processes.
+const LOOKUP_PORT_TTL: Duration = Duration::from_secs(2);
+const LOOKUP_PROCESS_TTL: Duration = Duration::from_secs(60);
+
+impl Registry {
+    /// Whether the UDP socket on `port` belongs to an ordinary application,
+    /// one installed outside Windows' own folder. Windows' DNS Client (svchost)
+    /// and other system processes are not.
+    fn lookup_is_from_an_application(&self, port: u16) -> bool {
+        let now = Instant::now();
+        let mut owners = self.lookup_owners.lock().unwrap();
+        if let Some((verdict, at)) = owners.ports.get(&port) {
+            if now.duration_since(*at) < LOOKUP_PORT_TTL {
+                return *verdict;
+            }
+        }
+        let verdict = crate::proxy_identity::udp_owner(port).is_some_and(|process_id| match owners
+            .processes
+            .get(&process_id)
+        {
+            Some((verdict, at)) if now.duration_since(*at) < LOOKUP_PROCESS_TTL => *verdict,
+            _ => {
+                let verdict =
+                    process_path(process_id).is_some_and(|path| is_application_path(&path));
+                owners.processes.insert(process_id, (verdict, now));
+                verdict
+            }
+        });
+        owners
+            .ports
+            .retain(|_, (_, at)| now.duration_since(*at) < LOOKUP_PORT_TTL);
+        owners
+            .processes
+            .retain(|_, (_, at)| now.duration_since(*at) < LOOKUP_PROCESS_TTL);
+        owners.ports.insert(port, (verdict, now));
+        verdict
+    }
+}
+
+/// Outside Windows' own folder. `path` is lowercase, as `process_path` gives.
+fn is_application_path(path: &str) -> bool {
+    let windows = std::env::var("SystemRoot")
+        .unwrap_or_else(|_| r"C:\Windows".to_owned())
+        .to_ascii_lowercase();
+    !path.starts_with(&format!("{}\\", windows.trim_end_matches('\\')))
 }
 
 /// How long a tunnelled lookup may go unanswered before lookups go to the LAN
@@ -3575,7 +3665,7 @@ mod tests {
     #[test]
     fn a_dns_answer_names_the_rule_it_answers() {
         let mut dns = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
-        dns.extend_from_slice(b"api	anthropiccom   ");
+        dns.extend_from_slice(b"\x03api\x09anthropic\x03com\x00\x00\x01\x00\x01");
         // Answer: a pointer to the question name, A, IN, TTL, 4 bytes.
         dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 160, 79, 104, 10]);
         let mut packet = vec![
@@ -3589,6 +3679,25 @@ mod tests {
             [(Ipv4Addr::new(160, 79, 104, 10), "api.anthropic.com")]
         );
         assert!(dns_addresses(&packet, &["claude.com".to_owned()]).is_empty());
+    }
+
+    /// Windows' resolver and other system processes stay with the game;
+    /// applications installed anywhere else can be left to the VPN.
+    #[test]
+    fn only_processes_outside_windows_count_as_applications() {
+        let windows = std::env::var("SystemRoot")
+            .unwrap_or_else(|_| r"C:\Windows".to_owned())
+            .to_ascii_lowercase();
+        assert!(!is_application_path(&format!(
+            r"{windows}\system32\svchost.exe"
+        )));
+        assert!(is_application_path(
+            r"c:\users\me\appdata\local\discord\app-1.0\discord.exe"
+        ));
+        assert!(is_application_path(
+            r"c:\program files\google\chrome\application\chrome.exe"
+        ));
+        assert!(is_application_path(&format!("{windows}.old\\app.exe")));
     }
 
     #[test]
