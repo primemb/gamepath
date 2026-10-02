@@ -326,6 +326,10 @@ fn start_native_l2tp(
 /// client can say why the session ended.
 pub(crate) fn stop_session(id: SlotId, registry: &Arc<Registry>, reason: Option<&str>) -> Value {
     let mut runtime = registry.slot(id).lock().unwrap();
+    stop_slot(&mut runtime, registry, reason)
+}
+
+fn stop_slot(runtime: &mut SessionSlot, registry: &Arc<Registry>, reason: Option<&str>) -> Value {
     let was_running = runtime.is_connected() || runtime.engine.is_some();
     if was_running {
         runtime.log(&match reason {
@@ -336,7 +340,7 @@ pub(crate) fn stop_session(id: SlotId, registry: &Arc<Registry>, reason: Option<
     // Torn down under the slot's lock, so a start that follows straight
     // after cannot race the old session's route removal.
     runtime.take_for_teardown(reason).run();
-    registry.publish(id, SlotSummary::idle(reason.map(str::to_owned)));
+    registry.publish(runtime.id, SlotSummary::idle(reason.map(str::to_owned)));
     json!({ "sessionStatus": "idle", "stopReason": reason })
 }
 
@@ -544,32 +548,33 @@ pub(crate) fn update_session_rules(
     Ok(capture)
 }
 
-/// Keeps `id`'s capture and routes clear of the other slot's tunnel after
-/// that slot started, stopped or moved relay.
-/// Tells a running slot's capture whether the other slot is running, without
-/// reopening it: the game learns the VPN is up and leaves the VPN's apps'
-/// own name lookups to it. Nothing about the game's traffic is touched.
-pub(crate) fn set_other_session_active(id: SlotId, registry: &Arc<Registry>, active: bool) {
+/// Read the latest summary only after acquiring the destination slot. A
+/// notification can wait through a long dial and arrive after newer changes.
+pub(crate) fn reconcile_other_session(id: SlotId, registry: &Arc<Registry>) {
     let mut runtime = registry.slot(id).lock().unwrap();
+    let foreign = registry.summary(id.other());
+    if id == SlotId::Vpn && foreign.owns_all_traffic() {
+        stop_slot(&mut runtime, registry, Some(STOPPED_FOR_GAME_ALL_TRAFFIC));
+        return;
+    }
     if !runtime.is_connected() {
         return;
     }
-    let Some(engine) = runtime.engine.as_mut() else {
+    if id == SlotId::Game {
+        let Some(engine) = runtime.engine.as_mut() else {
+            return;
+        };
+        if let Err(error) = engine.request(
+            "set-other-session-active",
+            json!({ "active": foreign.is_active() }),
+        ) {
+            runtime.warn(&format!(
+                "could not tell the capture the other session changed: {error}"
+            ));
+        }
         return;
-    };
-    if let Err(error) = engine.request("set-other-session-active", json!({ "active": active })) {
-        runtime.warn(&format!(
-            "could not tell the capture the other session changed: {error}"
-        ));
     }
-}
-
-pub(crate) fn set_foreign_bypass(id: SlotId, registry: &Arc<Registry>, foreign: &SlotSummary) {
     let addresses = foreign.bypass.as_slice();
-    let mut runtime = registry.slot(id).lock().unwrap();
-    if !runtime.is_connected() {
-        return;
-    }
     let native = runtime.native_l2tp_direct;
     let result = if let Some(routes) = runtime.bypass_routes.as_mut() {
         routes.apply(addresses).map(|_| routes.len())
@@ -694,6 +699,48 @@ fn native_l2tp_status(runtime: &mut SessionSlot) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delayed_all_traffic_notification_does_not_stop_the_vpn_after_the_game_stopped() {
+        let registry = Registry::new();
+        let mut vpn = registry.slot(SlotId::Vpn).lock().unwrap();
+        vpn.session_status = "connected".into();
+        registry.publish(
+            SlotId::Game,
+            SlotSummary {
+                status: "connected".into(),
+                traffic_mode: "all".into(),
+                ..SlotSummary::default()
+            },
+        );
+        registry.publish(SlotId::Game, SlotSummary::idle(None));
+        drop(vpn);
+        reconcile_other_session(SlotId::Vpn, &registry);
+        let vpn = registry.slot(SlotId::Vpn).lock().unwrap();
+        assert!(vpn.is_connected());
+        assert_eq!(vpn.stop_reason, None);
+    }
+
+    #[test]
+    fn a_current_all_traffic_game_still_stops_the_vpn() {
+        let registry = Registry::new();
+        registry.slot(SlotId::Vpn).lock().unwrap().session_status = "connected".into();
+        registry.publish(
+            SlotId::Game,
+            SlotSummary {
+                status: "connected".into(),
+                traffic_mode: "all".into(),
+                ..SlotSummary::default()
+            },
+        );
+        reconcile_other_session(SlotId::Vpn, &registry);
+        let vpn = registry.slot(SlotId::Vpn).lock().unwrap();
+        assert!(!vpn.is_connected());
+        assert_eq!(
+            vpn.stop_reason.as_deref(),
+            Some(STOPPED_FOR_GAME_ALL_TRAFFIC)
+        );
+    }
 
     #[test]
     fn a_session_id_tags_the_log_only_when_it_is_safe_to_print() {

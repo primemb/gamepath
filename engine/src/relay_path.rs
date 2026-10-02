@@ -681,6 +681,28 @@ pub enum DirectPath {
 }
 
 impl DirectPath {
+    pub fn probe_deadline_floor(&self) -> Duration {
+        #[cfg(feature = "openvpn")]
+        if let Self::OpenVpn(path) = self {
+            return match path.protocol() {
+                Protocol::Udp => crate::rtt::MIN_TIMEOUT,
+                Protocol::Tcp => crate::rtt::STREAMED_MIN_TIMEOUT,
+            };
+        }
+        crate::rtt::MIN_TIMEOUT
+    }
+
+    /// Health probes must survive the stream queue's realtime shedding.
+    pub fn send_probe(&mut self, packet: &[u8]) -> Result<(), String> {
+        match self {
+            Self::WireGuard(path) => path.send_packet(packet),
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn(path) => path.send_probe(packet),
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Socks5(path) => path.send_packet(packet),
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::WireGuard(_) => KIND_WIREGUARD,

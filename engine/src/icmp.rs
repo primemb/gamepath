@@ -32,20 +32,33 @@ pub(crate) fn icmp_echo_packet(
     packet
 }
 
-pub(crate) fn is_matching_icmp_reply(
+pub(crate) fn icmp_reply_sequence(
     packet: &[u8],
     source: std::net::Ipv4Addr,
     destination: std::net::Ipv4Addr,
     identifier: u16,
-) -> bool {
-    packet.len() >= 28
-        && packet[0] >> 4 == 4
-        && packet[9] == 1
-        && packet[12..16] == source.octets()
-        && packet[16..20] == destination.octets()
-        && packet[20] == 0
-        && u16::from_be_bytes([packet[24], packet[25]]) == identifier
-        && internet_checksum(&packet[20..]) == 0
+) -> Option<u16> {
+    if packet.len() < 28 || packet[0] >> 4 != 4 {
+        return None;
+    }
+    let header_length = usize::from(packet[0] & 0x0f) * 4;
+    let total_length = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if header_length < 20
+        || total_length < header_length + 8
+        || total_length > packet.len()
+        || packet[9] != 1
+        || packet[12..16] != source.octets()
+        || packet[16..20] != destination.octets()
+        || u16::from_be_bytes([packet[6], packet[7]]) & 0x3fff != 0
+    {
+        return None;
+    }
+    let echo = &packet[header_length..total_length];
+    (echo[0] == 0
+        && echo[1] == 0
+        && u16::from_be_bytes([echo[4], echo[5]]) == identifier
+        && internet_checksum(echo) == 0)
+        .then(|| u16::from_be_bytes([echo[6], echo[7]]))
 }
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
@@ -73,6 +86,58 @@ mod tests {
         let destination = "10.203.0.2".parse().unwrap();
         let packet = icmp_echo_packet(source, destination, 42, 1, true);
         assert_eq!(internet_checksum(&packet[..20]), 0);
-        assert!(is_matching_icmp_reply(&packet, source, destination, 42));
+        assert_eq!(
+            icmp_reply_sequence(&packet, source, destination, 42),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_delayed_reply_keeps_its_original_sequence() {
+        let source = "10.203.0.1".parse().unwrap();
+        let destination = "10.203.0.2".parse().unwrap();
+        let reply = icmp_echo_packet(source, destination, 42, 9, true);
+        assert_eq!(
+            icmp_reply_sequence(&reply, source, destination, 42),
+            Some(9)
+        );
+        assert_eq!(icmp_reply_sequence(&reply, source, destination, 43), None);
+    }
+
+    #[test]
+    fn a_reply_with_ipv4_options_is_matched_at_its_actual_header_length() {
+        let source = "10.203.0.1".parse().unwrap();
+        let destination = "10.203.0.2".parse().unwrap();
+        let mut reply = icmp_echo_packet(source, destination, 42, 9, true);
+        reply.splice(20..20, [1, 1, 1, 1]);
+        reply[0] = 0x46;
+        let length = reply.len() as u16;
+        reply[2..4].copy_from_slice(&length.to_be_bytes());
+        reply[10..12].fill(0);
+        let checksum = internet_checksum(&reply[..24]);
+        reply[10..12].copy_from_slice(&checksum.to_be_bytes());
+        assert_eq!(
+            icmp_reply_sequence(&reply, source, destination, 42),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn truncated_or_fragmented_replies_are_not_measurements() {
+        let source = "10.203.0.1".parse().unwrap();
+        let destination = "10.203.0.2".parse().unwrap();
+        let reply = icmp_echo_packet(source, destination, 42, 9, true);
+        for length in 0..reply.len() {
+            assert_eq!(
+                icmp_reply_sequence(&reply[..length], source, destination, 42),
+                None
+            );
+        }
+        let mut fragmented = reply;
+        fragmented[6..8].copy_from_slice(&0x2000_u16.to_be_bytes());
+        assert_eq!(
+            icmp_reply_sequence(&fragmented, source, destination, 42),
+            None
+        );
     }
 }

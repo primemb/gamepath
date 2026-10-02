@@ -687,7 +687,8 @@ fn describe_refusal(message: &str) -> String {
 
 fn build_tls_config(config: &OpenVpnConfig) -> Result<ClientConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = EmbeddedCaVerifier::new(&config.ca, provider.clone())?;
+    let verifier =
+        EmbeddedCaVerifier::new(&config.ca, config.server_name.clone(), provider.clone())?;
     let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|error| format!("could not configure TLS for OpenVPN: {error}"))?

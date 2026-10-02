@@ -179,8 +179,8 @@ pub(crate) fn another_path_is_up(healthy_mask: &AtomicU64, index: usize) -> bool
 /// itself dead after three probes of its own, inside a second.
 ///
 /// That gap was the bug. A real uplink stall shorter than the monitor's window
-/// - a Wi-Fi hiccup, a router pause, a congestion burst, which is the common
-/// case - killed every path at once while the monitor still said `Up`, so the
+/// (a Wi-Fi hiccup, a router pause, a congestion burst, which is the common
+/// case) killed every path at once while the monitor still said `Up`, so the
 /// guard below never engaged and all of them redialled simultaneously into a
 /// link that could not carry the dials. Observed live: three routes across two
 /// unrelated providers went unavailable inside 1.2 s and all three redialled,

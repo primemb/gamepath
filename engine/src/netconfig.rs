@@ -984,7 +984,7 @@ mod tests {
         if unsafe { GetIpForwardTable2(AF_INET6, &mut table) } != NO_ERROR || table.is_null() {
             return 0;
         }
-        let count = unsafe {
+        unsafe {
             let entries = (*table).NumEntries as usize;
             let found = std::slice::from_raw_parts((*table).Table.as_ptr(), entries)
                 .iter()
@@ -994,8 +994,7 @@ mod tests {
                 .count();
             FreeMibTable(table.cast());
             found
-        };
-        count
+        }
     }
 
     /// The ordering that matters. The configuration change is refused on some

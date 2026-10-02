@@ -18,6 +18,7 @@ mod crypto;
 mod link;
 mod session;
 mod verify;
+mod x509_name;
 
 pub use config::{OpenVpnConfig, Protocol};
 pub use session::Credentials;

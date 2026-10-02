@@ -109,7 +109,7 @@ Both modes send DNS through the tunnel. This is not only about privacy: where DN
 
 All-traffic mode points the tunnel adapter at a resolver reachable through the session. It prefers the relay's own resolver, whose address exists only inside the tunnel and so cannot leak by any route, and falls back to a public resolver reached through the tunnel when the relay has none — a relay installed before this existed keeps working, it just resolves further away. The chosen servers are logged and reported as `dnsServers`. They are cleared when capture stops.
 
-Split mode selects DNS whoever asked for it, over UDP and TCP, counted as `tunnelledDnsQueries` — but only queries already aimed at a public resolver, since a query to your own router means the relay's LAN once it arrives there and tunnelling it would destroy rather than redirect it. If your machine resolves through its router, all-traffic mode is the mode that protects lookups. A rule naming an application cannot do this on its own: Windows applications do not send DNS themselves, they call the resolver, and the DNS Client service inside `svchost.exe` sends the query — so an application rule selects every packet the game sends and still leaves its name lookups going out untunnelled, owned by a process nobody selected. If the session cannot carry a query it takes the normal route, so this can cost a lookup latency but never the ability to resolve.
+With remote DNS enabled, split mode also redirects lookups aimed at your router or ISP resolver to `8.8.8.8` through the tunnel and rewrites replies to appear from the resolver Windows asked. Queries already aimed at a public resolver are carried over UDP and TCP. Local names and private reverse lookups stay local. If redirected lookups go unanswered for two seconds, resolution falls back to the normal network while occasional tunnelled queries check for recovery. Windows' shared DNS Client service means most applications' lookups cannot be assigned to an application rule; when both sessions run, shared lookups follow the game and applications that send their own DNS queries can follow their own session. Turning remote DNS off leaves local resolution in place. This improves access on filtered networks, but does not promise leak-free DNS.
 
 To resolve inside the relay rather than through a public resolver, reinstall the relay with `deploy/install-relay.sh`; it configures a resolver bound to the tunnel address only, and refuses port 53 on the public interface so the relay never becomes an open resolver.
 
@@ -249,12 +249,17 @@ What is refused, by name and with the reason:
 - Compression of any kind, which leaks information about traffic and adds
   latency. A `no`, `stub` or `stub-v2` stub is accepted.
 - `--fragment`, `http-proxy`, `socks-proxy` and `static-challenge`.
+- Certificate pinning, revocation or script checks using `peer-fingerprint`, `verify-hash`,
+  `crl-verify` or `tls-verify`. GamePath cannot enforce them, so it refuses the file rather than
+  silently connecting without them.
 
 The server's certificate is checked against the `<ca>` in the file, inside its
 validity dates, and must be marked for server use. The hostname is deliberately
 not checked: OpenVPN does not authenticate a server that way, servers are
 routinely reached by bare IP, and their certificates routinely carry a name that
-matches nothing. Verification itself is never skipped.
+matches nothing. Verification itself is never skipped. When the file carries
+`verify-x509-name`, the server certificate's subject is checked the way the
+reference client checks it, with the `subject`, `name` and `name-prefix` types.
 
 The file and its credentials are encrypted by Windows secure storage and are
 decrypted only in the privileged process, at the moment the engine needs them.

@@ -98,28 +98,13 @@ impl Registry {
         if previous == summary {
             return;
         }
-        if id == SlotId::Vpn {
-            if previous.is_active() != summary.is_active() {
-                let active = summary.is_active();
-                self.in_background(move |registry| {
-                    crate::session::set_other_session_active(SlotId::Game, &registry, active);
-                });
-            }
-            return;
-        }
-        if summary.owns_all_traffic() {
-            if !previous.owns_all_traffic() {
-                self.in_background(|registry| {
-                    crate::session::stop_session(
-                        SlotId::Vpn,
-                        &registry,
-                        Some(STOPPED_FOR_GAME_ALL_TRAFFIC),
-                    );
-                });
-            }
-        } else if previous.bypass != summary.bypass || previous.is_active() != summary.is_active() {
+        let needs_update = previous.is_active() != summary.is_active()
+            || (id == SlotId::Game
+                && (previous.bypass != summary.bypass
+                    || previous.owns_all_traffic() != summary.owns_all_traffic()));
+        if needs_update {
             self.in_background(move |registry| {
-                crate::session::set_foreign_bypass(SlotId::Vpn, &registry, &summary);
+                crate::session::reconcile_other_session(id.other(), &registry);
             });
         }
     }

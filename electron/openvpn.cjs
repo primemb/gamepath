@@ -50,18 +50,22 @@ function parseOpenVpnConfig(source, filePath, id, importedAt = new Date().toISOS
 
 function readDirectives(source) {
   const directives = []
-  let insideBlock = false
+  let opaqueBlock = null
   for (const raw of source.split(/\r?\n/)) {
     const line = raw.trim()
     if (!line || line.startsWith('#') || line.startsWith(';')) continue
-    if (/^<\/?[a-z0-9-]+>$/i.test(line)) {
-      insideBlock = !line.startsWith('</')
+    if (opaqueBlock) {
+      if (line.toLowerCase() === `</${opaqueBlock}>`) opaqueBlock = null
       continue
     }
-    // A line inside `<ca>` or `<key>` is certificate body, not a directive.
-    if (insideBlock) continue
+    const tag = line.match(/^<(\/?)([a-z0-9-]+)>$/i)
+    if (tag) {
+      const name = tag[2].toLowerCase()
+      if (!tag[1] && name !== 'connection') opaqueBlock = name
+      continue
+    }
     const [name, ...args] = line.split(/\s+/)
-    directives.push({ name: name.toLowerCase(), arguments: args })
+    directives.push({ name: name.replace(/^--/, '').toLowerCase(), arguments: args })
   }
   return directives
 }
@@ -72,6 +76,19 @@ function readDirectives(source) {
  */
 function unsupported(directives, source) {
   const named = (name) => directives.find((line) => line.name === name)
+
+  for (const name of ['peer-fingerprint', 'verify-hash', 'crl-verify', 'tls-verify']) {
+    if (named(name) || new RegExp(`<${name}>`, 'i').test(source)) {
+      return `GamePath cannot enforce the \`${name}\` certificate verification requirement in this configuration. Use a client that supports this check.`
+    }
+  }
+  const serverName = named('verify-x509-name')
+  if (serverName) {
+    const type = serverName.arguments.join(' ').replace(/^("[^"]*"|\S+)\s*/, '') || 'subject'
+    if (!['subject', 'name', 'name-prefix'].includes(type)) {
+      return `\`verify-x509-name\` type \`${type}\` is not one of subject, name or name-prefix.`
+    }
+  }
 
   const device = named('dev')
   if (device && !(device.arguments[0] ?? '').startsWith('tun')) {

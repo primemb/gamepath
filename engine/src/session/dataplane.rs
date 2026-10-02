@@ -8,7 +8,7 @@
 use super::WireGuardSessionManager;
 use super::health::selected_paths;
 use super::state::SessionOverlay;
-use crate::icmp::{icmp_echo_packet, is_matching_icmp_reply};
+use crate::icmp::{icmp_echo_packet, icmp_reply_sequence};
 use gamepath_engine::relay_path::SessionMode;
 use gamepath_engine::userspace_wireguard::{ipv4_udp_packet, ipv4_udp_payload};
 use gamepath_engine::{dns, log_warn};
@@ -106,7 +106,8 @@ impl WireGuardSessionManager {
         };
         let reply = match self.send_data_packet(&request, timeout) {
             Ok(reply)
-                if is_matching_icmp_reply(&reply, benchmark_server, virtual_ipv4, identifier) =>
+                if icmp_reply_sequence(&reply, benchmark_server, virtual_ipv4, identifier)
+                    == Some(1) =>
             {
                 reply
             }

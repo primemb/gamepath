@@ -534,7 +534,7 @@ fn add_route(relay: Ipv4Addr, interface_index: u32) -> Result<(), String> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::is_fatal_send_error;
-    use std::io::{Error, ErrorKind};
+    use std::io::Error;
 
     /// The distinction the whole flag rests on: some send errors mean the
     /// socket is finished, and most do not.
@@ -557,9 +557,6 @@ mod tests {
         assert!(!is_fatal_send_error(&Error::from_raw_os_error(10051)));
 
         // An error carrying no OS code cannot be classified, so it is not.
-        assert!(!is_fatal_send_error(&Error::new(
-            ErrorKind::Other,
-            "no code"
-        )));
+        assert!(!is_fatal_send_error(&Error::other("no code")));
     }
 }

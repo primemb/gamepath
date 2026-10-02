@@ -10,8 +10,16 @@
 //! name, so the user is told what about their file is unsupported instead of
 //! watching a connection fail with no reason given.
 
+use super::x509_name::ServerNameCheck;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
+
+const UNSUPPORTED_CERTIFICATE_CHECKS: [&str; 4] = [
+    "peer-fingerprint",
+    "verify-hash",
+    "crl-verify",
+    "tls-verify",
+];
 
 /// How control packets are protected before TLS even starts.
 #[derive(Clone)]
@@ -220,6 +228,8 @@ pub struct OpenVpnConfig {
     pub digest: Digest,
     /// True when the server expects a username and password.
     pub wants_credentials: bool,
+    /// `--verify-x509-name`, checked against the server's leaf certificate.
+    pub server_name: Option<ServerNameCheck>,
     pub reneg_seconds: Option<u64>,
     pub tun_mtu: u16,
 }
@@ -241,6 +251,7 @@ impl std::fmt::Debug for OpenVpnConfig {
             .field("data_ciphers", &self.data_ciphers)
             .field("digest", &self.digest)
             .field("wants_credentials", &self.wants_credentials)
+            .field("server_name", &self.server_name)
             .field("reneg_seconds", &self.reneg_seconds)
             .field("tun_mtu", &self.tun_mtu)
             .finish()
@@ -345,6 +356,7 @@ struct Parser {
     legacy_cipher: Option<DataCipher>,
     digest: Option<Digest>,
     wants_credentials: bool,
+    server_name: Option<ServerNameCheck>,
     reneg_seconds: Option<u64>,
     tun_mtu: Option<u16>,
 }
@@ -372,6 +384,13 @@ impl Parser {
     }
 
     fn directive(&mut self, directive: &str, arguments: &[String]) -> Result<(), String> {
+        let directive = directive.strip_prefix("--").unwrap_or(directive);
+        if UNSUPPORTED_CERTIFICATE_CHECKS.contains(&directive) {
+            return Err(format!(
+                "GamePath cannot enforce the `{directive}` certificate verification requirement in \
+                 this configuration. Use a client that supports this check."
+            ));
+        }
         let argument = |index: usize| arguments.get(index).map(String::as_str);
         match directive {
             "remote" => {
@@ -383,6 +402,10 @@ impl Parser {
                     port: argument(1).map(parse_port).transpose()?,
                     protocol: argument(2).map(parse_protocol).transpose()?,
                 });
+                Ok(())
+            }
+            "verify-x509-name" => {
+                self.server_name = Some(ServerNameCheck::parse(arguments)?);
                 Ok(())
             }
             "proto" => {
@@ -500,6 +523,9 @@ impl Parser {
     }
 
     fn inline(&mut self, tag: &str, body: &str) -> Result<(), String> {
+        if UNSUPPORTED_CERTIFICATE_CHECKS.contains(&tag) {
+            return self.directive(tag, &[]);
+        }
         match tag {
             "ca" => {
                 self.ca = read_certificates(body, "ca")?;
@@ -541,7 +567,10 @@ impl Parser {
                     let Some((directive, arguments)) = tokens.split_first() else {
                         continue;
                     };
-                    if matches!(directive.as_str(), "remote" | "proto" | "port" | "rport") {
+                    let name = directive.strip_prefix("--").unwrap_or(directive);
+                    if matches!(name, "remote" | "proto" | "port" | "rport")
+                        || UNSUPPORTED_CERTIFICATE_CHECKS.contains(&name)
+                    {
                         self.directive(directive, arguments)?;
                     }
                 }
@@ -641,6 +670,7 @@ impl Parser {
             data_ciphers,
             digest,
             wants_credentials: self.wants_credentials,
+            server_name: self.server_name,
             reneg_seconds: self.reneg_seconds,
             tun_mtu: self.tun_mtu.unwrap_or(1500),
         })
@@ -803,6 +833,71 @@ mod tests {
 
     fn config(body: &str) -> String {
         format!("{body}\n<ca>\n{CA}</ca>\n")
+    }
+
+    #[test]
+    fn certificate_identity_and_revocation_requirements_are_not_ignored() {
+        for directive in UNSUPPORTED_CERTIFICATE_CHECKS {
+            for prefix in ["", "--"] {
+                for scoped in [false, true] {
+                    let check = format!("{prefix}{directive} required-check");
+                    let body = if scoped {
+                        format!(
+                            "<connection>\nremote vpn.example 443 tcp\n{check}\n</connection>\nauth-user-pass"
+                        )
+                    } else {
+                        format!("remote vpn.example 1194\nauth-user-pass\n{check}")
+                    };
+                    let error = OpenVpnConfig::parse(&config(&body)).unwrap_err();
+                    assert!(error.contains(directive), "{error}");
+                    assert!(error.contains("cannot enforce"), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verify_x509_name_is_kept_for_the_certificate_check() {
+        let parsed = OpenVpnConfig::parse(&config(
+            "remote vpn.example 1194
+auth-user-pass
+--verify-x509-name arn-476.windscribe.com name",
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed.server_name,
+            Some(ServerNameCheck::Name("arn-476.windscribe.com".into()))
+        );
+        let parsed = OpenVpnConfig::parse(&config(
+            "remote vpn.example 1194
+auth-user-pass
+verify-x509-name \"C=CA, CN=server\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed.server_name,
+            Some(ServerNameCheck::Subject("C=CA, CN=server".into()))
+        );
+        assert!(
+            OpenVpnConfig::parse(&config(
+                "remote vpn.example 1194
+auth-user-pass
+verify-x509-name server cn"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inline_fingerprints_and_revocation_lists_are_not_ignored() {
+        for directive in ["peer-fingerprint", "verify-hash", "crl-verify"] {
+            let body = format!(
+                "remote vpn.example 1194\nauth-user-pass\n<{directive}>\nrequired-check\n</{directive}>"
+            );
+            let error = OpenVpnConfig::parse(&config(&body)).unwrap_err();
+            assert!(error.contains(directive), "{error}");
+            assert!(error.contains("cannot enforce"), "{error}");
+        }
     }
 
     #[test]

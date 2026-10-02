@@ -148,7 +148,7 @@ the first leaves several retries of headroom inside the second.
 
 ## Packet size
 
-A captured packet is not what leaves the machine, so the tunnel MTU is derived from what the selected transports actually add rather than fixed at a constant. `EffectiveMtu::for_session` costs the outer IPv4/UDP header, the transport's own framing, and — for a relay session — the inner IPv4/UDP datagram, the 40-byte GamePath header and its 16-byte AEAD tag. Relay over WireGuard therefore costs 144 bytes and yields a 1356-byte MTU on a 1500-byte link; direct WireGuard costs 60 and yields 1440. A mixed route set takes the smallest, because the scheduler may move a packet onto any of them. The Wintun adapter is sized from this, and split mode clamps the TCP MSS to `mtu - 40` rather than to a fixed conservative value.
+A captured packet is not what leaves the machine, so the tunnel MTU is derived from what the selected transports actually add rather than fixed at a constant. `EffectiveMtu::for_session` costs the outer IPv4/UDP header, the transport's own framing, and — for a relay session — the inner IPv4/UDP datagram, the 40-byte GamePath header, its 16-byte AEAD tag and the 15-byte loss-repair reserve. Relay over WireGuard therefore costs 159 bytes and yields a 1341-byte MTU on a 1500-byte link; direct WireGuard costs 60 and yields 1440. A mixed route set takes the smallest, because the scheduler may move a packet onto any of them. The Wintun adapter is sized from this, and split mode clamps the TCP MSS to `mtu - 40` rather than to a fixed conservative value.
 
 The link MTU is read per endpoint from the route Windows would actually take, because a laptop can have Ethernet, Wi-Fi and a mobile interface up at once.
 
@@ -258,16 +258,13 @@ before removing the routes, so there is never a moment pointing at a resolver
 the tunnel can no longer reach.
 
 Split mode has no tunnel adapter to configure, so it selects name resolution in
-the classifier instead — but only queries already addressed to a public
-resolver. A home machine usually resolves through its own router, and
-`192.168.1.1` means the relay's own LAN once the packet arrives there, so
-tunnelling such a query does not redirect it, it destroys it. Observed live: a
-split session selected `UDP 192.168.1.1:53` and sent it to a relay that could
-never answer. What split mode can improve is the other case — the same public
-resolver, reached from the relay instead of through a filter that rewrites the
-answer in transit. Where the machine's resolver is on its own LAN the query is
-left alone, because the alternatives are to break it or to silently change
-which resolver the machine uses, and a packet filter should not do the second.
+the classifier instead. Queries already addressed to a public resolver travel
+unchanged. A query to `192.168.1.1` would mean the relay's own LAN once it
+arrived there, so remote DNS rewrites LAN and ISP resolver destinations to
+`TUNNEL_RESOLVER`, then rewrites replies to come from the original resolver.
+Local names stay local, and unanswered redirected lookups fall back after two
+seconds while occasional tunnel queries check for recovery. See _Remote DNS
+and the router's resolver_ for the concurrent-session and bootstrap exceptions.
 Selection is over UDP and TCP — TCP because a truncated answer is
 retried there and selecting only UDP would leak the largest replies. Narrow
 kernel filters carry `DNS_CLAUSE` for the same reason: a packet the kernel never
@@ -337,12 +334,17 @@ national filters blackhole or hijack outright, so a perfectly healthy tunnel
 measured as silent for the users behind them. It is `8.8.8.8`.
 
 Some providers filter ICMP while routing everything else perfectly. If no echo
-is ever answered, the engine stops asking after three attempts and stops
+is ever answered, the engine backs off to one attempt every fifteen seconds and stops
 counting them as loss — reporting such a node as totally lossy would be wrong —
 and the handshake round trip stands in for the route latency. **The cost is
 that a node in this state has no liveness signal at all** and stays reported as
-up while the tunnel is established. Probe counters stay unpublished until one
+up while the tunnel is established. Authenticated return traffic also proves
+liveness for five seconds regardless of ICMP loss. Probe counters stay unpublished until one
 echo is answered, so the client never shows probes it could not measure.
+
+Direct probes match both echo identifier and sequence, so a delayed reply cannot
+consume a newer probe's timer. Direct OpenVPN probes use reliable stream writes
+and the same transport-specific deadline floor as relay probes.
 
 Routes into the Wintun adapter derive their next hop from the session address
 rather than a fixed one. A relay hands out `10.203.0.x` and gets `10.203.0.1`
@@ -1064,7 +1066,10 @@ The slots never wait on each other's lock. A slot's lock is held for its whole s
 takes several seconds, so if one slot's status request queued behind the other's start, the client would see
 three failed polls and tear a healthy session down. Instead each slot publishes a small summary (status,
 traffic mode, where its own tunnel traffic goes) under a lock held only for a copy, and cross-slot decisions
-read that. Each slot also has its own lease watchdog.
+read that. Background notifications read the latest summary after acquiring
+the receiving slot's lock, so notifications delayed by a dial cannot restore
+old bypass addresses or stop a VPN after the game has already stopped. Each
+slot also has its own lease watchdog.
 
 **Priority is WinDivert's, not coordination.** The game's capture handles open at priority 0, as they always
 did; the VPN engine (`gamepath-engine.exe --role vpn`) opens its handles at −1000. WinDivert diverts a packet

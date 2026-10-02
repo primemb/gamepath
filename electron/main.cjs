@@ -1343,8 +1343,11 @@ async function pollSessionStatus() {
   if (state.session.status !== 'connected' || serviceBridge?.status.status !== 'ready') return
   if (sessionPollInFlight) return
   sessionPollInFlight = true
+  const polled = state.session
+  const isCurrent = () => state.session === polled && polled.status === 'connected'
   try {
     const runtime = await serviceBridge.request('session-status')
+    if (!isCurrent()) return
     updateSessionMetrics(runtime)
     recordUsage(runtime)
     if (runtime.mode !== 'direct') relayFailover.observe(runtime)
@@ -1365,6 +1368,7 @@ async function pollSessionStatus() {
           : 'Relay paths are unavailable. Selected traffic is not getting through — stop the session to use your normal connection.'
     }
   } catch (error) {
+    if (!isCurrent()) return
     sessionPollFailures += 1
     if (sessionPollFailures < SESSION_POLL_MAX_FAILURES) {
       // The paths are almost certainly still carrying traffic; only the status
@@ -1372,14 +1376,17 @@ async function pollSessionStatus() {
       logger.warn(`session status failed (${sessionPollFailures}/${SESSION_POLL_MAX_FAILURES}): ${error.message}`)
       return
     }
-    try {
-      await serviceBridge.request('stop-session')
-    } catch {}
-    state.session = { status: 'error', message: error.message }
-    stopSessionKeepAlive()
-    relayFailover.end()
-    logger.error(`session lost after ${sessionPollFailures} failed status requests: ${error.message}`)
-    notifyVpnOfGame()
+    await sessionExclusive(async () => {
+      // Start/Stop may have replaced this session while cleanup was queued.
+      if (!isCurrent()) return
+      try {
+        await serviceBridge.request('stop-session')
+      } catch {}
+      state.session = { status: 'error', message: error.message }
+      stopSessionKeepAlive()
+      relayFailover.end()
+      logger.error(`session lost after ${sessionPollFailures} failed status requests: ${error.message}`)
+    })
   } finally {
     sessionPollInFlight = false
   }

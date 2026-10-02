@@ -1,6 +1,5 @@
-//! The single thread a direct session runs: no relay to exchange control
-//! frames with, so the node's own handshake decides whether it is up and an
-//! ICMP echo through the tunnel is telemetry on top of that.
+//! The direct session's worker: setup proves initial availability, while
+//! tunnelled ICMP echoes and authenticated replies provide live health.
 
 use super::health::{PROBE_INTERVAL, publish_path_health, record_path_receive, record_path_send};
 use super::latency::{LatencyEvent, LatencyWatch};
@@ -10,7 +9,7 @@ use super::worker::{
     PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN, WORKER_RECEIVE_TIMEOUT,
     drain_send_queue,
 };
-use crate::icmp::{icmp_echo_packet, is_matching_icmp_reply};
+use crate::icmp::{icmp_echo_packet, icmp_reply_sequence};
 use gamepath_engine::relay_path::{DirectPath, KIND_WIREGUARD};
 use gamepath_engine::rtt::RttEstimator;
 use gamepath_engine::scheduler::PathMetrics;
@@ -47,15 +46,22 @@ const DIRECT_QUIET_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 /// answers echo requests, reached through the node like any game server.
 const DIRECT_PROBE_TARGET: std::net::Ipv4Addr = gamepath_engine::BENCHMARK_TARGET;
 
+fn take_matching_probe(pending: &mut Option<(u16, Instant)>, sequence: u16) -> Option<Instant> {
+    if pending.is_some_and(|(expected, _)| expected == sequence) {
+        pending.take().map(|(_, started)| started)
+    } else {
+        None
+    }
+}
+
 /// Carries a direct session's traffic through its single node.
 ///
 /// There is no relay here to exchange control frames with, so health and
-/// latency come from two different places. The WireGuard handshake decides
-/// whether the node is up: it either answered or it did not, and nothing about
-/// the user's traffic can make that ambiguous. An ICMP echo through the tunnel
-/// then measures the whole trip out to the Internet — but only as telemetry.
+/// latency come from two different places. The handshake proves the node
+/// answered at setup. An ICMP echo through the tunnel measures the whole trip
+/// out to the Internet and, once answered, provides a live health signal.
 /// Plenty of providers filter ICMP while routing everything else perfectly, so
-/// after a few unanswered probes this stops asking and stops counting them as
+/// after a few unanswered probes this backs off and stops counting them as
 /// loss, rather than reporting a healthy node as totally lossy.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_direct_path(
@@ -81,10 +87,10 @@ pub(crate) fn run_direct_path(
     };
     let mut probe_sequence = 0_u16;
     let mut next_probe = Instant::now();
-    let mut pending_probe: Option<Instant> = None;
+    let mut pending_probe: Option<(u16, Instant)> = None;
     // The probe deadline follows this node's own round trip, so a provider that
     // is simply distant is not mistaken for one that is losing packets.
-    let mut rtt = RttEstimator::default();
+    let mut rtt = RttEstimator::with_floor(path.probe_deadline_floor());
     let mut latency_watch = LatencyWatch::default();
     let mut last_iteration = Instant::now();
     let mut last_worker_gap_log: Option<Instant> = None;
@@ -130,7 +136,7 @@ pub(crate) fn run_direct_path(
         let handshake = path.handshake_latency_ms();
         // Authenticated return traffic outranks the probe verdict: a node that
         // is demonstrably carrying packets is not down because ICMP to
-        // 1.1.1.1 is being filtered somewhere past it.
+        // the benchmark target is being filtered somewhere past it.
         let carrying =
             last_authenticated_receive.is_some_and(|seen| seen.elapsed() <= DIRECT_LIVENESS_WINDOW);
         let losing = icmp_answered && consecutive_losses >= DIRECT_LOSS_LIMIT && !carrying;
@@ -177,7 +183,7 @@ pub(crate) fn run_direct_path(
                 probe_sequence,
                 false,
             );
-            match path.send_packet(&probe) {
+            match path.send_probe(&probe) {
                 Ok(()) => {
                     probes_attempted += 1;
                     // Until one probe is answered nothing is published, so a
@@ -186,7 +192,7 @@ pub(crate) fn run_direct_path(
                     if icmp_answered {
                         statuses.lock().unwrap()[0].probes_sent += 1;
                     }
-                    pending_probe = Some(Instant::now());
+                    pending_probe = Some((probe_sequence, Instant::now()));
                 }
                 // The handshake, not this probe, decides whether the node is
                 // up, so a failed send is recorded and the loop carries on.
@@ -202,8 +208,12 @@ pub(crate) fn run_direct_path(
         match path.receive_packets(WORKER_RECEIVE_TIMEOUT) {
             Ok(packets) => {
                 for packet in packets {
-                    if is_matching_icmp_reply(&packet, DIRECT_PROBE_TARGET, address, identifier) {
-                        let Some(started) = pending_probe.take() else {
+                    if let Some(sequence) =
+                        icmp_reply_sequence(&packet, DIRECT_PROBE_TARGET, address, identifier)
+                    {
+                        // A late reply must not consume the next probe's timer.
+                        let Some(started) = take_matching_probe(&mut pending_probe, sequence)
+                        else {
                             continue;
                         };
                         let elapsed = started.elapsed();
@@ -287,7 +297,7 @@ pub(crate) fn run_direct_path(
                  PrivateKey and Peer PublicKey"
             ));
         }
-        if pending_probe.is_some_and(|started| started.elapsed() > rtt.timeout()) {
+        if pending_probe.is_some_and(|(_, started)| started.elapsed() > rtt.timeout()) {
             pending_probe = None;
             if icmp_answered {
                 consecutive_losses += 1;
@@ -315,6 +325,17 @@ mod tests {
     use std::net::UdpSocket;
     use std::sync::atomic::AtomicU64;
     use std::thread;
+
+    #[test]
+    fn a_late_reply_cannot_answer_or_clear_a_newer_probe() {
+        let started = Instant::now();
+        let mut pending = Some((10, started));
+        assert_eq!(take_matching_probe(&mut pending, 9), None);
+        assert_eq!(pending, Some((10, started)));
+        assert_eq!(take_matching_probe(&mut pending, 10), Some(started));
+        assert_eq!(pending, None);
+        assert_eq!(take_matching_probe(&mut pending, 10), None);
+    }
 
     /// A WireGuard peer that answers ICMP echoes through the tunnel, and stops
     /// answering anything once `alive` is cleared — a node going down.

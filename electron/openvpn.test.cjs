@@ -12,6 +12,69 @@ const CA = [
 
 const config = (body) => `${body}\n${CA}\n`
 
+test('verify-x509-name is accepted with the types the engine enforces', () => {
+  for (const line of [
+    'verify-x509-name arn-476.windscribe.com name',
+    'verify-x509-name arn- name-prefix',
+    'verify-x509-name "C=CA, O=Windscribe Limited, CN=arn-476.windscribe.com"',
+    'verify-x509-name "C=CA, CN=server" subject',
+  ]) {
+    parseOpenVpnConfig(config(`remote vpn.example 1194\nauth-user-pass\n${line}`), 'x.ovpn', 'node-name')
+  }
+  assert.throws(
+    () =>
+      parseOpenVpnConfig(config('remote vpn.example 1194\nauth-user-pass\nverify-x509-name server cn'), 'x.ovpn', 'n'),
+    /type `cn`/,
+  )
+})
+
+test('certificate pinning and revocation requirements are never silently ignored', () => {
+  for (const name of ['peer-fingerprint', 'verify-hash', 'crl-verify', 'tls-verify']) {
+    for (const prefix of ['', '--']) {
+      assert.throws(
+        () =>
+          parseOpenVpnConfig(
+            config(`remote vpn.example 1194\nauth-user-pass\n${prefix}${name} required-check`),
+            'x.ovpn',
+            'node-security',
+          ),
+        /cannot enforce.*certificate verification/,
+        name,
+      )
+    }
+  }
+})
+
+test('inline fingerprints and revocation lists cannot bypass certificate requirements', () => {
+  for (const name of ['peer-fingerprint', 'verify-hash', 'crl-verify']) {
+    assert.throws(
+      () =>
+        parseOpenVpnConfig(
+          config(`remote vpn.example 1194\nauth-user-pass\n<${name}>\nrequired-check\n</${name}>`),
+          'x.ovpn',
+          'node-security',
+        ),
+      /cannot enforce.*certificate verification/,
+    )
+  }
+})
+
+test('connection blocks expose their remote and reject unsupported certificate checks', () => {
+  const body = 'auth-user-pass\n<connection>\nremote vpn.example 443 tcp\n</connection>'
+  const node = parseOpenVpnConfig(config(body), 'x.ovpn', 'node-connection')
+  assert.equal(node.endpoint, 'vpn.example:443')
+  assert.equal(node.protocol, 'tcp')
+  assert.throws(
+    () =>
+      parseOpenVpnConfig(
+        config(body.replace('</connection>', 'tls-verify ./check.sh\n</connection>')),
+        'x.ovpn',
+        'node-connection',
+      ),
+    /cannot enforce.*certificate verification/,
+  )
+})
+
 test('reads the server, protocol and name from a provider file', () => {
   const node = parseOpenVpnConfig(
     config('client\ndev tun\nremote tr2.example.ir 1403 tcp\nauth-user-pass'),

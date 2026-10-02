@@ -10,22 +10,29 @@
 //!
 //! What this deliberately does not do is skip verification. The chain still has
 //! to reach the configuration's own CA, still has to be inside its validity
-//! dates, and the signature over the handshake still has to check out.
+//! dates, and the signature over the handshake still has to check out. A file
+//! that names its server with `verify-x509-name` gets that check too.
 
+use super::x509_name::ServerNameCheck;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
+use rustls::{CertificateError, DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
 use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct EmbeddedCaVerifier {
     roots: Arc<RootCertStore>,
+    server_name: Option<ServerNameCheck>,
     provider: Arc<CryptoProvider>,
 }
 
 impl EmbeddedCaVerifier {
-    pub fn new(ca: &[Vec<u8>], provider: Arc<CryptoProvider>) -> Result<Self, String> {
+    pub fn new(
+        ca: &[Vec<u8>],
+        server_name: Option<ServerNameCheck>,
+        provider: Arc<CryptoProvider>,
+    ) -> Result<Self, String> {
         let mut roots = RootCertStore::empty();
         for certificate in ca {
             roots
@@ -39,6 +46,7 @@ impl EmbeddedCaVerifier {
         }
         Ok(Self {
             roots: Arc::new(roots),
+            server_name,
             provider,
         })
     }
@@ -61,6 +69,13 @@ impl ServerCertVerifier for EmbeddedCaVerifier {
             now,
             self.provider.signature_verification_algorithms.all,
         )?;
+        if self
+            .server_name
+            .as_ref()
+            .is_some_and(|check| !check.matches(end_entity))
+        {
+            return Err(Error::InvalidCertificate(CertificateError::NotValidForName));
+        }
         Ok(ServerCertVerified::assertion())
     }
 
@@ -106,13 +121,13 @@ mod tests {
     #[test]
     fn a_block_with_no_certificate_authority_is_refused() {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        assert!(EmbeddedCaVerifier::new(&[], provider).is_err());
+        assert!(EmbeddedCaVerifier::new(&[], None, provider).is_err());
     }
 
     #[test]
     fn something_that_is_not_a_certificate_is_refused() {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let error = EmbeddedCaVerifier::new(&[vec![1, 2, 3, 4]], provider).unwrap_err();
+        let error = EmbeddedCaVerifier::new(&[vec![1, 2, 3, 4]], None, provider).unwrap_err();
         assert!(error.contains("certificate authority"), "{error}");
     }
 }
