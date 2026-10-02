@@ -38,6 +38,9 @@ pub(crate) const WAKER: Token = Token(0);
 const TCP_RECEIVE_BUFFER: usize = 128 * 1024;
 const TCP_SEND_BUFFER: usize = 128 * 1024;
 /// Bytes held for one direction before that side is no longer read.
+/// How long a stream whose write would block waits before the next attempt.
+/// Short, because the proxy is on this machine and usually catches up at once.
+const WRITE_RETRY: Duration = Duration::from_millis(5);
 const PENDING_LIMIT: usize = 256 * 1024;
 const TCP_KEEP_ALIVE: StackDuration = StackDuration::from_secs(30);
 const TCP_TIMEOUT: StackDuration = StackDuration::from_secs(120);
@@ -75,6 +78,7 @@ pub(crate) struct Counters {
     pub(crate) dns_answered: AtomicU64,
     pub(crate) dns_failed: AtomicU64,
     pub(crate) dropped: AtomicU64,
+    pub(crate) turns: AtomicU64,
 }
 
 /// What the capture side and the loop share.
@@ -152,6 +156,12 @@ struct Upstream {
     /// Edge-triggered readiness that was not fully drained, because the far
     /// side's buffer was full. Retried every turn until it would block.
     read_pending: bool,
+    /// Registered for writability, which is only while a write is waiting;
+    /// see [`Upstream::flush`].
+    watching_writes: bool,
+    registry: Registry,
+    /// When a write that would block may be tried again; see [`Upstream::flush`].
+    write_retry_at: Option<Instant>,
     closed: bool,
 }
 
@@ -175,12 +185,28 @@ impl Upstream {
             outgoing: greeting,
             connected: false,
             read_pending: true,
+            watching_writes: true,
+            registry: registry.try_clone()?,
+            write_retry_at: None,
             closed: false,
         })
     }
 
     /// Writes what is queued. Errors close the stream.
+    ///
+    /// Writability is watched only while something is waiting to be written.
+    /// A connected socket is writable at once, and mio re-arms a socket every
+    /// time an operation on it would block, so a stream that kept watching it
+    /// was woken again by its own next read attempt, every turn. Observed live:
+    /// one core, all the time, measured as 225,000 writable events a second on
+    /// one flow of a paused video. A write that would block is not tried again
+    /// for [`WRITE_RETRY`] either, since Windows can report the socket writable
+    /// while every write still blocks.
     fn flush(&mut self) {
+        if self.write_retry_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        self.write_retry_at = None;
         while !self.outgoing.is_empty() && !self.closed {
             match self.stream.write(&self.outgoing) {
                 Ok(0) => self.closed = true,
@@ -188,10 +214,35 @@ impl Upstream {
                     self.connected = true;
                     self.outgoing.drain(..written);
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    self.write_retry_at = Some(Instant::now() + WRITE_RETRY);
+                    self.watch_writes(true);
+                    return;
+                }
                 Err(error) if error.kind() == ErrorKind::NotConnected => break,
                 Err(_) => self.closed = true,
             }
+        }
+        if self.outgoing.is_empty() && self.connected {
+            self.watch_writes(false);
+        }
+    }
+
+    fn watch_writes(&mut self, watch: bool) {
+        if watch == self.watching_writes {
+            return;
+        }
+        let interest = if watch {
+            Interest::READABLE | Interest::WRITABLE
+        } else {
+            Interest::READABLE
+        };
+        if self
+            .registry
+            .reregister(&mut self.stream, self.token, interest)
+            .is_ok()
+        {
+            self.watching_writes = watch;
         }
     }
 
@@ -354,6 +405,8 @@ pub(crate) struct Stack {
     dns_timeout_logged: bool,
     dns_close_logged: bool,
     last_summary: Instant,
+    /// Loop iterations since the last summary, to show an idle loop is idle.
+    turns: u64,
 }
 
 impl Stack {
@@ -400,6 +453,7 @@ impl Stack {
             dns_timeout_logged: false,
             dns_close_logged: false,
             last_summary: Instant::now(),
+            turns: 0,
         }
     }
 
@@ -416,7 +470,7 @@ impl Stack {
             }
             for event in events.iter() {
                 if event.token() != WAKER {
-                    self.ready(event.token());
+                    self.ready(event.token(), event.is_readable());
                 }
             }
             let packets = std::mem::take(&mut *self.shared.inbox.lock().unwrap());
@@ -804,14 +858,14 @@ impl Stack {
     }
 
     /// Readiness on a proxy stream or association socket.
-    fn ready(&mut self, token: Token) {
+    fn ready(&mut self, token: Token, readable: bool) {
         let Some(owner) = self.owners.get(&token).copied() else {
             return;
         };
         match owner {
             Owner::Tcp(key) => {
                 if let Some(flow) = self.tcp.get_mut(&key) {
-                    flow.upstream.read_pending = true;
+                    flow.upstream.read_pending |= readable;
                     flow.upstream.flush();
                 }
             }
@@ -1079,7 +1133,10 @@ impl Stack {
     }
 
     /// One turn of the stack: smoltcp, then every connection's two directions.
+    /// One pass over every flow and timer.
     fn turn(&mut self) {
+        self.turns += 1;
+        self.shared.counters.turns.fetch_add(1, Ordering::Relaxed);
         let now = StackInstant::now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.pump_tcp();
@@ -1306,7 +1363,7 @@ impl Stack {
         let counters = &self.shared.counters;
         log_info!(
             "SOCKS5 stack: tcp open={} opened={} refused={} udp assoc={} sent={} refused={} \
-             dns answered={} failed={} dropped={}",
+             dns answered={} failed={} dropped={} turns={}",
             self.tcp.len(),
             counters.tcp_opened.load(Ordering::Relaxed),
             counters.tcp_refused.load(Ordering::Relaxed),
@@ -1316,7 +1373,9 @@ impl Stack {
             counters.dns_answered.load(Ordering::Relaxed),
             counters.dns_failed.load(Ordering::Relaxed),
             counters.dropped.load(Ordering::Relaxed),
+            self.turns,
         );
+        self.turns = 0;
     }
 
     fn shutdown(&mut self) {

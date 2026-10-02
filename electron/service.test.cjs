@@ -66,7 +66,9 @@ test('the session lease is renewed from the main process, well inside its window
   // timers in an occluded window, which is what a fullscreen game makes this.
   assert.match(main, /sessionKeepAlive = setInterval\(pollSessionStatus, SESSION_POLL_MS\)/)
   assert.match(main, /startSessionKeepAlive\(\)/)
-  assert.match(main, /backgroundThrottling: false/)
+  // Which is what lets the window be throttled while a game hides it, so it
+  // takes no CPU from the game.
+  assert.match(main, /backgroundThrottling: true/)
 })
 
 test('split targets are reapplied without restarting the network session', () => {

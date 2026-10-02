@@ -443,6 +443,43 @@ fn a_large_transfer_survives_backpressure_in_both_directions() {
     assert!(echoed == payload, "bytes arrived out of order or damaged");
 }
 
+/// A paused video: data keeps arriving for an application that has stopped
+/// reading, so its window is shut. The stack must wait, not turn its loop as
+/// fast as the CPU allows. Observed live: one core, all the time.
+#[test]
+fn an_application_that_stops_reading_leaves_the_stack_idle() {
+    let mut app = App::new(spawn_proxy(true));
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 4096]),
+        tcp::SocketBuffer::new(vec![0; 256 * 1024]),
+    );
+    socket
+        .connect(app.iface.context(), (IpAddress::Ipv4(TARGET), 80), 40_010)
+        .unwrap();
+    let handle = app.sockets.add(socket);
+    assert!(app.until(|app| app.sockets.get::<tcp::Socket>(handle).may_send()));
+    let payload = vec![7_u8; 256 * 1024];
+    let settle = Instant::now() + Duration::from_millis(800);
+    let mut sent = 0;
+    while Instant::now() < settle {
+        let socket = app.sockets.get_mut::<tcp::Socket>(handle);
+        if sent < payload.len() && socket.can_send() {
+            sent += socket.send_slice(&payload[sent..]).unwrap();
+        }
+        app.step();
+    }
+    let before = app.stack.shared.counters.turns.load(Ordering::Relaxed);
+    let measure = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < measure {
+        app.step();
+    }
+    let turns = app.stack.shared.counters.turns.load(Ordering::Relaxed) - before;
+    assert!(
+        turns < 2_000,
+        "the stack turned {turns} times in a second while waiting"
+    );
+}
+
 #[test]
 fn the_proxy_ending_a_connection_ends_it_for_the_application() {
     let mut app = App::new(spawn_proxy(true));

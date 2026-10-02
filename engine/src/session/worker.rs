@@ -75,8 +75,8 @@ const _: () = assert!(
     "a full outbound queue can reorder further than the replay window covers"
 );
 
-/// How long a queued packet stays worth sending.
-const PATH_QUEUE_MAX_AGE: Duration = Duration::from_millis(50);
+/// How long a queued packet stays worth sending on a network path.
+pub(crate) const PATH_QUEUE_MAX_AGE: Duration = Duration::from_millis(50);
 
 /// A worker normally returns to its loop every millisecond. Only log gaps big
 /// enough to be felt in a game, and rate-limit the warning locally because a
@@ -87,10 +87,18 @@ pub(crate) const WORKER_GAP_WARN: Duration = Duration::from_millis(100);
 pub(crate) const WORKER_GAP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Sends at most [`PATH_SEND_BATCH`] queued packets, shedding any that waited
-/// past [`PATH_QUEUE_MAX_AGE`], and returns without draining the rest so the
-/// caller can service inbound frames, probes and timers.
+/// past `max_age`, and returns without draining the rest so the caller can
+/// service inbound frames, probes and timers.
+///
+/// `max_age` is `None` for a path that ends in this process: a SOCKS5 node's
+/// user-space TCP stack. There a queue only waits on local processing, and a
+/// dropped segment is resent by TCP, which adds the load that made it wait.
+/// Observed: a busy VPN shed stale packets, the stack resent, and the engine
+/// spiralled to 289,000 packets a minute until it stopped answering.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn drain_send_queue(
     commands: &mpsc::Receiver<PathCommand>,
+    max_age: Option<Duration>,
     index: usize,
     queue_depth: &[AtomicU64],
     dropped: &[AtomicU64],
@@ -105,7 +113,7 @@ pub(crate) fn drain_send_queue(
         if let Some(depth) = queue_depth.get(index) {
             depth.fetch_sub(1, Ordering::Relaxed);
         }
-        if command.queued_at.elapsed() > PATH_QUEUE_MAX_AGE {
+        if max_age.is_some_and(|age| command.queued_at.elapsed() > age) {
             if let Some(dropped) = dropped.get(index) {
                 dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -145,6 +153,7 @@ mod tests {
         let mut sent = 0;
         drain_send_queue(
             &receiver,
+            Some(PATH_QUEUE_MAX_AGE),
             0,
             &depth,
             &dropped,
@@ -157,6 +166,32 @@ mod tests {
         assert_eq!(sent, PATH_SEND_BATCH);
         assert_eq!(depth[0].load(Ordering::Relaxed) as usize, PATH_SEND_BATCH);
         assert_eq!(dropped[0].load(Ordering::Relaxed), 0);
+    }
+
+    /// A path into this process's own stack keeps every packet, however long
+    /// it waited.
+    #[test]
+    fn a_local_stack_path_sends_late_packets_rather_than_dropping_them() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let depth = vec![AtomicU64::new(1)];
+        let dropped = vec![AtomicU64::new(0)];
+        let stale = vec![AtomicU64::new(0)];
+        sender
+            .try_send(queued(vec![1; 64], PATH_QUEUE_MAX_AGE * 10))
+            .unwrap();
+        let mut sent = 0;
+        drain_send_queue(
+            &receiver,
+            None,
+            0,
+            &depth,
+            &dropped,
+            &stale,
+            |frame| (frame.len(), Ok(())),
+            |_, _| sent += 1,
+        );
+        assert_eq!(sent, 1);
+        assert_eq!(stale[0].load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -174,6 +209,7 @@ mod tests {
         let mut sent = Vec::new();
         drain_send_queue(
             &receiver,
+            Some(PATH_QUEUE_MAX_AGE),
             0,
             &depth,
             &dropped,

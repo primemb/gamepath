@@ -222,6 +222,7 @@ pub(crate) fn run_path(
         }
         drain_send_queue(
             &commands,
+            Some(super::worker::PATH_QUEUE_MAX_AGE),
             index,
             &telemetry.queue_depth,
             &telemetry.dropped,

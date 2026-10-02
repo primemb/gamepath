@@ -63,6 +63,10 @@ pub(crate) fn run_direct_path(
     session_id: u64,
 ) {
     let identifier = rand::random::<u16>();
+    // A SOCKS5 node is a TCP stack in this process, not a network; see
+    // `drain_send_queue`.
+    let max_age = (path.kind() != gamepath_engine::relay_path::KIND_SOCKS5)
+        .then_some(super::worker::PATH_QUEUE_MAX_AGE);
     let mut probe_sequence = 0_u16;
     let mut next_probe = Instant::now();
     let mut pending_probe: Option<Instant> = None;
@@ -144,6 +148,7 @@ pub(crate) fn run_direct_path(
         }
         drain_send_queue(
             &commands,
+            max_age,
             0,
             &telemetry.queue_depth,
             &telemetry.dropped,

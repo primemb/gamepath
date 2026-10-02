@@ -65,7 +65,7 @@
   inset: -6px;
   border: 1px solid rgba(138, 124, 255, 0.35);
   border-radius: 20px;
-  animation: command-pulse 2.4s ease-out infinite;
+  animation: command-pulse 2.4s ease-out 3;
 }
 .vpn-command.is-degraded .command-core,
 .vpn-command.is-paused .command-core,

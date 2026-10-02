@@ -1117,6 +1117,17 @@ the direct worker treats any packet back from the path as proof it is alive. ICM
 the worker's echo to the benchmark target is answered by a real `CONNECT` to it on port 53: the session's
 health and latency measure the proxy's actual route out.
 
+A stream to the proxy watches writability only while something is waiting to be written. A connected socket
+is writable at once, and mio re-arms a socket every time an operation on it would block, so a stream that kept
+watching it was woken by its own next read attempt, every turn: a paused video held one core at 100%, measured
+as 225,000 writable events a second on one flow. Now it turns about 150 times a second (`turns=` in the
+per-minute summary), and a write that would block is retried after 5 ms rather than on every event.
+
+The path worker does not shed stale packets into this stack. Shedding suits a network path, where a packet
+that waited 50 ms is worth less than the latency it adds; here the queue waits only on local processing, and a
+dropped segment is resent by TCP, adding the load that made it wait. Measured: a busy VPN spiralled to 289,000
+packets a minute and stopped answering status requests until the client reconnected it.
+
 Proxy clients built on sing-box, Clash or Xray (Throne, for one) often answer DNS with **fake-IP** addresses
 from 198.18.0.0/15 and map each back to its name when a connection to it arrives. Only that proxy can reach
 them, so with a SOCKS5 node the VPN carries every packet to that range whichever app sent it, and both

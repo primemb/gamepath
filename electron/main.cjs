@@ -1482,10 +1482,12 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      // A fullscreen game leaves this window occluded, and Chromium then
-      // throttles its timers to a crawl. The session lease no longer depends on
-      // them, but the live metrics the window shows still do.
-      backgroundThrottling: false,
+      // Throttled on purpose: a fullscreen game hides this window, and a hidden
+      // window that keeps animating and re-rendering takes CPU from the game.
+      // Nothing that matters runs here: session leases, usage and the VPN are
+      // all driven from main-process timers, and the window catches up on its
+      // next refresh when it is shown again.
+      backgroundThrottling: true,
     },
   })
   mainWindow = window

@@ -544,6 +544,10 @@ struct Registry {
     proxy: Option<crate::proxy_identity::ProxyIdentity>,
     /// See `PacketCaptureRequest::own_hostnames`.
     own_hostnames: HashSet<String>,
+    /// The hostname rule each address was learned for, so a connection it
+    /// carries is shown and counted as that site rather than as an anonymous
+    /// "matched destination".
+    destination_labels: RwLock<HashMap<Ipv4Addr, Arc<str>>>,
     fake_ip_packets: AtomicU64,
     handles: Mutex<Vec<Arc<Handle>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
@@ -818,6 +822,7 @@ impl SplitPacketCapture {
                 .map(|name| name.trim_end_matches('.').to_ascii_lowercase())
                 .collect(),
             fake_ip_packets: AtomicU64::new(0),
+            destination_labels: RwLock::new(HashMap::new()),
             handles: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
             selector_state: Mutex::new(SelectorState::default()),
@@ -868,14 +873,8 @@ impl SplitPacketCapture {
         for selector in destination_selectors(&plan)? {
             add_selector(&registry, selector);
         }
-        for ip in resolve_hostnames(&plan) {
-            add_selector(
-                &registry,
-                TrafficSelector::Destination {
-                    first: u32::from(ip),
-                    last: u32::from(ip),
-                },
-            );
+        for (ip, hostname) in resolve_hostnames(&plan) {
+            add_hostname_address(&registry, ip, &hostname);
         }
 
         if !plan.application_paths.is_empty() || !plan.folder_prefixes.is_empty() {
@@ -1757,7 +1756,8 @@ fn route_selected_packet(
         .filter(|path| path.process_id == process_id)
         .map(|path| Arc::clone(&path.usage))
         .unwrap_or_else(|| {
-            let name = application.unwrap_or("Unattributed");
+            let label = destination_label(registry, fields.destination);
+            let name = application.or(label.as_deref()).unwrap_or("Unattributed");
             let mut all = registry.app_usage.lock().unwrap();
             Arc::clone(
                 all.entry(name.to_owned())
@@ -2380,14 +2380,8 @@ fn spawn_dns_tracker(
                 let Ok((packet, _)) = handle.recv(65_535) else {
                     break;
                 };
-                for address in dns_addresses(&packet, &hostnames) {
-                    add_selector(
-                        &worker_registry,
-                        TrafficSelector::Destination {
-                            first: u32::from(address),
-                            last: u32::from(address),
-                        },
-                    );
+                for (address, hostname) in dns_addresses(&packet, &hostnames) {
+                    add_hostname_address(&worker_registry, address, hostname);
                 }
             }
         })
@@ -2744,18 +2738,49 @@ fn is_tcp_syn(packet: &[u8]) -> bool {
         .is_some_and(|flags| flags & 0x02 != 0)
 }
 
-fn resolve_hostnames(plan: &InterceptionPlan) -> HashSet<Ipv4Addr> {
-    let mut addresses = HashSet::new();
+fn resolve_hostnames(plan: &InterceptionPlan) -> Vec<(Ipv4Addr, String)> {
+    let mut addresses = Vec::new();
     for hostname in &plan.hostnames {
         let host = hostname.strip_prefix("*.").unwrap_or(hostname);
         if let Ok(resolved) = (host, 0).to_socket_addrs() {
             addresses.extend(resolved.filter_map(|address| match address.ip() {
-                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V4(ip) => Some((ip, hostname.clone())),
                 _ => None,
             }));
         }
     }
     addresses
+}
+
+/// Most addresses a capture remembers a hostname for. They come only from
+/// answers for the user's own hostname rules, so this is never reached in
+/// practice; it bounds the map against a resolver that churns addresses.
+const MAX_DESTINATION_LABELS: usize = 4096;
+
+fn add_hostname_address(registry: &Registry, address: Ipv4Addr, hostname: &str) {
+    {
+        let mut labels = registry.destination_labels.write().unwrap();
+        if labels.len() < MAX_DESTINATION_LABELS || labels.contains_key(&address) {
+            labels.insert(address, Arc::from(hostname));
+        }
+    }
+    add_selector(
+        registry,
+        TrafficSelector::Destination {
+            first: u32::from(address),
+            last: u32::from(address),
+        },
+    );
+}
+
+/// The hostname rule `address` was learned for, if any.
+fn destination_label(registry: &Registry, address: Ipv4Addr) -> Option<Arc<str>> {
+    registry
+        .destination_labels
+        .read()
+        .unwrap()
+        .get(&address)
+        .cloned()
 }
 
 fn bypass_clause(addresses: &[Ipv4Addr]) -> String {
@@ -2821,7 +2846,10 @@ fn record_handled_connection(
         1 => "ICMP",
         _ => "IP",
     };
-    let application = application.unwrap_or("Matched destination");
+    let label = destination_label(registry, fields.destination);
+    let application = application
+        .or(label.as_deref())
+        .unwrap_or("Matched destination");
     let first_seen = {
         let mut logged = registry.logged_destinations.lock().unwrap();
         logged.len() < 64
@@ -2884,7 +2912,9 @@ pub(crate) fn process_path(process_id: u32) -> Option<String> {
     }
 }
 
-fn dns_addresses(packet: &[u8], hostnames: &[String]) -> Vec<Ipv4Addr> {
+/// Addresses in a DNS answer for one of `hostnames`, each with the rule it
+/// answers.
+fn dns_addresses<'a>(packet: &[u8], hostnames: &'a [String]) -> Vec<(Ipv4Addr, &'a str)> {
     let Some(fields) = ipv4_fields(packet) else {
         return Vec::new();
     };
@@ -2901,22 +2931,25 @@ fn dns_addresses(packet: &[u8], hostnames: &[String]) -> Vec<Ipv4Addr> {
     let questions = u16::from_be_bytes([dns[4], dns[5]]) as usize;
     let answers = u16::from_be_bytes([dns[6], dns[7]]) as usize;
     let mut offset = 12;
-    let mut matched = false;
+    let mut matched = None;
     for _ in 0..questions {
         let Some((name, next)) = dns_name(dns, offset) else {
             return Vec::new();
         };
-        matched |= hostnames
-            .iter()
-            .any(|target| hostname_matches(&name, target));
+        matched = matched.or_else(|| {
+            hostnames
+                .iter()
+                .find(|target| hostname_matches(&name, target))
+                .map(String::as_str)
+        });
         offset = next + 4;
         if offset > dns.len() {
             return Vec::new();
         }
     }
-    if !matched {
+    let Some(rule) = matched else {
         return Vec::new();
-    }
+    };
     let mut result = Vec::new();
     for _ in 0..answers {
         let Some((_, next)) = dns_name(dns, offset) else {
@@ -2933,11 +2966,14 @@ fn dns_addresses(packet: &[u8], hostnames: &[String]) -> Vec<Ipv4Addr> {
             break;
         }
         if kind == 1 && length == 4 {
-            result.push(Ipv4Addr::new(
-                dns[offset],
-                dns[offset + 1],
-                dns[offset + 2],
-                dns[offset + 3],
+            result.push((
+                Ipv4Addr::new(
+                    dns[offset],
+                    dns[offset + 1],
+                    dns[offset + 2],
+                    dns[offset + 3],
+                ),
+                rule,
             ));
         }
         offset += length;
@@ -3532,6 +3568,27 @@ mod tests {
             "two and a half seconds waiting"
         );
         assert!(!answered_in_time(1, 10_000), "never handed to the session");
+    }
+
+    /// A DNS answer for a hostname rule yields its address together with the
+    /// rule, so the connection is shown as that site.
+    #[test]
+    fn a_dns_answer_names_the_rule_it_answers() {
+        let mut dns = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        dns.extend_from_slice(b"api	anthropiccom   ");
+        // Answer: a pointer to the question name, A, IN, TTL, 4 bytes.
+        dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 160, 79, 104, 10]);
+        let mut packet = vec![
+            0x45, 0, 0, 0, 0, 0, 0, 0, 64, 17, 0, 0, 8, 8, 8, 8, 10, 0, 0, 2,
+        ];
+        packet.extend_from_slice(&[0, 53, 0xc3, 0x50, 0, 0, 0, 0]);
+        packet.extend_from_slice(&dns);
+        let rules = vec!["anthropic.com".to_owned(), "api.anthropic.com".to_owned()];
+        assert_eq!(
+            dns_addresses(&packet, &rules),
+            [(Ipv4Addr::new(160, 79, 104, 10), "api.anthropic.com")]
+        );
+        assert!(dns_addresses(&packet, &["claude.com".to_owned()]).is_empty());
     }
 
     #[test]
