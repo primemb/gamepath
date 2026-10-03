@@ -162,37 +162,10 @@ pub fn probe_once(
     source: Option<std::net::Ipv4Addr>,
     timeout: Duration,
 ) -> bool {
-    use std::ffi::c_void;
-
-    #[link(name = "iphlpapi")]
-    unsafe extern "system" {
-        fn IcmpCreateFile() -> isize;
-        fn IcmpCloseHandle(handle: isize) -> i32;
-        fn IcmpSendEcho(
-            handle: isize,
-            destination: u32,
-            request: *const c_void,
-            request_size: u16,
-            options: *const c_void,
-            reply: *mut c_void,
-            reply_size: u32,
-            timeout: u32,
-        ) -> u32;
-        fn IcmpSendEcho2Ex(
-            handle: isize,
-            event: isize,
-            apc_routine: *const c_void,
-            apc_context: *const c_void,
-            source: u32,
-            destination: u32,
-            request: *const c_void,
-            request_size: u16,
-            options: *const c_void,
-            reply: *mut c_void,
-            reply_size: u32,
-            timeout: u32,
-        ) -> u32;
-    }
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, IcmpSendEcho2Ex,
+    };
 
     // Addresses go on the wire in network byte order, which on a little-endian
     // host means the octets in the order they are written.
@@ -204,7 +177,7 @@ pub fn probe_once(
     let timeout = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
     unsafe {
         let handle = IcmpCreateFile();
-        if handle == -1 {
+        if handle == INVALID_HANDLE_VALUE {
             return false;
         }
         let replies = match source {
@@ -213,7 +186,7 @@ pub fn probe_once(
             Some(source) => IcmpSendEcho2Ex(
                 handle,
                 0,
-                std::ptr::null(),
+                None,
                 std::ptr::null(),
                 u32::from_le_bytes(source.octets()),
                 destination,
@@ -275,6 +248,14 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn loopback_probes_work_with_and_without_source_pinning() {
+        let loopback = std::net::Ipv4Addr::LOCALHOST;
+        assert!(probe_once(loopback, None, Duration::from_secs(1)));
+        assert!(probe_once(loopback, Some(loopback), Duration::from_secs(1)));
+    }
 
     #[test]
     fn an_unproven_uplink_is_unknown_not_down() {

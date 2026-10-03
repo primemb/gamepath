@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use windows_sys::Win32::NetworkManagement::IpHelper::TCP_TABLE_OWNER_PID_LISTENER;
 
 /// How long a port's owner is trusted before it is looked up again. Ports are
 /// reused, so this stays short; lookups are rare enough that it costs little.
@@ -21,31 +22,6 @@ const OWNER_TTL: Duration = Duration::from_secs(2);
 /// How often the proxy's process is looked for again, since restarting the
 /// proxy can change which process listens.
 const PROCESS_TTL: Duration = Duration::from_secs(5);
-/// `TCP_TABLE_OWNER_PID_LISTENER`, `UDP_TABLE_OWNER_PID`.
-const TCP_LISTENERS: u32 = 3;
-const UDP_OWNER_PID: u32 = 1;
-const AF_INET: u32 = 2;
-
-#[link(name = "iphlpapi")]
-unsafe extern "system" {
-    fn GetExtendedTcpTable(
-        table: *mut std::ffi::c_void,
-        size: *mut u32,
-        order: i32,
-        family: u32,
-        table_class: u32,
-        reserved: u32,
-    ) -> u32;
-    fn GetExtendedUdpTable(
-        table: *mut std::ffi::c_void,
-        size: *mut u32,
-        order: i32,
-        family: u32,
-        table_class: u32,
-        reserved: u32,
-    ) -> u32;
-}
-
 pub(crate) struct ProxyIdentity {
     port: u16,
     /// The process listening on the proxy port, and when that was checked.
@@ -100,27 +76,18 @@ impl ProxyIdentity {
 
 /// The process listening for TCP on `port`, on loopback or every address.
 fn listener_owner(port: u16) -> Option<u32> {
-    let buffer = crate::split_capture::ip_table(|table, size| unsafe {
-        GetExtendedTcpTable(table, size, 0, AF_INET, TCP_LISTENERS, 0)
-    })?;
-    // MIB_TCPROW_OWNER_PID: state, local address and port, remote address and
-    // port, process id.
-    crate::split_capture::dword_rows(&buffer, 6)
+    crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_LISTENER)?
         .into_iter()
-        .find(|row| crate::split_capture::port_from_dword(row[2]) == port)
-        .map(|row| row[5])
+        .find(|row| crate::split_capture::port_from_dword(row.dwLocalPort) == port)
+        .map(|row| row.dwOwningPid)
 }
 
 /// The process owning the UDP socket on `port`.
 pub(crate) fn udp_owner(port: u16) -> Option<u32> {
-    let buffer = crate::split_capture::ip_table(|table, size| unsafe {
-        GetExtendedUdpTable(table, size, 0, AF_INET, UDP_OWNER_PID, 0)
-    })?;
-    // MIB_UDPROW_OWNER_PID: local address and port, process id.
-    crate::split_capture::dword_rows(&buffer, 3)
+    crate::socket_table::udp_rows()?
         .into_iter()
-        .find(|row| crate::split_capture::port_from_dword(row[1]) == port)
-        .map(|row| row[2])
+        .find(|row| crate::split_capture::port_from_dword(row.dwLocalPort) == port)
+        .map(|row| row.dwOwningPid)
 }
 
 #[cfg(test)]

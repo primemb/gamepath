@@ -280,6 +280,70 @@ fn a_connection_the_proxy_refuses_is_refused_to_the_application() {
 }
 
 #[test]
+fn cancelling_a_connection_while_the_proxy_is_dialling_closes_its_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let (dialled_tx, dialled) = mpsc::channel();
+    let (closed_tx, closed) = mpsc::channel();
+    thread::spawn(move || {
+        // The path checks the login before opening its first CONNECT stream.
+        let (mut setup, _) = listener.accept().unwrap();
+        let mut greeting = [0_u8; 3];
+        setup.read_exact(&mut greeting).unwrap();
+        setup.write_all(&[5, 0]).unwrap();
+        drop(setup);
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.read_exact(&mut greeting).unwrap();
+        stream.write_all(&[5, 0]).unwrap();
+        let mut request = [0_u8; 10];
+        stream.read_exact(&mut request).unwrap();
+        dialled_tx.send(()).unwrap();
+        let result = stream.read(&mut [0_u8; 1]);
+        let _ = closed_tx.send(matches!(result, Ok(0)));
+    });
+    let mut app = App::new(proxy);
+    let mut socket = tcp_socket();
+    socket
+        .connect(app.iface.context(), (IpAddress::Ipv4(TARGET), 80), 40_004)
+        .unwrap();
+    app.sockets.add(socket);
+    assert!(app.until(|_| dialled.try_recv().is_ok()));
+    let reset = super::packet::build_tcp_reset(
+        SocketAddrV4::new(CLIENT_ADDRESS, 40_004),
+        SocketAddrV4::new(TARGET, 80),
+        0,
+    );
+    app.stack.send_packet(&reset).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        app.step();
+        if let Ok(was_closed) = closed.try_recv() {
+            assert!(
+                was_closed,
+                "the abandoned proxy dial stayed open until its read timed out"
+            );
+            assert_eq!(
+                app.stack.shared.counters.tcp_opened.load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(
+                app.stack
+                    .shared
+                    .counters
+                    .tcp_cancelled
+                    .load(Ordering::Relaxed),
+                1
+            );
+            return;
+        }
+    }
+    panic!("the proxy stream was never released");
+}
+
+#[test]
 fn a_datagram_windows_fragmented_is_rebuilt_and_relayed_whole() {
     let mut app = App::new(spawn_proxy(true));
     let server = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 27_015);

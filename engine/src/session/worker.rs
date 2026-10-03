@@ -19,6 +19,7 @@ pub(crate) struct PathCommand {
 /// reads back. Grouped so the workers take one parameter for all of it.
 #[derive(Clone)]
 pub(crate) struct PathTelemetry {
+    pub(crate) packet_diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
     pub(crate) iterations: Arc<Vec<AtomicU64>>,
     pub(crate) queue_depth: Arc<Vec<AtomicU64>>,
     /// Highest dispatcher queue depth observed during this session. The
@@ -32,6 +33,9 @@ pub(crate) struct PathTelemetry {
     pub(crate) queue_full_dropped: Arc<Vec<AtomicU64>>,
     pub(crate) stale_dropped: Arc<Vec<AtomicU64>>,
     pub(crate) inbound_dropped: Arc<Vec<AtomicU64>>,
+    pub(crate) send_failed: Arc<Vec<AtomicU64>>,
+    pub(crate) stream_stale: Arc<Vec<AtomicU64>>,
+    pub(crate) stream_full: Arc<Vec<AtomicU64>>,
     /// Longest interval between two worker iterations. A one-second CPU stall
     /// or a transport call that blocks past its deadline otherwise leaves no
     /// trace once the worker resumes.
@@ -41,6 +45,43 @@ pub(crate) struct PathTelemetry {
     /// every node. Session-wide rather than per-path, but it rides here so the
     /// workers get it with the rest of what they read.
     pub(crate) uplink: Arc<UplinkMonitor>,
+}
+
+impl PathTelemetry {
+    pub(crate) fn new(route_count: usize) -> Self {
+        let counters = || {
+            Arc::new(
+                (0..route_count)
+                    .map(|_| AtomicU64::new(0))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        Self {
+            packet_diagnostics: Arc::default(),
+            iterations: counters(),
+            queue_depth: counters(),
+            queue_peak: counters(),
+            dropped: counters(),
+            queue_full_dropped: counters(),
+            stale_dropped: counters(),
+            inbound_dropped: counters(),
+            send_failed: counters(),
+            stream_stale: counters(),
+            stream_full: counters(),
+            worker_gap_peak_ms: counters(),
+            healthy_mask: Arc::new(AtomicU64::new(0)),
+            uplink: Arc::default(),
+        }
+    }
+
+    pub(crate) fn record_transport_drops(&self, index: usize, [stale, full]: [u64; 2]) {
+        if stale + full == 0 {
+            return;
+        }
+        self.stream_stale[index].fetch_add(stale, Ordering::Relaxed);
+        self.stream_full[index].fetch_add(full, Ordering::Relaxed);
+        self.dropped[index].fetch_add(stale + full, Ordering::Relaxed);
+    }
 }
 
 /// How long a worker waits on its socket per iteration. Short, because an

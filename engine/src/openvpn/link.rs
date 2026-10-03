@@ -91,6 +91,7 @@ pub enum Link {
         /// Bytes in `outbound` still to be written, kept as a running total so
         /// the budget check is not a walk of the queue.
         queued_bytes: usize,
+        dropped: [u64; 2],
     },
 }
 
@@ -130,8 +131,16 @@ impl Link {
                     outbound: VecDeque::new(),
                     written: 0,
                     queued_bytes: 0,
+                    dropped: [0; 2],
                 })
             }
+        }
+    }
+
+    pub fn take_drops(&mut self) -> [u64; 2] {
+        match self {
+            Self::Tcp { dropped, .. } => std::mem::take(dropped),
+            Self::Udp(_) => [0; 2],
         }
     }
 
@@ -165,6 +174,7 @@ impl Link {
             outbound,
             written,
             queued_bytes,
+            dropped,
             ..
         } = self
         else {
@@ -182,7 +192,10 @@ impl Link {
             urgency,
         });
         if *queued_bytes > MAX_OUTBOUND_BYTES {
-            shed(outbound, *written, queued_bytes, Instant::now());
+            let removed = shed(outbound, *written, queued_bytes, Instant::now());
+            for (count, delta) in dropped.iter_mut().zip(removed) {
+                *count += delta;
+            }
         }
         // Only control traffic, which is never shed, can still be over budget
         // here - and that much of it unsent means the stream is not moving.
@@ -203,6 +216,7 @@ impl Link {
             outbound,
             written,
             queued_bytes,
+            dropped,
             ..
         } = self
         else {
@@ -211,7 +225,10 @@ impl Link {
         if outbound.is_empty() {
             return Ok(());
         }
-        shed(outbound, *written, queued_bytes, Instant::now());
+        let removed = shed(outbound, *written, queued_bytes, Instant::now());
+        for (count, delta) in dropped.iter_mut().zip(removed) {
+            *count += delta;
+        }
         if outbound.is_empty() {
             return Ok(());
         }
@@ -320,7 +337,13 @@ fn write_queued(
 /// The stream is length-prefixed, so removing a packet the reader has begun to
 /// see would desynchronise it permanently - far worse than the delay being
 /// avoided.
-fn shed(outbound: &mut VecDeque<Outbound>, written: usize, queued_bytes: &mut usize, now: Instant) {
+fn shed(
+    outbound: &mut VecDeque<Outbound>,
+    written: usize,
+    queued_bytes: &mut usize,
+    now: Instant,
+) -> [u64; 2] {
+    let mut dropped = [0; 2];
     let mut index = usize::from(written > 0);
     while index < outbound.len() {
         let frame = &outbound[index];
@@ -328,10 +351,12 @@ fn shed(outbound: &mut VecDeque<Outbound>, written: usize, queued_bytes: &mut us
         if frame.urgency == Urgency::Realtime && (stale || *queued_bytes > MAX_OUTBOUND_BYTES) {
             *queued_bytes -= frame.bytes.len();
             outbound.remove(index);
+            dropped[usize::from(!stale)] += 1;
         } else {
             index += 1;
         }
     }
+    dropped
 }
 
 /// Cuts one length-prefixed packet off the front of a buffer.
@@ -450,7 +475,10 @@ mod tests {
             queued(Urgency::Realtime, Duration::ZERO, 100),
         ]);
         let mut queued_bytes = total(&outbound);
-        shed(&mut outbound, 0, &mut queued_bytes, Instant::now());
+        assert_eq!(
+            shed(&mut outbound, 0, &mut queued_bytes, Instant::now()),
+            [1, 0]
+        );
         assert_eq!(outbound.len(), 1, "the stale packet should be gone");
         assert_eq!(queued_bytes, 100);
         assert_eq!(queued_bytes, total(&outbound), "the running total drifted");
@@ -581,7 +609,8 @@ mod tests {
         }
         let mut queued_bytes = total(&outbound);
         assert!(queued_bytes > MAX_OUTBOUND_BYTES);
-        shed(&mut outbound, 0, &mut queued_bytes, Instant::now());
+        let removed = shed(&mut outbound, 0, &mut queued_bytes, Instant::now());
+        assert_eq!(removed, [0, 400 - outbound.len() as u64]);
         assert!(
             queued_bytes <= MAX_OUTBOUND_BYTES,
             "still holding {queued_bytes} bytes"

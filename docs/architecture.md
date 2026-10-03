@@ -133,6 +133,39 @@ Secrets never go in. Node configurations, enrollment tokens, pre-shared keys and
 the service token stay out entirely; where a value has to be correlated across
 lines, `log::fingerprint` gives a short stable tag instead of the value.
 
+Packet failures are counted on the data plane and reported by background threads,
+at most once every ten seconds per reporter, with pending counts drained at orderly
+shutdown. `+N` is the increase since that reporter's previous warning; status exposes
+cumulative counters under `packetFailures`. UDP/TCP refer to the inner IPv4 packet,
+including fragments. Encrypted frames and control traffic with no readable inner
+protocol are counted as `other`. Samples contain bounded API errors, never payloads.
+
+| Log field                                             | What it tells us                                                                                                              |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `outbound-no-queue`                                   | No selected path queue accepted this user packet. Repair may still rescue it.                                                 |
+| `outbound-no-worker`                                  | No workers were selected, or every selected worker queue was disconnected.                                                    |
+| `send-failed` / `transport-copy-send-failed`          | A transport rejected a copy; the warning preserves an API error even if later traffic clears path status.                     |
+| `stream-stale` / `stream-full`                        | OpenVPN over TCP shed encrypted copies from its own backlog by age or byte budget. This includes game UDP carried inside TCP. |
+| `wintun-return-injection-failed`                      | A reply reached GamePath but could not enter the Windows adapter ring.                                                        |
+| `bypass-injection-failed` / `return-injection-failed` | WinDivert could not put an ordinary or tunnelled packet back into Windows.                                                    |
+| `outbound-checksum-failed`                            | Rewriting a selected packet failed before it could enter the tunnel.                                                          |
+| `relay-return-too-old`                                | An authenticated reply copy arrived outside the replay window. Ordinary duplicate copies remain quiet.                        |
+| `repair-inbound-queue-rejected`                       | A rebuilt reply could not enter the local receiver.                                                                           |
+| `fragments-discarded` / `pmtu-feedback-failed`        | Split capture abandoned fragment data or could not inject fragmentation-needed feedback.                                      |
+
+Per-route `drop` counts rejected copies, including queue and OpenVPN stream shedding;
+it is not a count of packets lost by the game. Another path or repair can rescue a
+copy. Probe loss measures the probe exchange rather than game UDP delivery. No local
+send success proves that a provider, relay or game server delivered the packet:
+[Winsock documents that successful `sendto` does not confirm delivery](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-sendto).
+These logs identify observed local failures; a clean log cannot rule out filtering,
+remote loss, or a UDP application intentionally sending without a reply.
+
+If a Rust log cannot be opened or written, the logger reports the failure and falls
+back to stderr, retrying the file after thirty seconds. Dispatcher depth is reserved
+before publishing to a worker, so an immediate receive cannot underflow the counter
+and produce a false saturation peak.
+
 ## Session lease
 
 The privileged service holds a lease on every session and tears down capture and
@@ -169,6 +202,14 @@ The capture status reports these under `fragments`, including datagrams given up
 
 Interface MTUs, route installation and adapter lookups go through the IP Helper
 API in `engine/src/netconfig.rs`, not through the `Net*` PowerShell cmdlets.
+
+Documented Windows calls use Microsoft's generated `windows-sys` bindings
+from the `windows-rs` project. `engine/src/socket_table.rs` shares the TCP/UDP
+owner inventory reader across capture, proxy identification and TCP resets,
+using SDK row types and retrying when the table grows during a read. ICMP
+probes and session timer resolution use the same bindings. WinDivert's own
+DLL interface and the undocumented `DnsFlushResolverCache` export remain
+separate because they are not covered by those Windows bindings.
 
 The cmdlets are the obvious way to do this and were the original
 implementation. Each call starts a PowerShell engine plus the CIM/WMI machinery
@@ -1129,9 +1170,13 @@ drive all of it.
 
 A connection is answered only once the proxy has opened its far end: the SYN is held, then fed to smoltcp
 or refused with a reset. Answering first would make every connection look open while the proxy is down, and
-the direct worker treats any packet back from the path as proof it is alive. ICMP cannot cross a proxy, so
+the direct worker treats any packet back from the path as proof it is alive. A TCP reset while that SYN is
+held cancels the outstanding proxy stream immediately, rather than letting an abandoned dial finish and
+return a SYN/ACK for an application socket that no longer exists. ICMP cannot cross a proxy, so
 the worker's echo to the benchmark target is answered by a real `CONNECT` to it on port 53: the session's
-health and latency measure the proxy's actual route out.
+health and latency measure the proxy's acceptance of that connection. A local proxy can accept before its
+remote connection completes, so this can report a local round trip even while DNS queries time out beyond
+the proxy; it is not a measurement of game-server ping or successful DNS delivery.
 
 A stream to the proxy watches writability only while something is waiting to be written. A connected socket
 is writable at once, and mio re-arms a socket every time an operation on it would block, so a stream that kept
@@ -1209,6 +1254,16 @@ capture opens, `tcp_reset` ends those connections with `SetTcpEntry(MIB_TCP_STAT
 does, and the applications reconnect through the VPN at once. Connections the session already carries are
 kept, and nothing is ended while a game session runs, because the VPN cannot see the game's rules and must never
 end a connection the game carries.
+
+On disconnect, capture stops and its routes are removed before Windows' DNS cache
+is flushed and its tunnelled TCP connections are ended with `SetTcpEntry`. Split
+capture matches the recorded local and remote endpoints and, when known, the PID;
+it does not close every connection of a selected application. All-traffic capture
+matches its tunnel source address. This lets applications retry over the normal
+route instead of waiting for a dead proxy stream to time out. Live capture
+replacement transfers these flows without ending them. Applications that cache
+proxy fake-IP DNS answers themselves can still need to resolve the name again;
+flushing Windows' cache cannot clear an application's private cache.
 
 A capture restart (a live rule edit, or the other session starting or stopping) hands the new capture its
 predecessor's reply table, routed-connection list and usage counters (`CarriedFlows`), under the same capture

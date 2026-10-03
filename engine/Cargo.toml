@@ -66,4 +66,4 @@ smoltcp = { version = "0.12", default-features = false, optional = true, feature
   "assembler-max-segment-count-16",
 ] }
 wintun = "0.5.1"
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_Rras", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Media", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_Rras", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

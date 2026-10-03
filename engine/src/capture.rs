@@ -34,6 +34,7 @@ struct WindowsPacketCapture {
     workers: Vec<JoinHandle<()>>,
     routes: Vec<InstalledRoute>,
     adapter_index: u32,
+    virtual_ipv4: std::net::Ipv4Addr,
     /// Set only when this capture configured the adapter's resolvers, so
     /// teardown clears exactly what it set and leaves an adapter it never
     /// touched alone.
@@ -340,6 +341,12 @@ impl PacketCaptureManager {
                 .map_err(|error| format!("could not start Wintun packet ring: {error}"))?,
         );
         let stop = Arc::new(AtomicBool::new(false));
+        let diagnostics = sessions
+            .lock()
+            .unwrap()
+            .packet_diagnostics()
+            .ok_or("start the multipath session before packet capture")?;
+        let uplink_diagnostics = Arc::clone(&diagnostics);
         let uplink_sessions = Arc::clone(&sessions);
         let uplink_stop = Arc::clone(&stop);
         let uplink_session = Arc::clone(&session);
@@ -347,7 +354,13 @@ impl PacketCaptureManager {
             .name("gamepath-wintun-uplink".into())
             .spawn(move || {
                 gamepath_engine::thread_priority::raise_current_for_data_plane();
-                run_wintun_uplink(uplink_session, uplink_sessions, virtual_ipv4, uplink_stop)
+                run_wintun_uplink(
+                    uplink_session,
+                    uplink_sessions,
+                    virtual_ipv4,
+                    uplink_stop,
+                    uplink_diagnostics,
+                )
             })
             .map_err(|error| format!("could not start Wintun uplink: {error}"))?;
         let downlink_stop = Arc::clone(&stop);
@@ -356,7 +369,7 @@ impl PacketCaptureManager {
             .name("gamepath-wintun-downlink".into())
             .spawn(move || {
                 gamepath_engine::thread_priority::raise_current_for_data_plane();
-                run_wintun_downlink(downlink_session, data_receiver, downlink_stop)
+                run_wintun_downlink(downlink_session, data_receiver, downlink_stop, diagnostics)
             })
             .map_err(|error| format!("could not start Wintun downlink: {error}"))?;
 
@@ -366,6 +379,7 @@ impl PacketCaptureManager {
             workers: vec![uplink, downlink],
             routes: Vec::new(),
             adapter_index,
+            virtual_ipv4,
             dns_adapter: None,
             default_gateway,
             default_interface,
@@ -548,10 +562,28 @@ impl PacketCaptureManager {
         #[cfg(windows)]
         {
             let was_redirecting = self.dns_mode().is_some();
+            let tunnel_address = self.active.as_ref().map(|capture| capture.virtual_ipv4);
             drop(self.active.take());
-            drop(self.active_split.take());
+            let carried = self
+                .active_split
+                .take()
+                .map(crate::split_capture::SplitPacketCapture::into_carried);
             if was_redirecting {
                 gamepath_engine::netconfig::flush_dns_cache();
+            }
+            // Capture and routes must be gone and DNS fresh before apps retry.
+            // A live policy replacement uses into_carried without closing flows.
+            let closed = if let Some(carried) = carried {
+                carried.close_tcp_connections()
+            } else if let Some(address) = tunnel_address {
+                crate::tcp_reset::close_matching(|connection| *connection.local.ip() == address)
+            } else {
+                0
+            };
+            if closed != 0 {
+                log_info!(
+                    "ended {closed} tunnel TCP connection(s) so applications reconnect after disconnect"
+                );
             }
         }
         json!({ "state": "idle" })
@@ -630,17 +662,30 @@ fn run_wintun_uplink(
     sessions: Arc<Mutex<WireGuardSessionManager>>,
     virtual_ipv4: std::net::Ipv4Addr,
     stop: Arc<AtomicBool>,
+    diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
 ) {
     let mut sender = SenderCache::new(sessions);
     while !stop.load(Ordering::Acquire) {
         let packet = match session.receive_blocking() {
             Ok(packet) => packet,
-            Err(_) => return,
+            Err(error) => {
+                if !stop.load(Ordering::Acquire) {
+                    gamepath_engine::log_error!(
+                        "Wintun capture receiver stopped unexpectedly: {error}"
+                    );
+                }
+                return;
+            }
         };
         let bytes = packet.bytes().to_vec();
         drop(packet);
         if ipv4_source_address(&bytes) == Some(virtual_ipv4) {
             let _ = sender.send(&bytes);
+        } else {
+            diagnostics.record(
+                gamepath_engine::packet_diagnostics::Reason::WintunInvalidSource,
+                &bytes,
+            );
         }
     }
 }
@@ -650,19 +695,38 @@ fn run_wintun_downlink(
     session: Arc<wintun::Session>,
     data_receiver: Arc<DataReceiver>,
     stop: Arc<AtomicBool>,
+    diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
 ) {
     while !stop.load(Ordering::Acquire) {
         let reply = match data_receiver.receive(Duration::from_millis(250)) {
             Ok(Some(packet)) => packet,
             Ok(None) => continue,
-            Err(_) => return,
+            Err(error) => {
+                if !stop.load(Ordering::Acquire) {
+                    gamepath_engine::log_error!(
+                        "Wintun reply receiver stopped unexpectedly: {error}"
+                    );
+                }
+                return;
+            }
         };
         if reply.len() > u16::MAX as usize {
+            diagnostics.record(
+                gamepath_engine::packet_diagnostics::Reason::OversizedReply,
+                &reply,
+            );
             continue;
         }
-        if let Ok(mut packet) = session.allocate_send_packet(reply.len() as u16) {
-            packet.bytes_mut().copy_from_slice(&reply);
-            session.send_packet(packet);
+        match session.allocate_send_packet(reply.len() as u16) {
+            Ok(mut packet) => {
+                packet.bytes_mut().copy_from_slice(&reply);
+                session.send_packet(packet);
+            }
+            Err(error) => diagnostics.record_error(
+                gamepath_engine::packet_diagnostics::Reason::WintunInject,
+                &reply,
+                &error.to_string(),
+            ),
         }
     }
 }

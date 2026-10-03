@@ -7,7 +7,7 @@ use gamepath_engine::role::Role;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString, c_char, c_void};
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::NetworkManagement::IpHelper::TCP_TABLE_OWNER_PID_ALL;
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -530,6 +531,7 @@ impl SelectorTable {
 }
 
 struct Registry {
+    packet_diagnostics: gamepath_engine::packet_diagnostics::PacketDiagnostics,
     capture_id: u64,
     dll: PathBuf,
     bypass: String,
@@ -718,6 +720,35 @@ pub struct CarriedFlows {
     app_usage: HashMap<String, Arc<AppUsage>>,
 }
 
+impl CarriedFlows {
+    pub(crate) fn close_tcp_connections(&self) -> usize {
+        let flows = tcp_flow_owners(&self.return_paths);
+        crate::tcp_reset::close_matching(|connection| {
+            flows
+                .get(&(connection.local, connection.remote))
+                .is_some_and(|owner| owner.is_none_or(|pid| pid == connection.process_id))
+        })
+    }
+}
+
+fn tcp_flow_owners(
+    paths: &HashMap<ReturnKey, ReturnPath>,
+) -> HashMap<(SocketAddrV4, SocketAddrV4), Option<u32>> {
+    paths
+        .iter()
+        .filter(|(key, _)| key.protocol == 6)
+        .map(|(key, path)| {
+            (
+                (
+                    SocketAddrV4::new(path.local_ip, key.local_port),
+                    SocketAddrV4::new(path.resolver.unwrap_or(key.remote_ip), key.remote_port),
+                ),
+                path.process_id,
+            )
+        })
+        .collect()
+}
+
 pub struct SplitPacketCapture {
     stop: Arc<AtomicBool>,
     registry: Arc<Registry>,
@@ -900,6 +931,7 @@ impl SplitPacketCapture {
             return_wrong_destination: AtomicU64::new(0),
             return_without_flow: AtomicU64::new(0),
             no_flow_samples: Mutex::new(Vec::new()),
+            packet_diagnostics: Default::default(),
             unmatched_return_packets: AtomicU64::new(0),
             return_injection_errors: AtomicU64::new(0),
             // Clamped to what crosses unfragmented, which on a narrow link is
@@ -1203,6 +1235,7 @@ impl SplitPacketCapture {
             .collect::<Vec<_>>();
         let mut status = serde_json::json!({
             "captureId": self.registry.capture_id,
+            "packetFailures": self.registry.packet_diagnostics.status(),
             "matchedSockets": self.registry.matched_sockets.load(Ordering::Relaxed),
             "captureFilterCount": selector_table(&self.registry).len,
             "captureScope": if self.scope.broad { "all-outbound" } else { "destinations" },
@@ -1612,11 +1645,11 @@ fn run_selected_capture(
                         registry
                             .pending_syn_overflow
                             .fetch_add(1, Ordering::Relaxed);
-                        let _ = handle.send(&pending.packet, &pending.address);
+                        send_bypass(&handle, &registry, &pending.packet, &pending.address);
                     }
                     Err(mpsc::TrySendError::Disconnected(pending)) => {
                         registry.pending_syn_depth.fetch_sub(1, Ordering::Relaxed);
-                        let _ = handle.send(&pending.packet, &pending.address);
+                        send_bypass(&handle, &registry, &pending.packet, &pending.address);
                     }
                 }
                 continue;
@@ -1897,19 +1930,29 @@ fn reinject(
                     .bypass_queued_bytes
                     .fetch_sub(length, Ordering::AcqRel);
                 registry.bypass_queue_full.fetch_add(1, Ordering::Relaxed);
-                let _ = handle.send(&held.packet, &held.address);
+                send_bypass(handle, registry, &held.packet, &held.address);
                 return;
             }
         }
     }
     registry.bypass_queue_full.fetch_add(1, Ordering::Relaxed);
-    let _ = handle.send(packet, &address);
+    send_bypass(handle, registry, packet, &address);
 }
 
 /// Puts packets that were not selected back on the network stack.
 ///
 /// One thread, so the traffic it carries keeps its order: these are other
 /// applications' packets and reordering them is a cost with no upside.
+fn send_bypass(handle: &Handle, registry: &Registry, packet: &[u8], address: &Address) {
+    if let Err(error) = handle.send(packet, address) {
+        registry.packet_diagnostics.record_error(
+            gamepath_engine::packet_diagnostics::Reason::BypassInject,
+            packet,
+            &error,
+        );
+    }
+}
+
 fn run_bypass_injector(
     handle: Arc<Handle>,
     stop: Arc<AtomicBool>,
@@ -1917,7 +1960,7 @@ fn run_bypass_injector(
     bypass: mpsc::Receiver<Bypass>,
 ) {
     let send = |item: &Bypass| {
-        let _ = handle.send(&item.packet, &item.address);
+        send_bypass(&handle, &registry, &item.packet, &item.address);
         registry
             .bypass_queued_bytes
             .fetch_sub(item.packet.len(), Ordering::AcqRel);
@@ -2041,6 +2084,13 @@ fn route_selected_packet(
         clamp_tcp_mss(tunneled, registry.tcp_mss);
         handle.checksums(tunneled, &mut checksum_address)
     };
+    if let Err(error) = &checksummed {
+        registry.packet_diagnostics.record_error(
+            gamepath_engine::packet_diagnostics::Reason::Checksum,
+            packet,
+            error,
+        );
+    }
     let forwarded = if checksummed.is_err() {
         Err("could not update packet checksums".to_owned())
     } else {
@@ -2051,7 +2101,7 @@ fn route_selected_packet(
     } else if forwarded.is_err() {
         // Fail open for the selected connection when the relay is unavailable.
         registry.bypassed_packets.fetch_add(1, Ordering::Relaxed);
-        let _ = handle.send(packet, &address);
+        send_bypass(handle, registry, packet, &address);
     } else {
         registry.relayed_packets.fetch_add(1, Ordering::Relaxed);
         if forwarded == Ok(true) {
@@ -2083,7 +2133,7 @@ fn run_pending_syns(
         if stop.load(Ordering::Acquire) {
             // The capture handle is shutting down. Reinject every packet that
             // was already removed from the network stack before exiting.
-            let _ = handle.send(&item.packet, &item.address);
+            send_bypass(&handle, &registry, &item.packet, &item.address);
             continue;
         }
         if let Some(wait) = item.deadline.checked_duration_since(Instant::now()) {
@@ -2107,7 +2157,7 @@ fn run_pending_syns(
                 None,
             );
         } else {
-            let _ = handle.send(&item.packet, &item.address);
+            send_bypass(&handle, &registry, &item.packet, &item.address);
         }
     }
 }
@@ -2427,43 +2477,24 @@ impl ExistingSocket {
     }
 }
 
-#[link(name = "iphlpapi")]
-unsafe extern "system" {
-    fn GetExtendedTcpTable(
-        table: *mut c_void,
-        size: *mut u32,
-        order: i32,
-        family: u32,
-        table_class: u32,
-        reserved: u32,
-    ) -> u32;
-    fn GetExtendedUdpTable(
-        table: *mut c_void,
-        size: *mut u32,
-        order: i32,
-        family: u32,
-        table_class: u32,
-        reserved: u32,
-    ) -> u32;
-}
-
 fn tcp_socket_process(
     fields: Ipv4Fields,
     applications: &[String],
     folders: &[String],
 ) -> Option<(u32, String)> {
-    let buffer = ip_table(|table, size| unsafe { GetExtendedTcpTable(table, size, 0, 2, 5, 0) })?;
-    dword_rows(&buffer, 6).into_iter().find_map(|row| {
-        if port_from_dword(row[2]) != fields.source_port
-            || port_from_dword(row[4]) != fields.destination_port
-            || Ipv4Addr::from(row[3].to_ne_bytes()) != fields.destination
-        {
-            return None;
-        }
-        process_path(row[5])
-            .filter(|path| path_matches(path, applications, folders))
-            .map(|path| (row[5], path))
-    })
+    crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_ALL)?
+        .into_iter()
+        .find_map(|row| {
+            if port_from_dword(row.dwLocalPort) != fields.source_port
+                || port_from_dword(row.dwRemotePort) != fields.destination_port
+                || Ipv4Addr::from(row.dwRemoteAddr.to_ne_bytes()) != fields.destination
+            {
+                return None;
+            }
+            process_path(row.dwOwningPid)
+                .filter(|path| path_matches(path, applications, folders))
+                .map(|path| (row.dwOwningPid, path))
+        })
 }
 
 fn socket_is_active(
@@ -2518,13 +2549,11 @@ fn stale_owner_matches_return_key(
 
 fn existing_ipv4_udp_sockets() -> Option<Vec<ExistingSocket>> {
     let mut sockets = Vec::new();
-    // MIB_UDPROW_OWNER_PID is three DWORDs; UDP has no fixed remote endpoint.
-    let buffer = ip_table(|table, size| unsafe { GetExtendedUdpTable(table, size, 0, 2, 1, 0) })?;
-    for row in dword_rows(&buffer, 3) {
-        let local_port = port_from_dword(row[1]);
+    for row in crate::socket_table::udp_rows()? {
+        let local_port = port_from_dword(row.dwLocalPort);
         if local_port != 0 {
             sockets.push(ExistingSocket {
-                process_id: row[2],
+                process_id: row.dwOwningPid,
                 protocol: 17,
                 local_port,
                 remote_port: 0,
@@ -2538,14 +2567,11 @@ fn existing_ipv4_process_sockets() -> Option<HashSet<ExistingSocket>> {
     let mut sockets = existing_ipv4_udp_sockets()?
         .into_iter()
         .collect::<HashSet<_>>();
-    // MIB_TCPROW_OWNER_PID is six DWORDs: state, local address/port,
-    // remote address/port, and PID. Closed/TIME_WAIT rows owned by PID zero do
-    // not keep a process flow alive.
-    let buffer = ip_table(|table, size| unsafe { GetExtendedTcpTable(table, size, 0, 2, 5, 0) })?;
-    for row in dword_rows(&buffer, 6) {
-        let local_port = port_from_dword(row[2]);
-        let remote_port = port_from_dword(row[4]);
-        let process_id = row[5];
+    // Closed/TIME_WAIT rows owned by PID zero do not keep a process flow alive.
+    for row in crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_ALL)? {
+        let local_port = port_from_dword(row.dwLocalPort);
+        let remote_port = port_from_dword(row.dwRemotePort);
+        let process_id = row.dwOwningPid;
         if process_id != 0 && local_port != 0 {
             sockets.insert(ExistingSocket {
                 process_id,
@@ -2556,49 +2582,6 @@ fn existing_ipv4_process_sockets() -> Option<HashSet<ExistingSocket>> {
         }
     }
     Some(sockets)
-}
-
-pub(crate) fn ip_table(call: impl Fn(*mut c_void, *mut u32) -> u32) -> Option<Vec<u8>> {
-    let mut size = 0_u32;
-    let _ = call(std::ptr::null_mut(), &mut size);
-    if size < 4 {
-        return None;
-    }
-    let mut buffer = vec![0_u8; size as usize];
-    // The table may grow between the size probe and the read. Windows updates
-    // `size` with the new requirement, so retry without ever treating a
-    // temporary inventory failure as an empty table.
-    for _ in 0..3 {
-        let status = call(buffer.as_mut_ptr().cast(), &mut size);
-        if status == 0 {
-            return Some(buffer);
-        }
-        if status != 122 || size < 4 {
-            return None;
-        }
-        buffer.resize(size as usize, 0);
-    }
-    None
-}
-
-pub(crate) fn dword_rows(buffer: &[u8], width: usize) -> Vec<Vec<u32>> {
-    if buffer.len() < 4 {
-        return Vec::new();
-    }
-    let count = u32::from_ne_bytes(buffer[0..4].try_into().unwrap()) as usize;
-    let row_bytes = width * 4;
-    (0..count)
-        .filter_map(|index| {
-            let start = 4 + index * row_bytes;
-            let bytes = buffer.get(start..start + row_bytes)?;
-            Some(
-                bytes
-                    .chunks_exact(4)
-                    .map(|part| u32::from_ne_bytes(part.try_into().unwrap()))
-                    .collect(),
-            )
-        })
-        .collect()
 }
 
 pub(crate) fn port_from_dword(value: u32) -> u16 {
@@ -2720,9 +2703,17 @@ fn run_reply_injector(
         }
         clamp_tcp_mss(&mut packet, registry.tcp_mss);
         let mut address = Address::inbound(path.interface_index, path.subinterface_index);
-        if handle.checksums(&mut packet, &mut address).is_ok()
-            && handle.send(&packet, &address).is_ok()
-        {
+        let injected = handle
+            .checksums(&mut packet, &mut address)
+            .and_then(|()| handle.send(&packet, &address));
+        if let Err(error) = &injected {
+            registry.packet_diagnostics.record_error(
+                gamepath_engine::packet_diagnostics::Reason::ReturnInject,
+                &packet,
+                error,
+            );
+        }
+        if injected.is_ok() {
             registry
                 .injected_return_packets
                 .fetch_add(1, Ordering::Relaxed);
@@ -2767,7 +2758,20 @@ fn deliver_icmp_error(
     };
     readdress_icmp_error(packet, path.local_ip, path.resolver);
     let mut address = Address::inbound(path.interface_index, path.subinterface_index);
-    if handle.checksums(packet, &mut address).is_ok() && handle.send(packet, &address).is_ok() {
+    let injected = handle
+        .checksums(packet, &mut address)
+        .and_then(|()| handle.send(packet, &address));
+    if let Err(error) = &injected {
+        registry
+            .return_injection_errors
+            .fetch_add(1, Ordering::Relaxed);
+        registry.packet_diagnostics.record_error(
+            gamepath_engine::packet_diagnostics::Reason::ReturnInject,
+            packet,
+            error,
+        );
+    }
+    if injected.is_ok() {
         registry
             .icmp_errors_delivered
             .fetch_add(1, Ordering::Relaxed);
@@ -2828,32 +2832,42 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
             registry.return_without_flow.load(Ordering::Relaxed),
             registry.return_injection_errors.load(Ordering::Relaxed),
             registry.held_packets.load(Ordering::Relaxed),
+            registry.fragments_discarded.load(Ordering::Relaxed),
+            registry.fragmentation_needed_failed.load(Ordering::Relaxed),
         ]
     };
-    let mut reported = read();
+    let mut packet_reporter = gamepath_engine::packet_diagnostics::Reporter::default();
+    let packet_context = format!("split capture {}", registry.capture_id);
+    let mut reported = [0; 12];
     let mut last_log: Option<Instant> = None;
-    while !stop.load(Ordering::Acquire) {
+    loop {
         thread::sleep(Duration::from_millis(250));
         let observed_at = Instant::now();
+        packet_reporter.poll(&registry.packet_diagnostics, &packet_context, false);
         let current = read();
+        let stopping = stop.load(Ordering::Acquire);
         let changed = current
             .iter()
             .zip(&reported)
             .any(|(value, previous)| value > previous);
         if !changed
-            || last_log.is_some_and(|logged| {
-                observed_at.duration_since(logged) < CAPTURE_ANOMALY_LOG_INTERVAL
-            })
+            || (!stopping
+                && last_log.is_some_and(|logged| {
+                    observed_at.duration_since(logged) < CAPTURE_ANOMALY_LOG_INTERVAL
+                }))
         {
+            if stopping {
+                break;
+            }
             continue;
         }
         let delta =
-            std::array::from_fn::<_, 10, _>(|index| current[index].saturating_sub(reported[index]));
+            std::array::from_fn::<_, 12, _>(|index| current[index].saturating_sub(reported[index]));
         gamepath_engine::log_warn!(
             "split capture anomaly: selected-fail-open=+{} bypass-queue-full=+{} \
              receive-errors=+{} pending-syn-overflow=+{} slow-loops=+{} \
              returns-dropped=+{}/{}/{} (not-ipv4/wrong-dest/no-flow) \
-             return-injection-errors=+{} kill-switch-held=+{} peak-loop={}us",
+             return-injection-errors=+{} kill-switch-held=+{} fragments-discarded=+{} pmtu-feedback-failed=+{} peak-loop={}us",
             delta[0],
             delta[1],
             delta[2],
@@ -2864,6 +2878,8 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
             delta[7],
             delta[8],
             delta[9],
+            delta[10],
+            delta[11],
             registry.capture_loop_peak_us.load(Ordering::Relaxed),
         );
         let samples = std::mem::take(&mut *registry.no_flow_samples.lock().unwrap());
@@ -2872,7 +2888,11 @@ fn run_capture_diagnostics(stop: Arc<AtomicBool>, registry: Arc<Registry>) {
         }
         reported = current;
         last_log = Some(observed_at);
+        if stopping {
+            break;
+        }
     }
+    packet_reporter.poll(&registry.packet_diagnostics, &packet_context, true);
 }
 
 const NO_FLOW_SAMPLES: usize = 4;
@@ -3350,6 +3370,79 @@ fn hostname_matches(name: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn disconnect_matches_only_tracked_tcp_endpoints_and_keeps_the_owner() {
+        let local = Ipv4Addr::new(192, 168, 1, 20);
+        let remote = Ipv4Addr::new(203, 0, 113, 7);
+        let key = ReturnKey {
+            protocol: 6,
+            remote_ip: remote,
+            local_port: 51000,
+            remote_port: 443,
+        };
+        let path = ReturnPath {
+            local_ip: local,
+            interface_index: 1,
+            subinterface_index: 0,
+            process_id: Some(42),
+            usage: Arc::new(AppUsage::default()),
+            last_seen: Instant::now(),
+            resolver: None,
+        };
+        let mut paths = HashMap::from([(key, path.clone())]);
+        paths.insert(
+            ReturnKey {
+                protocol: 17,
+                ..key
+            },
+            path.clone(),
+        );
+        let flows = tcp_flow_owners(&paths);
+        let endpoints = (
+            SocketAddrV4::new(local, 51000),
+            SocketAddrV4::new(remote, 443),
+        );
+        assert_eq!(flows.len(), 1, "UDP sockets must be left open");
+        assert_eq!(flows.get(&endpoints), Some(&Some(42)));
+        for other in [
+            (SocketAddrV4::new(Ipv4Addr::LOCALHOST, 51000), endpoints.1),
+            (SocketAddrV4::new(local, 51001), endpoints.1),
+            (endpoints.0, SocketAddrV4::new(remote, 80)),
+            (endpoints.0, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443)),
+        ] {
+            assert!(
+                !flows.contains_key(&other),
+                "an unrelated socket must survive"
+            );
+        }
+        let resolver = Ipv4Addr::new(192, 168, 1, 1);
+        paths.insert(
+            ReturnKey {
+                remote_ip: TUNNEL_RESOLVER,
+                local_port: 51002,
+                remote_port: 53,
+                ..key
+            },
+            ReturnPath {
+                resolver: Some(resolver),
+                ..path
+            },
+        );
+        let flows = tcp_flow_owners(&paths);
+        assert_eq!(
+            flows.get(&(
+                SocketAddrV4::new(local, 51002),
+                SocketAddrV4::new(resolver, 53)
+            )),
+            Some(&Some(42)),
+            "Windows owns the connection to the original resolver"
+        );
+        assert!(!flows.contains_key(&(
+            SocketAddrV4::new(local, 51002),
+            SocketAddrV4::new(TUNNEL_RESOLVER, 53),
+        )));
+    }
 
     /// An ICMP error carries no ports, so it keys as port 0 in both directions
     /// and can never match a TCP or UDP flow. Whatever else is behind the

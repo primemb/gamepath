@@ -18,6 +18,7 @@ pub(crate) struct Dispatch {
 pub(crate) struct Dispatched {
     pub(crate) selected: usize,
     pub(crate) accepted: usize,
+    pub(crate) disconnected: usize,
 }
 
 impl Dispatch {
@@ -25,6 +26,7 @@ impl Dispatch {
         let mut outcome = Dispatched {
             selected: 0,
             accepted: 0,
+            disconnected: 0,
         };
         let queued_at = Instant::now();
         for (index, sender) in self.commands.iter().enumerate() {
@@ -33,14 +35,20 @@ impl Dispatch {
                 continue;
             }
             outcome.selected += 1;
+            // Reserve before publication: a worker can receive immediately and
+            // decrement the depth before try_send returns to this thread.
+            let reserved = self
+                .telemetry
+                .queue_depth
+                .get(index)
+                .map(|depth| depth.fetch_add(1, Ordering::Relaxed) + 1);
             match sender.try_send(PathCommand {
                 frame: frame.clone(),
                 queued_at,
             }) {
                 Ok(()) => {
                     outcome.accepted += 1;
-                    if let Some(depth) = self.telemetry.queue_depth.get(index) {
-                        let current = depth.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(current) = reserved {
                         if let Some(peak) = self.telemetry.queue_peak.get(index) {
                             peak.fetch_max(current, Ordering::Relaxed);
                         }
@@ -50,6 +58,9 @@ impl Dispatch {
                 // newest packet keeps the backlog bounded: game traffic is
                 // stale by the time it would drain, and TCP retransmits.
                 Err(mpsc::TrySendError::Full(_)) => {
+                    if let Some(depth) = self.telemetry.queue_depth.get(index) {
+                        depth.fetch_sub(1, Ordering::Relaxed);
+                    }
                     if let Some(dropped) = self.telemetry.dropped.get(index) {
                         dropped.fetch_add(1, Ordering::Relaxed);
                     }
@@ -57,7 +68,12 @@ impl Dispatch {
                         dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Err(mpsc::TrySendError::Disconnected(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    if let Some(depth) = self.telemetry.queue_depth.get(index) {
+                        depth.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    outcome.disconnected += 1;
+                }
             }
         }
         outcome

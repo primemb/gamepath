@@ -235,6 +235,15 @@ pub(crate) fn run_path(
             |frame| {
                 let started = Instant::now();
                 let result = path.send_frame(frame);
+                if let Err(error) = &result {
+                    telemetry.dropped[index].fetch_add(1, Ordering::Relaxed);
+                    telemetry.send_failed[index].fetch_add(1, Ordering::Relaxed);
+                    telemetry.packet_diagnostics.record_error(
+                        gamepath_engine::packet_diagnostics::Reason::TransportSend,
+                        &[],
+                        error,
+                    );
+                }
                 socket_send += started.elapsed();
                 frames_sent += 1;
                 (frame.len(), result)
@@ -347,7 +356,14 @@ pub(crate) fn run_path(
         match path.receive_frames(WORKER_RECEIVE_TIMEOUT) {
             Ok(frames) => {
                 for frame in frames {
-                    if let Ok((header, plaintext)) = crypto.open_server(&frame) {
+                    let opened = crypto.open_server(&frame);
+                    if opened.is_err() {
+                        telemetry.packet_diagnostics.record(
+                            gamepath_engine::packet_diagnostics::Reason::RelayAuthentication,
+                            &[],
+                        );
+                    }
+                    if let Ok((header, plaintext)) = opened {
                         if header.client_id != client_id || header.session_id != session_id {
                             continue;
                         }
@@ -497,6 +513,7 @@ pub(crate) fn run_path(
             // duplication.
             Err(error) => update_path_status(&statuses, index, Err(error)),
         }
+        telemetry.record_transport_drops(index, path.take_transport_drops());
         pass.receive = receive_started.elapsed();
         // Setup latency is fixed once a path is up, and this lock is shared by
         // every path worker, so it is taken only when the value actually moves.

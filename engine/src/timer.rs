@@ -16,24 +16,14 @@ pub struct HighResolutionTimer {
 }
 
 #[cfg(windows)]
-mod bindings {
-    #[link(name = "winmm")]
-    unsafe extern "system" {
-        pub fn timeBeginPeriod(period: u32) -> u32;
-        pub fn timeEndPeriod(period: u32) -> u32;
-    }
-}
-
-/// `TIMERR_NOERROR`, the only success value these two calls return.
-#[cfg(windows)]
-const TIMER_OK: u32 = 0;
+use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
 
 impl HighResolutionTimer {
     #[cfg(windows)]
     pub fn raise() -> Self {
         // 1 ms is the resolution games and media players ask for. If the system
         // refuses it the session still runs, only with coarser wakeups.
-        let granted = unsafe { bindings::timeBeginPeriod(1) } == TIMER_OK;
+        let granted = unsafe { timeBeginPeriod(1) } == TIMERR_NOERROR;
         Self {
             period: granted.then_some(1),
         }
@@ -61,7 +51,7 @@ impl Drop for HighResolutionTimer {
     fn drop(&mut self) {
         #[cfg(windows)]
         if let Some(period) = self.period.take() {
-            unsafe { bindings::timeEndPeriod(period) };
+            unsafe { timeEndPeriod(period) };
         }
     }
 }

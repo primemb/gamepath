@@ -79,6 +79,14 @@ fn unix_time_millis() -> u128 {
 }
 
 impl WireGuardSessionManager {
+    pub(crate) fn packet_diagnostics(
+        &self,
+    ) -> Option<Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>> {
+        self.active
+            .as_ref()
+            .map(|session| Arc::clone(&session.telemetry.packet_diagnostics))
+    }
+
     pub(crate) fn start(&mut self, payload: Value) -> Result<Value, String> {
         let input: SessionRequest = serde_json::from_value(payload)
             .map_err(|error| format!("invalid session request: {error}"))?;

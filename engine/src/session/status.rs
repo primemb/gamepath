@@ -60,6 +60,7 @@ impl WireGuardSessionManager {
                     "repairsReceived": counters.received,
                     "recovered": counters.recovered,
                     "unrecoverable": counters.unrecoverable,
+                    "queueRejected": ingress.repair_queue_rejected.load(Ordering::Relaxed),
                 })
             }
             // A direct node is the last hop and knows nothing of repairs.
@@ -108,7 +109,12 @@ impl WireGuardSessionManager {
                 .iter()
                 .map(|count| count.load(Ordering::Relaxed))
                 .collect::<Vec<_>>(),
+            "packetFailures": session.telemetry.packet_diagnostics.status(),
             "dropReasons": {
+                "streamStale": session.telemetry.stream_stale.iter().map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+                "streamFull": session.telemetry.stream_full.iter().map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+                "sendFailed": session.telemetry.send_failed.iter()
+                    .map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
                 "queueFull": session.telemetry.queue_full_dropped.iter()
                     .map(|count| count.load(Ordering::Relaxed)).collect::<Vec<_>>(),
                 "stale": session.telemetry.stale_dropped.iter()

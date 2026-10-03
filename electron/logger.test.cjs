@@ -76,7 +76,7 @@ test('a log directory that cannot be created does not throw', () => {
 test('the client and the Rust components agree on the log directory', () => {
   const rust = fs.readFileSync(path.join(__dirname, '..', 'engine', 'src', 'log.rs'), 'utf8')
   // Both put every component in one folder so a report is one directory.
-  assert.match(rust, /join\("GamePath"\)\.join\("logs"\)/)
+  assert.match(rust, /join\("GamePath"\)\s*\.join\("logs"\)/)
   if (process.platform === 'win32') {
     assert.match(logger.defaultLogPath(), /GamePath[\\/]logs[\\/]client\.log$/)
   }

@@ -163,6 +163,10 @@ impl Session {
         self.protocol
     }
 
+    pub fn take_transport_drops(&mut self) -> [u64; 2] {
+        self.link.take_drops()
+    }
+
     pub fn handshake_latency_ms(&self) -> Option<f64> {
         self.handshake_latency_ms
     }

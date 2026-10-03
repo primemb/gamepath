@@ -153,6 +153,8 @@ pub(crate) struct RelayIngress {
     session_id: u64,
     state: Mutex<IngressState>,
     pub(crate) recovered: AtomicU64,
+    pub(crate) repair_queue_rejected: AtomicU64,
+    diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
 }
 
 struct IngressState {
@@ -168,15 +170,21 @@ pub(crate) struct RepairCounters {
 }
 
 impl RelayIngress {
-    pub(crate) fn new(client_id: [u8; 16], session_id: u64) -> Self {
+    pub(crate) fn new(
+        client_id: [u8; 16],
+        session_id: u64,
+        diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
+    ) -> Self {
         Self {
             client_id,
             session_id,
+            diagnostics,
             state: Mutex::new(IngressState {
                 replay: ReplayWindow::default(),
                 repair: Decoder::default(),
             }),
             recovered: AtomicU64::new(0),
+            repair_queue_rejected: AtomicU64::new(0),
         }
     }
 
@@ -199,6 +207,12 @@ impl RelayIngress {
         }
         let mut state = self.state.lock().unwrap();
         if !state.replay.would_accept(header.sequence) {
+            if state.replay.is_too_old(header.sequence) {
+                self.diagnostics.record(
+                    gamepath_engine::packet_diagnostics::Reason::ReplayTooOld,
+                    &plaintext,
+                );
+            }
             return Ok(false);
         }
         // Kept even if the queue turns it away: its bytes still let a repair
@@ -249,7 +263,16 @@ impl RelayIngress {
             return false;
         }
         state.repair.remember(sequence, &packet);
+        let mut protocol_header = [0_u8; 20];
+        if let Some(header) = packet.get(..20) {
+            protocol_header.copy_from_slice(header);
+        }
         if inbound.try_send(packet).is_err() {
+            self.diagnostics.record(
+                gamepath_engine::packet_diagnostics::Reason::RepairQueue,
+                &protocol_header,
+            );
+            self.repair_queue_rejected.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         state.replay.accept(sequence);

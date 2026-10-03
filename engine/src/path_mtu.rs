@@ -62,53 +62,34 @@ fn search(link_mtu: u16, mut fits: impl FnMut(u16) -> Option<bool>) -> Option<u1
 /// when it came back whole, `Some(None)` when it did not.
 #[cfg(windows)]
 fn echo(destination: Ipv4Addr, size: u16, timeout: Duration) -> Option<Option<Duration>> {
-    use std::ffi::c_void;
-
-    /// `IP_OPTION_INFORMATION`.
-    #[repr(C)]
-    struct Options {
-        ttl: u8,
-        tos: u8,
-        flags: u8,
-        options_size: u8,
-        options_data: *mut u8,
-    }
-    const IP_FLAG_DF: u8 = 0x2;
-
-    #[link(name = "iphlpapi")]
-    unsafe extern "system" {
-        fn IcmpCreateFile() -> isize;
-        fn IcmpCloseHandle(handle: isize) -> i32;
-        fn IcmpSendEcho(
-            handle: isize,
-            destination: u32,
-            request: *const c_void,
-            request_size: u16,
-            options: *const c_void,
-            reply: *mut c_void,
-            reply_size: u32,
-            timeout: u32,
-        ) -> u32;
-    }
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    #[cfg(target_pointer_width = "32")]
+    use windows_sys::Win32::NetworkManagement::IpHelper::ICMP_ECHO_REPLY as EchoReply;
+    #[cfg(target_pointer_width = "64")]
+    use windows_sys::Win32::NetworkManagement::IpHelper::ICMP_ECHO_REPLY32 as EchoReply;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        IP_FLAG_DF, IP_OPTION_INFORMATION, IP_SUCCESS, IcmpCloseHandle, IcmpCreateFile,
+        IcmpSendEcho,
+    };
 
     let payload = usize::from(size.checked_sub(ECHO_HEADERS)?);
     let request = vec![0x61_u8; payload];
     // ICMP_ECHO_REPLY, the echoed data, room for an ICMP error and the
     // IO_STATUS_BLOCK, as IcmpSendEcho's documentation asks.
     let mut reply = vec![0_u8; payload + 128];
-    let options = Options {
-        ttl: 128,
-        tos: 0,
-        flags: IP_FLAG_DF,
-        options_size: 0,
-        options_data: std::ptr::null_mut(),
+    let options = IP_OPTION_INFORMATION {
+        Ttl: 128,
+        Tos: 0,
+        Flags: IP_FLAG_DF as u8,
+        OptionsSize: 0,
+        OptionsData: std::ptr::null_mut(),
     };
     let timeout_ms = u32::try_from(timeout.as_millis())
         .unwrap_or(u32::MAX)
         .max(1);
     let replies = unsafe {
         let handle = IcmpCreateFile();
-        if handle == -1 {
+        if handle == INVALID_HANDLE_VALUE {
             return None;
         }
         let replies = IcmpSendEcho(
@@ -116,7 +97,7 @@ fn echo(destination: Ipv4Addr, size: u16, timeout: Duration) -> Option<Option<Du
             u32::from_le_bytes(destination.octets()),
             request.as_ptr().cast(),
             payload as u16,
-            (&options as *const Options).cast(),
+            &options,
             reply.as_mut_ptr().cast(),
             reply.len() as u32,
             timeout_ms,
@@ -124,13 +105,14 @@ fn echo(destination: Ipv4Addr, size: u16, timeout: Duration) -> Option<Option<Du
         IcmpCloseHandle(handle);
         replies
     };
-    // ICMP_ECHO_REPLY: Address, Status, RoundTripTime, DataSize.
-    let status = u32::from_ne_bytes(reply[4..8].try_into().unwrap());
-    let round_trip = u32::from_ne_bytes(reply[8..12].try_into().unwrap());
-    let echoed = u16::from_ne_bytes(reply[12..14].try_into().unwrap());
+    if replies == 0 {
+        return Some(None);
+    }
+    // Windows uses the REPLY32 layout on 64-bit hosts; embedded pointers are never dereferenced.
+    let reply = unsafe { reply.as_ptr().cast::<EchoReply>().read_unaligned() };
     Some(
-        (replies > 0 && status == 0 && usize::from(echoed) == payload)
-            .then(|| Duration::from_millis(u64::from(round_trip))),
+        (reply.Status == IP_SUCCESS && usize::from(reply.DataSize) == payload)
+            .then(|| Duration::from_millis(u64::from(reply.RoundTripTime))),
     )
 }
 
@@ -142,6 +124,16 @@ fn echo(_destination: Ipv4Addr, _size: u16, _timeout: Duration) -> Option<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_loopback_echo_reads_the_windows_reply() {
+        assert!(
+            echo(Ipv4Addr::LOCALHOST, 1500, Duration::from_secs(1))
+                .flatten()
+                .is_some()
+        );
+    }
 
     fn path(real: u16) -> impl FnMut(u16) -> Option<bool> {
         move |size| Some(size <= real)

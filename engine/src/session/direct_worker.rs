@@ -179,6 +179,15 @@ pub(crate) fn run_direct_path(
             |frame| {
                 let started = Instant::now();
                 let result = path.send_packet(frame);
+                if let Err(error) = &result {
+                    telemetry.dropped[0].fetch_add(1, Ordering::Relaxed);
+                    telemetry.send_failed[0].fetch_add(1, Ordering::Relaxed);
+                    telemetry.packet_diagnostics.record_error(
+                        gamepath_engine::packet_diagnostics::Reason::TransportSend,
+                        frame,
+                        error,
+                    );
+                }
                 socket_send += started.elapsed();
                 frames_sent += 1;
                 (frame.len(), result)
@@ -302,6 +311,7 @@ pub(crate) fn run_direct_path(
                 }
             }
         }
+        telemetry.record_transport_drops(0, path.take_transport_drops());
         pass.receive = receive_started.elapsed();
         // A silent peer is the usual way a direct session fails to start, and
         // the timeout alone would not say which part of the file to look at.
@@ -343,9 +353,7 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use gamepath_engine::relay_path::NodeSpec;
-    use gamepath_engine::uplink::UplinkMonitor;
     use std::net::UdpSocket;
-    use std::sync::atomic::AtomicU64;
     use std::thread;
 
     #[test]
@@ -360,7 +368,7 @@ mod tests {
     }
 
     /// A WireGuard peer that answers ICMP echoes through the tunnel, and stops
-    /// answering anything once `alive` is cleared — a node going down.
+    /// answering anything once `alive` is cleared â€” a node going down.
     fn spawn_echoing_peer(
         server_secret: [u8; 32],
         client_public: [u8; 32],
@@ -477,18 +485,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (_commands, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
         let (inbound_tx, _inbound) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
-        let telemetry = PathTelemetry {
-            iterations: Arc::new(vec![AtomicU64::new(0)]),
-            queue_depth: Arc::new(vec![AtomicU64::new(0)]),
-            queue_peak: Arc::new(vec![AtomicU64::new(0)]),
-            dropped: Arc::new(vec![AtomicU64::new(0)]),
-            queue_full_dropped: Arc::new(vec![AtomicU64::new(0)]),
-            stale_dropped: Arc::new(vec![AtomicU64::new(0)]),
-            inbound_dropped: Arc::new(vec![AtomicU64::new(0)]),
-            worker_gap_peak_ms: Arc::new(vec![AtomicU64::new(0)]),
-            healthy_mask: Arc::new(AtomicU64::new(0)),
-            uplink: Arc::new(UplinkMonitor::new()),
-        };
+        let telemetry = PathTelemetry::new(1);
         let worker = thread::spawn({
             let (stop, statuses) = (Arc::clone(&stop), Arc::clone(&statuses));
             move || {

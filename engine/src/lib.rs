@@ -24,6 +24,7 @@ pub mod mtu;
 pub mod netconfig;
 #[cfg(feature = "openvpn")]
 pub mod openvpn;
+pub mod packet_diagnostics;
 pub mod path_mtu;
 pub mod policy;
 pub mod protocol;

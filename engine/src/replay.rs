@@ -83,6 +83,10 @@ impl ReplayWindow {
             || (self.highest - sequence < WINDOW && !self.is_set(sequence))
     }
 
+    pub fn is_too_old(&self, sequence: u64) -> bool {
+        self.initialized && self.highest.saturating_sub(sequence) >= WINDOW
+    }
+
     fn slot(sequence: u64) -> (usize, u64) {
         let position = sequence % WINDOW;
         ((position / 64) as usize, 1_u64 << (position % 64))

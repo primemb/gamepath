@@ -73,6 +73,7 @@ const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) struct Counters {
     pub(crate) tcp_opened: AtomicU64,
     pub(crate) tcp_refused: AtomicU64,
+    pub(crate) tcp_cancelled: AtomicU64,
     pub(crate) udp_sent: AtomicU64,
     pub(crate) udp_refused: AtomicU64,
     pub(crate) dns_answered: AtomicU64,
@@ -264,7 +265,12 @@ impl Upstream {
                     self.read_pending = false;
                     return (data, false);
                 }
-                Err(error) if error.kind() == ErrorKind::NotConnected => return (data, false),
+                Err(error) if error.kind() == ErrorKind::NotConnected => {
+                    // DNS drains while read_pending is set. A pending Windows
+                    // connect must yield too, or that drain never reaches stop.
+                    self.read_pending = false;
+                    return (data, false);
+                }
                 Err(_) => {
                     self.closed = true;
                     finished = true;
@@ -530,6 +536,13 @@ impl Stack {
                     remote: SocketAddrV4::new(ip.destination, head.destination_port),
                 };
                 match self.tcp.get_mut(&key) {
+                    Some(flow) if flow.socket.is_none() && head.rst => {
+                        self.shared
+                            .counters
+                            .tcp_cancelled
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.remove_tcp(key);
+                    }
                     Some(flow) if flow.socket.is_some() => self.device.rx.push_back(packet),
                     // A retransmitted SYN while the proxy is still dialling.
                     Some(flow) if head.syn => flow.held_syn = Some((packet, head.sequence)),
@@ -1370,11 +1383,12 @@ impl Stack {
         self.last_summary = Instant::now();
         let counters = &self.shared.counters;
         log_info!(
-            "SOCKS5 stack: tcp open={} opened={} refused={} udp assoc={} sent={} refused={} \
+            "SOCKS5 stack: tcp open={} opened={} refused={} cancelled={} udp assoc={} sent={} refused={} \
              dns answered={} failed={} dropped={} turns={}",
             self.tcp.len(),
             counters.tcp_opened.load(Ordering::Relaxed),
             counters.tcp_refused.load(Ordering::Relaxed),
+            counters.tcp_cancelled.load(Ordering::Relaxed),
             self.udp.len(),
             counters.udp_sent.load(Ordering::Relaxed),
             counters.udp_refused.load(Ordering::Relaxed),
@@ -1449,6 +1463,54 @@ pub(crate) fn proxy_bypass(proxy: SocketAddr) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unconnected_dns_stream_yields_until_readiness_changes() {
+        let poll = Poll::new().unwrap();
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        socket
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut stream = TcpStream::from_std(socket.into());
+        let mut buffer = [0_u8; 64];
+        assert_eq!(
+            stream.read(&mut buffer).unwrap_err().kind(),
+            ErrorKind::NotConnected
+        );
+        poll.registry()
+            .register(
+                &mut stream,
+                Token(1),
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .unwrap();
+        let mut upstream = Upstream {
+            stream,
+            token: Token(1),
+            handshake: None,
+            outgoing: Vec::new(),
+            connected: false,
+            read_pending: true,
+            watching_writes: true,
+            registry: poll.registry().try_clone().unwrap(),
+            write_retry_at: None,
+            closed: false,
+        };
+        let (data, finished) = upstream.read(buffer.len(), &mut buffer);
+        assert!(data.is_empty());
+        assert!(!finished);
+        assert!(!upstream.closed);
+        assert!(
+            !upstream.read_pending,
+            "DNS draining must stop when a read makes no progress"
+        );
+    }
 
     #[test]
     fn a_relayed_datagram_round_trips_through_the_socks_header() {

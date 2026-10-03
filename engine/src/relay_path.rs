@@ -444,6 +444,11 @@ pub enum PathIdentity {
 /// they reach a path, so a path is only responsible for moving opaque bytes and
 /// for reporting whether it can still do so.
 pub trait RelayPath: Send {
+    /// Stream queue copies discarded since the last read: stale, then byte budget.
+    fn take_transport_drops(&mut self) -> [u64; 2] {
+        [0; 2]
+    }
+
     fn send_frame(&mut self, frame: &[u8]) -> Result<(), String>;
 
     /// Sends a health probe without shedding it in a stream's game-data queue.
@@ -688,6 +693,14 @@ pub enum DirectPath {
 }
 
 impl DirectPath {
+    pub fn take_transport_drops(&mut self) -> [u64; 2] {
+        #[cfg(feature = "openvpn")]
+        if let Self::OpenVpn(path) = self {
+            return path.take_transport_drops();
+        }
+        [0; 2]
+    }
+
     pub fn probe_deadline_floor(&self) -> Duration {
         #[cfg(feature = "openvpn")]
         if let Self::OpenVpn(path) = self {
@@ -846,6 +859,10 @@ impl OpenVpnRelayPath {
 
 #[cfg(feature = "openvpn")]
 impl RelayPath for OpenVpnRelayPath {
+    fn take_transport_drops(&mut self) -> [u64; 2] {
+        self.path.take_transport_drops()
+    }
+
     fn send_probe(&mut self, frame: &[u8]) -> Result<(), String> {
         let inner = ipv4_udp_packet(
             self.path.address(),

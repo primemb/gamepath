@@ -344,6 +344,10 @@ everything else keeps the normal connection.
   menu has a **Connect VPN** / **Disconnect VPN** item for use while a game is fullscreen.
 - Its traffic is counted apart from the game's, under **VPN** on the Statistics screen.
 
+Turning the VPN off ends its existing TCP connections so apps can reconnect over your normal route.
+If a SOCKS5 proxy returns fake-IP DNS answers, an app's own DNS cache can retain them; use real-IP DNS in the
+proxy to avoid needing to restart that app after disconnecting.
+
 IPv6 is not carried, as for the game: on a dual-stack connection, a selected app can still reach a site over
 IPv6 directly. `npm run vpn:coexist-test` checks both sessions together on a real machine.
 

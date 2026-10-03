@@ -82,6 +82,7 @@ struct Sink {
     path: Option<PathBuf>,
     file: Option<File>,
     written: u64,
+    file_retry_at: Instant,
     /// Also mirror to stderr. The service captures its child's stderr, and a
     /// developer running a component directly expects to see something.
     stderr: bool,
@@ -98,7 +99,9 @@ pub fn log_path(component: &str) -> PathBuf {
     let root = std::env::var_os("PROGRAMDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    root.join("GamePath").join("logs").join(format!("{component}.log"))
+    root.join("GamePath")
+        .join("logs")
+        .join(format!("{component}.log"))
 }
 
 /// Where a non-Windows component writes its log. The relay is the only one that
@@ -113,7 +116,10 @@ pub fn log_path(component: &str) -> PathBuf {
 /// `path` is the log file; `None` logs to stderr only, which is what a test or
 /// a one-shot command wants. Calling this again replaces the previous sink.
 pub fn init(component: &'static str, path: Option<PathBuf>, stderr: bool) {
-    if let Some(level) = std::env::var("GAMEPATH_LOG").ok().and_then(|value| Level::parse(&value)) {
+    if let Some(level) = std::env::var("GAMEPATH_LOG")
+        .ok()
+        .and_then(|value| Level::parse(&value))
+    {
         LEVEL.store(level as u8, Ordering::Relaxed);
     }
     let (file, written) = match &path {
@@ -126,6 +132,7 @@ pub fn init(component: &'static str, path: Option<PathBuf>, stderr: bool) {
         path,
         file,
         written,
+        file_retry_at: Instant::now() + REPEAT_WINDOW,
         stderr,
         repeat: None,
     });
@@ -227,23 +234,57 @@ impl Sink {
         let Some(path) = self.path.clone() else {
             return;
         };
-        if self.written + line.len() as u64 > MAX_BYTES {
+        if self.file.is_none() && Instant::now() >= self.file_retry_at {
+            (self.file, self.written) = open_log(&path);
+            self.file_retry_at = Instant::now() + REPEAT_WINDOW;
+        }
+        if self.file.is_some() && self.written + line.len() as u64 > MAX_BYTES {
             self.rotate(&path);
         }
-        let wrote = self
-            .file
-            .as_mut()
-            .is_some_and(|file| file.write_all(line.as_bytes()).is_ok());
-        if wrote {
-            self.written += line.len() as u64;
+        if let Some(file) = self.file.as_mut() {
+            match file.write_all(line.as_bytes()) {
+                Ok(()) => {
+                    self.written += line.len() as u64;
+                    return;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{} ERROR {} log write failed at {}: {error}; falling back to stderr",
+                        timestamp(),
+                        self.component,
+                        path.display()
+                    );
+                    self.file = None;
+                    self.file_retry_at = Instant::now() + REPEAT_WINDOW;
+                }
+            }
+        }
+        if !self.stderr {
+            let _ = std::io::stderr().write_all(line.as_bytes());
         }
     }
 
     fn rotate(&mut self, path: &Path) {
         self.file = None;
         let previous = path.with_extension("log.1");
-        let _ = std::fs::remove_file(&previous);
-        let _ = std::fs::rename(path, &previous);
+        let rotated = (|| {
+            match std::fs::remove_file(&previous) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error),
+            }
+            std::fs::rename(path, &previous)
+        })();
+        if let Err(error) = rotated {
+            eprintln!(
+                "{} ERROR {} log rotation failed at {}: {error}; falling back to stderr",
+                timestamp(),
+                self.component,
+                path.display()
+            );
+            self.file_retry_at = Instant::now() + REPEAT_WINDOW;
+            return;
+        }
         let (file, written) = open_log(path);
         self.file = file;
         self.written = written;
@@ -251,12 +292,26 @@ impl Sink {
 }
 
 fn open_log(path: &Path) -> (Option<File>, u64) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let opened = (|| {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        OpenOptions::new().create(true).append(true).open(path)
+    })();
+    match opened {
+        Ok(file) => {
+            let written = file.metadata().map(|data| data.len()).unwrap_or(0);
+            (Some(file), written)
+        }
+        Err(error) => {
+            eprintln!(
+                "{} ERROR log unavailable at {}: {error}; falling back to stderr",
+                timestamp(),
+                path.display()
+            );
+            (None, 0)
+        }
     }
-    let file = OpenOptions::new().create(true).append(true).open(path).ok();
-    let written = std::fs::metadata(path).map(|data| data.len()).unwrap_or(0);
-    (file, written)
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ`, so lines sort and diff cleanly and a timestamp
@@ -282,7 +337,11 @@ fn format_timestamp(seconds: u64, millis: u32) -> String {
 /// Days since the Unix epoch to a civil date, by Howard Hinnant's algorithm.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let shifted = days + 719_468;
-    let era = if shifted >= 0 { shifted } else { shifted - 146_096 } / 146_097;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
     let day_of_era = (shifted - era * 146_097) as u64;
     let year_of_era =
         (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
@@ -365,8 +424,14 @@ mod tests {
     #[test]
     fn a_leap_day_is_not_off_by_one() {
         // 2024-02-29T00:00:00Z
-        assert_eq!(format_timestamp(1_709_164_800, 0), "2024-02-29T00:00:00.000Z");
-        assert_eq!(format_timestamp(1_709_251_200, 0), "2024-03-01T00:00:00.000Z");
+        assert_eq!(
+            format_timestamp(1_709_164_800, 0),
+            "2024-02-29T00:00:00.000Z"
+        );
+        assert_eq!(
+            format_timestamp(1_709_251_200, 0),
+            "2024-03-01T00:00:00.000Z"
+        );
     }
 
     #[test]
@@ -402,6 +467,7 @@ mod tests {
             path: None,
             file: None,
             written: 0,
+            file_retry_at: Instant::now() + REPEAT_WINDOW,
             stderr: false,
             repeat: None,
         }
@@ -440,6 +506,39 @@ mod tests {
     }
 
     #[test]
+    fn an_unavailable_log_is_reopened_when_the_path_recovers() {
+        let path = std::env::temp_dir().join(format!(
+            "gamepath-log-recovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let (file, written) = open_log(&path);
+        assert!(file.is_none(), "a directory cannot be opened as a log file");
+        let mut sink = Sink {
+            path: Some(path.clone()),
+            file,
+            written,
+            ..sink("test")
+        };
+        sink.emit(Level::Warn, "failure remains visible on stderr".into());
+        std::fs::remove_dir(&path).unwrap();
+        sink.file_retry_at = Instant::now();
+        sink.emit(Level::Info, "file logging recovered".into());
+        assert!(sink.file.is_some());
+        drop(sink);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("file logging recovered")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rotation_keeps_one_previous_file_and_starts_a_new_one() {
         let directory = std::env::temp_dir().join(format!("gamepath-log-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
@@ -450,6 +549,7 @@ mod tests {
             path: Some(path.clone()),
             file,
             written,
+            file_retry_at: Instant::now() + REPEAT_WINDOW,
             stderr: false,
             repeat: None,
         };

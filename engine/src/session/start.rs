@@ -29,7 +29,6 @@ use gamepath_engine::relay_path::{NodeSpec, RelayPath, SessionMode};
 use gamepath_engine::scheduler::{PathMetrics, Strategy};
 use gamepath_engine::thread_priority;
 use gamepath_engine::timer::HighResolutionTimer;
-use gamepath_engine::uplink::UplinkMonitor;
 use gamepath_engine::{log_info, log_warn};
 use std::net::SocketAddrV4;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -185,25 +184,7 @@ impl WireGuardSessionManager {
             (1_u64 << route_count) - 1
         };
         let decision_mask = Arc::new(AtomicU64::new(initial_mask));
-        let counters = || {
-            Arc::new(
-                (0..route_count)
-                    .map(|_| AtomicU64::new(0))
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let telemetry = PathTelemetry {
-            iterations: counters(),
-            queue_depth: counters(),
-            queue_peak: counters(),
-            dropped: counters(),
-            queue_full_dropped: counters(),
-            stale_dropped: counters(),
-            inbound_dropped: counters(),
-            worker_gap_peak_ms: counters(),
-            healthy_mask: Arc::new(AtomicU64::new(0)),
-            uplink: Arc::new(UplinkMonitor::new()),
-        };
+        let telemetry = PathTelemetry::new(route_count);
         let mut workers = Vec::with_capacity(route_count + 1);
         let (commands, receivers): (Vec<_>, Vec<_>) = (0..route_count)
             .map(|_| mpsc::sync_channel(PATH_QUEUE_DEPTH))
@@ -224,7 +205,11 @@ impl WireGuardSessionManager {
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let local_tap = Arc::new(LocalTap::default());
         let inbound = InboundSink::new(inbound_tx, Arc::clone(&local_tap));
-        let ingress = Arc::new(RelayIngress::new(client_id, session_id));
+        let ingress = Arc::new(RelayIngress::new(
+            client_id,
+            session_id,
+            Arc::clone(&telemetry.packet_diagnostics),
+        ));
         for (index, ((_, _, node, path), command_rx)) in
             paths.into_iter().zip(receivers).enumerate()
         {
@@ -376,18 +361,7 @@ impl WireGuardSessionManager {
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let local_tap = Arc::new(LocalTap::default());
         let inbound = InboundSink::new(inbound_tx, Arc::clone(&local_tap));
-        let telemetry = PathTelemetry {
-            iterations: Arc::new(vec![AtomicU64::new(0)]),
-            queue_depth: Arc::new(vec![AtomicU64::new(0)]),
-            queue_peak: Arc::new(vec![AtomicU64::new(0)]),
-            dropped: Arc::new(vec![AtomicU64::new(0)]),
-            queue_full_dropped: Arc::new(vec![AtomicU64::new(0)]),
-            stale_dropped: Arc::new(vec![AtomicU64::new(0)]),
-            inbound_dropped: Arc::new(vec![AtomicU64::new(0)]),
-            worker_gap_peak_ms: Arc::new(vec![AtomicU64::new(0)]),
-            healthy_mask: Arc::new(AtomicU64::new(0)),
-            uplink: Arc::new(UplinkMonitor::new()),
-        };
+        let telemetry = PathTelemetry::new(1);
         let worker_telemetry = telemetry.clone();
         let dispatch_telemetry = telemetry.clone();
         let worker_stop = Arc::clone(&stop);

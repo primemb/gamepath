@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Instant;
 
 fn ingress() -> RelayIngress {
-    RelayIngress::new([7; 16], 123)
+    RelayIngress::new([7; 16], 123, Arc::default())
 }
 
 fn header(sequence: u64) -> FrameHeader {
@@ -51,6 +51,34 @@ fn slow_duplicate_bursts_cannot_fill_the_game_queue() {
     assert_eq!(rx.try_recv().unwrap(), vec![1]);
     assert_eq!(rx.try_recv().unwrap(), vec![2]);
     assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn replay_diagnostics_warn_for_expired_packets_and_leave_duplicates_quiet() {
+    let diagnostics = Arc::new(gamepath_engine::packet_diagnostics::PacketDiagnostics::default());
+    let ingress = RelayIngress::new([7; 16], 123, Arc::clone(&diagnostics));
+    let (tx, _rx) = mpsc::sync_channel(2);
+    let mut udp = vec![0_u8; 20];
+    udp[0] = 0x45;
+    udp[9] = 17;
+    ingress
+        .enqueue_authenticated(&header(1), udp.clone(), &tx)
+        .unwrap();
+    assert!(
+        !ingress
+            .enqueue_authenticated(&header(1), udp.clone(), &tx)
+            .unwrap()
+    );
+    assert_eq!(diagnostics.status()["relay-return-too-old"]["udp"], 0);
+    ingress
+        .enqueue_authenticated(
+            &header(gamepath_engine::replay::WINDOW + 1),
+            udp.clone(),
+            &tx,
+        )
+        .unwrap();
+    assert!(!ingress.enqueue_authenticated(&header(1), udp, &tx).unwrap());
+    assert_eq!(diagnostics.status()["relay-return-too-old"]["udp"], 1);
 }
 
 #[test]
@@ -314,6 +342,34 @@ fn a_single_path_repair_carries_its_reply_on_its_own() {
             .enqueue_authenticated(&header(1), vec![7; 80], &tx)
             .unwrap()
     );
+}
+
+#[test]
+fn a_rebuilt_udp_reply_rejected_by_the_receiver_is_visible_in_diagnostics() {
+    let diagnostics = Arc::new(gamepath_engine::packet_diagnostics::PacketDiagnostics::default());
+    let ingress = RelayIngress::new([7; 16], 123, Arc::clone(&diagnostics));
+    let (tx, rx) = mpsc::sync_channel(1);
+    tx.try_send(vec![0]).unwrap();
+    let mut udp = [0_u8; 20];
+    udp[0] = 0x45;
+    udp[9] = 17;
+    let mut encoder = Encoder::new(fec::SINGLE_PATH_GROUP, 1400);
+    let now = Instant::now();
+    encoder.push(1, &udp, now);
+    let repair = encoder.flush_due(now + fec::GROUP_MAX_AGE).unwrap();
+    assert!(!ingress.enqueue_repair(&repair_header(2), &repair, &tx));
+    assert_eq!(
+        diagnostics.status()["repair-inbound-queue-rejected"]["udp"],
+        1
+    );
+    assert_eq!(ingress.repair_counters().recovered, 0);
+    rx.try_recv().unwrap();
+    assert!(
+        ingress
+            .enqueue_authenticated(&header(1), udp.to_vec(), &tx)
+            .unwrap()
+    );
+    assert_eq!(rx.try_recv().unwrap(), udp);
 }
 
 #[test]

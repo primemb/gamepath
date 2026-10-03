@@ -104,6 +104,8 @@ fn run_session_summary(
     scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
 ) {
     let route_count = statuses.lock().unwrap().len();
+    let mut packet_reporter = gamepath_engine::packet_diagnostics::Reporter::default();
+    let packet_context = format!("session {session_id}");
     let mut previous_lost = vec![0_u64; route_count];
     let mut previous_dropped = vec![0_u64; route_count];
     let mut previous_sent = vec![0_u64; route_count];
@@ -112,9 +114,14 @@ fn run_session_summary(
     let mut reported_full = vec![0_u64; route_count];
     let mut reported_stale = vec![0_u64; route_count];
     let mut reported_inbound = vec![0_u64; route_count];
+    let mut reported_send_failed = vec![0_u64; route_count];
+    let mut reported_stream_stale = vec![0_u64; route_count];
+    let mut reported_stream_full = vec![0_u64; route_count];
     let mut last_drop_log: Option<Instant> = None;
     let mut next = Instant::now() + SESSION_SUMMARY_INTERVAL;
-    while !stop.load(Ordering::Acquire) {
+    loop {
+        let stopping = stop.load(Ordering::Acquire);
+        packet_reporter.poll(&telemetry.packet_diagnostics, &packet_context, stopping);
         let observed_at = Instant::now();
         let current_dropped = telemetry
             .dropped
@@ -126,8 +133,9 @@ fn run_session_summary(
             .zip(&reported_dropped)
             .any(|(current, reported)| current > reported);
         if has_new_drops
-            && last_drop_log
-                .is_none_or(|logged| observed_at.duration_since(logged) >= DROP_LOG_INTERVAL)
+            && (stopping
+                || last_drop_log
+                    .is_none_or(|logged| observed_at.duration_since(logged) >= DROP_LOG_INTERVAL))
         {
             let details = (0..route_count)
                 .filter_map(|index| {
@@ -136,18 +144,27 @@ fn run_session_summary(
                         let full = telemetry.queue_full_dropped[index].load(Ordering::Relaxed);
                         let stale = telemetry.stale_dropped[index].load(Ordering::Relaxed);
                         let inbound = telemetry.inbound_dropped[index].load(Ordering::Relaxed);
+                        let send_failed = telemetry.send_failed[index].load(Ordering::Relaxed);
+                        let stream_stale = telemetry.stream_stale[index].load(Ordering::Relaxed);
+                        let stream_full = telemetry.stream_full[index].load(Ordering::Relaxed);
                         let detail = format!(
-                            "{}:+{total} (full +{}, stale +{}, inbound +{}, q={}, peak={})",
+                            "{}:+{total} (full +{}, stale +{}, inbound +{}, send-failed +{}, stream-stale +{}, stream-full +{}, q={}, peak={})",
                             index + 1,
                             full.saturating_sub(reported_full[index]),
                             stale.saturating_sub(reported_stale[index]),
                             inbound.saturating_sub(reported_inbound[index]),
+                            send_failed.saturating_sub(reported_send_failed[index]),
+                            stream_stale.saturating_sub(reported_stream_stale[index]),
+                            stream_full.saturating_sub(reported_stream_full[index]),
                             telemetry.queue_depth[index].load(Ordering::Relaxed),
                             telemetry.queue_peak[index].load(Ordering::Relaxed),
                         );
                         reported_full[index] = full;
                         reported_stale[index] = stale;
                         reported_inbound[index] = inbound;
+                        reported_send_failed[index] = send_failed;
+                        reported_stream_stale[index] = stream_stale;
+                        reported_stream_full[index] = stream_full;
                         detail
                     })
                 })
@@ -156,6 +173,9 @@ fn run_session_summary(
             log_warn!("session {session_id} packet shedding by route: {details}");
             reported_dropped.clone_from(&current_dropped);
             last_drop_log = Some(observed_at);
+        }
+        if stopping {
+            break;
         }
         if observed_at < next {
             thread::sleep(Duration::from_millis(250));
@@ -198,7 +218,7 @@ fn run_session_summary(
                 format!(
                     "{}:{}{} relay-rtt={relay_rtt} ewma={ewma:.0}ms jitter={jitter:.0}ms \
                      loss-ewma={loss:.0}% probes-lost={} (+{lost_delta}) q={}/peak={} \
-                     drop={dropped} (+{dropped_delta}; full={} stale={} inbound={}) \
+                     drop={dropped} (+{dropped_delta}; full={} stale={} inbound={} send-failed={} stream-stale={} stream-full={}) \
                      packets=+{sent_delta}/+{received_delta} worker-gap-peak={}ms",
                     path.route,
                     if path.reachable { "up" } else { "down" },
@@ -209,6 +229,9 @@ fn run_session_summary(
                     telemetry.queue_full_dropped[index].load(Ordering::Relaxed),
                     telemetry.stale_dropped[index].load(Ordering::Relaxed),
                     telemetry.inbound_dropped[index].load(Ordering::Relaxed),
+                    telemetry.send_failed[index].load(Ordering::Relaxed),
+                    telemetry.stream_stale[index].load(Ordering::Relaxed),
+                    telemetry.stream_full[index].load(Ordering::Relaxed),
                     telemetry.worker_gap_peak_ms[index].load(Ordering::Relaxed),
                 )
             })
@@ -219,4 +242,5 @@ fn run_session_summary(
             telemetry.uplink.state()
         );
     }
+    packet_reporter.poll(&telemetry.packet_diagnostics, &packet_context, true);
 }

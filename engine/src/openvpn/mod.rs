@@ -142,6 +142,10 @@ impl UserSpaceOpenVpnPath {
         self.session.handshake_latency_ms()
     }
 
+    pub fn take_transport_drops(&mut self) -> [u64; 2] {
+        self.session.take_transport_drops()
+    }
+
     pub fn send_inner(&mut self, packet: &[u8]) -> Result<(), String> {
         self.session.send_inner(packet)
     }

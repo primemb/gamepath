@@ -9,37 +9,11 @@
 //! (`close_tcp_connections.cpp`).
 
 use std::net::{Ipv4Addr, SocketAddrV4};
-
-/// `MIB_TCP_STATE_ESTAB`.
-const ESTABLISHED: u32 = 5;
-/// `MIB_TCP_STATE_DELETE_TCB`: the one state `SetTcpEntry` accepts. It sends
-/// the peer a reset and fails the application's socket.
-const DELETE_TCB: u32 = 12;
-/// `TCP_TABLE_OWNER_PID_CONNECTIONS`: connections only, no listeners.
-const OWNER_PID_CONNECTIONS: u32 = 4;
-const AF_INET: u32 = 2;
-
-#[repr(C)]
-struct MibTcpRow {
-    state: u32,
-    local_address: u32,
-    local_port: u32,
-    remote_address: u32,
-    remote_port: u32,
-}
-
-#[link(name = "iphlpapi")]
-unsafe extern "system" {
-    fn GetExtendedTcpTable(
-        table: *mut std::ffi::c_void,
-        size: *mut u32,
-        order: i32,
-        family: u32,
-        table_class: u32,
-        reserved: u32,
-    ) -> u32;
-    fn SetTcpEntry(row: *const MibTcpRow) -> u32;
-}
+use windows_sys::Win32::Foundation::NO_ERROR;
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB, MIB_TCPROW_LH, MIB_TCPROW_LH_0, SetTcpEntry,
+    TCP_TABLE_OWNER_PID_CONNECTIONS,
+};
 
 pub(crate) struct Connection {
     pub(crate) local: SocketAddrV4,
@@ -52,27 +26,27 @@ pub(crate) struct Connection {
 
 /// Every established IPv4 TCP connection, with the process that owns it.
 pub(crate) fn established() -> Vec<Connection> {
-    let Some(buffer) = crate::split_capture::ip_table(|table, size| unsafe {
-        GetExtendedTcpTable(table, size, 0, AF_INET, OWNER_PID_CONNECTIONS, 0)
-    }) else {
+    let Some(rows) = crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_CONNECTIONS) else {
         return Vec::new();
     };
-    // MIB_TCPROW_OWNER_PID: state, local address and port, remote address and
-    // port, process id. Addresses are in network order, ports in the low word.
-    crate::split_capture::dword_rows(&buffer, 6)
-        .into_iter()
-        .filter(|row| row[0] == ESTABLISHED && row[5] != 0)
+    rows.into_iter()
+        .filter(|row| row.dwState == MIB_TCP_STATE_ESTAB as u32 && row.dwOwningPid != 0)
         .map(|row| Connection {
             local: SocketAddrV4::new(
-                Ipv4Addr::from(row[1].to_ne_bytes()),
-                crate::split_capture::port_from_dword(row[2]),
+                Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()),
+                crate::split_capture::port_from_dword(row.dwLocalPort),
             ),
             remote: SocketAddrV4::new(
-                Ipv4Addr::from(row[3].to_ne_bytes()),
-                crate::split_capture::port_from_dword(row[4]),
+                Ipv4Addr::from(row.dwRemoteAddr.to_ne_bytes()),
+                crate::split_capture::port_from_dword(row.dwRemotePort),
             ),
-            process_id: row[5],
-            raw: [row[1], row[2], row[3], row[4]],
+            process_id: row.dwOwningPid,
+            raw: [
+                row.dwLocalAddr,
+                row.dwLocalPort,
+                row.dwRemoteAddr,
+                row.dwRemotePort,
+            ],
         })
         .collect()
 }
@@ -80,20 +54,70 @@ pub(crate) fn established() -> Vec<Connection> {
 /// Ends `connection`. Needs administrator rights, which the session engine
 /// has. A connection that closed meanwhile is simply not found.
 pub(crate) fn close(connection: &Connection) -> bool {
-    let row = MibTcpRow {
-        state: DELETE_TCB,
-        local_address: connection.raw[0],
-        local_port: connection.raw[1],
-        remote_address: connection.raw[2],
-        remote_port: connection.raw[3],
+    let row = MIB_TCPROW_LH {
+        Anonymous: MIB_TCPROW_LH_0 {
+            State: MIB_TCP_STATE_DELETE_TCB,
+        },
+        dwLocalAddr: connection.raw[0],
+        dwLocalPort: connection.raw[1],
+        dwRemoteAddr: connection.raw[2],
+        dwRemotePort: connection.raw[3],
     };
-    unsafe { SetTcpEntry(&row) == 0 }
+    unsafe { SetTcpEntry(&row) == NO_ERROR }
+}
+
+pub(crate) fn close_matching(matches: impl Fn(&Connection) -> bool) -> usize {
+    established()
+        .iter()
+        .filter(|connection| matches(connection) && close(connection))
+        .count()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    #[test]
+    #[ignore = "SetTcpEntry requires an elevated shell; uses only temporary loopback sockets"]
+    fn closing_a_selected_connection_wakes_its_app_and_leaves_other_sockets_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut selected = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _selected_server = listener.accept().unwrap();
+        let mut untouched = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut untouched_server, _) = listener.accept().unwrap();
+        selected
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        untouched
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let local = selected.local_addr().unwrap();
+        let remote = selected.peer_addr().unwrap();
+        let selected_only = |connection: &Connection| {
+            std::net::SocketAddr::V4(connection.local) == local
+                && std::net::SocketAddr::V4(connection.remote) == remote
+                && connection.process_id == std::process::id()
+        };
+        assert_eq!(close_matching(selected_only), 1);
+        assert!(!established().iter().any(selected_only));
+        let mut buffer = [0];
+        match selected.read(&mut buffer) {
+            Ok(0) => {}
+            Err(error) => assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )),
+            result => panic!("the application should see its connection ended: {result:?}"),
+        }
+        untouched_server.write_all(b"x").unwrap();
+        untouched.read_exact(&mut buffer).unwrap();
+        assert_eq!(buffer, *b"x");
+    }
 
     /// Addresses, ports and the owner come back as the socket API sees them.
     #[test]
