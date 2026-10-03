@@ -322,7 +322,8 @@ way: a browser, a chat client or a launcher's store can use a VPN while the game
 everything else keeps the normal connection.
 
 - **One node, connected directly.** WireGuard, OpenVPN, L2TP/IPsec or SOCKS5. Nothing is duplicated and no
-  relay is involved. Adding a node while one is saved replaces it; a running VPN reconnects through the new one.
+  relay is involved. Save multiple nodes and select one at a time. Adding a node keeps the current selection;
+  selecting another reconnects a running VPN through it. Removing an unused node leaves the connection alone.
 - **Its own targets.** Applications, folders, websites and IP ranges, exactly like the game's split rules, or
   all traffic except the game. Edits apply live, without reconnecting.
 - **The game always comes first.** Whatever the game session selects goes through the game, even if the VPN

@@ -3,7 +3,7 @@ const test = require('node:test')
 const { createVpnFeature } = require('./vpn-ipc.cjs')
 const { defaultVpn } = require('./vpn-state.cjs')
 
-function harness({ service: script = {}, game = { status: 'idle' }, gameMode = 'split' } = {}) {
+function harness({ service: script = {}, game = { status: 'idle' }, gameMode = 'split', saved = {} } = {}) {
   const handlers = new Map()
   const state = {
     session: game,
@@ -11,6 +11,7 @@ function harness({ service: script = {}, game = { status: 'idle' }, gameMode = '
     rules: [{ id: 'g', kind: 'application', value: 'C:\\Games\\game.exe', enabled: true, groupId: null }],
     ruleGroups: [],
     vpn: defaultVpn(),
+    ...saved,
   }
   const calls = []
   const service = {
@@ -56,8 +57,8 @@ const l2tp = { server: 'office.example', preSharedKey: 'psk', username: 'me', pa
 test('a node is stored sealed and never appears in what the window sees', async () => {
   const { state, invoke } = harness()
   const result = await invoke('vpn:add-socks5', { ...socks5, username: 'user', password: 'secret' })
-  assert.equal(state.vpn.node.kind, 'socks5')
-  assert.match(state.encryptedVpnConfig, /^sealed:/)
+  assert.equal(result.vpn.node.kind, 'socks5')
+  assert.match(state.encryptedVpnConfigs[result.vpn.node.id], /^sealed:/)
   assert.doesNotMatch(JSON.stringify(result), /secret/)
 })
 
@@ -153,9 +154,107 @@ test('removing the node turns the VPN off and forgets its secret', async () => {
   await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example' })
   await invoke('vpn:connect')
   await invoke('vpn:remove-node')
-  assert.equal(state.vpn.node, null)
-  assert.equal(state.encryptedVpnConfig, undefined)
+  assert.deepEqual(state.vpn.nodes, [])
+  assert.equal(state.vpn.selectedNodeId, null)
+  assert.deepEqual(state.encryptedVpnConfigs, {})
   assert.equal(state.vpn.wantConnected, false)
+})
+
+test('adding and removing an unused node keeps the running VPN untouched', async () => {
+  const { feature, invoke, calls, state } = harness()
+  const first = (await invoke('vpn:add-socks5', socks5)).vpn.node
+  await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example' })
+  await invoke('vpn:connect')
+  const sessionId = feature.publicVpn().session.sessionId
+  const before = calls.length
+  const added = await invoke('vpn:add-socks5', {
+    address: 'second.example:1081',
+    username: 'other',
+    password: 'second-secret',
+  })
+  const other = added.vpn.nodes.find((node) => node.id !== first.id)
+  assert.equal(added.vpn.nodes.length, 2)
+  assert.equal(added.vpn.node.id, first.id)
+  assert.equal(added.vpn.session.sessionId, sessionId)
+  assert.equal(calls.length, before)
+  assert.doesNotMatch(JSON.stringify(added), /second-secret/)
+  await invoke('vpn:test-socks5', undefined, other.id)
+  assert.equal(calls.at(-1).payload.host, 'second.example')
+  assert.equal(calls.at(-1).payload.username, 'other')
+  const afterTest = calls.length
+  const removed = await invoke('vpn:remove-node', other.id)
+  assert.equal(removed.vpn.node.id, first.id)
+  assert.equal(removed.vpn.session.sessionId, sessionId)
+  assert.equal(calls.length, afterTest)
+  assert.equal(state.encryptedVpnConfigs[other.id], undefined)
+  assert.ok(state.encryptedVpnConfigs[first.id])
+})
+
+test('switching saved nodes stops the old path before starting only the selected path', async () => {
+  const { invoke, calls, feature } = harness()
+  const first = (await invoke('vpn:add-socks5', socks5)).vpn.node
+  const second = (
+    await invoke('vpn:add-socks5', { address: 'second.example:1081', username: 'second', password: 'pw' })
+  ).vpn.nodes.find((node) => node.id !== first.id)
+  await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example' })
+  await invoke('vpn:connect')
+  const before = calls.length
+  const selected = await invoke('vpn:select-node', second.id)
+  assert.deepEqual(
+    calls.slice(before).map((call) => call.command),
+    ['stop-session', 'validate-runtime', 'start-session'],
+  )
+  const start = calls.at(-1).payload
+  assert.equal(start.slot, 'vpn')
+  assert.equal(start.nodes.length, 1)
+  assert.equal(start.nodes[0].host, 'second.example')
+  assert.equal(start.nodes[0].username, 'second')
+  assert.equal(selected.vpn.session.node.id, second.id)
+  assert.equal(selected.vpn.session.status, 'connected')
+  assert.equal(selected.vpn.nodes.filter((node) => node.enabled).length, 1)
+  const after = calls.length
+  await invoke('vpn:select-node', second.id)
+  assert.equal(calls.length, after)
+  await invoke('vpn:disconnect')
+  const off = calls.length
+  await invoke('vpn:select-node', first.id)
+  assert.equal(calls.length, off)
+  assert.equal(feature.publicVpn().session.status, 'idle')
+})
+
+test('an incompatible selection does not disturb the current node or connection', async () => {
+  const { invoke, calls } = harness()
+  const first = (await invoke('vpn:add-socks5', socks5)).vpn.node
+  const saved = await invoke('vpn:add-l2tp', l2tp)
+  const second = saved.vpn.nodes.find((node) => node.id !== first.id)
+  await invoke('vpn:add-rule', { kind: 'application', value: 'C:\\Apps\\chat.exe' })
+  const connected = await invoke('vpn:connect')
+  const before = calls.length
+  await assert.rejects(invoke('vpn:select-node', second.id), /cannot select applications/)
+  await assert.rejects(invoke('vpn:select-node', 'missing'), /no longer exists/)
+  const current = await invoke('vpn:status')
+  assert.equal(current.vpn.node.id, first.id)
+  assert.equal(current.vpn.session.sessionId, connected.vpn.session.sessionId)
+  assert.equal(calls.length, before)
+})
+
+test('removing the selected node stops the VPN and keeps the remaining node and secret', async () => {
+  const { state, invoke, calls } = harness()
+  const first = (await invoke('vpn:add-socks5', socks5)).vpn.node
+  const second = (await invoke('vpn:add-socks5', { address: 'second.example:1081' })).vpn.nodes.find(
+    (node) => node.id !== first.id,
+  )
+  await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example' })
+  await invoke('vpn:connect')
+  const before = calls.length
+  const removed = await invoke('vpn:remove-node', first.id)
+  assert.equal(calls.length, before + 1)
+  assert.equal(calls.at(-1).command, 'stop-session')
+  assert.equal(removed.vpn.node.id, second.id)
+  assert.equal(removed.vpn.session.status, 'idle')
+  assert.equal(removed.vpn.wantConnected, false)
+  assert.equal(state.encryptedVpnConfigs[first.id], undefined)
+  assert.ok(state.encryptedVpnConfigs[second.id])
 })
 
 test('a SOCKS5 proxy is tested through the engine, not the relay', async () => {
@@ -170,4 +269,59 @@ test('a SOCKS5 proxy is tested through the engine, not the relay', async () => {
   await invoke('vpn:add-socks5', { address: 'saved.example:1080', username: 'saved', password: 'secret' })
   await invoke('vpn:test-socks5')
   assert.equal(calls.at(-1).payload.username, 'saved')
+})
+
+test('a restored legacy VPN reconnects with its original encrypted configuration', async () => {
+  const saved = {
+    vpn: {
+      node: { id: 'legacy', name: 'Legacy proxy', kind: 'socks5', host: 'legacy.example', port: 1080 },
+      rules: [{ id: 'target', kind: 'hostname', value: 'news.example', enabled: true }],
+      wantConnected: true,
+    },
+    encryptedVpnConfig: 'sealed:{"username":"original","password":"secret"}',
+  }
+  const { feature, calls } = harness({ saved })
+  await feature.resume()
+  assert.equal(feature.publicVpn().selectedNodeId, 'legacy')
+  assert.equal(feature.publicVpn().session.status, 'connected')
+  assert.equal(calls.at(-1).payload.nodes[0].host, 'legacy.example')
+  assert.equal(calls.at(-1).payload.nodes[0].username, 'original')
+  assert.doesNotMatch(JSON.stringify(feature.publicVpn()), /secret/)
+})
+
+test('rapid selections are serialized and each start carries exactly one node', async () => {
+  const { invoke, calls } = harness()
+  const first = (await invoke('vpn:add-socks5', socks5)).vpn.node
+  const second = (await invoke('vpn:add-socks5', { address: 'second.example:1081' })).vpn.nodes.find(
+    (node) => node.id !== first.id,
+  )
+  await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example' })
+  await invoke('vpn:connect')
+  await Promise.all([invoke('vpn:select-node', second.id), invoke('vpn:select-node', first.id)])
+  const starts = calls.filter((call) => call.command === 'start-session')
+  assert.deepEqual(
+    starts.map((call) => call.payload.nodes.map((node) => node.host)),
+    [['proxy.example'], ['second.example'], ['proxy.example']],
+  )
+  const result = await invoke('vpn:status')
+  assert.equal(result.vpn.node.id, first.id)
+  assert.equal(result.vpn.session.node.id, first.id)
+})
+
+test('switching while paused keeps the VPN out of the games way and resumes the new node', async () => {
+  const { invoke, calls, state, feature } = harness({ game: { status: 'connected' }, gameMode: 'all' })
+  const first = (await invoke('vpn:add-socks5', socks5)).vpn.node
+  const second = (await invoke('vpn:add-socks5', { address: 'second.example:1081' })).vpn.nodes.find(
+    (node) => node.id !== first.id,
+  )
+  await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example' })
+  await invoke('vpn:connect')
+  const result = await invoke('vpn:select-node', second.id)
+  assert.equal(result.vpn.session.status, 'paused')
+  assert.equal(result.vpn.wantConnected, true)
+  assert.equal(calls.length, 0)
+  state.session = { status: 'idle' }
+  await feature.gameChanged()
+  assert.equal(calls.at(-1).payload.nodes[0].host, 'second.example')
+  assert.ok(calls.every((call) => call.payload.slot === 'vpn'))
 })

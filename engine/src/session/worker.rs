@@ -86,6 +86,43 @@ pub(crate) const WORKER_GAP_WARN: Duration = Duration::from_millis(100);
 
 pub(crate) const WORKER_GAP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Where one pass of a path worker spent its time. A gap is the pass before
+/// it running long, so it is reported with that pass's breakdown: the socket,
+/// the shared status lock, redial bookkeeping, or Windows not running the
+/// thread mid-phase, which shows as one phase long with nothing in it.
+#[derive(Default)]
+pub(crate) struct PassProfile {
+    /// Health, redial and status bookkeeping before the send queue.
+    pub(crate) bookkeeping: Duration,
+    pub(crate) socket_send: Duration,
+    pub(crate) status_lock: Duration,
+    pub(crate) frames_sent: u32,
+    pub(crate) probe: Duration,
+    pub(crate) receive: Duration,
+    pub(crate) total: Duration,
+}
+
+impl std::fmt::Display for PassProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        let phases =
+            self.bookkeeping + self.socket_send + self.status_lock + self.probe + self.receive;
+        write!(
+            formatter,
+            "pass {:.1} ms: bookkeeping {:.1}, send {:.1} over {} frame(s), status lock {:.1}, \
+             probe {:.1}, receive {:.1}, rest {:.1}",
+            ms(self.total),
+            ms(self.bookkeeping),
+            ms(self.socket_send),
+            self.frames_sent,
+            ms(self.status_lock),
+            ms(self.probe),
+            ms(self.receive),
+            ms(self.total.saturating_sub(phases)),
+        )
+    }
+}
+
 /// Sends at most [`PATH_SEND_BATCH`] queued packets, shedding any that waited
 /// past `max_age`, and returns without draining the rest so the caller can
 /// service inbound frames, probes and timers.
@@ -130,6 +167,24 @@ pub(crate) fn drain_send_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slow_pass_says_which_phase_held_it() {
+        let pass = PassProfile {
+            bookkeeping: Duration::from_micros(300),
+            socket_send: Duration::from_millis(190),
+            status_lock: Duration::from_micros(200),
+            frames_sent: 12,
+            probe: Duration::ZERO,
+            receive: Duration::from_millis(1),
+            total: Duration::from_millis(200),
+        };
+        assert_eq!(
+            pass.to_string(),
+            "pass 200.0 ms: bookkeeping 0.3, send 190.0 over 12 frame(s), status lock 0.2, \
+             probe 0.0, receive 1.0, rest 8.5"
+        );
+    }
 
     fn queued(frame: Vec<u8>, age: Duration) -> PathCommand {
         PathCommand {

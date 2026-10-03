@@ -6,15 +6,12 @@
 //! everything on this path is deliberately lock-light.
 
 use super::WireGuardSessionManager;
-use super::health::selected_paths;
-use super::state::SessionOverlay;
 use crate::icmp::{icmp_echo_packet, icmp_reply_sequence};
 use gamepath_engine::relay_path::SessionMode;
 use gamepath_engine::userspace_wireguard::{ipv4_udp_packet, ipv4_udp_payload};
 use gamepath_engine::{dns, log_warn};
 use serde_json::{Value, json};
 use std::net::Ipv4Addr;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// How long the resolver probe waits. Short on purpose: it sits on the connect
@@ -104,19 +101,14 @@ impl WireGuardSessionManager {
             SessionMode::Relay => Duration::from_secs(8),
             SessionMode::Direct => Duration::from_secs(2),
         };
-        let reply = match self.send_data_packet(&request, timeout) {
-            Ok(reply)
-                if icmp_reply_sequence(&reply, benchmark_server, virtual_ipv4, identifier)
-                    == Some(1) =>
-            {
-                reply
-            }
-            outcome => {
+        let answers = |reply: &[u8]| {
+            icmp_reply_sequence(reply, benchmark_server, virtual_ipv4, identifier) == Some(1)
+        };
+        let reply = match self.exchange_data_packet(&request, timeout, answers) {
+            Ok(reply) => reply,
+            Err(error) => {
                 if mode == SessionMode::Relay {
-                    return Err(match outcome {
-                        Ok(_) => "relay data plane returned an unexpected packet".to_owned(),
-                        Err(error) => error,
-                    });
+                    return Err(error);
                 }
                 return Ok(json!({
                     "reachable": false,
@@ -156,67 +148,44 @@ impl WireGuardSessionManager {
         }))
     }
 
-    fn send_data_packet(&mut self, packet: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
+    /// Sends `packet` and waits for the reply `answers` accepts. Anything else
+    /// the tunnel delivers meanwhile (a late reply, a packet for a flow from
+    /// before) is skipped rather than taken for the answer: observed live, one
+    /// such packet arriving first failed a session start outright.
+    fn exchange_data_packet(
+        &mut self,
+        packet: &[u8],
+        timeout: Duration,
+        answers: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<u8>, String> {
         self.enqueue_data_packet(packet)?;
         let deadline = Instant::now() + timeout;
+        let mut skipped = 0_usize;
+        let mut first_skipped = None;
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if let Some(packet) = self.receive_data_packet(remaining)? {
-                return Ok(packet);
+            let Some(reply) = self.receive_data_packet(remaining)? else {
+                continue;
+            };
+            if answers(&reply) {
+                return Ok(reply);
             }
+            skipped += 1;
+            first_skipped.get_or_insert_with(|| describe_packet(&reply));
         }
-        Err("no path returned the relayed packet before timeout".into())
+        Err(match first_skipped {
+            Some(first) => format!(
+                "no path returned the relayed packet before timeout; {skipped} other packet(s) \
+                 arrived instead, the first {first}"
+            ),
+            None => "no path returned the relayed packet before timeout".into(),
+        })
     }
 
     pub(crate) fn enqueue_data_packet(&mut self, packet: &[u8]) -> Result<bool, String> {
-        use gamepath_engine::protocol::FrameHeader;
-
-        let session = self
-            .active
-            .as_mut()
-            .ok_or("start the WireGuard session before sending packets")?;
-        let (frame, sequence) = match &session.overlay {
-            SessionOverlay::Relay { client_id, crypto } => {
-                let sequence = session.sequences.fetch_add(1, Ordering::Relaxed);
-                let header = FrameHeader {
-                    flags: 0,
-                    client_id: *client_id,
-                    session_id: session.session_id,
-                    sequence,
-                };
-                (crypto.seal_client(header, packet)?, Some(sequence))
-            }
-            // The node routes the packet as it stands, so there is nothing to
-            // wrap it in and no sequence for anyone to compare copies by.
-            SessionOverlay::Direct => (packet.to_vec(), None),
-        };
-        // The scheduler's pick, narrowed to the paths that are actually
-        // carrying traffic. A path that never came up would otherwise take a
-        // copy of every packet and throw it away.
-        let decision = session.decision_mask.load(Ordering::Acquire);
-        let healthy = session.telemetry.healthy_mask.load(Ordering::Acquire);
-        let dispatched = session
-            .dispatch
-            .send(frame, selected_paths(decision, healthy));
-        // Nothing to send down. Split mode reads this as the relay being
-        // unavailable and lets the packet take the normal route; that fail-open
-        // is only correct here, when no path was ever chosen. A packet dropped
-        // because every chosen path is saturated must not bypass: half a flow
-        // arriving from a different source address breaks it at the server.
-        if dispatched.selected == 0 {
-            return Err("no active path workers accepted the packet".into());
-        }
-        // Covered even when every chosen queue was full: the relay can still
-        // rebuild it from the repair, and it was never going to bypass.
-        if let (Some(repair), Some(sequence)) = (&session.loss_repair, sequence) {
-            repair.protect(sequence, packet);
-        }
-        if dispatched.accepted > 0 {
-            session
-                .user_bytes_sent
-                .fetch_add(packet.len() as u64, Ordering::Relaxed);
-        }
-        Ok(dispatched.accepted > 0)
+        self.data_sender()
+            .ok_or("start the WireGuard session before sending packets")?
+            .send(packet)
     }
 
     fn receive_data_packet(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
@@ -226,4 +195,19 @@ impl WireGuardSessionManager {
             .ok_or("start the WireGuard session before receiving packets")?;
         session.data_receiver.receive(timeout)
     }
+}
+
+/// Protocol and source of a packet, for saying what arrived instead.
+fn describe_packet(packet: &[u8]) -> String {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return format!("a {}-byte non-IPv4 packet", packet.len());
+    }
+    let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let protocol = match packet[9] {
+        1 => "ICMP".to_owned(),
+        6 => "TCP".to_owned(),
+        17 => "UDP".to_owned(),
+        other => format!("protocol {other}"),
+    };
+    format!("{protocol} from {source}, {} bytes", packet.len())
 }

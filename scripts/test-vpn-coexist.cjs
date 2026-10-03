@@ -21,6 +21,7 @@ const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { ServiceBridge } = require('../electron/service.cjs')
 const { nodeSpec } = require('../electron/node-spec.cjs')
+const { migrateVpnState, selectedVpnNode } = require('../electron/vpn-state.cjs')
 
 app.setName('gamepath-client')
 
@@ -81,7 +82,10 @@ app
     if (!relay?.address || !state.encryptedRelayTokens?.[relay.id] || !tunnels.length) {
       throw new Error('Configure a relay and enable at least one WireGuard node first')
     }
-    if (!state.vpn?.node || !state.encryptedVpnConfig) throw new Error('Save a VPN node first')
+    migrateVpnState(state)
+    const vpnNode = selectedVpnNode(state.vpn)
+    const vpnSecret = vpnNode && state.encryptedVpnConfigs[vpnNode.id]
+    if (!vpnNode || !vpnSecret) throw new Error('Save a VPN node first')
 
     const service = new ServiceBridge()
     const echoHost = new URL(IP_ECHO).hostname
@@ -105,7 +109,7 @@ app
       remoteDns: false,
       killSwitch: false,
       rules: [{ kind: 'ip', value: `${echoIp}/32` }],
-      nodes: [nodeSpec(state.vpn.node, decrypt(state.encryptedVpnConfig))],
+      nodes: [nodeSpec(vpnNode, decrypt(vpnSecret))],
     }
     try {
       await service.request('start-session', game, 30000)

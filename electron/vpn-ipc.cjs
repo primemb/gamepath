@@ -18,6 +18,8 @@ const {
   createRule,
   ruleConflicts,
   activeGameRules,
+  selectedVpnNode,
+  migrateVpnState,
 } = require('./vpn-state.cjs')
 
 /**
@@ -44,11 +46,19 @@ function createVpnFeature({
 }) {
   const state = () => getState()
   const vpn = () => state().vpn
+  migrateVpnState(state())
   // Set between the game deciding to start in all-traffic mode and its
   // session existing, so the VPN is already out of the way when it does.
   let gameStartingAllTraffic = false
   let offeredOpenVpnFile = null
   let ruleQueue = Promise.resolve()
+  let nodeQueue = Promise.resolve()
+
+  function changeNodes(change) {
+    const operation = nodeQueue.then(change)
+    nodeQueue = operation.catch(() => {})
+    return operation
+  }
 
   // The running game keeps the traffic mode it started with; the saved
   // setting can change under it and only applies to its next start.
@@ -60,15 +70,15 @@ function createVpnFeature({
 
   function buildRequest() {
     const settings = vpn()
-    if (!settings.node) throw new VpnConfigError('Add a VPN node first.')
+    const node = selectedVpnNode(settings)
+    if (!node) throw new VpnConfigError('Add a VPN node first.')
     const [blocked] = unroutableRules(settings)
-    if (blocked)
-      throw new VpnConfigError(ruleLimitation(settings.node, settings.trafficMode, blocked.kind, blocked.value))
+    if (blocked) throw new VpnConfigError(ruleLimitation(node, settings.trafficMode, blocked.kind, blocked.value))
     const rules = vpnRuleSpecs(settings)
     if (settings.trafficMode === 'split' && !rules.length) {
       throw new VpnConfigError('Add at least one app or website for the VPN, or switch it to all traffic.')
     }
-    const stored = state().encryptedVpnConfig
+    const stored = state().encryptedVpnConfigs[node.id]
     let secret
     try {
       secret = stored && decrypt(stored)
@@ -76,10 +86,10 @@ function createVpnFeature({
       secret = null
     }
     if (!secret) {
-      throw new VpnConfigError(`${settings.node.name} is missing its stored secret. Remove it and add it again.`)
+      throw new VpnConfigError(`${node.name} is missing its stored secret. Remove it and add it again.`)
     }
     return {
-      node: settings.node,
+      node,
       request: {
         mode: 'direct',
         trafficMode: settings.trafficMode,
@@ -87,7 +97,7 @@ function createVpnFeature({
         remoteDns: settings.remoteDns,
         ownHostnames: ownHostnames(state()),
         killSwitch: settings.killSwitch,
-        nodes: [nodeSpec(settings.node, secret)],
+        nodes: [nodeSpec(node, secret)],
       },
     }
   }
@@ -103,17 +113,19 @@ function createVpnFeature({
 
   function publicVpn() {
     const settings = vpn()
+    const node = selectedVpnNode(settings)
     const limitations = Object.fromEntries(
       settings.rules
-        .map((rule) => [rule.id, ruleLimitation(settings.node, settings.trafficMode, rule.kind, rule.value)])
+        .map((rule) => [rule.id, ruleLimitation(node, settings.trafficMode, rule.kind, rule.value)])
         .filter(([, limitation]) => limitation),
     )
     return {
       ...settings,
+      node,
       session: controller.snapshot(),
       conflicts: ruleConflicts(settings.rules, activeGameRules(state().rules, state().ruleGroups)),
       limitations,
-      canSelectApps: !(settings.node?.kind === 'l2tp' && settings.trafficMode === 'split'),
+      canSelectApps: !(node?.kind === 'l2tp' && settings.trafficMode === 'split'),
     }
   }
 
@@ -125,11 +137,37 @@ function createVpnFeature({
   }
 
   function setNode(node, secret) {
-    const replacing = vpn().node
-    vpn().node = { ...node, enabled: true }
-    state().encryptedVpnConfig = encrypt(secret)
-    logger.scope('vpn').info(`${replacing ? 'node replaced' : 'node added'}: kind=${node.kind}`)
-    return saveAndReconnect('the VPN node changed')
+    return changeNodes(() => {
+      const sealed = encrypt(secret)
+      const selected = !selectedVpnNode(vpn())
+      vpn().nodes.push({ ...node, enabled: selected })
+      if (selected) vpn().selectedNodeId = node.id
+      state().encryptedVpnConfigs[node.id] = sealed
+      logger.scope('vpn').info(`node added: kind=${node.kind} selected=${selected}`)
+      saveState()
+      return publicState()
+    })
+  }
+
+  function selectNode(id) {
+    return changeNodes(async () => {
+      const node = vpn().nodes.find((item) => item.id === id)
+      if (!node) throw new Error('That VPN node no longer exists.')
+      if (id === vpn().selectedNodeId) return publicState()
+      const blocked = vpn().rules.find(
+        (rule) => rule.enabled && ruleLimitation(node, vpn().trafficMode, rule.kind, rule.value),
+      )
+      if (blocked) throw new Error(ruleLimitation(node, vpn().trafficMode, blocked.kind, blocked.value))
+      if (!state().encryptedVpnConfigs[id])
+        throw new Error('That VPN node is missing its stored secret. Remove it and add it again.')
+      vpn().selectedNodeId = id
+      vpn().nodes = vpn().nodes.map((item) => ({ ...item, enabled: item.id === id }))
+      saveState()
+      await controller.restart('the selected VPN node changed')
+      vpn().wantConnected = controller.wanted
+      saveState()
+      return publicState()
+    })
   }
 
   /** Same contract as the game's rule edits: live, or not at all. */
@@ -161,7 +199,7 @@ function createVpnFeature({
    * for a reason retrying will not fix is not retried at the next launch.
    */
   async function setWanted(on) {
-    if (on && !vpn().node) throw new Error('Add a VPN node first.')
+    if (on && !selectedVpnNode(vpn())) throw new Error('Add a VPN node first.')
     vpn().wantConnected = on
     saveState()
     if (on) await controller.connect()
@@ -172,8 +210,8 @@ function createVpnFeature({
     }
   }
 
-  function readSecret() {
-    const stored = state().encryptedVpnConfig
+  function readSecret(node = selectedVpnNode(vpn())) {
+    const stored = node && state().encryptedVpnConfigs[node.id]
     if (!stored) throw new Error('The VPN node is missing its stored secret. Remove it and add it again.')
     return JSON.parse(decrypt(stored))
   }
@@ -189,7 +227,10 @@ function createVpnFeature({
       if (result.canceled) return { canceled: true }
       const filePath = result.filePaths[0]
       const source = fs.readFileSync(filePath, 'utf8')
-      return { canceled: false, state: setNode(parseWireGuardConfig(source, filePath, crypto.randomUUID()), source) }
+      return {
+        canceled: false,
+        state: await setNode(parseWireGuardConfig(source, filePath, crypto.randomUUID()), source),
+      }
     })
 
     // Like the game's OpenVPN import: the file body stays here, the window
@@ -242,19 +283,23 @@ function createVpnFeature({
       return setNode(node, JSON.stringify(credentials))
     })
 
-    ipcMain.handle('vpn:test-l2tp', (_event, input) => {
+    ipcMain.handle('vpn:test-l2tp', (_event, input, nodeId) => {
       if (!service.ready()) throw new Error('Install and start the GamePath Network Service first')
-      const credentials = input ? parseL2tpNode(input, 'probe').credentials : readSecret()
+      const node = nodeId === undefined ? selectedVpnNode(vpn()) : vpn().nodes.find((item) => item.id === nodeId)
+      if (!input && node?.kind !== 'l2tp') throw new Error('The VPN node is not an L2TP/IPsec node')
+      const credentials = input ? parseL2tpNode(input, 'probe').credentials : readSecret(node)
       return service.request('probe-l2tp-node', credentials, 60000)
     })
 
     // The proxy is tested the way the VPN uses it: a login, then a
     // connection out through it. No relay is involved.
-    ipcMain.handle('vpn:test-socks5', (_event, input) => {
+    ipcMain.handle('vpn:test-socks5', (_event, input, nodeId) => {
       if (!engine.ready()) throw new Error('The native routing engine is unavailable')
+      const saved = nodeId === undefined ? selectedVpnNode(vpn()) : vpn().nodes.find((item) => item.id === nodeId)
+      if (!input && saved?.kind !== 'socks5') throw new Error('The VPN node is not a SOCKS5 proxy')
       const { node, credentials } = input
         ? parseSocks5Node(input, 'probe')
-        : { node: vpn().node, credentials: readSecret() }
+        : { node: saved, credentials: readSecret(saved) }
       if (node?.kind !== 'socks5') throw new Error('The VPN node is not a SOCKS5 proxy')
       return engine.request(
         'probe-socks5-proxy',
@@ -268,15 +313,28 @@ function createVpnFeature({
       )
     })
 
-    ipcMain.handle('vpn:remove-node', async () => {
-      vpn().wantConnected = false
-      await controller.disconnect()
-      vpn().node = null
-      delete state().encryptedVpnConfig
-      logger.scope('vpn').info('node removed')
-      saveState()
-      return publicState()
-    })
+    ipcMain.handle('vpn:select-node', (_event, id) => selectNode(id))
+
+    ipcMain.handle('vpn:remove-node', (_event, nodeId) =>
+      changeNodes(async () => {
+        const id = nodeId ?? vpn().selectedNodeId
+        if (!vpn().nodes.some((node) => node.id === id)) throw new Error('That VPN node no longer exists.')
+        const selected = id === vpn().selectedNodeId
+        if (selected) {
+          vpn().wantConnected = false
+          await controller.disconnect()
+        }
+        vpn().nodes = vpn().nodes.filter((node) => node.id !== id)
+        if (selected) {
+          vpn().selectedNodeId = vpn().nodes[0]?.id ?? null
+          vpn().nodes = vpn().nodes.map((node) => ({ ...node, enabled: node.id === vpn().selectedNodeId }))
+        }
+        delete state().encryptedVpnConfigs[id]
+        logger.scope('vpn').info(`node removed: selected=${selected}`)
+        saveState()
+        return publicState()
+      }),
+    )
 
     ipcMain.handle('vpn:set-traffic-mode', (_event, mode) => {
       if (mode !== 'split' && mode !== 'all') throw new Error('Unknown traffic mode')
@@ -309,7 +367,7 @@ function createVpnFeature({
 
     ipcMain.handle('vpn:add-rule', (_event, input) => {
       const rule = createRule(input, crypto.randomUUID())
-      const limitation = ruleLimitation(vpn().node, vpn().trafficMode, rule.kind, rule.value)
+      const limitation = ruleLimitation(selectedVpnNode(vpn()), vpn().trafficMode, rule.kind, rule.value)
       if (limitation) throw new Error(limitation)
       return commitRuleChange((settings) => settings.rules.push(rule))
     })
@@ -357,7 +415,7 @@ function createVpnFeature({
     },
     /** At launch: a VPN the user left on comes back on. */
     resume() {
-      if (vpn().wantConnected && vpn().node) return controller.connect()
+      if (vpn().wantConnected && selectedVpnNode(vpn())) return controller.connect()
       return Promise.resolve()
     },
     setWanted,

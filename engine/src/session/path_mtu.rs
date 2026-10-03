@@ -42,7 +42,24 @@ impl SessionMtu {
             let spawned = thread::Builder::new()
                 .name("gamepath-path-mtu".into())
                 .spawn(move || {
-                    let narrowest = narrowest_path(&endpoints, link_mtu);
+                    let measured = measure_paths(&endpoints, link_mtu);
+                    // Every endpoint's figure, so a reading that differs from
+                    // the last session can be told apart from a changed path.
+                    log_info!(
+                        "path MTU measured: {}",
+                        measured
+                            .iter()
+                            .map(|(endpoint, mtu)| match mtu {
+                                Some(mtu) => format!("{endpoint}={mtu}"),
+                                None => format!("{endpoint}=no answer"),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let narrowest = measured
+                        .into_iter()
+                        .filter_map(|(endpoint, mtu)| Some((endpoint, mtu?)))
+                        .min_by_key(|(_, mtu)| *mtu);
                     let Some((endpoint, path)) = narrowest else {
                         log_info!(
                             "path MTU: endpoints do not answer echo requests; keeping the {link_mtu}-byte interface MTU"
@@ -76,19 +93,20 @@ impl SessionMtu {
     }
 }
 
-fn narrowest_path(endpoints: &[Ipv4Addr], link_mtu: u16) -> Option<(Ipv4Addr, u16)> {
+fn measure_paths(endpoints: &[Ipv4Addr], link_mtu: u16) -> Vec<(Ipv4Addr, Option<u16>)> {
     thread::scope(|scope| {
         let probes = endpoints
             .iter()
             .map(|&endpoint| {
-                scope.spawn(move || {
-                    path_mtu::measure(endpoint, link_mtu, MEASURE_BUDGET).map(|mtu| (endpoint, mtu))
-                })
+                (
+                    endpoint,
+                    scope.spawn(move || path_mtu::measure(endpoint, link_mtu, MEASURE_BUDGET)),
+                )
             })
             .collect::<Vec<_>>();
         probes
             .into_iter()
-            .filter_map(|probe| probe.join().ok().flatten())
-            .min_by_key(|(_, mtu)| *mtu)
+            .map(|(endpoint, probe)| (endpoint, probe.join().ok().flatten()))
+            .collect()
     })
 }

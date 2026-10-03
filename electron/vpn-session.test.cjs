@@ -154,6 +154,14 @@ test('a refused request is not retried either', async () => {
   assert.equal(timers.pendingTimeout(), undefined)
 })
 
+test('a check the busy service never answered is retried, not taken as a refusal', async () => {
+  const timedOut = Object.assign(new Error('Network service request timed out'), { transient: true })
+  const { controller, timers } = harness({ script: { 'validate-runtime': timedOut } })
+  await controller.connect()
+  assert.equal(controller.wanted, true)
+  assert.equal(timers.pendingTimeout().delay, RECONNECT_DELAYS_MS[0])
+})
+
 test('a node that does not answer is retried with growing waits, then connects', async () => {
   let failures = 2
   const { controller, timers, service } = harness({

@@ -93,6 +93,7 @@ pub(crate) fn initial_status(
 }
 
 /// What a session wraps captured packets in before a path carries them.
+#[derive(Clone)]
 pub(crate) enum SessionOverlay {
     /// Relay sessions seal every packet under the enrollment key, so the relay
     /// can authenticate it and so a duplicate arriving by another path can be
@@ -113,7 +114,7 @@ pub(crate) struct ActiveWireGuardSession {
     pub(crate) overlay: SessionOverlay,
     pub(crate) session_id: u64,
     pub(crate) started_at: u128,
-    pub(crate) user_bytes_sent: AtomicU64,
+    pub(crate) user_bytes_sent: Arc<AtomicU64>,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) paths: Arc<Mutex<Vec<PathSessionStatus>>>,
     pub(crate) workers: Vec<JoinHandle<()>>,

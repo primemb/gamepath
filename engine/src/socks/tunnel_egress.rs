@@ -100,10 +100,13 @@ pub(crate) trait PacketOutlet: Send {
 
 impl PacketOutlet for Arc<Mutex<WireGuardSessionManager>> {
     fn send_batch(&self, packets: Vec<Vec<u8>>) {
-        let mut sessions = self.lock().unwrap();
+        // Taken once per batch, and the lock released before sending.
+        let Some(sender) = self.lock().unwrap().data_sender() else {
+            return;
+        };
         for packet in packets {
             // A packet no path took is lost like any other; TCP retransmits.
-            let _ = sessions.enqueue_data_packet(&packet);
+            let _ = sender.send(&packet);
         }
     }
 }

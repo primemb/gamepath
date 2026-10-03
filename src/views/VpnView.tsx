@@ -14,7 +14,7 @@ import { vpnLive, vpnOn } from '../lib/vpn'
 import { L2tpModal } from '../modals/L2tpModal'
 import { OpenVpnLoginModal } from '../modals/OpenVpnLoginModal'
 import { Socks5Modal } from '../modals/Socks5Modal'
-import type { AppState, NodeKind, OpenVpnCandidate, RuleKind, VpnProxyProbe } from '../types'
+import type { AppState, NodeKind, OpenVpnCandidate, RuleKind, VpnNode, VpnProxyProbe } from '../types'
 
 const describeProxyProbe = (probe: VpnProxyProbe) =>
   `Logged in to ${probe.proxy} in ${Math.round(probe.setupLatencyMs)} ms, and reached the Internet through it in ${Math.round(probe.latencyMs)} ms.`
@@ -97,24 +97,21 @@ export function VpnView({
     })
   }
 
-  const testSavedNode =
-    vpn.node?.kind === 'l2tp' || vpn.node?.kind === 'socks5'
-      ? async () => {
-          try {
-            if (vpn.node?.kind === 'socks5') {
-              notify(describeProxyProbe(await api.vpn.testSocks5()), 'success')
-              return
-            }
-            const probe = await api.vpn.testL2tp()
-            notify(
-              `L2TP/IPsec works: connected in ${Math.round(probe.setupLatencyMs)} ms, data returned in ${Math.round(probe.dataLatencyMs)} ms.`,
-              'success',
-            )
-          } catch (error) {
-            notify(errorMessage(error), 'error')
-          }
-        }
-      : null
+  const testSavedNode = async (node: VpnNode) => {
+    try {
+      if (node.kind === 'socks5') {
+        notify(describeProxyProbe(await api.vpn.testSocks5(undefined, node.id)), 'success')
+        return
+      }
+      const probe = await api.vpn.testL2tp(undefined, node.id)
+      notify(
+        `L2TP/IPsec works: connected in ${Math.round(probe.setupLatencyMs)} ms, data returned in ${Math.round(probe.dataLatencyMs)} ms.`,
+        'success',
+      )
+    } catch (error) {
+      notify(errorMessage(error), 'error')
+    }
+  }
 
   const saved = (next: AppState, what: string) => {
     setState(next)
@@ -125,7 +122,7 @@ export function VpnView({
   const handled = vpn.session.capture?.diagnostics?.handledConnections?.length ?? 0
   const extras: Partial<Record<VpnTab, TabExtras>> = {
     overview: { badge: vpnLive(vpn.session.status) && vpn.trafficMode === 'split' ? handled : null },
-    node: { dot: vpn.node ? null : 'warning' },
+    node: { badge: vpn.nodes.length || null, dot: vpn.node ? null : 'warning' },
     split: {
       badge: vpn.trafficMode === 'split' ? vpn.rules.filter((rule) => rule.enabled).length : null,
       dot: Object.keys(vpn.limitations).length ? 'warning' : null,
@@ -141,11 +138,21 @@ export function VpnView({
         {tab === 'overview' && <VpnOverview vpn={vpn} onOpenTab={onTabChange} />}
         {tab === 'node' && (
           <VpnNodePanel
-            node={vpn.node}
-            connected={vpnLive(vpn.session.status)}
+            nodes={vpn.nodes}
+            selectedNodeId={vpn.selectedNodeId}
+            session={vpn.session}
+            busy={toggling}
             onChoose={chooseNode}
+            onSelect={(id) =>
+              guard(async () => {
+                const next = await api.vpn.selectNode(id)
+                if (next.vpn.session.status === 'error' && next.vpn.session.message)
+                  notify(next.vpn.session.message, 'error')
+                return next
+              })
+            }
             onTest={testSavedNode}
-            onRemove={() => guard(() => api.vpn.removeNode())}
+            onRemove={(id) => guard(() => api.vpn.removeNode(id))}
           />
         )}
         {tab === 'split' && (

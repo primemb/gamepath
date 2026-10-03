@@ -240,7 +240,7 @@ export type LanProxyStatus = {
   clients?: LanProxyDevice[]
 }
 
-/** The VPN's one node. Same public shape as a game node, without groups. */
+/** A saved VPN node. Same public shape as a game node, without groups. */
 export type VpnNode = Omit<Tunnel, 'groupId'>
 
 export type VpnRule = {
@@ -283,6 +283,9 @@ export type VpnSession = {
  * split rules, and a session of its own. The game always takes priority.
  */
 export type VpnState = {
+  nodes: VpnNode[]
+  selectedNodeId: string | null
+  /** The selected node, ready to connect or reconnect. */
   node: VpnNode | null
   trafficMode: 'all' | 'split'
   remoteDns: boolean
@@ -308,10 +311,11 @@ export type VpnApi = {
   addSocks5: (input: Socks5NodeInput) => Promise<AppState>
   addL2tp: (input: L2tpNodeInput) => Promise<AppState>
   /** Tests the given login, or the saved node's when called without one. */
-  testL2tp: (input?: L2tpNodeInput) => Promise<L2tpProbeResult>
+  testL2tp: (input?: L2tpNodeInput, nodeId?: string) => Promise<L2tpProbeResult>
   /** Logs in to the proxy and opens a connection out through it. */
-  testSocks5: (input?: Socks5NodeInput) => Promise<VpnProxyProbe>
-  removeNode: () => Promise<AppState>
+  testSocks5: (input?: Socks5NodeInput, nodeId?: string) => Promise<VpnProxyProbe>
+  selectNode: (id: string) => Promise<AppState>
+  removeNode: (id?: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
   setRemoteDns: (enabled: boolean) => Promise<AppState>
   setKillSwitch: (enabled: boolean) => Promise<AppState>

@@ -52,7 +52,7 @@ class ServiceBridge {
         if (error) reject(error)
         else resolve(value)
       }
-      const timeout = setTimeout(() => finish(new Error('Network service request timed out')), timeoutMs)
+      const timeout = setTimeout(() => finish(transient('Network service request timed out')), timeoutMs)
       socket.setEncoding('utf8')
       socket.on('connect', () => socket.write(`${JSON.stringify({ id, token, command, payload })}\n`))
       socket.on('data', (chunk) => {
@@ -75,12 +75,20 @@ class ServiceBridge {
           finish(new Error(`Invalid network service response: ${error.message}`))
         }
       })
-      socket.on('error', (error) => finish(new Error(`Network service unavailable: ${error.message}`)))
+      socket.on('error', (error) => finish(transient(`Network service unavailable: ${error.message}`)))
       socket.on('end', () => {
-        if (!settled) finish(new Error('Network service closed the connection'))
+        if (!settled) finish(transient('Network service closed the connection'))
       })
     })
   }
+}
+
+/**
+ * A request that never got an answer, as opposed to one the service refused.
+ * Callers retry these: a busy or restarting service answers the next one.
+ */
+function transient(message) {
+  return Object.assign(new Error(message), { transient: true })
 }
 
 module.exports = { ServiceBridge }

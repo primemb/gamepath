@@ -15,7 +15,7 @@ function hostOf(value) {
 
 /**
  * Every hostname GamePath itself connects to: game nodes, relays and the VPN's
- * node. Neither session redirects lookups for these, so each tunnel resolves
+ * nodes. Neither session redirects lookups for these, so each tunnel resolves
  * its own servers exactly as it would with the other session off. Without it,
  * a game node resolved while the VPN was on got the VPN proxy's fake-IP answer,
  * and the game's route then ran through the VPN.
@@ -24,8 +24,7 @@ function ownHostnames(state) {
   const candidates = [
     ...(state.tunnels ?? []).flatMap((tunnel) => [tunnel.endpoint, tunnel.host]),
     ...(state.relays ?? []).map((relay) => relay.address),
-    state.vpn?.node?.endpoint,
-    state.vpn?.node?.host,
+    ...(state.vpn?.nodes ?? [state.vpn?.node]).flatMap((node) => [node?.endpoint, node?.host]),
   ]
   return [...new Set(candidates.map(hostOf).filter(Boolean))].sort()
 }

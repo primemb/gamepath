@@ -23,7 +23,7 @@ const { withoutSecrets } = require('./public-state.cjs')
 const { nodeSpec } = require('./node-spec.cjs')
 const { ownHostnames } = require('./own-hostnames.cjs')
 const { startWithWindows, setStartWithWindows, launchedAtLogin } = require('./startup.cjs')
-const { defaultVpn, normalizeVpn } = require('./vpn-state.cjs')
+const { defaultVpn, selectedVpnNode, migrateVpnState } = require('./vpn-state.cjs')
 const { createVpnFeature } = require('./vpn-ipc.cjs')
 const { RelayFailoverController, normalizeRelayFailover, standbyRelayFor } = require('./relay-failover.cjs')
 const {
@@ -151,7 +151,7 @@ function loadState() {
     if (state.routingStrategy !== 'manual') state.routingStrategy = 'smart'
     state.lanProxy = normalizeLanProxy(state.lanProxy)
     state.relayFailover = normalizeRelayFailover(state.relayFailover)
-    state.vpn = normalizeVpn(state.vpn)
+    migrateVpnState(state)
     state.nodeGroups = Array.isArray(state.nodeGroups) ? state.nodeGroups : []
     const nodeGroupIds = new Set(state.nodeGroups.map((group) => group.id))
     // Nodes imported before SOCKS5 support existed are all WireGuard routes,
@@ -1438,7 +1438,7 @@ function trayVpnItem() {
   const on = state?.vpn.wantConnected && status !== 'idle'
   return {
     label: on ? 'Disconnect VPN' : 'Connect VPN',
-    enabled: Boolean(state?.vpn.node),
+    enabled: Boolean(state && selectedVpnNode(state.vpn)),
     click: () => {
       void vpnFeature.setWanted(!on).catch((error) => logger.warn(`VPN tray action failed: ${error.message}`))
     },

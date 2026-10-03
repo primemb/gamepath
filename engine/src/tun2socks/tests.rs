@@ -401,6 +401,37 @@ fn a_lookup_the_proxy_fails_is_answered_with_servfail_at_once() {
 }
 
 #[test]
+fn a_lookup_that_times_out_is_answered_with_servfail() {
+    let mut app = App::new(spawn_proxy(true));
+    let client = SocketAddrV4::new(CLIENT_ADDRESS, 42_201);
+    let mut query = vec![0x56, 0x79, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    query.extend_from_slice(b"\x05stuck\x03com\x00\x00\x01\x00\x01");
+    app.stack
+        .send_packet(&build_udp(client, SocketAddrV4::new(RESOLVER, 53), &query))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(7);
+    while Instant::now() < deadline {
+        app.step();
+        if app.other.iter().any(|packet| {
+            let ip = parse_ipv4(packet).unwrap();
+            parse_udp(ip.payload).is_some_and(|udp| {
+                ip.source == RESOLVER
+                    && udp.destination_port == client.port()
+                    && udp.payload[..2] == [0x56, 0x79]
+                    && udp.payload[3] & 0x0f == 2
+            })
+        }) {
+            assert_eq!(
+                app.stack.shared.counters.dns_failed.load(Ordering::Relaxed),
+                1
+            );
+            return;
+        }
+    }
+    panic!("the timed-out lookup was left unanswered");
+}
+
+#[test]
 fn the_session_health_probe_is_answered_only_through_the_proxy() {
     let mut app = App::new(spawn_proxy(true));
     let mut message = vec![8, 0, 0, 0, 0xab, 0xcd, 0, 1];

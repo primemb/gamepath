@@ -194,8 +194,9 @@ class VpnSessionController {
     try {
       await this.service.request('validate-runtime', { ...request, slot: 'vpn' })
     } catch (error) {
-      log.error(`refused before connecting: ${error.message}`)
-      this.fail(error, false)
+      // A refusal stays refused; a request that never got an answer is retried.
+      log.error(`${error.transient ? 'could not check' : 'refused'} before connecting: ${error.message}`)
+      this.fail(error, error.transient === true)
       return
     }
     try {

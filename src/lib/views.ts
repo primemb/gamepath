@@ -59,7 +59,12 @@ export const vpnTabs: TabDefinition<VpnTab>[] = [
     icon: LayoutDashboard,
     description: 'A second connection for everyday apps, beside your game and never in its way.',
   },
-  { id: 'node', label: 'Node', icon: ShieldCheck, description: 'The one node the VPN connects through.' },
+  {
+    id: 'node',
+    label: 'Nodes',
+    icon: ShieldCheck,
+    description: 'Save your VPN nodes and choose one to connect through.',
+  },
   {
     id: 'split',
     label: 'Split tunnel',

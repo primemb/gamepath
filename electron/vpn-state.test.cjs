@@ -3,6 +3,8 @@ const test = require('node:test')
 const {
   defaultVpn,
   normalizeVpn,
+  selectedVpnNode,
+  migrateVpnState,
   vpnRuleSpecs,
   ruleLimitation,
   unroutableRules,
@@ -35,7 +37,7 @@ test('a saved VPN keeps what is valid and drops what is not', () => {
       { id: 'd', kind: 'hostname', value: 'news.example' },
     ],
   })
-  assert.equal(vpn.node.kind, 'wireguard')
+  assert.equal(selectedVpnNode(vpn).kind, 'wireguard')
   assert.equal(vpn.trafficMode, 'all')
   assert.equal(vpn.remoteDns, false)
   assert.equal(vpn.killSwitch, true)
@@ -61,11 +63,60 @@ test('an L2TP split VPN refuses selectors Windows routes cannot express', () => 
   assert.equal(ruleLimitation(l2tp, 'all', 'application', 'C:\\a.exe'), null)
   assert.equal(ruleLimitation(wireguard, 'split', 'application', 'C:\\a.exe'), null)
 
-  const vpn = { ...defaultVpn(), node: l2tp, rules: [createRule({ kind: 'folder', value: 'C:\\Apps' }, 'f')] }
+  const vpn = {
+    ...defaultVpn(),
+    nodes: [l2tp],
+    selectedNodeId: l2tp.id,
+    rules: [createRule({ kind: 'folder', value: 'C:\\Apps' }, 'f')],
+  }
   assert.deepEqual(
     unroutableRules(vpn).map((rule) => rule.id),
     ['f'],
   )
+})
+
+test('legacy VPN saves keep their node, selection and encrypted secret', () => {
+  const state = { vpn: { node: wireguard, wantConnected: true }, encryptedVpnConfig: 'sealed:legacy' }
+  migrateVpnState(state)
+  assert.equal(state.vpn.nodes.length, 1)
+  assert.equal(state.vpn.selectedNodeId, wireguard.id)
+  assert.equal(selectedVpnNode(state.vpn).enabled, true)
+  assert.equal(state.vpn.wantConnected, true)
+  assert.deepEqual(state.encryptedVpnConfigs, { [wireguard.id]: 'sealed:legacy' })
+  assert.equal(state.encryptedVpnConfig, undefined)
+  const before = structuredClone(state)
+  migrateVpnState(state)
+  assert.deepEqual(state, before)
+})
+
+test('saved VPN lists discard duplicates and keep exactly one selected node', () => {
+  const other = { ...l2tp, id: 'other' }
+  const vpn = normalizeVpn({
+    nodes: [wireguard, other, wireguard, null],
+    selectedNodeId: other.id,
+    wantConnected: true,
+  })
+  assert.deepEqual(
+    vpn.nodes.map((node) => [node.id, node.enabled]),
+    [
+      [wireguard.id, false],
+      [other.id, true],
+    ],
+  )
+  assert.equal(selectedVpnNode(vpn).id, other.id)
+  const restored = normalizeVpn({ ...vpn, selectedNodeId: 'removed' })
+  assert.equal(restored.selectedNodeId, other.id)
+  assert.equal(normalizeVpn({ nodes: [], node: wireguard, wantConnected: true }).wantConnected, false)
+})
+
+test('migration preserves each nodes secret and removes orphaned secrets', () => {
+  const other = { ...l2tp, id: 'other' }
+  const state = {
+    vpn: { nodes: [wireguard, other], selectedNodeId: other.id },
+    encryptedVpnConfigs: { [wireguard.id]: 'sealed:first', [other.id]: 'sealed:second', orphan: 'sealed:gone' },
+  }
+  migrateVpnState(state)
+  assert.deepEqual(state.encryptedVpnConfigs, { [wireguard.id]: 'sealed:first', [other.id]: 'sealed:second' })
 })
 
 test('a new rule needs a known kind and a target, and labels itself', () => {

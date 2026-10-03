@@ -7,7 +7,7 @@
 
 use crate::ipc::PacketCaptureRequest;
 use crate::netutil::ipv6_exposure;
-use crate::session::{DataReceiver, WireGuardSessionManager};
+use crate::session::{DataReceiver, SenderCache, WireGuardSessionManager};
 use gamepath_engine::policy::compile as compile_policy;
 use gamepath_engine::{log_info, log_warn};
 use serde_json::{Value, json};
@@ -631,6 +631,7 @@ fn run_wintun_uplink(
     virtual_ipv4: std::net::Ipv4Addr,
     stop: Arc<AtomicBool>,
 ) {
+    let mut sender = SenderCache::new(sessions);
     while !stop.load(Ordering::Acquire) {
         let packet = match session.receive_blocking() {
             Ok(packet) => packet,
@@ -639,7 +640,7 @@ fn run_wintun_uplink(
         let bytes = packet.bytes().to_vec();
         drop(packet);
         if ipv4_source_address(&bytes) == Some(virtual_ipv4) {
-            let _ = sessions.lock().unwrap().enqueue_data_packet(&bytes);
+            let _ = sender.send(&bytes);
         }
     }
 }

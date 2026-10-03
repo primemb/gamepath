@@ -33,4 +33,8 @@ test('game nodes, relays and the VPN node are all collected once', () => {
     'turkey1.pingkhor.xyz',
   ])
   assert.deepEqual(ownHostnames({}), [])
+  assert.deepEqual(ownHostnames({ vpn: { nodes: [{ endpoint: 'first.example:1080' }, { host: 'second.example' }] } }), [
+    'first.example',
+    'second.example',
+  ])
 })

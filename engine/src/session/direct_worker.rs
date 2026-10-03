@@ -6,8 +6,8 @@ use super::latency::{LatencyEvent, LatencyWatch};
 use super::local_tap::{InboundQueue, InboundSink};
 use super::state::PathSessionStatus;
 use super::worker::{
-    PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN, WORKER_RECEIVE_TIMEOUT,
-    drain_send_queue,
+    PassProfile, PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN,
+    WORKER_RECEIVE_TIMEOUT, drain_send_queue,
 };
 use crate::icmp::{icmp_echo_packet, icmp_reply_sequence};
 use gamepath_engine::relay_path::{DirectPath, KIND_WIREGUARD};
@@ -112,6 +112,7 @@ pub(crate) fn run_direct_path(
     let mut last_authenticated_receive: Option<Instant> = None;
     let mut published_healthy = false;
     let endpoint = path.endpoint();
+    let mut pass = PassProfile::default();
 
     while !stop.load(Ordering::Acquire) {
         let iteration_started = Instant::now();
@@ -124,12 +125,13 @@ pub(crate) fn run_direct_path(
         {
             last_worker_gap_log = Some(iteration_started);
             log_warn!(
-                "session {session_id} route 1 worker gap {worker_gap_ms} ms; q={} drop={} uplink={:?}",
+                "session {session_id} route 1 worker gap {worker_gap_ms} ms; q={} drop={} uplink={:?}; {pass}",
                 telemetry.queue_depth[0].load(Ordering::Relaxed),
                 telemetry.dropped[0].load(Ordering::Relaxed),
                 telemetry.uplink.state()
             );
         }
+        pass = PassProfile::default();
         telemetry.iterations[0].fetch_add(1, Ordering::Relaxed);
         // Health is decided first so the rest of the iteration can see it, and
         // published only when it moves: this lock is on the hot path.
@@ -164,6 +166,9 @@ pub(crate) fn run_direct_path(
             verdict = losing;
             published_health = (handshake, reachable);
         }
+        pass.bookkeeping = iteration_started.elapsed();
+        let (mut socket_send, mut status_lock, mut frames_sent) =
+            (Duration::ZERO, Duration::ZERO, 0);
         drain_send_queue(
             &commands,
             max_age,
@@ -171,9 +176,22 @@ pub(crate) fn run_direct_path(
             &telemetry.queue_depth,
             &telemetry.dropped,
             &telemetry.stale_dropped,
-            |frame| (frame.len(), path.send_packet(frame)),
-            |length, result| record_path_send(&statuses, 0, length, result),
+            |frame| {
+                let started = Instant::now();
+                let result = path.send_packet(frame);
+                socket_send += started.elapsed();
+                frames_sent += 1;
+                (frame.len(), result)
+            },
+            |length, result| {
+                let started = Instant::now();
+                record_path_send(&statuses, 0, length, result);
+                status_lock += started.elapsed();
+            },
         );
+        (pass.socket_send, pass.status_lock, pass.frames_sent) =
+            (socket_send, status_lock, frames_sent);
+        let probe_started = Instant::now();
         if pending_probe.is_none() && Instant::now() >= next_probe {
             probe_sequence = probe_sequence.wrapping_add(1);
             let probe = icmp_echo_packet(
@@ -205,6 +223,8 @@ pub(crate) fn run_direct_path(
             }
             next_probe = Instant::now() + probe_interval;
         }
+        pass.probe = probe_started.elapsed();
+        let receive_started = Instant::now();
         match path.receive_packets(WORKER_RECEIVE_TIMEOUT) {
             Ok(packets) => {
                 for packet in packets {
@@ -282,6 +302,7 @@ pub(crate) fn run_direct_path(
                 }
             }
         }
+        pass.receive = receive_started.elapsed();
         // A silent peer is the usual way a direct session fails to start, and
         // the timeout alone would not say which part of the file to look at.
         if !reported_silence
@@ -311,6 +332,7 @@ pub(crate) fn run_direct_path(
                 next_probe = Instant::now() + DIRECT_QUIET_PROBE_INTERVAL;
             }
         }
+        pass.total = iteration_started.elapsed();
     }
 }
 

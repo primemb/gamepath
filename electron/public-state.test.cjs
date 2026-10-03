@@ -12,6 +12,7 @@ test('every encrypted field is removed, whatever it is called', () => {
     encryptedRelayTokens: {},
     encryptedLanProxyPassword: 'x',
     encryptedVpnConfig: 'x',
+    encryptedVpnConfigs: { a: 'x' },
     vpn: { node: null },
   })
   assert.deepEqual(Object.keys(safe).sort(), ['tunnels', 'vpn'])

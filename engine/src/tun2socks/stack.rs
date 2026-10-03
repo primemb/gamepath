@@ -731,31 +731,26 @@ impl Stack {
         if query.len() < 12 || query.len() > usize::from(u16::MAX) {
             return;
         }
+        let original = u16::from_be_bytes([query[0], query[1]]);
+        let pending = DnsQuery {
+            local_port,
+            id: original,
+            sent: Instant::now(),
+            message: query.clone(),
+            retried,
+        };
         let Some(stream) = self.dns_stream_for(resolver) else {
-            self.shared
-                .counters
-                .dns_failed
-                .fetch_add(1, Ordering::Relaxed);
+            self.fail_lookup(resolver, &pending);
             return;
         };
         let upstream = self.dns.get_mut(&stream).unwrap();
         // Lookups from different applications can share an id; each gets one
         // of its own on the stream and is given its own back.
-        let original = u16::from_be_bytes([query[0], query[1]]);
         let mut id = rand::random::<u16>();
         while upstream.in_flight.contains_key(&id) {
             id = id.wrapping_add(1);
         }
-        upstream.in_flight.insert(
-            id,
-            DnsQuery {
-                local_port,
-                id: original,
-                sent: Instant::now(),
-                message: query.clone(),
-                retried,
-            },
-        );
+        upstream.in_flight.insert(id, pending);
         let mut framed = Vec::with_capacity(query.len() + 2);
         framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
         framed.extend_from_slice(&id.to_be_bytes());
@@ -815,15 +810,20 @@ impl Stack {
         self.next_dns_stream += 1;
         let stream = self.next_dns_stream;
         let token = self.token(Owner::Dns(stream));
-        let upstream = Upstream::dial(
+        let upstream = match Upstream::dial(
             self.poll.registry(),
             token,
             self.config.proxy,
             Command::Connect,
             SocketAddrV4::new(resolver, DNS_PORT),
             self.config.credentials.clone(),
-        )
-        .ok()?;
+        ) {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                self.owners.remove(&token);
+                return None;
+            }
+        };
         self.dns.insert(
             stream,
             DnsUpstream {
@@ -1336,10 +1336,6 @@ impl Stack {
             dns.upstream.deregister(self.poll.registry());
             self.owners.remove(&dns.upstream.token);
             let lost = dns.in_flight.len();
-            self.shared
-                .counters
-                .dns_failed
-                .fetch_add(lost as u64, Ordering::Relaxed);
             if late && !self.dns_timeout_logged {
                 self.dns_timeout_logged = true;
                 log_warn!(
@@ -1348,6 +1344,9 @@ impl Stack {
                     DNS_TIMEOUT.as_secs(),
                     dns.resolver
                 );
+            }
+            for query in dns.in_flight.into_values() {
+                self.fail_lookup(dns.resolver, &query);
             }
         }
         let stale: Vec<u64> = self

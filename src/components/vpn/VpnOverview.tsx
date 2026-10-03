@@ -58,7 +58,7 @@ export function VpnOverview({ vpn, onOpenTab }: { vpn: VpnState; onOpenTab: (tab
           detail={
             vpn.node
               ? `${nodeKindLabels[vpn.node.kind]}${latency != null ? ` · ${Math.round(latency)} ms` : ''}`
-              : 'Add a node in the Node tab to get started.'
+              : 'Add a node in the Nodes tab to get started.'
           }
           onOpen={() => onOpenTab('node')}
         />

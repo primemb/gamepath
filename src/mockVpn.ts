@@ -1,9 +1,9 @@
-import type { AppState, VpnApi, VpnRule, VpnSession, VpnState } from './types'
+import type { AppState, VpnApi, VpnNode, VpnRule, VpnSession, VpnState } from './types'
 
-/** A VPN with one node and two targets, for exploring its screen in a browser. */
+/** Saved VPN nodes and targets, for exploring the screen in a browser. */
 export function seedVpn(): VpnState {
-  return {
-    node: {
+  const nodes: VpnNode[] = [
+    {
       id: 'vpn-demo',
       kind: 'wireguard',
       name: 'Frankfurt Home',
@@ -14,6 +14,22 @@ export function seedVpn(): VpnState {
       importedAt: new Date().toISOString(),
       hasPrivateKey: true,
     },
+    {
+      id: 'vpn-backup',
+      kind: 'socks5',
+      name: 'Amsterdam Proxy',
+      endpoint: 'nl-01.example:1080',
+      address: 'Proxy',
+      dns: 'Proxy',
+      enabled: false,
+      importedAt: new Date().toISOString(),
+      hasPrivateKey: false,
+    },
+  ]
+  return {
+    nodes,
+    selectedNodeId: nodes[0].id,
+    node: nodes[0],
     trafficMode: 'split',
     remoteDns: true,
     killSwitch: false,
@@ -46,6 +62,7 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
   const listeners = new Set<(vpn: VpnState) => void>()
   let tick = 0
   let timer: number | undefined
+  let connectTimer: number | undefined
   const vpn = () => get().vpn
   const emit = () => listeners.forEach((listener) => listener(structuredClone(vpn())))
   const setSession = (session: VpnSession) => {
@@ -125,6 +142,51 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
     return snapshot()
   }
 
+  const syncSelection = (state: VpnState) => {
+    state.nodes = state.nodes.map((node) => ({ ...node, enabled: node.id === state.selectedNodeId }))
+    state.node = state.nodes.find((node) => node.enabled) ?? null
+    state.canSelectApps = !(state.node?.kind === 'l2tp' && state.trafficMode === 'split')
+    state.limitations = {}
+    if (!state.canSelectApps) {
+      for (const rule of state.rules) {
+        if (
+          rule.kind === 'application' ||
+          rule.kind === 'folder' ||
+          (rule.kind === 'hostname' && rule.value.startsWith('*.'))
+        ) {
+          state.limitations[rule.id] = 'This L2TP/IPsec node routes exact hostnames and IP ranges only.'
+        }
+      }
+    }
+  }
+
+  const start = () => {
+    window.clearTimeout(connectTimer)
+    window.clearInterval(timer)
+    setSession({ status: 'connecting', message: `Connecting to ${vpn().node?.name}…` })
+    connectTimer = window.setTimeout(() => {
+      if (!vpn().wantConnected) return
+      setSession(
+        gameHoldsAllTraffic()
+          ? {
+              status: 'paused',
+              pauseReason: 'game-all-traffic',
+              message:
+                'Your game session is carrying all traffic. The VPN resumes when it stops or switches to split mode.',
+            }
+          : connected(),
+      )
+      animate()
+    }, CONNECT_DELAY_MS)
+  }
+
+  const addNode = (node: VpnNode) =>
+    mutate((state) => {
+      state.nodes.push(node)
+      state.selectedNodeId ??= node.id
+      syncSelection(state)
+    })
+
   return {
     importWireGuard: async () => ({ canceled: true }),
     chooseOpenVpn: async () => {
@@ -132,34 +194,28 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
     },
     addOpenVpn: async () => snapshot(),
     addSocks5: async (input) =>
-      mutate((state) => {
-        state.node = {
-          id: 'vpn-socks',
-          kind: 'socks5',
-          name: input.label || input.address,
-          endpoint: input.address,
-          address: 'Proxy',
-          dns: 'Proxy',
-          enabled: true,
-          importedAt: new Date().toISOString(),
-          hasPrivateKey: false,
-        }
-        state.canSelectApps = true
+      addNode({
+        id: crypto.randomUUID(),
+        kind: 'socks5',
+        name: input.label || input.address,
+        endpoint: input.address,
+        address: 'Proxy',
+        dns: 'Proxy',
+        enabled: true,
+        importedAt: new Date().toISOString(),
+        hasPrivateKey: false,
       }),
     addL2tp: async (input) =>
-      mutate((state) => {
-        state.node = {
-          id: 'vpn-l2tp',
-          kind: 'l2tp',
-          name: input.label || input.server,
-          endpoint: input.server,
-          address: 'Assigned by server',
-          dns: 'Assigned by server',
-          enabled: true,
-          importedAt: new Date().toISOString(),
-          hasPrivateKey: false,
-        }
-        state.canSelectApps = state.trafficMode === 'all'
+      addNode({
+        id: crypto.randomUUID(),
+        kind: 'l2tp',
+        name: input.label || input.server,
+        endpoint: input.server,
+        address: 'Assigned by server',
+        dns: 'Assigned by server',
+        enabled: true,
+        importedAt: new Date().toISOString(),
+        hasPrivateKey: false,
       }),
     testL2tp: async () => ({
       reachable: true,
@@ -170,16 +226,48 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
       dataLatencyMs: 61,
     }),
     testSocks5: async () => ({ reachable: true, proxy: '203.0.113.20:1080', setupLatencyMs: 42, latencyMs: 96 }),
-    removeNode: async () =>
+    selectNode: async (id) =>
       mutate((state) => {
-        state.node = null
-        state.wantConnected = false
-        state.session = { status: 'idle' }
+        const node = state.nodes.find((item) => item.id === id)
+        if (!node) throw new Error('That VPN node no longer exists.')
+        if (state.selectedNodeId === id) return
+        if (
+          node.kind === 'l2tp' &&
+          state.trafficMode === 'split' &&
+          state.rules.some(
+            (rule) =>
+              rule.enabled &&
+              (rule.kind === 'application' ||
+                rule.kind === 'folder' ||
+                (rule.kind === 'hostname' && rule.value.startsWith('*.'))),
+          )
+        ) {
+          throw new Error(
+            'This L2TP/IPsec node routes exact hostnames and IP ranges only. Use another node or all traffic.',
+          )
+        }
+        state.selectedNodeId = id
+        syncSelection(state)
+        if (state.wantConnected) start()
+      }),
+    removeNode: async (id = vpn().selectedNodeId ?? undefined) =>
+      mutate((state) => {
+        if (!state.nodes.some((node) => node.id === id)) throw new Error('That VPN node no longer exists.')
+        const selected = state.selectedNodeId === id
+        state.nodes = state.nodes.filter((node) => node.id !== id)
+        if (selected) {
+          window.clearTimeout(connectTimer)
+          window.clearInterval(timer)
+          state.selectedNodeId = state.nodes[0]?.id ?? null
+          state.wantConnected = false
+          state.session = { status: 'idle' }
+        }
+        syncSelection(state)
       }),
     setTrafficMode: async (mode) =>
       mutate((state) => {
         state.trafficMode = mode
-        state.canSelectApps = !(state.node?.kind === 'l2tp' && mode === 'split')
+        syncSelection(state)
       }),
     setRemoteDns: async (enabled) => mutate((state) => void (state.remoteDns = enabled)),
     setKillSwitch: async (enabled) => mutate((state) => void (state.killSwitch = enabled)),
@@ -196,24 +284,13 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
       }),
     removeRule: async (id) => mutate((state) => void (state.rules = state.rules.filter((rule) => rule.id !== id))),
     connect: async () => {
+      if (!vpn().node) throw new Error('Add a VPN node first.')
       vpn().wantConnected = true
-      setSession({ status: 'connecting', message: `Connecting to ${vpn().node?.name}…` })
-      window.setTimeout(() => {
-        setSession(
-          gameHoldsAllTraffic()
-            ? {
-                status: 'paused',
-                pauseReason: 'game-all-traffic',
-                message:
-                  'Your game session is carrying all traffic. The VPN resumes when it stops or switches to split mode.',
-              }
-            : connected(),
-        )
-        animate()
-      }, CONNECT_DELAY_MS)
+      start()
       return snapshot()
     },
     disconnect: async () => {
+      window.clearTimeout(connectTimer)
       window.clearInterval(timer)
       vpn().wantConnected = false
       setSession({ status: 'idle' })

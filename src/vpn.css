@@ -306,10 +306,62 @@
   background: var(--vpn-accent-soft);
 }
 .vpn-node {
-  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+.vpn-node.is-selected {
+  border-color: var(--vpn-accent-line);
+  background: var(--vpn-accent-soft);
+}
+.vpn-node-list {
+  margin: 16px 0 0;
+  padding: 0;
+  min-width: 0;
+  border: 0;
+  display: grid;
+  gap: 10px;
+}
+.vpn-node-choice {
   display: flex;
   align-items: center;
   gap: 14px;
+  min-width: 0;
+  flex: 1 1 260px;
+  cursor: pointer;
+}
+.vpn-node-choice input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  flex: none;
+  accent-color: var(--vpn-accent);
+}
+.vpn-node-choice input:focus-visible {
+  outline: 2px solid var(--vpn-accent);
+  outline-offset: 4px;
+}
+.vpn-node-selection {
+  color: var(--muted);
+  font-size: 12px;
+}
+.vpn-node.is-selected .vpn-node-selection {
+  color: var(--vpn-accent);
+}
+.vpn-node-hint,
+.vpn-node-remove-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 12px 0 0;
+}
+.vpn-node-remove-hint {
+  flex-basis: 100%;
+  margin: 0;
 }
 .vpn-node-avatar {
   width: 44px;
@@ -329,6 +381,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 .vpn-node-title strong {
   overflow: hidden;
@@ -347,24 +400,13 @@
   color: var(--muted);
   font-family: 'Cascadia Code', monospace;
   font-size: 11px;
+  overflow-wrap: anywhere;
 }
 .vpn-node-actions {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-.vpn-replace {
-  margin-top: 16px;
-  padding-top: 14px;
-  border-top: 1px solid var(--line);
-}
-.vpn-replace p {
-  margin: 0;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--muted);
-  font-size: 11.5px;
+  flex-wrap: wrap;
 }
 
 /* Targets. */

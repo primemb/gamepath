@@ -16,8 +16,8 @@ use super::local_tap::InboundSink;
 use super::repair::{LossRepair, Probe};
 use super::state::{PathSessionStatus, RelayIngress};
 use super::worker::{
-    PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN, WORKER_RECEIVE_TIMEOUT,
-    drain_send_queue,
+    PassProfile, PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN,
+    WORKER_RECEIVE_TIMEOUT, drain_send_queue,
 };
 use gamepath_engine::relay_path::RelayPath;
 use gamepath_engine::rtt::RttEstimator;
@@ -26,7 +26,7 @@ use gamepath_engine::{log_info, log_warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_path(
@@ -75,6 +75,7 @@ pub(crate) fn run_path(
     let mut latency_watch = LatencyWatch::default();
     let mut last_iteration = Instant::now();
     let mut last_worker_gap_log: Option<Instant> = None;
+    let mut pass = PassProfile::default();
     // Consecutive failed health checks and the next redial deadline reset as
     // soon as the path answers. An already-running redial stays owned until
     // it finishes, then is discarded if that recovery made it obsolete.
@@ -107,7 +108,7 @@ pub(crate) fn run_path(
         {
             last_worker_gap_log = Some(iteration_started);
             log_warn!(
-                "session {session_id} route {} worker gap {} ms; q={} drop={} uplink={:?}",
+                "session {session_id} route {} worker gap {} ms; q={} drop={} uplink={:?}; {pass}",
                 index + 1,
                 worker_gap_ms,
                 telemetry.queue_depth[index].load(Ordering::Relaxed),
@@ -115,6 +116,7 @@ pub(crate) fn run_path(
                 telemetry.uplink.state()
             );
         }
+        pass = PassProfile::default();
         telemetry.iterations[index].fetch_add(1, Ordering::Relaxed);
         match dialing.as_mut().map(ReconnectAttempt::poll) {
             Some(ReconnectPoll::Finished(Ok(replacement))) => {
@@ -220,6 +222,9 @@ pub(crate) fn run_path(
                 }
             }
         }
+        pass.bookkeeping = iteration_started.elapsed();
+        let (mut socket_send, mut status_lock, mut frames_sent) =
+            (Duration::ZERO, Duration::ZERO, 0);
         drain_send_queue(
             &commands,
             Some(super::worker::PATH_QUEUE_MAX_AGE),
@@ -227,9 +232,21 @@ pub(crate) fn run_path(
             &telemetry.queue_depth,
             &telemetry.dropped,
             &telemetry.stale_dropped,
-            |frame| (frame.len(), path.send_frame(frame)),
-            |length, result| record_path_send(&statuses, index, length, result),
+            |frame| {
+                let started = Instant::now();
+                let result = path.send_frame(frame);
+                socket_send += started.elapsed();
+                frames_sent += 1;
+                (frame.len(), result)
+            },
+            |length, result| {
+                let started = Instant::now();
+                record_path_send(&statuses, index, length, result);
+                status_lock += started.elapsed();
+            },
         );
+        (pass.socket_send, pass.status_lock, pass.frames_sent) =
+            (socket_send, status_lock, frames_sent);
         // A transport that has established it is gone will not answer a probe
         // either, so waiting three of them out only costs the user the traffic
         // handed to a socket that cannot carry it. The probe machinery still
@@ -249,6 +266,7 @@ pub(crate) fn run_path(
                 index + 1
             );
         }
+        let probe_started = Instant::now();
         if Instant::now() >= next_probe && pending_probe.is_none() {
             let sequence = sequences.fetch_add(1, Ordering::Relaxed);
             let result = (|| {
@@ -324,6 +342,8 @@ pub(crate) fn run_path(
                 let _ = path.send_probe(&frame);
             }
         }
+        pass.probe = probe_started.elapsed();
+        let receive_started = Instant::now();
         match path.receive_frames(WORKER_RECEIVE_TIMEOUT) {
             Ok(frames) => {
                 for frame in frames {
@@ -477,6 +497,7 @@ pub(crate) fn run_path(
             // duplication.
             Err(error) => update_path_status(&statuses, index, Err(error)),
         }
+        pass.receive = receive_started.elapsed();
         // Setup latency is fixed once a path is up, and this lock is shared by
         // every path worker, so it is taken only when the value actually moves.
         let setup_latency = path.setup_latency_ms();
@@ -547,5 +568,6 @@ pub(crate) fn run_path(
             }
             next_probe = Instant::now() + PROBE_INTERVAL_DEGRADED;
         }
+        pass.total = iteration_started.elapsed();
     }
 }

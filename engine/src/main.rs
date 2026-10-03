@@ -29,12 +29,15 @@ use commands::{
     scheduler_demo,
 };
 use gamepath_engine::role::Role;
-use gamepath_engine::{log_error, log_info};
+use gamepath_engine::{log_error, log_info, log_warn};
 use ipc::{Request, Response};
 use serde_json::json;
 use session::WireGuardSessionManager;
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
+
+/// A request answered slower than this is logged by name.
+const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() {
     let role = match Role::from_args(std::env::args()) {
@@ -69,7 +72,20 @@ fn main() {
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle_request(request, &sessions, &mut capture, &mut proxy),
+            Ok(request) => {
+                let command = request.command.clone();
+                let started = std::time::Instant::now();
+                let response = handle_request(request, &sessions, &mut capture, &mut proxy);
+                // The client gives up on a session after a few unanswered
+                // polls, so a slow answer is worth naming before that happens.
+                if started.elapsed() >= SLOW_REQUEST {
+                    log_warn!(
+                        "request {command} took {:.1} s",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                response
+            }
             Err(error) => Response {
                 id: 0,
                 ok: false,

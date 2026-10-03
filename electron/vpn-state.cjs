@@ -1,11 +1,11 @@
 'use strict'
 
 /**
- * The VPN's saved settings: one node, its own split rules, and whether the
+ * The VPN's saved settings: saved nodes, its own split rules, and whether the
  * user wants it on. Pure functions over plain objects, so every rule here is
  * tested without Electron.
  *
- * The node's secret is not part of this. It lives in `state.encryptedVpnConfig`,
+ * Node secrets live separately in `state.encryptedVpnConfigs`,
  * which `publicState()` strips with every other `encrypted*` field.
  */
 
@@ -14,7 +14,8 @@ const NODE_KINDS = ['wireguard', 'openvpn', 'l2tp', 'socks5']
 
 function defaultVpn() {
   return {
-    node: null,
+    nodes: [],
+    selectedNodeId: null,
     trafficMode: 'split',
     // On for the same reason as the game's: a filtered resolver poisons the
     // names of exactly the sites the VPN is for.
@@ -44,9 +45,24 @@ function normalizeRule(rule) {
 function normalizeVpn(saved) {
   const vpn = defaultVpn()
   if (!isObject(saved)) return vpn
-  if (isObject(saved.node) && NODE_KINDS.includes(saved.node.kind) && typeof saved.node.id === 'string') {
-    vpn.node = { ...saved.node }
+  const candidates = Array.isArray(saved.nodes) ? saved.nodes : [saved.node]
+  const nodeIds = new Set()
+  for (const node of candidates) {
+    if (
+      !isObject(node) ||
+      !NODE_KINDS.includes(node.kind) ||
+      typeof node.id !== 'string' ||
+      !node.id ||
+      nodeIds.has(node.id)
+    )
+      continue
+    nodeIds.add(node.id)
+    vpn.nodes.push({ ...node })
   }
+  vpn.selectedNodeId = nodeIds.has(saved.selectedNodeId)
+    ? saved.selectedNodeId
+    : (vpn.nodes.find((node) => node.enabled !== false)?.id ?? vpn.nodes[0]?.id ?? null)
+  vpn.nodes = vpn.nodes.map((node) => ({ ...node, enabled: node.id === vpn.selectedNodeId }))
   if (saved.trafficMode === 'all') vpn.trafficMode = 'all'
   if (saved.remoteDns === false) vpn.remoteDns = false
   if (saved.killSwitch === true) vpn.killSwitch = true
@@ -59,8 +75,26 @@ function normalizeVpn(saved) {
       }
     }
   }
-  vpn.wantConnected = saved.wantConnected === true && vpn.node !== null
+  vpn.wantConnected = saved.wantConnected === true && vpn.selectedNodeId !== null
   return vpn
+}
+
+function selectedVpnNode(vpn) {
+  return vpn.nodes.find((node) => node.id === vpn.selectedNodeId) ?? null
+}
+
+/** Move the original single-node save without decrypting or exposing it. */
+function migrateVpnState(state) {
+  const legacyId = state.vpn?.node?.id
+  state.vpn = normalizeVpn(state.vpn)
+  const stored = isObject(state.encryptedVpnConfigs) ? state.encryptedVpnConfigs : {}
+  state.encryptedVpnConfigs = Object.fromEntries(
+    state.vpn.nodes.filter((node) => typeof stored[node.id] === 'string').map((node) => [node.id, stored[node.id]]),
+  )
+  if (state.vpn.nodes.some((node) => node.id === legacyId) && typeof state.encryptedVpnConfig === 'string') {
+    state.encryptedVpnConfigs[legacyId] ??= state.encryptedVpnConfig
+  }
+  delete state.encryptedVpnConfig
 }
 
 /** The rule list the service compiles. */
@@ -88,7 +122,9 @@ function ruleLimitation(node, trafficMode, kind, value) {
 
 /** Rules of the saved set that the current node cannot route. */
 function unroutableRules(vpn) {
-  return vpn.rules.filter((rule) => rule.enabled && ruleLimitation(vpn.node, vpn.trafficMode, rule.kind, rule.value))
+  return vpn.rules.filter(
+    (rule) => rule.enabled && ruleLimitation(selectedVpnNode(vpn), vpn.trafficMode, rule.kind, rule.value),
+  )
 }
 
 function createRule(input, id) {
@@ -134,6 +170,8 @@ module.exports = {
   RULE_KINDS,
   defaultVpn,
   normalizeVpn,
+  selectedVpnNode,
+  migrateVpnState,
   vpnRuleSpecs,
   ruleLimitation,
   unroutableRules,

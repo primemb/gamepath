@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use crate::session::{DataReceiver, WireGuardSessionManager};
+use crate::session::{DataReceiver, SenderCache, WireGuardSessionManager};
 use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::policy::{InterceptionPlan, RuleSpec, compile};
 use gamepath_engine::role::Role;
@@ -1424,6 +1424,7 @@ fn run_selected_capture(
     let mut table_version = registry.table_version.load(Ordering::Acquire);
     let mut table = selector_table(&registry);
     let mut fragments = gamepath_engine::ipv4_fragments::FragmentTrail::default();
+    let mut sender = SenderCache::new(Arc::clone(&sessions));
     while !stop.load(Ordering::Acquire) {
         let (packet_length, address) = match handle.recv_into(&mut packet_buffer) {
             Ok(packet) => packet,
@@ -1457,7 +1458,7 @@ fn run_selected_capture(
             match fragments.lookup(packet, Instant::now()) {
                 Some(redirect) => route_later_fragment(
                     &handle,
-                    &sessions,
+                    &mut sender,
                     virtual_ipv4,
                     &registry,
                     packet,
@@ -1651,7 +1652,7 @@ fn run_selected_capture(
         let hold_on_failure = registry.kill_switch && !implicit_dns;
         let carried = route_selected_packet(
             &handle,
-            &sessions,
+            &mut sender,
             &return_paths,
             virtual_ipv4,
             &registry,
@@ -1679,7 +1680,7 @@ fn run_selected_capture(
 #[allow(clippy::too_many_arguments)]
 fn route_later_fragment(
     handle: &Handle,
-    sessions: &Mutex<WireGuardSessionManager>,
+    sender: &mut SenderCache,
     virtual_ipv4: Ipv4Addr,
     registry: &Registry,
     packet: &[u8],
@@ -1697,11 +1698,7 @@ fn route_later_fragment(
     let forwarded = handle
         .ip_checksum(tunnel_buffer, &mut checksum_address)
         .is_ok()
-        && sessions
-            .lock()
-            .unwrap()
-            .enqueue_data_packet(tunnel_buffer)
-            .is_ok();
+        && sender.send(tunnel_buffer).is_ok();
     // Never fails open: the first fragment is already in the tunnel, and half
     // a datagram on each path reassembles nowhere.
     if forwarded {
@@ -1948,7 +1945,7 @@ fn run_bypass_injector(
 #[allow(clippy::too_many_arguments)]
 fn route_selected_packet(
     handle: &Handle,
-    sessions: &Mutex<WireGuardSessionManager>,
+    sender: &mut SenderCache,
     return_paths: &Mutex<HashMap<ReturnKey, ReturnPath>>,
     virtual_ipv4: Ipv4Addr,
     registry: &Registry,
@@ -2047,7 +2044,7 @@ fn route_selected_packet(
     let forwarded = if checksummed.is_err() {
         Err("could not update packet checksums".to_owned())
     } else {
-        sessions.lock().unwrap().enqueue_data_packet(tunneled)
+        sender.send(tunneled)
     };
     if forwarded.is_err() && hold_on_failure {
         registry.held_packets.fetch_add(1, Ordering::Relaxed);
@@ -2075,6 +2072,7 @@ fn run_pending_syns(
     pending: mpsc::Receiver<PendingSyn>,
 ) {
     let mut tunnel_buffer = Vec::with_capacity(65_535);
+    let mut sender = SenderCache::new(sessions);
     loop {
         let item = match pending.recv_timeout(Duration::from_millis(10)) {
             Ok(item) => item,
@@ -2095,7 +2093,7 @@ fn run_pending_syns(
         if let Some((application, process_id)) = table.lookup(item.fields) {
             route_selected_packet(
                 &handle,
-                &sessions,
+                &mut sender,
                 &return_paths,
                 virtual_ipv4,
                 &registry,

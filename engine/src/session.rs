@@ -17,6 +17,7 @@ mod monitors;
 mod path_mtu;
 mod relay_worker;
 mod repair;
+mod sender;
 mod start;
 mod state;
 mod status;
@@ -34,6 +35,7 @@ use crate::ipc::SessionRequest;
 use gamepath_engine::log_info;
 use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::relay_path::SessionMode;
+pub(crate) use sender::{DataSender, SenderCache};
 use serde_json::{Value, json};
 use state::ActiveWireGuardSession;
 use std::sync::Arc;
@@ -149,6 +151,12 @@ impl WireGuardSessionManager {
         self.active.as_ref().map(|session| session.virtual_ipv4)
     }
 
+    /// What a packet path needs to hand packets to this session without
+    /// holding the manager's lock; see [`sender`].
+    pub(crate) fn data_sender(&self) -> Option<DataSender> {
+        self.active.as_ref().map(DataSender::of)
+    }
+
     pub(crate) fn effective_mtu(&self) -> Option<EffectiveMtu> {
         self.active.as_ref().map(|session| session.mtu.current())
     }
@@ -246,5 +254,60 @@ mod tests {
         );
         assert!(error.contains("relay mode"), "{error}");
         assert!(manager.active.is_none());
+    }
+
+    #[test]
+    fn packets_flow_while_a_control_request_holds_the_session_lock() {
+        use base64::Engine as _;
+        use std::sync::Mutex;
+
+        // A peer that never answers: WireGuard opens without a handshake, and
+        // a packet is accepted once its path worker queues it.
+        let peer = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let key = base64::engine::general_purpose::STANDARD.encode([7_u8; 32]);
+        let config = format!(
+            "[Interface]\nPrivateKey = {key}\nAddress = 10.66.66.2/32\n[Peer]\nPublicKey = {key}\n\
+             Endpoint = 127.0.0.1:{}\nAllowedIPs = 0.0.0.0/0",
+            peer.local_addr().unwrap().port()
+        );
+        let sessions = Arc::new(Mutex::new(WireGuardSessionManager::default()));
+        sessions
+            .lock()
+            .unwrap()
+            .start_direct(&[NodeSpec::WireGuard {
+                config,
+                label: None,
+            }])
+            .unwrap();
+        let packet = crate::icmp::icmp_echo_packet(
+            std::net::Ipv4Addr::new(10, 66, 66, 2),
+            gamepath_engine::BENCHMARK_TARGET,
+            1,
+            1,
+            false,
+        );
+        let mut cache = SenderCache::new(Arc::clone(&sessions));
+        cache.send(&packet).unwrap();
+
+        // A status poll holding the lock for as long as it likes.
+        let held = sessions.lock().unwrap();
+        let sender = thread::spawn(move || {
+            (0..100)
+                .all(|_| cache.send(&packet).is_ok())
+                .then_some(cache)
+        });
+        let mut cache = sender.join().unwrap().expect("sent without the lock");
+        drop(held);
+
+        // A stopped session is noticed, and its replacement picked up.
+        sessions.lock().unwrap().stop();
+        let probe = crate::icmp::icmp_echo_packet(
+            std::net::Ipv4Addr::new(10, 66, 66, 2),
+            gamepath_engine::BENCHMARK_TARGET,
+            1,
+            2,
+            false,
+        );
+        assert!(cache.send(&probe).is_err());
     }
 }
