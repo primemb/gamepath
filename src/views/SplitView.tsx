@@ -120,7 +120,7 @@ function TrafficModeCard({
           <strong>Resolve names through the tunnel</strong>
           <p>
             {state.remoteDns
-              ? 'Websites and game servers are looked up at the far end of the tunnel, so a filtered or poisoned local resolver cannot send you to the wrong address. Applies to every app on this PC, not only the ones you select.'
+              ? 'Names resolve through the game tunnel and never fall back to local DNS. Shared Windows lookups use the game; identifiable VPN apps can use their own VPN resolver.'
               : 'Lookups use whatever resolver this PC normally uses. Turn this on if a game or site fails to connect while the tunnel itself is healthy.'}
           </p>
         </div>

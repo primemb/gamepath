@@ -22,6 +22,10 @@ pub(crate) struct PacketCaptureManager {
     active: Option<WindowsPacketCapture>,
     #[cfg(windows)]
     active_split: Option<crate::split_capture::SplitPacketCapture>,
+    #[cfg(windows)]
+    dns_guard: Option<crate::dns_guard::DnsGuard>,
+    #[cfg(windows)]
+    native_dns_adapter: Option<u128>,
     /// The request the running capture was started with, so a change to the
     /// other session's tunnel can be applied without the caller resending it.
     last_request: Option<Value>,
@@ -109,7 +113,7 @@ fn configure_tunnel_dns(
     adapter_guid: u128,
     sessions: &Mutex<WireGuardSessionManager>,
     tunnel_gateway: std::net::Ipv4Addr,
-) -> Vec<std::net::Ipv4Addr> {
+) -> Result<Vec<std::net::Ipv4Addr>, String> {
     let relay = sessions
         .lock()
         .unwrap()
@@ -132,15 +136,11 @@ fn configure_tunnel_dns(
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            servers
+            Ok(servers)
         }
-        // Not fatal. A session that carries traffic is worth more than this,
-        // and leaving the adapter without servers is exactly the behaviour
-        // every previous release had.
-        Err(error) => {
-            log_warn!("name resolution will not go through the tunnel: {error}");
-            Vec::new()
-        }
+        Err(error) => Err(format!(
+            "could not configure remote DNS; refusing local fallback: {error}"
+        )),
     }
 }
 
@@ -216,6 +216,33 @@ fn open_session_adapter() -> Result<std::sync::Arc<wintun::Adapter>, String> {
 
 impl PacketCaptureManager {
     #[cfg(windows)]
+    pub(crate) fn start_native_dns(&mut self, payload: Value) -> Result<Value, String> {
+        let input: PacketCaptureRequest = serde_json::from_value(payload.clone())
+            .map_err(|error| format!("invalid native DNS request: {error}"))?;
+        let index = payload["interfaceIndex"]
+            .as_u64()
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or("native DNS needs the VPN interface index")?;
+        if input.remote_dns {
+            let guard = crate::dns_guard::DnsGuard::start(&input, Some(index))?;
+            let servers = gamepath_engine::dns::resolver_order(None);
+            let guid = gamepath_engine::netconfig::set_interface_dns_by_index(index, &servers)?;
+            self.native_dns_adapter = Some(guid);
+            self.dns_guard = Some(guard);
+            gamepath_engine::netconfig::flush_dns_cache();
+        } else {
+            self.dns_guard = None;
+            if let Some(adapter) = self.native_dns_adapter.take() {
+                gamepath_engine::netconfig::set_interface_dns(adapter, &[])?;
+                gamepath_engine::netconfig::flush_dns_cache();
+            }
+        }
+        self.last_request = Some(payload);
+        Ok(json!({"remoteDns": input.remote_dns,
+            "dnsServers": if input.remote_dns { gamepath_engine::dns::resolver_order(None) } else { vec![] }}))
+    }
+
+    #[cfg(windows)]
     pub(crate) fn start(
         &mut self,
         payload: Value,
@@ -234,6 +261,13 @@ impl PacketCaptureManager {
         }
         #[cfg(windows)]
         let previous_dns = self.dns_mode();
+        // Keep assigned DNS closed while replacing a live capture policy.
+        #[cfg(windows)]
+        let _transition_dns_guard = if input.remote_dns {
+            Some(crate::dns_guard::DnsGuard::start(&input, Some(u32::MAX))?)
+        } else {
+            None
+        };
         #[cfg(windows)]
         let carried = {
             drop(self.active.take());
@@ -258,6 +292,14 @@ impl PacketCaptureManager {
             )
         };
         if input.traffic_mode == "split" {
+            self.dns_guard = if input.remote_dns {
+                Some(crate::dns_guard::DnsGuard::start(&input, None)?)
+            } else {
+                None
+            };
+            let own_apps_only = gamepath_engine::role::Role::current()
+                == gamepath_engine::role::Role::Vpn
+                && input.other_session_active;
             let mut excluded = bypass_ips;
             excluded.extend(&input.foreign_bypass);
             let split = crate::split_capture::SplitPacketCapture::start(
@@ -269,6 +311,11 @@ impl PacketCaptureManager {
                 effective_mtu,
                 crate::split_capture::SplitOptions {
                     kill_switch: input.kill_switch,
+                    remote_dns: input.remote_dns,
+                    own_apps_only,
+                    yield_foreign_lookups: yields_foreign_lookups(
+                        input.other_session_active && input.other_session_app_dns,
+                    ),
                     own_hostnames: input.own_hostnames.clone(),
                     carried,
                     // Only the VPN, and only with no game running: the VPN
@@ -288,7 +335,9 @@ impl PacketCaptureManager {
                 == gamepath_engine::role::Role::Vpn
                 && input.other_session_active;
             split.set_redirect_dns(input.remote_dns, own_apps_only);
-            split.set_yield_foreign_lookups(yields_foreign_lookups(input.other_session_active));
+            split.set_yield_foreign_lookups(yields_foreign_lookups(
+                input.other_session_active && input.other_session_app_dns,
+            ));
             self.active_split = Some(split);
             let dns = self.dns_mode();
             // Answers cached before the switch would outlive it: the router's
@@ -421,11 +470,19 @@ impl PacketCaptureManager {
         // so pointing Windows at a tunnel resolver before they exist would ask
         // it to resolve through a path that is not there yet.
         let adapter_guid = adapter.get_guid();
+        self.dns_guard = if input.remote_dns {
+            Some(crate::dns_guard::DnsGuard::start(
+                &input,
+                Some(adapter_index),
+            )?)
+        } else {
+            None
+        };
         // With the setting off the adapter is left without servers, so Windows
         // falls back to the physical interface's - the behaviour every release
         // before the setting had.
         let resolvers = if input.remote_dns {
-            configure_tunnel_dns(adapter_guid, &sessions, tunnel_gateway)
+            configure_tunnel_dns(adapter_guid, &sessions, tunnel_gateway)?
         } else {
             log_info!("remote DNS is off: name resolution stays with the local resolver");
             Vec::new()
@@ -561,6 +618,14 @@ impl PacketCaptureManager {
         self.last_request = None;
         #[cfg(windows)]
         {
+            self.dns_guard = None;
+            if let Some(adapter) = self.native_dns_adapter.take() {
+                let _ = gamepath_engine::netconfig::set_interface_dns(adapter, &[]);
+                gamepath_engine::netconfig::flush_dns_cache();
+            }
+        }
+        #[cfg(windows)]
+        {
             let was_redirecting = self.dns_mode().is_some();
             let tunnel_address = self.active.as_ref().map(|capture| capture.virtual_ipv4);
             drop(self.active.take());
@@ -597,11 +662,16 @@ impl PacketCaptureManager {
     #[cfg(windows)]
     pub(crate) fn set_other_session_active(&mut self, payload: &Value) -> Value {
         let active = payload["active"] == json!(true);
+        let can_route_apps = payload["canRouteAppDns"].as_bool().unwrap_or(true);
         if let Some(request) = self.last_request.as_mut() {
             request["otherSessionActive"] = json!(active);
+            request["otherSessionAppDns"] = json!(can_route_apps);
         }
         if let Some(split) = &self.active_split {
-            split.set_yield_foreign_lookups(yields_foreign_lookups(active));
+            split.set_yield_foreign_lookups(yields_foreign_lookups(active && can_route_apps));
+        }
+        if let Some(guard) = &self.dns_guard {
+            guard.set_other_active(active, can_route_apps);
         }
         json!({ "otherSessionActive": active })
     }

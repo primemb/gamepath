@@ -11,7 +11,7 @@
 //! so the injector delivers it whole, as a VPN adapter would.
 //!
 //! Outbound, Windows fragments a datagram larger than the path MTU before
-//! capture sees it. [`FragmentTrail`] sends the later fragments wherever the
+//! capture sees it. [`crate::fragment_router::FragmentRouter`] sends later fragments wherever the
 //! first one went, so a selected datagram is not split between the tunnel and
 //! the open network, where neither half can be reassembled.
 

@@ -21,16 +21,16 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS,
-    DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2,
-    DeleteUnicastIpAddressEntry, FreeMibTable, GetBestRoute2, GetIfEntry2, GetIpForwardTable2,
-    GetIpInterfaceEntry, GetIpInterfaceTable, GetUnicastIpAddressTable, IF_TYPE_ETHERNET_CSMACD,
-    IF_TYPE_IEEE80211, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
-    InitializeUnicastIpAddressEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
-    MIB_IPINTERFACE_ROW, MIB_IPINTERFACE_TABLE, MIB_UNICASTIPADDRESS_ROW,
+    ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToGuid, CreateIpForwardEntry2,
+    CreateUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+    DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, DeleteUnicastIpAddressEntry, FreeMibTable,
+    GetBestRoute2, GetIfEntry2, GetIpForwardTable2, GetIpInterfaceEntry, GetIpInterfaceTable,
+    GetUnicastIpAddressTable, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IP_ADDRESS_PREFIX,
+    InitializeIpForwardEntry, InitializeUnicastIpAddressEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
+    MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, MIB_IPINTERFACE_TABLE, MIB_UNICASTIPADDRESS_ROW,
     MIB_UNICASTIPADDRESS_TABLE, SetInterfaceDnsSettings, SetIpInterfaceEntry,
 };
-use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+use windows_sys::Win32::NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH};
 use windows_sys::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IpDadStatePreferred,
     RouterDiscoveryDisabled, SOCKADDR_IN, SOCKADDR_INET,
@@ -764,6 +764,29 @@ pub fn remove_route_via(
 ///
 /// `adapter` is the interface GUID rather than its index, because that is what
 /// `SetInterfaceDnsSettings` takes.
+pub fn set_interface_dns_by_index(index: u32, servers: &[Ipv4Addr]) -> Result<u128, String> {
+    let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+    let mut guid: GUID = unsafe { std::mem::zeroed() };
+    let status = unsafe { ConvertInterfaceIndexToLuid(index, &mut luid) };
+    if status != NO_ERROR {
+        return Err(format!(
+            "could not identify DNS interface {index} (error {status})"
+        ));
+    }
+    let status = unsafe { ConvertInterfaceLuidToGuid(&luid, &mut guid) };
+    if status != NO_ERROR {
+        return Err(format!(
+            "could not identify DNS adapter {index} (error {status})"
+        ));
+    }
+    let guid = (u128::from(guid.data1) << 96)
+        | (u128::from(guid.data2) << 80)
+        | (u128::from(guid.data3) << 64)
+        | u128::from(u64::from_be_bytes(guid.data4));
+    set_interface_dns(guid, servers)?;
+    Ok(guid)
+}
+
 pub fn set_interface_dns(adapter: u128, servers: &[Ipv4Addr]) -> Result<(), String> {
     // The API takes one space-separated, NUL-terminated wide string. A null
     // pointer with the flag set is how "no servers" is spelled.

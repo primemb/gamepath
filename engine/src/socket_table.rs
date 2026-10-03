@@ -2,11 +2,12 @@ use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
     MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_CLASS, TCP_TABLE_OWNER_PID_ALL,
     TCP_TABLE_OWNER_PID_CONNECTIONS, TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
 };
-use windows_sys::Win32::Networking::WinSock::AF_INET;
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
 pub(crate) fn tcp_rows(class: TCP_TABLE_CLASS) -> Option<Vec<MIB_TCPROW_OWNER_PID>> {
     if !matches!(
@@ -27,6 +28,39 @@ pub(crate) fn udp_rows() -> Option<Vec<MIB_UDPROW_OWNER_PID>> {
         GetExtendedUdpTable(table, size, 0, u32::from(AF_INET), UDP_TABLE_OWNER_PID, 0)
     })?;
     unsafe { rows(&buffer, offset_of!(MIB_UDPTABLE_OWNER_PID, table)) }
+}
+
+pub(crate) fn ipv6_owner(protocol: u8, port: u16) -> Option<u32> {
+    if protocol == 17 {
+        let buffer = read_table(|table, size| unsafe {
+            GetExtendedUdpTable(table, size, 0, u32::from(AF_INET6), UDP_TABLE_OWNER_PID, 0)
+        })?;
+        let rows = unsafe {
+            rows::<MIB_UDP6ROW_OWNER_PID>(&buffer, offset_of!(MIB_UDP6TABLE_OWNER_PID, table))
+        }?;
+        rows.into_iter()
+            .find(|row| u16::from_be(row.dwLocalPort as u16) == port)
+            .map(|row| row.dwOwningPid)
+    } else if protocol == 6 {
+        let buffer = read_table(|table, size| unsafe {
+            GetExtendedTcpTable(
+                table,
+                size,
+                0,
+                u32::from(AF_INET6),
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            )
+        })?;
+        let rows = unsafe {
+            rows::<MIB_TCP6ROW_OWNER_PID>(&buffer, offset_of!(MIB_TCP6TABLE_OWNER_PID, table))
+        }?;
+        rows.into_iter()
+            .find(|row| u16::from_be(row.dwLocalPort as u16) == port)
+            .map(|row| row.dwOwningPid)
+    } else {
+        None
+    }
 }
 
 fn read_table(call: impl Fn(*mut c_void, *mut u32) -> u32) -> Option<Vec<u8>> {

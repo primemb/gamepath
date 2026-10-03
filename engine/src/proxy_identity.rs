@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::NetworkManagement::IpHelper::TCP_TABLE_OWNER_PID_LISTENER;
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    TCP_TABLE_OWNER_PID_ALL, TCP_TABLE_OWNER_PID_LISTENER,
+};
 
 /// How long a port's owner is trusted before it is looked up again. Ports are
 /// reused, so this stays short; lookups are rare enough that it costs little.
@@ -27,7 +29,7 @@ pub(crate) struct ProxyIdentity {
     /// The process listening on the proxy port, and when that was checked.
     /// Compared by id, so a lookup never has to open a process.
     process: Mutex<(Option<u32>, Option<Instant>)>,
-    owners: Mutex<HashMap<u16, (bool, Instant)>>,
+    owners: Mutex<HashMap<(u8, u16), (bool, Instant)>>,
 }
 
 impl ProxyIdentity {
@@ -58,18 +60,30 @@ impl ProxyIdentity {
     }
 
     /// Whether the UDP socket on `local_port` belongs to the proxy's process.
+    #[cfg(test)]
     pub(crate) fn owns_udp_port(&self, local_port: u16) -> bool {
-        if let Some((owned, at)) = self.owners.lock().unwrap().get(&local_port) {
+        self.owns_port(17, local_port)
+    }
+
+    pub(crate) fn owns_port(&self, protocol: u8, local_port: u16) -> bool {
+        if let Some((owned, at)) = self.owners.lock().unwrap().get(&(protocol, local_port)) {
             if at.elapsed() < OWNER_TTL {
                 return *owned;
             }
         }
-        let owned = self
-            .process_id()
-            .is_some_and(|proxy| udp_owner(local_port) == Some(proxy));
+        let owner = if protocol == 17 {
+            udp_owner(local_port)
+        } else {
+            crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_ALL).and_then(|rows| {
+                rows.into_iter()
+                    .find(|row| u16::from_be(row.dwLocalPort as u16) == local_port)
+                    .map(|row| row.dwOwningPid)
+            })
+        };
+        let owned = self.process_id().is_some_and(|proxy| owner == Some(proxy));
         let mut owners = self.owners.lock().unwrap();
         owners.retain(|_, (_, at)| at.elapsed() < OWNER_TTL);
-        owners.insert(local_port, (owned, Instant::now()));
+        owners.insert((protocol, local_port), (owned, Instant::now()));
         owned
     }
 }

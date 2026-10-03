@@ -129,6 +129,8 @@ pub(crate) struct Socks5ProbeRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PacketCaptureRequest {
     pub(crate) traffic_mode: String,
+    #[serde(default = "enabled")]
+    pub(crate) other_session_app_dns: bool,
     #[serde(default)]
     pub(crate) rules: Vec<RuleSpec>,
     /// Whether name resolution should follow the tunnel.

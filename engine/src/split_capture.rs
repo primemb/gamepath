@@ -1,6 +1,9 @@
 #![cfg(windows)]
 
 use crate::session::{DataReceiver, SenderCache, WireGuardSessionManager};
+use gamepath_engine::fragment_router::{
+    Action as FragmentAction, FragmentRouter, Route as FragmentRoute, Ticket as FragmentTicket,
+};
 use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::policy::{InterceptionPlan, RuleSpec, compile};
 use gamepath_engine::role::Role;
@@ -65,7 +68,7 @@ impl Default for AddressData {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct Address {
+pub(crate) struct Address {
     _timestamp: i64,
     flags: u32,
     _reserved: u32,
@@ -111,7 +114,7 @@ struct Api {
 unsafe impl Send for Api {}
 unsafe impl Sync for Api {}
 
-struct Handle {
+pub(crate) struct Handle {
     api: Arc<Api>,
     raw: isize,
 }
@@ -120,7 +123,7 @@ unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
 
 impl Handle {
-    fn open(
+    pub(crate) fn open(
         path: &Path,
         filter: &str,
         layer: u32,
@@ -191,7 +194,7 @@ impl Handle {
         Ok((packet, address))
     }
 
-    fn recv_into(&self, packet: &mut [u8]) -> Result<(usize, Address), std::io::Error> {
+    pub(crate) fn recv_into(&self, packet: &mut [u8]) -> Result<(usize, Address), std::io::Error> {
         let mut length = 0;
         let mut address = Address::default();
         if unsafe {
@@ -209,7 +212,7 @@ impl Handle {
         Ok((length as usize, address))
     }
 
-    fn send(&self, packet: &[u8], address: &Address) -> Result<(), String> {
+    pub(crate) fn send(&self, packet: &[u8], address: &Address) -> Result<(), String> {
         let mut sent = 0;
         if unsafe {
             (self.api.send)(
@@ -228,7 +231,7 @@ impl Handle {
         }
     }
 
-    fn set_param(&self, parameter: u32, value: u64) -> Result<(), String> {
+    pub(crate) fn set_param(&self, parameter: u32, value: u64) -> Result<(), String> {
         if unsafe { (self.api.set_param)(self.raw, parameter, value) } == 0 {
             Err(std::io::Error::last_os_error().to_string())
         } else {
@@ -268,7 +271,7 @@ impl Handle {
         }
     }
 
-    fn shutdown_receive(&self) {
+    pub(crate) fn shutdown_receive(&self) {
         unsafe {
             (self.api.shutdown)(self.raw, 1);
         }
@@ -535,10 +538,7 @@ struct Registry {
     capture_id: u64,
     dll: PathBuf,
     bypass: String,
-    /// Drop rule-selected packets the session cannot carry instead of letting
-    /// them out on the normal connection. Never applies to the name lookups
-    /// captured without a rule, or a down tunnel would stop the whole machine
-    /// resolving.
+    /// Drop rule-selected traffic on failure. Remote DNS always fails closed independently.
     kill_switch: bool,
     /// Packets dropped by the kill switch.
     held_packets: AtomicU64,
@@ -554,18 +554,8 @@ struct Registry {
     /// Whether each recently seen lookup socket belongs to an ordinary
     /// application, by local port, and each process by id.
     lookup_owners: Mutex<LookupOwners>,
-    /// When the oldest tunnelled name lookup still waiting for an answer was
-    /// sent, in [`Registry::clock_ms`] (0: none waiting). Lookups are only
-    /// redirected while the tunnel answers, so a dead tunnel never leaves the
-    /// machine unable to resolve. Handing a packet to the session proves
-    /// nothing here: with every path down it is still sent on the last one.
-    unanswered_dns_since: AtomicU64,
-    /// Lookups go to the LAN resolver because the tunnel stopped answering.
-    dns_fallback: AtomicBool,
-    /// When a lookup was last redirected anyway to see whether the tunnel
-    /// answers again, in [`Registry::clock_ms`].
-    last_dns_probe: AtomicU64,
-    clock: Instant,
+    udp_classifier: Mutex<crate::udp_classifier::UdpClassifier>,
+    fragments: Mutex<FragmentRouter<Address>>,
     redirected_dns: AtomicU64,
     /// The session is a proxy that may hand out fake-IP addresses.
     proxy_fake_ips: bool,
@@ -699,6 +689,9 @@ impl TrafficSelector {
 /// Session choices a split capture is started with, beyond its rules.
 pub struct SplitOptions {
     pub kill_switch: bool,
+    pub remote_dns: bool,
+    pub own_apps_only: bool,
+    pub yield_foreign_lookups: bool,
     /// See `PacketCaptureRequest::own_hostnames`.
     pub own_hostnames: Vec<String>,
     /// The flows of the capture this one replaces.
@@ -718,6 +711,8 @@ pub struct CarriedFlows {
     return_paths: HashMap<ReturnKey, ReturnPath>,
     handled_connections: HashMap<ReturnKey, HandledConnection>,
     app_usage: HashMap<String, Arc<AppUsage>>,
+    fragments: FragmentRouter<Address>,
+    destination_labels: HashMap<Ipv4Addr, Arc<str>>,
 }
 
 impl CarriedFlows {
@@ -835,7 +830,7 @@ fn capture_scope(plan: &InterceptionPlan, destinations: &[(u32, u32)]) -> Captur
         // Name resolution is added to every narrow filter, because the
         // classifier behind it selects DNS whoever asked for it and a packet
         // the kernel never hands up cannot be selected at all.
-        clause: format!("(({clause}) or {DNS_CLAUSE})"),
+        clause: format!("(({clause}) or {DNS_CLAUSE} or fragment)"),
         broad: false,
         reason: "destination rules are matched in the kernel",
     }
@@ -853,25 +848,33 @@ impl SplitPacketCapture {
     ) -> Result<Self, String> {
         let SplitOptions {
             kill_switch,
+            remote_dns,
+            own_apps_only,
+            yield_foreign_lookups,
             own_hostnames,
             carried,
             reset_existing,
         } = options;
         let plan = compile("split", rules)?;
-        let (capture_id, carried_paths, carried_handled, carried_usage) = match carried {
-            Some(flows) => (
-                flows.capture_id,
-                flows.return_paths,
-                flows.handled_connections,
-                flows.app_usage,
-            ),
-            None => (
-                NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-            ),
-        };
+        let (capture_id, carried_paths, carried_handled, carried_usage, fragments, labels) =
+            match carried {
+                Some(flows) => (
+                    flows.capture_id,
+                    flows.return_paths,
+                    flows.handled_connections,
+                    flows.app_usage,
+                    flows.fragments,
+                    flows.destination_labels,
+                ),
+                None => (
+                    NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    FragmentRouter::default(),
+                    HashMap::new(),
+                ),
+            };
         let socks_proxy = sessions.lock().unwrap().socks_proxy();
         let proxy_fake_ips = socks_proxy.is_some();
         let registry = Arc::new(Registry {
@@ -880,14 +883,12 @@ impl SplitPacketCapture {
             bypass: bypass_clause(bypass_ips),
             kill_switch,
             held_packets: AtomicU64::new(0),
-            redirect_dns: AtomicBool::new(false),
-            dns_own_apps_only: AtomicBool::new(false),
-            yield_foreign_lookups: AtomicBool::new(false),
+            redirect_dns: AtomicBool::new(remote_dns),
+            dns_own_apps_only: AtomicBool::new(own_apps_only),
+            yield_foreign_lookups: AtomicBool::new(yield_foreign_lookups),
             lookup_owners: Mutex::new(LookupOwners::default()),
-            unanswered_dns_since: AtomicU64::new(0),
-            dns_fallback: AtomicBool::new(false),
-            last_dns_probe: AtomicU64::new(0),
-            clock: Instant::now(),
+            udp_classifier: Mutex::new(crate::udp_classifier::UdpClassifier::default()),
+            fragments: Mutex::new(fragments),
             redirected_dns: AtomicU64::new(0),
             proxy_fake_ips,
             proxy: socks_proxy.and_then(crate::proxy_identity::ProxyIdentity::for_endpoint),
@@ -957,7 +958,7 @@ impl SplitPacketCapture {
         for selector in destination_selectors(&plan)? {
             add_selector(&registry, selector);
         }
-        for (ip, hostname) in resolve_hostnames(&plan) {
+        for (ip, hostname) in retained_hostname_addresses(labels, &plan.hostnames) {
             add_hostname_address(&registry, ip, &hostname);
         }
 
@@ -993,7 +994,7 @@ impl SplitPacketCapture {
         }
         let scope = capture_scope(&plan, &destinations);
         let network_filter = format!(
-            "outbound and ip and !loopback and {} and {}",
+            "outbound and ip and (!loopback or {DNS_CLAUSE}) and {} and {}",
             scope.clause, registry.bypass
         );
         let network_handle = Arc::new(Handle::open(
@@ -1104,6 +1105,10 @@ impl SplitPacketCapture {
             .map_err(|error| format!("could not start capture diagnostics: {error}"))?;
         registry.workers.lock().unwrap().push(worker);
 
+        // Resolve only after DNS capture and reply injection are running. A stalled
+        // resolver must never hold the control loop or a capture teardown open.
+        spawn_hostname_seed(plan.hostnames, &registry, &stop)?;
+
         // Only now, with capture open, so the reconnection is caught.
         if reset_existing {
             let closed = close_preexisting_connections(&registry, &return_paths);
@@ -1124,8 +1129,7 @@ impl SplitPacketCapture {
         })
     }
 
-    /// Answers lookups aimed at LAN resolvers through the tunnel, for as long
-    /// as the tunnel answers them.
+    /// Remote DNS stays assigned to this tunnel even while its paths are down.
     pub fn set_redirect_dns(&self, redirect: bool, own_apps_only: bool) {
         self.registry
             .dns_own_apps_only
@@ -1298,6 +1302,8 @@ impl SplitPacketCapture {
             return_paths: std::mem::take(&mut *return_paths.lock().unwrap()),
             handled_connections: std::mem::take(&mut *registry.handled_connections.lock().unwrap()),
             app_usage: std::mem::take(&mut *registry.app_usage.lock().unwrap()),
+            fragments: std::mem::take(&mut *registry.fragments.lock().unwrap()),
+            destination_labels: std::mem::take(&mut *registry.destination_labels.write().unwrap()),
         }
     }
 }
@@ -1375,8 +1381,8 @@ fn add_process_selector(
     };
     let mut state = registry.selector_state.lock().unwrap();
     let owners = state.flow_owners.entry(selector).or_default();
-    // A packet-table lookup may discover a TCP flow just before WinDivert's
-    // CONNECT notification arrives. Replace that PID-only fallback with the
+    // A packet-table lookup may discover a flow before WinDivert's socket
+    // notification arrives. Replace that PID-only fallback with the
     // endpoint-owned record so the later CLOSE notification can remove it.
     if endpoint_id.is_some() {
         owners.retain(|held| !(held.endpoint_id.is_none() && held.process_id == process_id));
@@ -1456,7 +1462,6 @@ fn run_selected_capture(
     // keeps its own copy and touches the lock on the versions that change.
     let mut table_version = registry.table_version.load(Ordering::Acquire);
     let mut table = selector_table(&registry);
-    let mut fragments = gamepath_engine::ipv4_fragments::FragmentTrail::default();
     let mut sender = SenderCache::new(Arc::clone(&sessions));
     while !stop.load(Ordering::Acquire) {
         let (packet_length, address) = match handle.recv_into(&mut packet_buffer) {
@@ -1488,23 +1493,52 @@ fn run_selected_capture(
         // wherever its first fragment went. Checked before the fields are
         // read, because a final fragment can be shorter than a port pair.
         if gamepath_engine::ipv4_fragments::is_later_fragment(packet) {
-            match fragments.lookup(packet, Instant::now()) {
-                Some(redirect) => route_later_fragment(
+            let action = {
+                let mut fragments = registry.fragments.lock().unwrap();
+                let action = fragments.later(packet, address, Instant::now());
+                registry
+                    .fragments_discarded
+                    .fetch_add(fragments.take_discarded(), Ordering::Relaxed);
+                action
+            };
+            if let FragmentAction::Route(route) = action {
+                dispatch_fragment(
                     &handle,
+                    &bypass,
                     &mut sender,
                     virtual_ipv4,
                     &registry,
                     packet,
                     address,
                     &mut tunnel_buffer,
-                    redirect,
-                ),
-                None => reinject(&handle, &bypass, &registry, packet, address),
+                    route,
+                );
             }
             continue;
         }
+        let first_fragment =
+            gamepath_engine::ipv4_fragments::is_first_fragment(packet).then(|| {
+                registry
+                    .fragments
+                    .lock()
+                    .unwrap()
+                    .begin(packet, Instant::now())
+            });
         let Some(fields) = ipv4_fields(packet) else {
-            reinject(&handle, &bypass, &registry, packet, address);
+            if let Some(ticket) = first_fragment {
+                finish_fragments(
+                    &handle,
+                    &bypass,
+                    &mut sender,
+                    virtual_ipv4,
+                    &registry,
+                    ticket,
+                    FragmentRoute::Drop,
+                    &mut tunnel_buffer,
+                );
+            } else {
+                reinject(&handle, &bypass, &registry, packet, address);
+            }
             continue;
         };
         let (mut selected, application, mut process_id) = match table.lookup(fields) {
@@ -1512,6 +1546,63 @@ fn run_selected_capture(
             None => (false, None, None),
         };
         let mut application = application;
+        let mut uncertain_dns_owner = false;
+        if !selected && matches!(fields.protocol, 6 | 17) && fields.destination_port == 53 {
+            match dns_socket_process(fields) {
+                Some((pid, path))
+                    if path_matches(&path, &registry.applications, &registry.folders) =>
+                {
+                    application = Some(Cow::Owned(process_name(&path)));
+                    process_id = Some(pid);
+                    add_process_selector(
+                        &registry,
+                        process_socket_selector(
+                            fields.protocol,
+                            fields.source_port,
+                            fields.destination_port,
+                        ),
+                        path,
+                        pid,
+                        None,
+                    );
+                    selected = true;
+                }
+                Some(_) => {}
+                None => uncertain_dns_owner = true,
+            }
+        }
+        // Discord's first UDP discovery packet raced the socket observer and
+        // learned the ISP address; later voice packets used the VPN address.
+        // Resolve ownership before that first datagram can leave directly.
+        if !selected
+            && fields.protocol == 17
+            && (!registry.applications.is_empty() || !registry.folders.is_empty())
+            && (crate::netutil::is_globally_routable_ipv4(fields.destination)
+                || fields.destination_port == 53)
+        {
+            let owner = registry.udp_classifier.lock().unwrap().selected_owner(
+                fields.source,
+                fields.source_port,
+                |pid| {
+                    process_path(pid).filter(|path| {
+                        path_matches(path, &registry.applications, &registry.folders)
+                    })
+                },
+            );
+            if let Some((pid, path)) = owner {
+                application = Some(Cow::Owned(process_name(&path)));
+                process_id = Some(pid);
+                add_process_selector(
+                    &registry,
+                    process_socket_selector(17, fields.source_port, fields.destination_port),
+                    path,
+                    pid,
+                    None,
+                );
+                registry.matched_sockets.fetch_add(1, Ordering::Relaxed);
+                selected = true;
+            }
+        }
         // Name resolution goes through the tunnel no matter which process asked
         // for it, and this is the only place it can be caught.
         //
@@ -1530,36 +1621,67 @@ fn run_selected_capture(
         // TCP as well as UDP: a truncated answer is retried over TCP, so
         // selecting only UDP would leak exactly the largest replies.
         //
-        // If the session cannot carry it, `route_selected_packet` fails open
-        // and the query takes the normal route, so this can cost lookups
-        // latency but never the ability to resolve.
+        // Remote DNS must fail closed even when the general kill switch is off.
         let question = lookup_name(packet, fields);
         // GamePath resolving its own nodes: left exactly as it would go with
         // this session off, whichever session's capture sees it first.
-        let own_lookup = question.as_deref().is_some_and(|name| {
-            registry.own_hostnames.contains(name)
-                || registry
-                    .proxy
-                    .as_ref()
-                    .is_some_and(|proxy| proxy.owns_udp_port(fields.source_port))
-        });
+        let own_lookup = registry.proxy.as_ref().is_some_and(|proxy| {
+            matches!(fields.protocol, 6 | 17)
+                && fields.destination_port == 53
+                && proxy.owns_port(fields.protocol, fields.source_port)
+        }) || (question
+            .as_deref()
+            .is_some_and(|name| registry.own_hostnames.contains(name))
+            && !registry.lookup_is_from_an_application(fields.protocol, fields.source_port));
         let rule_selected = selected;
         // Discord and Chrome resolve with their own DNS client. Taken here, a
         // VPN app's lookups went out through the game's tunnel, and a game
         // route in a country that blocks the app (Turkey blocks Discord)
         // answered with nothing usable. Windows' own resolver, which most
         // applications and games use, still resolves through the game.
-        let own_lookup = own_lookup
-            || (question.is_some()
-                && !rule_selected
-                && registry.yield_foreign_lookups.load(Ordering::Relaxed)
-                && registry.lookup_is_from_an_application(fields.source_port));
         let own_apps_only = registry.dns_own_apps_only.load(Ordering::Relaxed);
-        let mut implicit_dns = false;
-        if !selected && !own_apps_only && !own_lookup && is_name_resolution(fields) {
-            selected = true;
-            implicit_dns = true;
-            registry.tunnelled_dns.fetch_add(1, Ordering::Relaxed);
+        let remote_enabled = registry.redirect_dns.load(Ordering::Relaxed);
+        let dns_packet = matches!(fields.protocol, 6 | 17) && fields.destination_port == 53;
+        if dns_packet
+            && remote_enabled
+            && own_apps_only
+            && uncertain_dns_owner
+            && !own_lookup
+            && !rule_selected
+        {
+            registry.held_packets.fetch_add(1, Ordering::Relaxed);
+            if let Some(ticket) = first_fragment {
+                finish_fragments(
+                    &handle,
+                    &bypass,
+                    &mut sender,
+                    virtual_ipv4,
+                    &registry,
+                    ticket,
+                    FragmentRoute::Drop,
+                    &mut tunnel_buffer,
+                );
+            }
+            continue;
+        }
+        let foreign_application = dns_packet
+            && !rule_selected
+            && registry.yield_foreign_lookups.load(Ordering::Relaxed)
+            && registry.lookup_is_from_an_application(fields.protocol, fields.source_port);
+        let remote_dns = dns_packet
+            && gamepath_engine::dns_policy::route(
+                remote_enabled,
+                own_apps_only,
+                registry.yield_foreign_lookups.load(Ordering::Relaxed),
+                rule_selected,
+                foreign_application,
+                own_lookup,
+            ) == gamepath_engine::dns_policy::DnsRoute::Remote;
+        if dns_packet {
+            selected = remote_dns;
+            if remote_dns {
+                registry.tunnelled_dns.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // Remote DNS without touching Windows' resolver settings: a lookup to
         // the router is answered by a public resolver through the tunnel, and
@@ -1573,15 +1695,7 @@ fn run_selected_capture(
         // arrives here already selected by its rule, and would otherwise be
         // sent to the router because the router is a LAN address.
         let mut redirect = None;
-        if registry.redirect_dns.load(Ordering::Relaxed)
-            && (rule_selected || !own_apps_only)
-            && is_outside_name_resolution(fields)
-            && !own_lookup
-            && !question
-                .as_deref()
-                .is_some_and(gamepath_engine::dns::is_local_only_name)
-            && registry.tunnel_answers_dns()
-        {
+        if remote_dns && is_outside_name_resolution(fields) {
             if registry.redirected_dns.fetch_add(1, Ordering::Relaxed) == 0 {
                 gamepath_engine::log_info!(
                     "name lookups to {} are answered by {TUNNEL_RESOLVER} through the tunnel",
@@ -1590,7 +1704,6 @@ fn run_selected_capture(
             }
             redirect = Some(fields.destination);
             selected = true;
-            implicit_dns = true;
         }
         // An address the proxy invented reaches nothing but the proxy, whoever
         // looked it up.
@@ -1607,7 +1720,7 @@ fn run_selected_capture(
         }
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
-        if !selected && is_tcp_syn(packet) {
+        if !selected && !dns_packet && first_fragment.is_none() && is_tcp_syn(packet) {
             if let Some((matched_process_id, path)) =
                 tcp_socket_process(fields, &registry.applications, &registry.folders)
             {
@@ -1676,13 +1789,22 @@ fn run_selected_capture(
             registry.local_destinations.fetch_add(1, Ordering::Relaxed);
         }
         if !selected {
-            if gamepath_engine::ipv4_fragments::is_first_fragment(packet) {
-                fragments.record(packet, None, Instant::now());
-            }
             reinject(&handle, &bypass, &registry, packet, address);
+            if let Some(ticket) = first_fragment {
+                finish_fragments(
+                    &handle,
+                    &bypass,
+                    &mut sender,
+                    virtual_ipv4,
+                    &registry,
+                    ticket,
+                    FragmentRoute::Bypass,
+                    &mut tunnel_buffer,
+                );
+            }
             continue;
         }
-        let hold_on_failure = registry.kill_switch && !implicit_dns;
+        let hold_on_failure = registry.kill_switch || remote_dns;
         let carried = route_selected_packet(
             &handle,
             &mut sender,
@@ -1700,13 +1822,89 @@ fn run_selected_capture(
         );
         // A held first fragment counts as tunnelled: its later fragments are
         // then dropped with it rather than leaving on their own.
-        if gamepath_engine::ipv4_fragments::is_first_fragment(packet) {
-            let tunnelled = (carried || hold_on_failure).then_some(redirect);
-            fragments.record(packet, tunnelled, Instant::now());
+        if let Some(ticket) = first_fragment {
+            let route = if carried {
+                FragmentRoute::Tunnel(redirect)
+            } else if hold_on_failure {
+                FragmentRoute::Drop
+            } else {
+                FragmentRoute::Bypass
+            };
+            finish_fragments(
+                &handle,
+                &bypass,
+                &mut sender,
+                virtual_ipv4,
+                &registry,
+                ticket,
+                route,
+                &mut tunnel_buffer,
+            );
         }
-        if implicit_dns {
-            registry.dns_sent(carried);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_fragment(
+    handle: &Handle,
+    bypass: &mpsc::SyncSender<Bypass>,
+    sender: &mut SenderCache,
+    virtual_ipv4: Ipv4Addr,
+    registry: &Registry,
+    packet: &[u8],
+    address: Address,
+    tunnel_buffer: &mut Vec<u8>,
+    route: FragmentRoute,
+) {
+    match route {
+        FragmentRoute::Tunnel(redirect) => route_later_fragment(
+            handle,
+            sender,
+            virtual_ipv4,
+            registry,
+            packet,
+            address,
+            tunnel_buffer,
+            redirect,
+        ),
+        FragmentRoute::Bypass => reinject(handle, bypass, registry, packet, address),
+        FragmentRoute::Drop => {
+            registry.fragments_discarded.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_fragments(
+    handle: &Handle,
+    bypass: &mpsc::SyncSender<Bypass>,
+    sender: &mut SenderCache,
+    virtual_ipv4: Ipv4Addr,
+    registry: &Registry,
+    ticket: FragmentTicket,
+    route: FragmentRoute,
+    tunnel_buffer: &mut Vec<u8>,
+) {
+    let waiting = {
+        let mut fragments = registry.fragments.lock().unwrap();
+        let waiting = fragments.finish(ticket, route, Instant::now());
+        registry
+            .fragments_discarded
+            .fetch_add(fragments.take_discarded(), Ordering::Relaxed);
+        waiting
+    };
+    for (packet, address) in waiting {
+        dispatch_fragment(
+            handle,
+            bypass,
+            sender,
+            virtual_ipv4,
+            registry,
+            &packet,
+            address,
+            tunnel_buffer,
+            route,
+        );
     }
 }
 
@@ -1770,7 +1968,7 @@ fn signal_fragmentation_needed(
 
 #[derive(Default)]
 struct LookupOwners {
-    ports: HashMap<u16, (bool, Instant)>,
+    ports: HashMap<(u8, u16), (bool, Instant)>,
     processes: HashMap<u32, (bool, Instant)>,
 }
 
@@ -1783,109 +1981,77 @@ impl Registry {
     /// Whether the UDP socket on `port` belongs to an ordinary application,
     /// one installed outside Windows' own folder. Windows' DNS Client (svchost)
     /// and other system processes are not.
-    fn lookup_is_from_an_application(&self, port: u16) -> bool {
+    fn lookup_is_from_an_application(&self, protocol: u8, port: u16) -> bool {
         let now = Instant::now();
         let mut owners = self.lookup_owners.lock().unwrap();
-        if let Some((verdict, at)) = owners.ports.get(&port) {
+        if let Some((verdict, at)) = owners.ports.get(&(protocol, port)) {
             if now.duration_since(*at) < LOOKUP_PORT_TTL {
                 return *verdict;
             }
         }
-        let verdict = crate::proxy_identity::udp_owner(port).is_some_and(|process_id| match owners
-            .processes
-            .get(&process_id)
-        {
-            Some((verdict, at)) if now.duration_since(*at) < LOOKUP_PROCESS_TTL => *verdict,
-            _ => {
-                let verdict =
-                    process_path(process_id).is_some_and(|path| is_application_path(&path));
-                owners.processes.insert(process_id, (verdict, now));
-                verdict
-            }
-        });
+        let process_id = if protocol == 17 {
+            crate::proxy_identity::udp_owner(port)
+        } else {
+            crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_ALL).and_then(|rows| {
+                rows.into_iter()
+                    .find(|row| u16::from_be(row.dwLocalPort as u16) == port)
+                    .map(|row| row.dwOwningPid)
+            })
+        };
+        let verdict =
+            process_id.is_some_and(|process_id| match owners.processes.get(&process_id) {
+                Some((verdict, at)) if now.duration_since(*at) < LOOKUP_PROCESS_TTL => *verdict,
+                _ => {
+                    let verdict =
+                        process_path(process_id).is_some_and(|path| is_application_path(&path));
+                    owners.processes.insert(process_id, (verdict, now));
+                    verdict
+                }
+            });
         owners
             .ports
             .retain(|_, (_, at)| now.duration_since(*at) < LOOKUP_PORT_TTL);
         owners
             .processes
             .retain(|_, (_, at)| now.duration_since(*at) < LOOKUP_PROCESS_TTL);
-        owners.ports.insert(port, (verdict, now));
+        owners.ports.insert((protocol, port), (verdict, now));
         verdict
     }
 }
 
 /// Outside Windows' own folder. `path` is lowercase, as `process_path` gives.
-fn is_application_path(path: &str) -> bool {
+pub(crate) fn is_application_path(path: &str) -> bool {
     let windows = std::env::var("SystemRoot")
         .unwrap_or_else(|_| r"C:\Windows".to_owned())
         .to_ascii_lowercase();
     !path.starts_with(&format!("{}\\", windows.trim_end_matches('\\')))
 }
 
-/// How long a tunnelled lookup may go unanswered before lookups go to the LAN
-/// resolver instead. Windows retries a lookup after one second, so a dead
-/// tunnel costs a lookup about two seconds before the fallback answers it.
-const DNS_ANSWER_TIMEOUT_MS: u64 = 2_000;
-
-/// How often one lookup is still sent through the tunnel during a fallback.
-/// Without it nothing would be sent there, and nothing could notice the tunnel
-/// answering again.
-const DNS_PROBE_INTERVAL_MS: u64 = 1_000;
-
-impl Registry {
-    /// Milliseconds since the capture started, never 0.
-    fn clock_ms(&self) -> u64 {
-        self.clock.elapsed().as_millis() as u64 + 1
-    }
-
-    fn dns_sent(&self, carried: bool) {
-        if carried {
-            let _ = self.unanswered_dns_since.compare_exchange(
-                0,
-                self.clock_ms(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
-        } else {
-            // Not handed to the session at all: as unanswered as it gets.
-            self.unanswered_dns_since.store(1, Ordering::Relaxed);
-        }
-    }
-
-    fn dns_answered(&self) {
-        self.unanswered_dns_since.store(0, Ordering::Relaxed);
-        if self.dns_fallback.swap(false, Ordering::Relaxed) {
-            gamepath_engine::log_info!("the tunnel answers name lookups again");
-        }
-    }
-
-    /// Whether this lookup should go through the tunnel.
-    fn tunnel_answers_dns(&self) -> bool {
-        let now = self.clock_ms();
-        if answered_in_time(self.unanswered_dns_since.load(Ordering::Relaxed), now) {
-            return true;
-        }
-        if !self.dns_fallback.swap(true, Ordering::Relaxed) {
-            gamepath_engine::log_warn!(
-                "the tunnel left a name lookup unanswered for {DNS_ANSWER_TIMEOUT_MS} ms; \
-                 lookups go to the LAN resolver until it answers again"
-            );
-        }
-        let last = self.last_dns_probe.load(Ordering::Relaxed);
-        now.saturating_sub(last) >= DNS_PROBE_INTERVAL_MS
-            && self
-                .last_dns_probe
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-    }
-}
-
-fn answered_in_time(unanswered_since: u64, now: u64) -> bool {
-    unanswered_since == 0 || now.saturating_sub(unanswered_since) < DNS_ANSWER_TIMEOUT_MS
-}
-
 /// The name a UDP lookup asks for. TCP lookups are not parsed: they are rare,
 /// and a stream's first segment carries no question.
+fn dns_socket_process(fields: Ipv4Fields) -> Option<(u32, String)> {
+    let pid = if fields.protocol == 17 {
+        crate::socket_table::udp_rows()?
+            .into_iter()
+            .find(|row| {
+                let address = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+                u16::from_be(row.dwLocalPort as u16) == fields.source_port
+                    && (address.is_unspecified() || address == fields.source)
+            })?
+            .dwOwningPid
+    } else {
+        crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_ALL)?
+            .into_iter()
+            .find(|row| {
+                u16::from_be(row.dwLocalPort as u16) == fields.source_port
+                    && Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()) == fields.source
+                    && u16::from_be(row.dwRemotePort as u16) == fields.destination_port
+            })?
+            .dwOwningPid
+    };
+    Some((pid, process_path(pid)?))
+}
+
 fn lookup_name(packet: &[u8], fields: Ipv4Fields) -> Option<String> {
     if fields.protocol != 17 || fields.destination_port != 53 {
         return None;
@@ -2211,6 +2377,13 @@ fn spawn_process_tracker(
                 };
                 let event_kind = address.event();
                 let event = address.socket_data();
+                if event.protocol == 17 {
+                    worker_registry
+                        .udp_classifier
+                        .lock()
+                        .unwrap()
+                        .socket_changed(event.local_port);
+                }
                 if event_kind == 7 {
                     remove_closed_socket(&worker_registry, &worker_returns, event);
                     continue;
@@ -2238,11 +2411,7 @@ fn spawn_process_tracker(
                     .fetch_add(1, Ordering::Relaxed);
                 add_process_selector(
                     &worker_registry,
-                    TrafficSelector::Flow {
-                        protocol,
-                        local_port: port,
-                        remote_port: (remote_port != 0).then_some(remote_port),
-                    },
+                    process_socket_selector(protocol, port, remote_port),
                     path,
                     event.process_id,
                     (event.endpoint_id != 0).then_some(event.endpoint_id),
@@ -2469,12 +2638,29 @@ struct ExistingSocket {
 
 impl ExistingSocket {
     fn selector(self) -> TrafficSelector {
-        TrafficSelector::Flow {
-            protocol: self.protocol,
-            local_port: self.local_port,
-            remote_port: (self.remote_port != 0).then_some(self.remote_port),
-        }
+        process_socket_selector(self.protocol, self.local_port, self.remote_port)
     }
+}
+
+fn process_socket_selector(protocol: u8, local_port: u16, remote_port: u16) -> TrafficSelector {
+    TrafficSelector::Flow {
+        protocol,
+        local_port,
+        remote_port: (protocol == 6 && remote_port != 0).then_some(remote_port),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn udp_bind_and_connect_events_keep_the_same_socket_selector() {
+    assert_eq!(
+        process_socket_selector(17, 50_000, 0),
+        process_socket_selector(17, 50_000, 19_330)
+    );
+    assert_ne!(
+        process_socket_selector(6, 50_000, 0),
+        process_socket_selector(6, 50_000, 443)
+    );
 }
 
 fn tcp_socket_process(
@@ -2694,9 +2880,6 @@ fn run_reply_injector(
             path.last_seen = Instant::now();
             path.clone()
         };
-        if fields.source_port == 53 {
-            registry.dns_answered();
-        }
         packet[16..20].copy_from_slice(&path.local_ip.octets());
         if let Some(resolver) = path.resolver {
             packet[12..16].copy_from_slice(&resolver.octets());
@@ -2985,20 +3168,15 @@ struct Ipv4Fields {
 /// So only a query already addressed to a public resolver is taken. That is
 /// the case this can improve — the same public resolver, reached from the
 /// relay instead of through a filter that rewrites the answer on the way. A
-/// query to a LAN resolver is left alone, because the honest alternatives are
-/// to break it or to change which resolver the machine uses, and silently
-/// doing the second from inside a packet filter is not something split mode
-/// should do.
-/// A lookup aimed at a resolver on this side of the tunnel: the router, or
-/// anything else the LAN or the ISP hands out. Loopback is left alone, because
-/// a resolver on this machine is one the user chose.
+/// A resolver address that has no useful meaning at the tunnel exit. Remote
+/// DNS redirects it even for local names; the setting must never leak a query.
 fn is_outside_name_resolution(fields: Ipv4Fields) -> bool {
     matches!(fields.protocol, 6 | 17)
         && fields.destination_port == 53
-        && !fields.destination.is_loopback()
         && !crate::netutil::is_globally_routable_ipv4(fields.destination)
 }
 
+#[cfg(test)]
 fn is_name_resolution(fields: Ipv4Fields) -> bool {
     matches!(fields.protocol, 6 | 17)
         && fields.destination_port == 53
@@ -3092,18 +3270,77 @@ fn is_tcp_syn(packet: &[u8]) -> bool {
         .is_some_and(|flags| flags & 0x02 != 0)
 }
 
-fn resolve_hostnames(plan: &InterceptionPlan) -> Vec<(Ipv4Addr, String)> {
-    let mut addresses = Vec::new();
-    for hostname in &plan.hostnames {
+fn retained_hostname_addresses(
+    labels: HashMap<Ipv4Addr, Arc<str>>,
+    hostnames: &[String],
+) -> HashMap<Ipv4Addr, Arc<str>> {
+    labels
+        .into_iter()
+        .filter(|(_, label)| hostnames.iter().any(|target| target == label.as_ref()))
+        .collect()
+}
+
+fn spawn_hostname_seed(
+    hostnames: Vec<String>,
+    registry: &Arc<Registry>,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    if hostnames.is_empty() {
+        return Ok(());
+    }
+    let registry = Arc::downgrade(registry);
+    let stop = Arc::clone(stop);
+    thread::Builder::new()
+        .name("gamepath-hostname-seed".into())
+        .spawn(move || {
+            seed_hostname_rules(
+                &hostnames,
+                &stop,
+                |host| {
+                    (host, 0)
+                        .to_socket_addrs()
+                        .map(|addresses| {
+                            addresses
+                                .filter_map(|address| match address.ip() {
+                                    IpAddr::V4(ip) => Some(ip),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                },
+                |ip, hostname| {
+                    if let Some(registry) = registry.upgrade() {
+                        add_hostname_address(&registry, ip, hostname);
+                    }
+                },
+            );
+        })
+        .map_err(|error| format!("could not start hostname resolution: {error}"))?;
+    // The resolver owns only a weak registry reference. Windows may keep a
+    // lookup pending; it must not keep capture handles alive or delay shutdown.
+    Ok(())
+}
+
+fn seed_hostname_rules(
+    hostnames: &[String],
+    stop: &AtomicBool,
+    mut resolve: impl FnMut(&str) -> Vec<Ipv4Addr>,
+    mut publish: impl FnMut(Ipv4Addr, &str),
+) {
+    for hostname in hostnames {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let host = hostname.strip_prefix("*.").unwrap_or(hostname);
-        if let Ok(resolved) = (host, 0).to_socket_addrs() {
-            addresses.extend(resolved.filter_map(|address| match address.ip() {
-                IpAddr::V4(ip) => Some((ip, hostname.clone())),
-                _ => None,
-            }));
+        let addresses = resolve(host);
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        for address in addresses {
+            publish(address, hostname);
         }
     }
-    addresses
 }
 
 /// Most addresses a capture remembers a hostname for. They come only from
@@ -3149,7 +3386,7 @@ fn bypass_clause(addresses: &[Ipv4Addr]) -> String {
     }
 }
 
-fn dll_path() -> Result<PathBuf, String> {
+pub(crate) fn dll_path() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let installed = executable
         .parent()
@@ -3864,6 +4101,67 @@ mod tests {
         assert!(!hostname_matches("other.example", "*.game.example"));
     }
 
+    #[test]
+    fn capture_replacement_retains_only_addresses_for_unchanged_hostname_rules() {
+        let kept = Ipv4Addr::new(203, 0, 113, 1);
+        let removed = Ipv4Addr::new(203, 0, 113, 2);
+        let labels = HashMap::from([
+            (kept, Arc::<str>::from("*.game.example")),
+            (removed, Arc::<str>::from("old.example")),
+        ]);
+        let carried = retained_hostname_addresses(labels, &["*.game.example".into()]);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[&kept].as_ref(), "*.game.example");
+    }
+
+    #[test]
+    fn a_stalled_hostname_lookup_cannot_publish_after_capture_stops() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            seed_hostname_rules(
+                &["blocked.example".into(), "next.example".into()],
+                &worker_stop,
+                |host| {
+                    assert_eq!(host, "blocked.example");
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    vec![Ipv4Addr::new(203, 0, 113, 1)]
+                },
+                |_, _| panic!("stopped capture received a late hostname result"),
+            );
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        stop.store(true, Ordering::Release);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn hostname_seeding_preserves_wildcards_and_survives_an_unanswered_rule() {
+        let stop = AtomicBool::new(false);
+        let address = Ipv4Addr::new(203, 0, 113, 1);
+        let mut queries = Vec::new();
+        let mut published = Vec::new();
+        seed_hostname_rules(
+            &["unanswered.example".into(), "*.game.example".into()],
+            &stop,
+            |host| {
+                queries.push(host.to_owned());
+                if host == "game.example" {
+                    vec![address]
+                } else {
+                    Vec::new()
+                }
+            },
+            |ip, rule| published.push((ip, rule.to_owned())),
+        );
+        assert_eq!(queries, ["unanswered.example", "game.example"]);
+        assert_eq!(published, [(address, "*.game.example".into())]);
+    }
+
     /// A TCP SYN advertising `mss`.
     fn syn_with_mss(mss: u16) -> Vec<u8> {
         let mut packet = vec![0_u8; 44];
@@ -4003,7 +4301,7 @@ mod tests {
             (Ipv4Addr::new(10, 0, 0, 1), true),
             (Ipv4Addr::new(100, 64, 0, 1), true),
             (Ipv4Addr::new(8, 8, 8, 8), false),
-            (Ipv4Addr::new(127, 0, 0, 1), false),
+            (Ipv4Addr::new(127, 0, 0, 1), true),
         ] {
             for protocol in [6, 17] {
                 let mut fields = dns_fields(protocol, 53);
@@ -4014,18 +4312,6 @@ mod tests {
         let mut web = dns_fields(6, 443);
         web.destination = Ipv4Addr::new(192, 168, 1, 1);
         assert!(!is_outside_name_resolution(web));
-    }
-
-    /// Redirecting holds while answers come back, and lifts once one is late.
-    #[test]
-    fn lookups_are_redirected_only_while_the_tunnel_answers() {
-        assert!(answered_in_time(0, 10_000), "nothing waiting");
-        assert!(answered_in_time(9_000, 10_000), "one second waiting");
-        assert!(
-            !answered_in_time(7_500, 10_000),
-            "two and a half seconds waiting"
-        );
-        assert!(!answered_in_time(1, 10_000), "never handed to the session");
     }
 
     /// A DNS answer for a hostname rule yields its address together with the

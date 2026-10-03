@@ -11,6 +11,14 @@ The privileged Windows service installs filters based on Windows Filtering Platf
 3. Hostname rules are correlated through the client's DNS policy cache and compiled to current address sets. IP and CIDR rules match destinations directly.
 4. Selected UDP and TCP packets are passed to the GamePath transport. Unselected packets continue unchanged.
 
+The first UDP datagram can arrive before the socket observer publishes its process owner. For application
+and folder rules, an unmatched public UDP packet therefore checks the Windows owner-PID endpoint table
+before bypassing. A confirmed unselected socket is cached for two seconds, invalidated by socket events;
+selected flows use the normal selector table thereafter. UDP bind and connect events share a local-port
+selector so the endpoint notification replaces the fallback owner and close removes both. This prevents
+Discord voice discovery learning the ISP address while subsequent voice packets leave from the VPN address,
+which was observed during a live reconnect on October 3, 2026.
+
 The current implementation uses the signed WinDivert callout driver as the WFP capture layer, in one of two scopes reported as `captureScope` in capture diagnostics:
 
 - **`destinations`** — every rule in the plan names an address or CIDR, so the whole set is compiled into the kernel filter. Unrelated traffic stays in the kernel and is never handed to the client.
@@ -192,7 +200,7 @@ UDP has no MSS to clamp, so split mode does for UDP what a tunnel adapter with t
 - **The size split mode enforces is what crosses unfragmented** (`EffectiveMtu::unfragmented`): the link's budget after encapsulation, which on a narrow link is under the 1280 floor the tunnel MTU keeps. Measured live: a 1445-byte path carrying L2TP routes (215 bytes) leaves 1230, and a 1280-byte packet would leave as 1495. It never goes under 1228, QUIC's mandatory 1200 bytes of UDP payload with its headers (RFC 9000 §14). The TCP MSS clamp, in both directions, uses the same figure.
 - **A selected Don't Fragment packet larger than that is answered, not sent**: ICMP "fragmentation needed" carrying the size, quoting the packet as the application sent it, built as WinDivert's driver builds its own (`windivert_inject_packet_too_big`). Windows records the smaller path MTU for that destination, so a later oversized send can fail with `WSAEMSGSIZE` (measured: a 1500-byte Don't Fragment send refused with 10040 once the path MTU was known), and RakNet treats exactly that error as "use the next size". The send that triggered it has already succeeded from the application's view, so the first probe to a new destination is lost and RakNet's own retry moves on. Without the answer the packet would simply vanish, the failure WinDivert issue #278 describes; if the answer cannot be injected, the packet is carried after all.
 - **ICMP errors that come back through the tunnel are matched by the packet they quote**, rewritten to the local address and delivered. A router's "fragmentation needed" or "unreachable" for a tunnelled packet is addressed to the virtual address, and matched by its own header, as an echo reply is, it fit no flow: the log's `ICMP ... -> :0` replies with no flow were these. Path MTU discovery now works beyond the relay too.
-- **Fragments are handled in both directions.** Inbound, a datagram is reassembled before it is matched to a flow, because a fragment cannot pass through the injector as it is: `WinDivertHelperCalcChecksums` returns `FALSE` for a TCP or UDP fragment, and only the first fragment carries the ports. Windows accepts an injected inbound datagram above the link MTU, which is what WinDivert's default reassembled capture hands out anyway. Only an exact copy of a fragment counts as a duplicate (multipath delivers them); a conflicting one discards the datagram. Outbound, a first fragment's transport checksum is corrected incrementally for the rewritten address (RFC 1624), every first fragment records where it went, and the later fragments follow it, identified by source, destination, protocol and IP ID, with a reused ID always following the newest datagram. A later fragment whose first went into the tunnel never fails open: half a datagram on each path reassembles nowhere. Known limit: a later fragment sent before its first takes the normal route, which Windows does not do.
+- **Fragments are handled in both directions.** Inbound, a datagram is reassembled before flow matching and injection; duplicate copies are accepted only when identical. Outbound, the first fragment's transport checksum is corrected incrementally (RFC 1624). One capture-wide `fragment_router` coordinates all readers using source, destination, protocol and IP ID. It reserves the first fragment's verdict before classification or sending, and buffers later fragments whose verdict is unknown for at most 100 ms. Once known, every piece follows the same tunnel/redirect, bypass or discard decision. Unknown, expired or failed selected fragments never fail open. Storage is bounded to 64 datagrams, 64 waiting pieces per datagram and 1 MiB total; known verdicts last 5 s. A generation ticket prevents an older worker from overwriting a reused ID's new verdict. Capture replacement transfers this state with the reply table. Narrow kernel filters also admit fragments so DNS fragments lacking ports cannot escape the classifier. Ordinary unfragmented packets do not acquire the fragment lock.
 
 The capture status reports these under `fragments`, including datagrams given up on (`discarded`) and answers that could not be injected (`fragmentationNeededFailed`).
 
@@ -314,8 +322,8 @@ the classifier instead. Queries already addressed to a public resolver travel
 unchanged. A query to `192.168.1.1` would mean the relay's own LAN once it
 arrived there, so remote DNS rewrites LAN and ISP resolver destinations to
 `TUNNEL_RESOLVER`, then rewrites replies to come from the original resolver.
-Local names stay local, and unanswered redirected lookups fall back after two
-seconds while occasional tunnel queries check for recovery. See _Remote DNS
+Remote-enabled lookups fail closed, including local names and private reverse
+lookups: a timeout or failed send never switches to the local resolver. See _Remote DNS
 and the router's resolver_ for the concurrent-session and bootstrap exceptions.
 Selection is over UDP and TCP — TCP because a truncated answer is
 retried there and selecting only UDP would leak the largest replies. Narrow
@@ -325,8 +333,8 @@ Windows applications do not send DNS themselves; they call the resolver, and the
 DNS Client service inside `svchost.exe` sends the query. A rule naming a game
 therefore selects every packet that game sends and still leaves its name lookups
 going out untunnelled, owned by a process the user never selected. Queries the
-session cannot carry fail open to the normal route, so this costs a lookup
-latency at worst, never the ability to resolve.
+session cannot carry are held or failed on the remote path, independently of the general
+kill switch. A synthetic SERVFAIL cannot change capture policy or claim the path recovered.
 
 The probe asks for `example.com`, which is IANA-reserved and belongs to nobody
 whose service could disappear. The first version asked for `dns.google`, which
@@ -1144,6 +1152,13 @@ physical gateway. When the game starts, stops or moves relay, the service pushes
 `set-foreign-bypass`, in the background, so the game never waits for it. The game is never rebuilt because of
 the VPN; for the game the set is only an optimisation, applied at its next start.
 
+Hostname seeding starts in the background after outbound capture and reply injection are running.
+Resolving synchronously before those workers started made the fail-closed transition guard block its
+own hostname queries: observed `set-foreign-bypass` taking 25.8 s after the game stopped, long enough
+for VPN status polls to time out and reconnect. A pending Windows lookup owns only a weak registry
+reference, so it cannot hold capture handles alive or delay teardown; stopped captures discard its
+results. Replacement also carries learned hostname addresses, filtered against the new rules.
+
 **The game wins conflicts.** A game session in all-traffic mode leaves the VPN nothing to carry, and its
 default route would swallow the VPN's tunnel, so the client stops the VPN before such a session starts and
 resumes it afterwards. The service enforces the same thing: it refuses a VPN start with
@@ -1160,10 +1175,15 @@ so under a busy CPU the game's packets go first. Every service line about a slot
 A proxy cannot be handed captured packets, so the VPN engine puts a smoltcp stack in front of it
 (`engine/src/tun2socks`). TCP is answered there and replayed with `CONNECT`; UDP is forwarded datagram by
 datagram over one `UDP ASSOCIATE` per local socket; UDP lookups to port 53 go over TCP, one lookup at a time
-per stream with up to eight streams per resolver and one kept ready, with ids remapped so lookups from
+per stream with up to eight streams per resolver, with ids remapped so lookups from
 different apps cannot collide. Sharing one stream let a lookup the proxy never answered hold up every lookup
 behind it (measured through Throne). sing-box also closes a DNS stream when any lookup on it fails, so a lookup
 lost that way is sent once more on a fresh stream and then answered with SERVFAIL, never left to time out.
+New DNS streams are opened only when a lookup is ready to send. An empty spare stream misses sing-box's
+300 ms sniffing deadline and falls through to ordinary TCP forwarding, bypassing the proxy's configured
+DNS handler and cache. Reproduced through Throne: an immediate query used its DNS handler; the same query
+sent after a 700 ms idle period instead opened a VLESS connection to port 53. Streams that have already
+carried a query remain reusable.
 Lookups to a LAN resolver are redirected whichever process sent them: Chromium-based apps (Chrome, Discord)
 resolve with their own DNS client, not the system's. One thread and one `mio` poll
 drive all of it.
@@ -1206,16 +1226,21 @@ name resolution). On a filtered network the router answers first, with the filte
   the reply rewritten to come from the resolver Windows asked. Windows only ever sees its own resolver
   answering, so there is no race. An earlier design pointed a resolver-only Wintun adapter at 8.8.8.8; with
   no route on that adapter its queries never left the machine, and blocking the router to win the race then
-  left the machine with no DNS at all. The redirect stops as soon as a tunnelled lookup goes unanswered for
-  2 s, and while it is stopped one lookup a second is still sent through the tunnel, so the first answer
-  turns it back on; a dead tunnel costs a lookup about two seconds and never leaves the machine unable to
-  resolve. Handing the query to the session is no proof: with every path down it is still sent on the last
-  one. Names only the LAN can answer (single-label, `.local`, `.lan`, `.home.arpa`, reverse lookups for
-  private addresses) are never redirected: elsewhere they go unanswered, and through a proxy that resolves
-  them with the system resolver they would loop.
+  left the machine with no DNS at all. Remote DNS now has no local fallback timer or health-triggered
+  bypass. Both public and LAN/loopback-resolver queries assigned to the session stay on its remote path,
+  including local-only names; those names may fail remotely. Failed sends are held even with the ordinary
+  kill switch off. DNS policy is initialized before capture workers start. Unknown application ownership
+  uses the game resolver; a VPN that cannot verify ownership beside the game holds that query rather than
+  risking a local send. Removing all split rules retains DNS capture while remote DNS is on.
 - **All-traffic mode** points the adapter at the relay's resolver (or a public one), reached through the
-  tunnel's routes. Lookups to the router are not blocked: a kernel filter cannot tell GamePath's own lookups
-  from any other, and the game has to be able to re-resolve its nodes while its tunnel is down.
+  tunnel's routes. `dns_guard` drops assigned UDP/TCP port-53 traffic on other interfaces so a physical
+  resolver cannot win Windows' multi-interface race. Configuring the remote resolver or guard is required;
+  an installation error fails capture startup instead of quietly leaving local DNS enabled.
+- **Native direct L2TP** configures remote resolvers on the RAS adapter and installs explicit resolver
+  host routes, preserved across live target updates. Its privileged engine child owns the same interface
+  guard even when console sharing is off. Target hostnames resolve after remote DNS is configured.
+- **IPv6 classic DNS** assigned to an IPv4 split tunnel is blocked by the guard. Application-managed DoH
+  and DoT follow application traffic rules; this guard does not inspect encrypted protocols.
 
 **While both sessions run, applications' own lookups go to their own session.** Windows' resolver (svchost)
 answers for most applications and games and cannot be split by application, so it stays with the game. But

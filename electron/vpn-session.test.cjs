@@ -89,7 +89,10 @@ function harness({ script, pauseReason = () => null, buildRequest } = {}) {
   let clock = 1_000
   const timers = fakeTimers()
   const service = fakeService({
-    'start-session': { paths: connectedPaths, capture: { backend: 'windivert', effectiveMtu: 1420 } },
+    'start-session': {
+      paths: connectedPaths,
+      capture: { backend: 'windivert', effectiveMtu: 1420, dnsServers: ['8.8.8.8'] },
+    },
     'session-status': { ...connectedPaths, state: 'connected' },
     ...script,
   })
@@ -167,7 +170,9 @@ test('a node that does not answer is retried with growing waits, then connects',
   const { controller, timers, service } = harness({
     script: {
       'start-session': () =>
-        failures-- > 0 ? new Error('no WireGuard handshake reply within 3 s') : { paths: connectedPaths, capture: {} },
+        failures-- > 0
+          ? new Error('no WireGuard handshake reply within 3 s')
+          : { paths: connectedPaths, capture: { dnsServers: ['8.8.8.8'] } },
     },
   })
   await controller.connect()
@@ -306,10 +311,14 @@ test('every log line carries the session id', async () => {
   assert.ok(logger.lines.some((line) => line.startsWith('vpn vpn-abc123 info connected in')))
 })
 
-test('remote DNS that the engine could not set up is logged as a warning', async () => {
-  const withoutDns = harness()
+test('remote DNS setup failure stops the session before reporting connected or renewing it', async () => {
+  const withoutDns = harness({ script: { 'start-session': { paths: connectedPaths, capture: {} } } })
   await withoutDns.controller.connect()
-  assert.ok(withoutDns.logger.lines.some((line) => line.includes('warn remote DNS unavailable')))
+  assert.equal(withoutDns.controller.snapshot().status, 'reconnecting')
+  assert.equal(withoutDns.service.calls.at(-1).command, 'stop-session')
+  assert.ok(withoutDns.logger.lines.some((line) => line.includes('prevent local DNS fallback')))
+  assert.deepEqual(withoutDns.usage.started, [])
+  assert.equal(withoutDns.timers.intervals.length, 0)
 
   const withDns = harness({
     script: {
@@ -317,7 +326,13 @@ test('remote DNS that the engine could not set up is logged as a warning', async
     },
   })
   await withDns.controller.connect()
-  assert.ok(!withDns.logger.lines.some((line) => line.includes('remote DNS unavailable')))
+  assert.equal(withDns.controller.snapshot().status, 'connected')
+  const localDns = harness({
+    script: { 'start-session': { paths: connectedPaths, capture: {} } },
+    buildRequest: () => ({ request: { ...request, remoteDns: false }, node }),
+  })
+  await localDns.controller.connect()
+  assert.equal(localDns.controller.snapshot().status, 'connected')
 })
 
 test('a poll answered after the VPN was turned off does not bring it back', async () => {

@@ -25,6 +25,7 @@ pub(crate) struct SlotSummary {
     /// around itself.
     pub(crate) bypass: Vec<Ipv4Addr>,
     pub(crate) stop_reason: Option<String>,
+    pub(crate) app_dns_rules: bool,
 }
 
 impl SlotSummary {
@@ -168,6 +169,7 @@ mod tests {
             route_count: 1,
             bypass: bypass.to_vec(),
             stop_reason: None,
+            app_dns_rules: traffic_mode == "all",
         }
     }
 

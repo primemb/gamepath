@@ -8,6 +8,8 @@
 mod capture;
 mod commands;
 #[cfg(windows)]
+mod dns_guard;
+#[cfg(windows)]
 mod file_icon;
 mod icmp;
 mod ipc;
@@ -24,6 +26,8 @@ mod socks;
 mod split_capture;
 #[cfg(windows)]
 mod tcp_reset;
+#[cfg(windows)]
+mod udp_classifier;
 
 use capture::PacketCaptureManager;
 use commands::{
@@ -183,6 +187,8 @@ fn handle_request(
         "wireguard-session-status" => Ok(sessions.lock().unwrap().status()),
         "probe-data-plane" => sessions.lock().unwrap().probe_data_plane(),
         "start-packet-capture" => capture.start(request.payload, Arc::clone(sessions)),
+        #[cfg(windows)]
+        "start-native-dns" => capture.start_native_dns(request.payload),
         "update-packet-capture" => capture.update(request.payload, Arc::clone(sessions)),
         "set-foreign-bypass" => capture.set_foreign_bypass(request.payload, Arc::clone(sessions)),
         "set-other-session-active" => Ok(capture.set_other_session_active(&request.payload)),

@@ -5,6 +5,7 @@ use crate::engine_process::EngineProcess;
 use crate::l2tp::{
     L2tpSession, apply_direct_l2tp_prefixes, apply_direct_l2tp_routes, connect_l2tp_nodes,
     direct_l2tp_prefixes, native_l2tp_result, probe_direct_l2tp, sample_l2tp_usage,
+    validate_direct_l2tp_rules,
 };
 use crate::registry::{Registry, STOPPED_FOR_GAME_ALL_TRAFFIC, SlotSummary};
 use crate::slot::{SessionSlot, SlotId};
@@ -37,6 +38,12 @@ fn summary_of(slot: &SessionSlot, status: &str, bypass: Vec<Ipv4Addr>) -> SlotSu
         route_count: slot.route_count,
         bypass,
         stop_reason: None,
+        app_dns_rules: slot.traffic_mode == "all"
+            || slot.session_rules.as_array().is_some_and(|rules| {
+                rules
+                    .iter()
+                    .any(|rule| matches!(rule["kind"].as_str(), Some("application" | "folder")))
+            }),
     }
 }
 
@@ -65,6 +72,7 @@ fn capture_request(slot: &SessionSlot, rules: &Value, foreign: &SlotSummary) -> 
         "ownHostnames": slot.own_hostnames,
         "foreignBypass": foreign.bypass,
         "otherSessionActive": foreign.is_active(),
+        "otherSessionAppDns": foreign.app_dns_rules,
     })
 }
 
@@ -177,6 +185,7 @@ fn start_slot(
     let foreign = registry.summary(id.other());
     let foreign_bypass = foreign.bypass.clone();
     let rules = payload["rules"].clone();
+    runtime.session_rules = rules.clone();
     if request.mode == SessionMode::Direct && matches!(nodes.as_slice(), [NodeSpec::L2tp { .. }]) {
         return start_native_l2tp(
             runtime,
@@ -266,11 +275,9 @@ fn start_native_l2tp(
     let split = runtime.traffic_mode == "split";
     // Reject selectors Windows routes cannot express before creating a
     // VPN profile or changing any route.
-    let direct_prefixes = if split {
-        direct_l2tp_prefixes(&rules)?
-    } else {
-        Vec::new()
-    };
+    if split {
+        validate_direct_l2tp_rules(&rules)?;
+    }
     // RAS takes the default route over in all-traffic mode, so the physical
     // gateway has to be found first; the other slot's tunnel is then routed
     // around the VPN through it.
@@ -284,6 +291,34 @@ fn start_native_l2tp(
         .l2tp_sessions
         .first_mut()
         .ok_or("the L2TP direct session did not create a Windows connection")?;
+    if runtime.remote_dns {
+        session.enable_remote_dns()?;
+    }
+    let interface_index = session.interface_index;
+    let server = session.server_address;
+    let connection = session.connection;
+    if runtime.remote_dns {
+        let mut engine = EngineProcess::start(runtime.id)?;
+        engine.request(
+            "start-native-dns",
+            json!({
+                "interfaceIndex": interface_index, "trafficMode": runtime.traffic_mode,
+                "rules": rules, "remoteDns": true, "ownHostnames": runtime.own_hostnames,
+            "otherSessionActive": registry.summary(runtime.id.other()).is_active(),
+            "otherSessionAppDns": registry.summary(runtime.id.other()).app_dns_rules,
+            }),
+        )?;
+        runtime.engine = Some(engine);
+    }
+    let direct_prefixes = if split {
+        direct_l2tp_prefixes(&rules)?
+    } else {
+        Vec::new()
+    };
+    let session = runtime
+        .l2tp_sessions
+        .first_mut()
+        .ok_or("no active L2TP direct session")?;
     if split {
         apply_direct_l2tp_prefixes(session, &direct_prefixes)?;
     }
@@ -291,15 +326,19 @@ fn start_native_l2tp(
         routes.apply(foreign_bypass)?;
     }
     let target_count = rules.as_array().map_or(0, Vec::len);
-    let (paths, data_plane, capture) =
+    let (paths, data_plane, mut capture) =
         native_l2tp_result(session, &label, &runtime.traffic_mode, target_count);
+    capture["dnsServers"] = json!(if runtime.remote_dns {
+        gamepath_engine::dns::resolver_order(None)
+    } else {
+        vec![]
+    });
+    capture["remoteDns"] = json!(runtime.remote_dns);
     if data_plane["reachable"] != json!(true) {
         return Err(
             "Windows connected L2TP/IPsec, but no data returned through the VPN adapter".into(),
         );
     }
-    let server = session.server_address;
-    let connection = session.connection;
     runtime.session_status = "connected".into();
     runtime.route_count = 1;
     runtime.session_rules = rules;
@@ -391,7 +430,7 @@ fn apply_lan_proxy(runtime: &mut SessionSlot, request: Option<Value>) -> Value {
             if let Some(engine) = runtime.engine.as_mut() {
                 let _ = engine.request("stop-socks-server", json!({}));
             }
-            if runtime.native_l2tp_direct {
+            if runtime.native_l2tp_direct && !runtime.remote_dns {
                 runtime.engine = None;
             }
             json!({ "state": "stopped" })
@@ -497,7 +536,7 @@ pub(crate) fn update_session_rules(
     }
     let rules_are_empty = rules.as_array().is_some_and(Vec::is_empty);
     let previous_rules_are_empty = previous_rules.as_array().is_some_and(Vec::is_empty);
-    if rules_are_empty {
+    if rules_are_empty && !runtime.remote_dns {
         runtime
             .engine
             .as_mut()
@@ -566,7 +605,7 @@ pub(crate) fn reconcile_other_session(id: SlotId, registry: &Arc<Registry>) {
         };
         if let Err(error) = engine.request(
             "set-other-session-active",
-            json!({ "active": foreign.is_active() }),
+            json!({ "active": foreign.is_active(), "canRouteAppDns": foreign.app_dns_rules }),
         ) {
             runtime.warn(&format!(
                 "could not tell the capture the other session changed: {error}"
@@ -576,6 +615,19 @@ pub(crate) fn reconcile_other_session(id: SlotId, registry: &Arc<Registry>) {
     }
     let addresses = foreign.bypass.as_slice();
     let native = runtime.native_l2tp_direct;
+    if native {
+        if let Some(engine) = runtime.engine.as_mut() {
+            engine
+                .request(
+                    "set-other-session-active",
+                    json!({"active": foreign.is_active(), "canRouteAppDns": foreign.app_dns_rules}),
+                )
+                .unwrap_or_else(|error| {
+                    gamepath_engine::log_warn!("could not update native DNS ownership: {error}");
+                    json!({})
+                });
+        }
+    }
     let result = if let Some(routes) = runtime.bypass_routes.as_mut() {
         routes.apply(addresses).map(|_| routes.len())
     } else if native {
@@ -792,6 +844,7 @@ mod tests {
                 route_count: 1,
                 bypass: Vec::new(),
                 stop_reason: None,
+                app_dns_rules: true,
             },
         );
         let error = start_session(

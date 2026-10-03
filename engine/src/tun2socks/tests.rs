@@ -20,18 +20,22 @@ const REFUSED_PORT: u16 = 9;
 /// A SOCKS5 proxy that echoes TCP, answers DNS over TCP on port 53, refuses
 /// `REFUSED_PORT`, and echoes UDP through an association.
 fn spawn_proxy(accept_login: bool) -> SocketAddr {
+    spawn_proxy_with_dns_sniff(accept_login, false)
+}
+
+fn spawn_proxy_with_dns_sniff(accept_login: bool, sniff_dns: bool) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
-            thread::spawn(move || serve(stream, accept_login));
+            thread::spawn(move || serve(stream, accept_login, sniff_dns));
         }
     });
     address
 }
 
-fn serve(mut stream: std::net::TcpStream, accept_login: bool) {
+fn serve(mut stream: std::net::TcpStream, accept_login: bool, sniff_dns: bool) {
     let mut greeting = [0_u8; 2];
     if stream.read_exact(&mut greeting).is_err() {
         return;
@@ -74,6 +78,18 @@ fn serve(mut stream: std::net::TcpStream, accept_login: bool) {
     let _ = stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
     let mut buffer = [0_u8; 4096];
     if target.port() == 53 {
+        let recognised = if sniff_dns {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            let recognised = stream.peek(&mut [0_u8; 1]).is_ok_and(|read| read > 0);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            recognised
+        } else {
+            true
+        };
         loop {
             let mut length = [0_u8; 2];
             if stream.read_exact(&mut length).is_err() {
@@ -94,8 +110,14 @@ fn serve(mut stream: std::net::TcpStream, accept_login: bool) {
                 return;
             }
             message[2] |= 0x80;
+            if !recognised {
+                message[3] = (message[3] & 0xf0) | 2;
+            }
             let _ = stream.write_all(&length);
             let _ = stream.write_all(&message);
+            if sniff_dns {
+                return;
+            }
         }
     }
     while let Ok(read) = stream.read(&mut buffer) {
@@ -410,6 +432,41 @@ fn a_name_lookup_goes_over_tcp_and_keeps_its_own_id() {
                 && udp.payload[2] & 0x80 != 0
         })
     }));
+}
+
+#[test]
+fn a_dns_connection_sends_its_query_before_the_proxy_stops_sniffing() {
+    let mut app = App::new(spawn_proxy_with_dns_sniff(true, true));
+    let client = SocketAddrV4::new(CLIENT_ADDRESS, 42_010);
+    for id in [1_u16, 2] {
+        let mut query = id.to_be_bytes().to_vec();
+        query.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        query.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        app.stack
+            .send_packet(&build_udp(client, SocketAddrV4::new(RESOLVER, 53), &query))
+            .unwrap();
+        assert!(app.until(|app| {
+            app.other.iter().any(|packet| {
+                let ip = parse_ipv4(packet).unwrap();
+                parse_udp(ip.payload).is_some_and(|udp| {
+                    udp.destination_port == client.port() && udp.payload[..2] == id.to_be_bytes()
+                })
+            })
+        }));
+        let response = app.other.iter().find_map(|packet| {
+            let ip = parse_ipv4(packet)?;
+            let udp = parse_udp(ip.payload)?;
+            (udp.payload[..2] == id.to_be_bytes()).then_some(udp.payload)
+        });
+        assert_eq!(
+            response.unwrap()[3] & 0x0f,
+            0,
+            "lookup {id} used a connection that the proxy had already routed without DNS sniffing"
+        );
+        // The responder closes after its answer. Any empty spare connection
+        // has time to fall through the proxy's sniffing deadline before reuse.
+        thread::sleep(Duration::from_millis(600));
+    }
 }
 
 #[test]

@@ -101,7 +101,7 @@ cargo test --locked --manifest-path relay/Cargo.toml
 
 All-traffic mode captures and reinjects IPv4 through Wintun. IPv6 is not carried: on a dual-stack connection, IPv6 keeps using your normal route while a session runs, and the client warns when it detects one.
 
-Split mode compiles IP and CIDR targets straight into the WinDivert kernel filter, so unrelated traffic never leaves the kernel. Executable, folder and hostname targets cannot be expressed in a filter that is fixed when the handle opens, so those plans admit all outbound IPv4 and classify in user space, reinjecting what was not selected — a compatibility backend with a measurable cost, reported as `captureScope` in capture diagnostics. Exact hostnames resolve at activation; a copy-only DNS observer learns later addresses and wildcard subdomains.
+Split mode compiles IP and CIDR targets straight into the WinDivert kernel filter, so unrelated traffic never leaves the kernel. Executable, folder and hostname targets cannot be expressed in a filter that is fixed when the handle opens, so those plans admit all outbound IPv4 and classify in user space, reinjecting what was not selected — a compatibility backend with a measurable cost, reported as `captureScope` in capture diagnostics. Exact hostnames resolve in the background after capture is ready; a copy-only DNS observer learns later addresses and wildcard subdomains. Capture replacement preserves learned addresses for unchanged hostname rules, so starting or stopping the game beside the VPN does not wait for DNS resolution.
 
 ### Name resolution
 
@@ -109,7 +109,11 @@ Both modes send DNS through the tunnel. This is not only about privacy: where DN
 
 All-traffic mode points the tunnel adapter at a resolver reachable through the session. It prefers the relay's own resolver, whose address exists only inside the tunnel and so cannot leak by any route, and falls back to a public resolver reached through the tunnel when the relay has none — a relay installed before this existed keeps working, it just resolves further away. The chosen servers are logged and reported as `dnsServers`. They are cleared when capture stops.
 
-With remote DNS enabled, split mode also redirects lookups aimed at your router or ISP resolver to `8.8.8.8` through the tunnel and rewrites replies to appear from the resolver Windows asked. Queries already aimed at a public resolver are carried over UDP and TCP. Local names and private reverse lookups stay local. If redirected lookups go unanswered for two seconds, resolution falls back to the normal network while occasional tunnelled queries check for recovery. Windows' shared DNS Client service means most applications' lookups cannot be assigned to an application rule; when both sessions run, shared lookups follow the game and applications that send their own DNS queries can follow their own session. Turning remote DNS off leaves local resolution in place. This improves access on filtered networks, but does not promise leak-free DNS.
+**Remote DNS never falls back to local DNS.** With the option on, lookups assigned to a session resolve through its nodes and, in relay mode, its relay. A timeout or failed transport leaves the lookup on that remote path or fails it; it never sends it to the LAN/ISP resolver, even with the general kill switch off. Split mode redirects UDP and TCP lookups aimed at a router, ISP or loopback resolver to `8.8.8.8` through the tunnel and rewrites replies to appear from the resolver Windows asked. Public-resolver queries stay tunnelled too. This includes local names and private reverse lookups: they may fail remotely instead of leaking locally. Turning remote DNS off permits normal DNS.
+
+While Game and VPN run together, shared Windows DNS follows the game because Windows' DNS Client service does not expose the requesting application. Identifiable app-owned DNS follows its game rule first, otherwise its selected VPN rule; unrelated identifiable apps can use normal DNS. If ownership cannot be separated, the game resolver is the fallback. All-traffic and native L2TP sessions guard against Windows racing a local resolver against the tunnel resolver. Native L2TP installs explicit routes for its remote DNS servers. Unsupported IPv6 classic DNS assigned to an IPv4-only session is blocked instead of sent locally.
+
+Tunnel/proxy bootstrap lookups needed to connect the nodes are kept outside their own tunnel to avoid a resolution loop. Application-managed encrypted DNS follows the application's traffic rules; GamePath does not inspect HTTPS/TLS to identify it. These transport/bootstrap boundaries and the IPv6 traffic limitation below still apply; the remote DNS option is not a claim that every kind of traffic is leak-free.
 
 To resolve inside the relay rather than through a public resolver, reinstall the relay with `deploy/install-relay.sh`; it configures a resolver bound to the tunnel address only, and refuses port 53 on the public interface so the relay never becomes an open resolver.
 
@@ -337,7 +341,7 @@ everything else keeps the normal connection.
 - **L2TP/IPsec routes by address.** In split mode it carries websites and IP ranges, not individual apps; use
   all-traffic mode or another kind of node for those, as with direct game sessions.
 - **Kill switch** (off by default). While the node is not answering, selected apps are blocked instead of
-  using the normal connection. Name lookups are never blocked. During an automatic reconnect there is a gap
+  using the normal connection. Remote DNS fails closed independently of this setting. During an automatic reconnect there is a gap
   of a second or two where it cannot hold traffic.
 - **It stays up.** A dropped VPN reconnects on its own, quickly at first and then every 30 s, and right away
   after the PC wakes from sleep. A VPN left on when the app quits comes back on at the next launch. The tray

@@ -15,6 +15,5 @@ vite.config.d.ts
 font/*
 !font/IRANYekanX-Regular (1).woff2
 !font/IRANYekanX-Bold (1).woff2
-
 AGENTS.md
 CLAUDE.md

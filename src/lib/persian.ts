@@ -1,4 +1,12 @@
 export const persian: Record<string, string> = {
+  'Names resolve through the game tunnel and never fall back to local DNS. Shared Windows lookups use the game; identifiable VPN apps can use their own VPN resolver.':
+    'نام‌ها از طریق تونل بازی پیدا می‌شوند و هرگز به DNS محلی برنمی‌گردند. درخواست‌های مشترک ویندوز از بازی استفاده می‌کنند؛ برنامه‌های قابل‌شناسایی VPN می‌توانند از DNS همان VPN استفاده کنند.',
+  'Names assigned to the VPN resolve through its node and never fall back to local DNS. While a game runs, shared Windows lookups use the game resolver.':
+    'نام‌های مربوط به VPN از طریق گره آن پیدا می‌شوند و هرگز به DNS محلی برنمی‌گردند. هنگام اجرای بازی، درخواست‌های مشترک ویندوز از DNS بازی استفاده می‌کنند.',
+  'While the node is not answering, selected apps are blocked. Remote DNS always stays on its tunnel, even when this switch is off.':
+    'وقتی گره پاسخ نمی‌دهد، برنامه‌های انتخاب‌شده مسدود می‌شوند. DNS راه دور همیشه در تونل خود می‌ماند، حتی وقتی این کلید خاموش باشد.',
+  'Selected traffic can use your normal connection when the node is unavailable. Remote DNS still stays on its tunnel.':
+    'وقتی گره در دسترس نیست، ترافیک انتخاب‌شده می‌تواند از اتصال عادی استفاده کند. DNS راه دور همچنان در تونل خود می‌ماند.',
   'Statistics for': 'آمار برای',
   Game: 'بازی',
   'Carried by the VPN': 'منتقل‌شده از طریق VPN',

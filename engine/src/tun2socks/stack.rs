@@ -774,26 +774,6 @@ impl Stack {
         } else {
             upstream.queued.extend_from_slice(&framed);
         }
-        self.keep_spare_dns_stream(resolver);
-    }
-
-    /// Keeps one stream to `resolver` connected and idle, so the next lookup
-    /// is written at once instead of waiting for a proxy handshake.
-    fn keep_spare_dns_stream(&mut self, resolver: Ipv4Addr) {
-        let (open, idle) = self.dns_streams(resolver);
-        if idle == 0 && open < DNS_STREAMS_PER_RESOLVER {
-            let _ = self.dial_dns_stream(resolver);
-        }
-    }
-
-    /// Streams to `resolver`: how many are open, and how many are idle.
-    fn dns_streams(&self, resolver: Ipv4Addr) -> (usize, usize) {
-        self.dns
-            .values()
-            .filter(|stream| stream.resolver == resolver)
-            .fold((0, 0), |(open, idle), stream| {
-                (open + 1, idle + usize::from(stream.in_flight.is_empty()))
-            })
     }
 
     /// An idle stream to `resolver`, a new one while fewer than
@@ -816,6 +796,9 @@ impl Stack {
         if open >= DNS_STREAMS_PER_RESOLVER {
             return least_busy.map(|(id, _)| id);
         }
+        // An empty preconnection misses sing-box's 300 ms DNS sniff deadline
+        // and falls through to ordinary TCP forwarding. Dial only with a query
+        // ready; a stream that already carried DNS can safely be reused.
         self.dial_dns_stream(resolver)
     }
 
@@ -1329,7 +1312,7 @@ impl Stack {
         // A stream with a lookup this late is not trusted with another: the
         // proxy may be answering it in order behind the one it lost.
         // An idle stream is closed once unused for a while, except the last
-        // one to each resolver, which is the spare the next lookup goes out on.
+        // one to each resolver, which can be reused for the next lookup.
         let mut closing = Vec::new();
         let mut spare_kept = HashSet::new();
         for (id, dns) in &self.dns {

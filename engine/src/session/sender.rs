@@ -232,6 +232,7 @@ mod tests {
         drop(sender);
         worker.join().unwrap();
         assert_eq!(telemetry.queue_depth[0].load(Ordering::Relaxed), 0);
-        assert!(telemetry.queue_peak[0].load(Ordering::Relaxed) <= 2);
+        // One dequeued item awaiting its decrement, one queued, and one reserved.
+        assert!(telemetry.queue_peak[0].load(Ordering::Relaxed) <= 3);
     }
 }

@@ -48,7 +48,7 @@ export function VpnTrafficCard({
           <strong>Resolve names through the VPN</strong>
           <p>
             {vpn.remoteDns
-              ? 'Website names are looked up through the VPN, so a filtered local resolver cannot send you to a blocked or fake address. A running game session with this on handles lookups first.'
+              ? 'Names assigned to the VPN resolve through its node and never fall back to local DNS. While a game runs, shared Windows lookups use the game resolver.'
               : 'Lookups use the resolver this PC normally uses. Turn this on if sites fail to open while the VPN is connected.'}
           </p>
         </div>
@@ -66,8 +66,8 @@ export function VpnTrafficCard({
           <strong>Kill switch</strong>
           <p>
             {vpn.killSwitch
-              ? 'While the node is not answering, apps you selected are blocked instead of using your normal connection. Name lookups are never blocked.'
-              : 'While the node is not answering, apps you selected use your normal connection until it is back.'}
+              ? 'While the node is not answering, selected apps are blocked. Remote DNS always stays on its tunnel, even when this switch is off.'
+              : 'Selected traffic can use your normal connection when the node is unavailable. Remote DNS still stays on its tunnel.'}
           </p>
         </div>
         <span className="node-group-switch">

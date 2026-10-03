@@ -20,7 +20,7 @@ function harness({ service: script = {}, game = { status: 'idle' }, gameMode = '
       calls.push({ command, payload })
       const answer = script[command]
       if (answer instanceof Error) throw answer
-      return answer ?? { paths: { paths: [] }, capture: {} }
+      return answer ?? { paths: { paths: [] }, capture: { dnsServers: ['8.8.8.8', '8.8.4.4'] } }
     },
   }
   const quiet = { info() {}, warn() {}, error() {}, debug() {} }

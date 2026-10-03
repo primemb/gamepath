@@ -202,6 +202,9 @@ class VpnSessionController {
     try {
       const timeout = node.kind === 'l2tp' ? L2TP_START_TIMEOUT_MS : START_TIMEOUT_MS
       const started = await this.service.request('start-session', { ...request, slot: 'vpn', sessionId }, timeout)
+      if (request.remoteDns && request.trafficMode === 'split' && !started.capture?.dnsServers?.length) {
+        throw new Error('Remote DNS could not be enabled. The VPN was stopped to prevent local DNS fallback.')
+      }
       this.session = {
         status: 'connected',
         sessionId,
@@ -221,9 +224,6 @@ class VpnSessionController {
         `connected in ${this.now() - startedAt} ms: mtu=${started.capture?.effectiveMtu ?? 'unknown'} ` +
           `capture=${started.capture?.backend ?? 'unknown'}`,
       )
-      if (request.remoteDns && request.trafficMode === 'split' && !started.capture?.dnsServers?.length) {
-        log.warn('remote DNS unavailable: lookups use the normal network and can return filtered addresses')
-      }
     } catch (error) {
       try {
         await this.service.request('stop-session', { slot: 'vpn' })

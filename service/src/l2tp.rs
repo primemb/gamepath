@@ -83,6 +83,7 @@ pub(crate) struct L2tpSession {
     uplink_mtu: u16,
     mtu: u16,
     routes: Vec<String>,
+    remote_dns: bool,
 }
 
 unsafe impl Send for L2tpSession {}
@@ -419,6 +420,7 @@ impl L2tpSession {
             uplink_mtu,
             mtu,
             routes: Vec::new(),
+            remote_dns: false,
         })
     }
 
@@ -444,6 +446,24 @@ impl L2tpSession {
                 netconfig::remove_route(destination, length, self.interface_index);
             }
         }
+    }
+
+    pub(crate) fn enable_remote_dns(&mut self) -> Result<(), String> {
+        self.remote_dns = true;
+        self.install_dns_routes()
+    }
+
+    fn install_dns_routes(&mut self) -> Result<(), String> {
+        if self.remote_dns {
+            for resolver in gamepath_engine::dns::FALLBACK_RESOLVERS {
+                let prefix = format!("{resolver}/32");
+                netconfig::add_route(resolver, 32, self.interface_index)?;
+                if !self.routes.contains(&prefix) {
+                    self.routes.push(prefix);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn runtime(&self, route: usize) -> L2tpRuntime {
@@ -614,11 +634,11 @@ fn canonical_ipv4_prefix(value: &str) -> Result<String, String> {
 /// Windows RAS split tunnelling is route based. IP and exact-hostname
 /// targets map cleanly to routes; process/folder ownership and wildcard
 /// DNS matching require a WFP callout and are deliberately rejected.
-pub(crate) fn direct_l2tp_prefixes(rules: &Value) -> Result<Vec<String>, String> {
+pub(crate) fn validate_direct_l2tp_rules(rules: &Value) -> Result<(), String> {
     let rules: Vec<RuleSpec> = serde_json::from_value(rules.clone())
         .map_err(|error| format!("invalid split targets: {error}"))?;
     if rules.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let plan = compile_policy("split", &rules)?;
     if !plan.application_paths.is_empty() || !plan.folder_prefixes.is_empty() {
@@ -627,6 +647,24 @@ pub(crate) fn direct_l2tp_prefixes(rules: &Value) -> Result<Vec<String>, String>
                 .into(),
         );
     }
+    if plan
+        .hostnames
+        .iter()
+        .any(|hostname| hostname.starts_with("*."))
+    {
+        return Err("L2TP direct split mode cannot keep wildcard hostnames updated. Use an exact hostname, an IP range, or all-traffic mode.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn direct_l2tp_prefixes(rules: &Value) -> Result<Vec<String>, String> {
+    validate_direct_l2tp_rules(rules)?;
+    let rules: Vec<RuleSpec> = serde_json::from_value(rules.clone())
+        .map_err(|error| format!("invalid split targets: {error}"))?;
+    if rules.is_empty() {
+        return Ok(Vec::new());
+    }
+    let plan = compile_policy("split", &rules)?;
     let mut prefixes = std::collections::BTreeSet::new();
     for network in plan.ip_networks {
         prefixes.insert(canonical_ipv4_prefix(&network)?);
@@ -662,6 +700,7 @@ pub(crate) fn apply_direct_l2tp_prefixes(
     prefixes: &[String],
 ) -> Result<(), String> {
     session.remove_routes();
+    session.install_dns_routes()?;
     for prefix in prefixes {
         session.add_route(prefix)?;
     }
