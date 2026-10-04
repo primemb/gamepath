@@ -53,6 +53,9 @@ impl DnsGuard {
         let worker = thread::Builder::new()
             .name("gamepath-dns-guard".into())
             .spawn(move || {
+                // Its filter also takes every outbound fragment, the session's
+                // own fragmented tunnel packets included.
+                gamepath_engine::thread_priority::raise_current_for_data_plane();
                 let mut buffer = vec![0; 65_535];
                 let mut fragments = FragmentRouter::default();
                 while !worker_stop.load(Ordering::Acquire) {

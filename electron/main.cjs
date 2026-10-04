@@ -22,7 +22,7 @@ const { UsageStore } = require('./usage.cjs')
 const { withoutSecrets } = require('./public-state.cjs')
 const { nodeSpec } = require('./node-spec.cjs')
 const { ownHostnames } = require('./own-hostnames.cjs')
-const { startWithWindows, setStartWithWindows, launchedAtLogin } = require('./startup.cjs')
+const { startWithWindows, refreshStartWithWindows, setStartWithWindows, launchedAtLogin } = require('./startup.cjs')
 const { defaultVpn, selectedVpnNode, migrateVpnState } = require('./vpn-state.cjs')
 const { createVpnFeature } = require('./vpn-ipc.cjs')
 const { RelayFailoverController, normalizeRelayFailover, standbyRelayFor } = require('./relay-failover.cjs')
@@ -119,7 +119,7 @@ function publicState() {
     lanAddresses,
     vpn: vpnFeature?.publicVpn() ?? { ...state.vpn, session: { status: 'idle' } },
     clientVersion: app.getVersion(),
-    startWithWindows: startWithWindows(app),
+    startWithWindows: startWithWindows(),
     engine: engineBridge?.status ?? {
       status: 'offline',
       version: '',
@@ -843,8 +843,8 @@ function registerIpc() {
     return publicState()
   })
 
-  ipcMain.handle('app:set-start-with-windows', (_event, enabled) => {
-    const result = setStartWithWindows(app, enabled)
+  ipcMain.handle('app:set-start-with-windows', async (_event, enabled) => {
+    const result = await setStartWithWindows(app, enabled)
     logger.info(`start with Windows ${result.enabled ? 'on' : 'off'}`)
     return publicState()
   })
@@ -1576,6 +1576,7 @@ app.whenReady().then(async () => {
     logger.flush()
   })
   loadState()
+  refreshStartWithWindows(app).catch((error) => logger.warn(`start with Windows could not be read: ${error.message}`))
   try {
     fs.mkdirSync(app.getPath('userData'), { recursive: true })
     usageStore = new UsageStore(app.getPath('userData'))

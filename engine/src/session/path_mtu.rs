@@ -33,10 +33,13 @@ impl SessionMtu {
         derive: impl FnOnce(u16) -> EffectiveMtu + Send + 'static,
     ) -> Self {
         let measured = Arc::new(OnceLock::new());
-        let endpoints = endpoints
+        // Two routes through one node share its path; measure it once.
+        let mut endpoints = endpoints
             .into_iter()
             .filter(|endpoint| is_globally_routable_ipv4(*endpoint))
             .collect::<Vec<_>>();
+        endpoints.sort_unstable();
+        endpoints.dedup();
         if !endpoints.is_empty() {
             let slot = Arc::clone(&measured);
             let spawned = thread::Builder::new()

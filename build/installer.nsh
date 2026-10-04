@@ -12,7 +12,13 @@
   DetailPrint "Stopping and removing the GamePath network service..."
   nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\deploy\uninstall-windows-service.ps1"'
   Pop $0
-  ; "Start with Windows" (electron/startup.cjs), and Task Manager's switch for it.
-  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "GamePath"
-  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "GamePath"
+  ; "Start with Windows" (electron/startup.cjs). An update runs this uninstaller
+  ; too, and must keep the user's choice.
+  ${ifNot} ${isUpdated}
+    nsExec::Exec 'schtasks.exe /Delete /TN "GamePath" /F'
+    Pop $0
+    ; The Run entry earlier releases wrote, and Task Manager's switch for it.
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "GamePath"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "GamePath"
+  ${endIf}
 !macroend
