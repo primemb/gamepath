@@ -618,6 +618,7 @@ impl PacketCaptureManager {
         self.last_request = None;
         #[cfg(windows)]
         {
+            crate::teardown::step("DNS guard");
             self.dns_guard = None;
             if let Some(adapter) = self.native_dns_adapter.take() {
                 let _ = gamepath_engine::netconfig::set_interface_dns(adapter, &[]);
@@ -628,6 +629,7 @@ impl PacketCaptureManager {
         {
             let was_redirecting = self.dns_mode().is_some();
             let tunnel_address = self.active.as_ref().map(|capture| capture.virtual_ipv4);
+            crate::teardown::step("all-traffic capture");
             drop(self.active.take());
             let carried = self
                 .active_split
@@ -638,6 +640,7 @@ impl PacketCaptureManager {
             }
             // Capture and routes must be gone and DNS fresh before apps retry.
             // A live policy replacement uses into_carried without closing flows.
+            crate::teardown::step("ending tunnel TCP connections");
             let closed = if let Some(carried) = carried {
                 carried.close_tcp_connections()
             } else if let Some(address) = tunnel_address {

@@ -19,6 +19,22 @@ const INCUMBENCY_MARGIN: f64 = 8.0;
 
 const INCUMBENCY_JITTER_MARGIN: f64 = 1.0;
 
+/// Clean probes a route needs after a lost or spiking one before Adaptive mode
+/// trusts it as one of its two carrying routes again. A carrying route probes
+/// once a second, so this holds an escalated set for about ten seconds.
+const PROBES_TO_SETTLE: u32 = 10;
+
+/// A probe this far above the route's smoothed RTT counts as a spike. On the
+/// ~50 ms routes this was tuned on, 25 ms separates the 80-470 ms stalls a
+/// player feels from the few milliseconds of ordinary jitter.
+const SPIKE_RISE_MIN_MS: f64 = 25.0;
+
+const SPIKE_RISE_RATIO: f64 = 0.5;
+
+/// Adaptive mode duplicates onto this many settled routes, and keeps adding
+/// routes until it has them, so each unstable route brings in one more.
+const SETTLED_ROUTES_WANTED: usize = 2;
+
 /// How far ahead a challenger must be to take a slot off the route already
 /// carrying traffic: a constant floor, plus the part of that route's score
 /// which is a measure of its own variance rather than of it being worse.
@@ -38,6 +54,10 @@ pub struct PathMetrics {
     last_latency_ms: Option<f64>,
     #[serde(default)]
     consecutive_losses: u32,
+    /// Clean probes still needed before this route counts as settled again.
+    /// Zero, the default, means settled: a route is trusted until it misbehaves.
+    #[serde(default)]
+    unsettled_probes: u32,
 }
 
 impl PathMetrics {
@@ -51,6 +71,7 @@ impl PathMetrics {
             loss_ratio: 0.0,
             last_latency_ms: None,
             consecutive_losses: 0,
+            unsettled_probes: 0,
         }
     }
 
@@ -59,6 +80,12 @@ impl PathMetrics {
         if self.last_latency_ms.is_none() {
             self.latency_ms = latency_ms;
         } else {
+            let spike = SPIKE_RISE_MIN_MS.max(self.latency_ms * SPIKE_RISE_RATIO);
+            if latency_ms - self.latency_ms >= spike {
+                self.unsettled_probes = PROBES_TO_SETTLE;
+            } else {
+                self.unsettled_probes = self.unsettled_probes.saturating_sub(1);
+            }
             let deviation = (latency_ms - self.latency_ms).abs();
             self.jitter_ms = ewma(self.jitter_ms, deviation);
             self.latency_ms = ewma(self.latency_ms, latency_ms);
@@ -77,9 +104,16 @@ impl PathMetrics {
         self.loss_ratio = ewma_with(self.loss_ratio, 1.0, LOSS_SMOOTHING).clamp(0.0, 1.0);
         self.samples += 1;
         self.consecutive_losses = self.consecutive_losses.saturating_add(1);
+        self.unsettled_probes = PROBES_TO_SETTLE;
         if self.consecutive_losses >= LOSSES_BEFORE_INACTIVE {
             self.active = false;
         }
+    }
+
+    /// Whether the route has gone [`PROBES_TO_SETTLE`] probes without a loss or
+    /// a spike, so Adaptive mode can rely on it without a backup alongside.
+    pub fn is_settled(&self) -> bool {
+        self.unsettled_probes == 0
     }
 
     pub fn score(&self) -> f64 {
@@ -222,17 +256,61 @@ pub fn choose_paths_with_incumbent(
     let delivery_delay = |path: &PathMetrics| {
         (path.latency_ms + path.jitter_ms * 2.0).max(path.last_latency_ms.unwrap_or(0.0))
     };
-    let quickest_delivery = candidates
+    let quickest_delivery = healthy
         .iter()
         .map(|path| delivery_delay(path))
         .fold(f64::INFINITY, f64::min);
-    let latency_comparable = candidates
+    let within_budget = |path: &PathMetrics| {
+        delivery_delay(path) <= quickest_delivery + ADAPTIVE_DUPLICATE_DELAY_BUDGET_MS
+    };
+    // Any second route in budget, not just the runner-up: an incumbent that
+    // just spiked can hold second place by its margin, and judging only it
+    // dropped the session to one route at the worst moment.
+    let unsettled_carrier = |path: &PathMetrics| holding(path) && !path.is_settled();
+    let latency_comparable = healthy
         .iter()
-        .all(|path| delivery_delay(path) <= quickest_delivery + ADAPTIVE_DUPLICATE_DELAY_BUDGET_MS);
+        .filter(|path| within_budget(path) || unsettled_carrier(path))
+        .count()
+        >= 2;
     let should_duplicate = strategy == Strategy::Duplicate || (!all_degraded && latency_comparable);
     if should_duplicate {
+        // Two routes protect a packet only while both behave. An unsettled one
+        // brings in the next route instead of being swapped out, and that one
+        // stays until the pair has proved itself again for PROBES_TO_SETTLE probes:
+        // trading places on every spike left a single good copy at the moment
+        // the uplink was most likely to stall the other one too.
+        //
+        // Expansion answers trouble the other routes do not share. With fewer
+        // than two settled routes left it is the shared uplink, usually its
+        // upload queue, and more copies would only deepen it. Congestion
+        // reaches the routes one probe at a time rather than all at once, so
+        // this counts every route instead of judging only the newest spike.
+        let independent =
+            healthy.iter().filter(|path| path.is_settled()).count() >= SETTLED_ROUTES_WANTED;
+        let mut chosen: Vec<&PathMetrics> = Vec::new();
+        let mut settled = 0;
+        for &path in &healthy {
+            let enough = chosen.len() >= 2 && (!independent || settled >= SETTLED_ROUTES_WANTED);
+            if enough {
+                break;
+            }
+            if chosen.len() >= 2 && (!within_budget(path) || !path.is_settled()) {
+                continue;
+            }
+            chosen.push(path);
+            if path.is_settled() {
+                settled += 1;
+            }
+        }
+        // No delay budget here: the spike that unsettled the route is also
+        // what would put it over, and a late duplicate costs only bandwidth.
+        for &path in healthy.iter().filter(|_| independent) {
+            if unsettled_carrier(path) && !chosen.iter().any(|chosen| chosen.id == path.id) {
+                chosen.push(path);
+            }
+        }
         Decision::Duplicate {
-            path_ids: healthy.iter().take(2).map(|path| path.id.clone()).collect(),
+            path_ids: chosen.iter().map(|path| path.id.clone()).collect(),
         }
     } else {
         Decision::Single {
@@ -743,7 +821,8 @@ mod tests {
     /// The live regression. Two WireGuard routes at 47 ms and an L2TP route at
     /// 86 ms: losing a single probe on a fast route must not hand the session
     /// to one 39 ms slower. This is the flapping that produced 50 selection
-    /// changes in six minutes.
+    /// changes in six minutes. The slow route may join as an extra copy while
+    /// the fast one is unsettled, but neither fast route may lose its slot.
     #[test]
     fn a_single_loss_does_not_promote_a_route_that_is_far_slower() {
         let mut fast = measured("fast", 47.0);
@@ -756,8 +835,8 @@ mod tests {
             panic!("three healthy routes should still duplicate");
         };
         assert!(
-            !path_ids.contains(&"slow".to_owned()),
-            "one lost probe promoted the slow route: {path_ids:?}"
+            path_ids.contains(&"fast".to_owned()) && path_ids.contains(&"steady".to_owned()),
+            "one lost probe handed a fast route's slot to the slow one: {path_ids:?}"
         );
     }
 
@@ -799,5 +878,134 @@ mod tests {
         // And one good probe brings it straight back.
         path.record_probe(40.0);
         assert!(path.active);
+    }
+
+    fn steady(id: &str, latency: f64) -> PathMetrics {
+        let mut path = measured(id, latency);
+        for _ in 0..PROBES_TO_SETTLE {
+            path.record_probe(latency);
+        }
+        path
+    }
+
+    fn carried(paths: &[PathMetrics], incumbent: &[&str]) -> Vec<String> {
+        let Decision::Duplicate { mut path_ids } =
+            choose_paths_with_incumbent(paths, Strategy::Adaptive, incumbent)
+        else {
+            panic!("comparable healthy routes should duplicate");
+        };
+        path_ids.sort();
+        path_ids
+    }
+
+    #[test]
+    fn settled_routes_duplicate_on_exactly_two() {
+        let paths = [
+            steady("0", 50.0),
+            steady("1", 51.0),
+            steady("2", 52.0),
+            steady("3", 53.0),
+        ];
+        assert_eq!(carried(&paths, &["0", "1"]), ["0", "1"]);
+    }
+
+    #[test]
+    fn ordinary_jitter_does_not_unsettle_a_route() {
+        let mut path = steady("0", 50.0);
+        path.record_probe(62.0);
+        assert!(path.is_settled());
+    }
+
+    /// The recorded pattern: one carrying route spikes from ~52 ms to well over
+    /// 100 ms. It must stay as an extra copy with a third route alongside.
+    #[test]
+    fn a_spiking_carrier_brings_in_a_third_route_and_keeps_its_slot() {
+        let mut paths = [
+            steady("0", 50.0),
+            steady("1", 51.0),
+            steady("2", 52.0),
+            steady("3", 53.0),
+        ];
+        paths[0].record_probe(170.0);
+        assert!(!paths[0].is_settled());
+        assert_eq!(carried(&paths, &["0", "1"]), ["0", "1", "2"]);
+    }
+
+    #[test]
+    fn a_second_unstable_route_brings_in_a_fourth() {
+        let mut paths = [
+            steady("0", 50.0),
+            steady("1", 51.0),
+            steady("2", 52.0),
+            steady("3", 53.0),
+        ];
+        paths[0].record_probe(170.0);
+        paths[2].record_loss();
+        assert_eq!(carried(&paths, &["0", "1", "2"]), ["0", "1", "2", "3"]);
+    }
+
+    #[test]
+    fn the_extra_route_stays_until_the_pair_has_settled_again() {
+        let mut paths = [steady("0", 50.0), steady("1", 51.0), steady("2", 52.0)];
+        paths[0].record_probe(170.0);
+        let mut incumbent = carried(&paths, &["0", "1"]);
+        for _ in 0..PROBES_TO_SETTLE - 1 {
+            paths[0].record_probe(50.0);
+            let ids: Vec<&str> = incumbent.iter().map(String::as_str).collect();
+            incumbent = carried(&paths, &ids);
+            assert_eq!(
+                incumbent.len(),
+                3,
+                "the escalated set shrank before route 0 settled"
+            );
+        }
+        paths[0].record_probe(50.0);
+        let ids: Vec<&str> = incumbent.iter().map(String::as_str).collect();
+        assert_eq!(carried(&paths, &ids).len(), 2);
+    }
+
+    #[test]
+    fn a_spike_on_every_route_at_once_does_not_add_copies() {
+        let mut paths = [
+            steady("0", 50.0),
+            steady("1", 51.0),
+            steady("2", 52.0),
+            steady("3", 53.0),
+        ];
+        for path in &mut paths {
+            path.record_probe(170.0);
+        }
+        assert_eq!(carried(&paths, &["0", "1"]), ["0", "1"]);
+    }
+
+    /// Congestion on the shared uplink unsettles the routes one probe apart,
+    /// each spike looking independent when it lands. Once most routes are
+    /// unsettled the set must fall back to two, not hold every extra it grew.
+    #[test]
+    fn staggered_spikes_across_most_routes_fall_back_to_two() {
+        let mut paths = [
+            steady("0", 50.0),
+            steady("1", 51.0),
+            steady("2", 52.0),
+            steady("3", 53.0),
+        ];
+        let mut incumbent = vec!["0".to_owned(), "1".to_owned()];
+        for route in [0, 2, 3] {
+            paths[route].record_probe(170.0);
+            let ids: Vec<&str> = incumbent.iter().map(String::as_str).collect();
+            incumbent = carried(&paths, &ids);
+        }
+        assert_eq!(
+            incumbent.len(),
+            2,
+            "shared congestion held extra copies: {incumbent:?}"
+        );
+    }
+
+    #[test]
+    fn escalation_does_not_add_a_far_slower_backup() {
+        let mut paths = [steady("0", 50.0), steady("1", 51.0), steady("2", 400.0)];
+        paths[0].record_probe(170.0);
+        assert!(!carried(&paths, &["0", "1"]).contains(&"2".to_owned()));
     }
 }

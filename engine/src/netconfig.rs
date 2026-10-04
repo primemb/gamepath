@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
@@ -252,10 +253,47 @@ unsafe extern "system" {
     fn DnsFlushResolverCache() -> i32;
 }
 
-/// Empties the DNS Client service's cache.
+/// Empties the DNS Client service's cache, on a thread of its own.
+///
+/// The flush is a call into the DNS Client service, which can sit behind that
+/// service's own work for minutes. Observed live: a session stop waited
+/// 520 s, released seconds after its L2TP/IPsec adapters went down. A stale
+/// cache entry costs one lookup; a blocked control thread costs the session.
+/// A flush asked for while one runs is done again once it returns, so the
+/// last caller's view of the network is the one flushed.
 pub fn flush_dns_cache() {
-    if unsafe { DnsFlushResolverCache() } == 0 {
-        crate::log_warn!("could not flush the DNS resolver cache");
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    static AGAIN: AtomicBool = AtomicBool::new(false);
+    AGAIN.store(true, Ordering::Release);
+    if RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("gamepath-dns-flush".into())
+        .spawn(|| {
+            loop {
+                while AGAIN.swap(false, Ordering::AcqRel) {
+                    let started = Instant::now();
+                    if unsafe { DnsFlushResolverCache() } == 0 {
+                        crate::log_warn!("could not flush the DNS resolver cache");
+                    }
+                    if started.elapsed() > Duration::from_secs(2) {
+                        crate::log_warn!(
+                            "flushing the DNS resolver cache took {:.1} s",
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+                RUNNING.store(false, Ordering::Release);
+                // A request that arrived between the last flush and the line
+                // above found RUNNING set and left; take it here.
+                if !AGAIN.load(Ordering::Acquire) || RUNNING.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+            }
+        });
+    if spawned.is_err() {
+        RUNNING.store(false, Ordering::Release);
     }
 }
 

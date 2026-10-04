@@ -1316,6 +1316,10 @@ impl Drop for SplitPacketCapture {
         }
         let workers = std::mem::take(&mut *self.registry.workers.lock().unwrap());
         for worker in workers {
+            crate::teardown::step(format!(
+                "split capture thread {}",
+                worker.thread().name().unwrap_or("unnamed")
+            ));
             let _ = worker.join();
         }
     }

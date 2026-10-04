@@ -531,10 +531,14 @@ late by a slower path is discarded as a duplicate.
   most that. A game sending one packet per tick gets a repair per packet a few
   milliseconds behind it, which is cheap at game rates and is the spacing that
   lets a repair survive the burst that took the original.
-- **Repairs go to every healthy path**, not only the ones the scheduler picked
-  for data. A backup too slow to be picked for game packets still carries their
-  repairs, and a burst on the fast path cannot take a packet and its repair
-  together. A path whose queue is past `REPAIR_QUEUE_LIMIT` (a quarter full)
+- **Each uplink repair goes to one healthy path**, preferring one the scheduler
+  did not pick for data and rotating among those, so a burst on the carrying
+  paths cannot take a packet and its repair together. It used to go to every
+  healthy path: on a live four-route session that made repairs over half of all
+  upload packets, each carrying ~145-200 bytes of tunnel and relay overhead, while the stalls
+  that session suffered looked upload-only. A loss that reaches every copy of a
+  packet is shared by the uplink and takes extra repair copies with it, so they
+  bought nothing and added to the congestion. A path whose queue is past `REPAIR_QUEUE_LIMIT` (a quarter full)
   gets no repairs: it is saturated, and a repair must never take queue space a
   game packet then cannot get.
 - **Negotiated, never assumed.** Path workers send an `offer` control frame
@@ -667,6 +671,36 @@ latency, jitter and loss, because that is a question about the routes and not
 about which of them was picked last time. The same margin holds the armed
 fallback steady during a total outage, where two equally dead routes could
 otherwise alternate on every timeout.
+
+### Escalating past two routes
+
+Two copies protect a packet only while both routes behave. On a live four-route
+session every route spiked from ~52 ms to 100-470 ms every few seconds, usually
+one at a time, and the response was a swap: the spiking route lost its slot to
+a standby, which spiked next. Each swap left one good copy exactly when the
+uplink was most likely to stall it too.
+
+Adaptive mode now takes routes in rank order until it holds
+`SETTLED_ROUTES_WANTED` (two) _settled_ ones, and keeps any carrying route that
+is not settled as an extra copy. A route is unsettled for `PROBES_TO_SETTLE`
+clean probes (about ten seconds on a carrying route) after a lost probe or one
+`SPIKE_RISE_MIN_MS` / `SPIKE_RISE_RATIO` above its smoothed RTT. One unstable
+route therefore brings in a third, a second brings in a fourth, and the set
+shrinks back to two only once the pair has proved itself again. A route added
+this way must be settled itself, and expansion only happens while at least two
+routes are settled. Congestion on the shared uplink, usually its upload queue,
+reaches the routes one probe apart rather than at once, so each spike looks
+independent when it lands; judging only the newest one let a set grow to four
+copies route by route, deepening the very congestion behind it. With fewer than
+two settled routes the set falls back to the plain best two and holds no extras.
+Escalation routes also have to fit `ADAPTIVE_DUPLICATE_DELAY_BUDGET_MS`; an unsettled
+incumbent does not, because the spike that unsettled it is what would put it
+over, and a late duplicate costs only bandwidth.
+
+The same incident exposed the opposite failure: whether to duplicate at all was
+judged on the top two only, so a spiking incumbent holding second place by its
+incumbency margin failed the delay budget and the session fell to a single
+route. The check now asks whether _any_ second route is in budget.
 
 ### The deadline floor depends on the transport
 
@@ -1113,6 +1147,8 @@ Each purchased configuration is parsed only in memory for the active session. Th
 ## Privileged service
 
 The Electron UI remains unprivileged. `GamePathService` runs through Windows Service Control Manager and owns the native engine behind a token-authenticated loopback API on `127.0.0.1`. The installer creates a random 256-bit control token under `%ProgramData%\GamePath`, protects it for Local System, administrators, and the installing user, and installs the signed Wintun and WinDivert runtime files beside the service. A Windows Job Object with `KILL_ON_JOB_CLOSE` prevents the capture engine from surviving a service exit. The client renews a thirty-second session lease from its main process every three seconds; if the client disappears, the service closes the engine and its capture handles automatically. The renewal cannot be driven from the renderer, whose timers Chromium throttles whenever the window is hidden or occluded — see _Session lease_.
+
+Every engine request has a deadline: 10 s for status, 15 s for a stop, two minutes for a start, which may dial L2TP/IPsec or complete an OpenVPN handshake. A request is made under its slot's lock, so an engine stuck mid-command used to hold the slot indefinitely. Observed live: a game stop waited 520 s, both L2TP/IPsec connections stayed up, and Windows could not hang them up either, because the RAS connections belong to the service. Past the deadline the service ends the engine process instead, and the stop proceeds. While a stop runs, the engine records the step it has reached and logs it every five seconds once the stop runs long. The stop came free seconds after the L2TP/IPsec adapters went down, and the one step that waits on another Windows service is the DNS cache flush, a call into the DNS Client service; it now runs on its own thread, and logs when it takes longer than two seconds.
 
 ## Concurrent sessions
 

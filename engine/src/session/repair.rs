@@ -2,9 +2,13 @@
 //!
 //! Uplink: every data frame the dispatcher sends joins the encoder's open
 //! group, and the group's repair is sealed and sent like any other frame. A
-//! repair goes to every healthy path, not only the ones carrying data, so a
-//! backup too slow to be picked for game packets still carries their repairs,
-//! and a burst on the fast path cannot take a packet and its repair together.
+//! repair goes to one healthy path, preferring one not carrying data, so a
+//! burst on the carrying paths cannot take a packet and its repair together.
+//! It used to go to every healthy path: on a live four-route session that made
+//! repairs over half of all upload packets, each with ~145-200 bytes of tunnel
+//! overhead, on a link whose stalls looked upload-only. A loss that reaches every
+//! copy of a packet is shared by the uplink, which takes extra repair copies
+//! down with it, so they bought nothing and added to the congestion.
 //!
 //! Downlink: the relay encodes its replies the same way once this client has
 //! offered, with the same group size this side uses and this session's tunnel
@@ -237,6 +241,8 @@ impl LossRepair {
         if mask == 0 {
             return;
         }
+        let carrying = self.decision_mask.load(Ordering::Acquire);
+        let mask = repair_target(mask, carrying, self.repairs_sent.load(Ordering::Relaxed));
         let header = FrameHeader {
             flags: FLAG_REPAIR,
             client_id: self.client_id,
@@ -349,6 +355,18 @@ impl LossRepair {
     }
 }
 
+/// The single path a repair takes out of `mask`: a spare one when any is free
+/// of data, otherwise one of the carrying ones, rotated by `turn` so no one
+/// path carries every repair.
+fn repair_target(mask: u64, carrying: u64, turn: u64) -> u64 {
+    let spare = mask & !carrying;
+    let mut pool = if spare != 0 { spare } else { mask };
+    for _ in 0..turn % u64::from(pool.count_ones()) {
+        pool &= pool - 1;
+    }
+    pool & pool.wrapping_neg()
+}
+
 /// Closes groups that stopped growing, so a game's last packet before a pause
 /// is covered within [`fec::GROUP_MAX_AGE`] rather than whenever the next one
 /// comes along.
@@ -381,4 +399,29 @@ pub(crate) fn spawn_flusher(
                 encoder = repair.wake.wait_timeout(encoder, wait).unwrap().0;
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repair_target;
+
+    #[test]
+    fn a_repair_takes_exactly_one_path() {
+        for turn in 0..8 {
+            assert_eq!(repair_target(0b1111, 0b0011, turn).count_ones(), 1);
+        }
+    }
+
+    #[test]
+    fn a_repair_prefers_a_path_not_carrying_data_and_rotates_among_them() {
+        assert_eq!(repair_target(0b1111, 0b0011, 0), 0b0100);
+        assert_eq!(repair_target(0b1111, 0b0011, 1), 0b1000);
+        assert_eq!(repair_target(0b1111, 0b0011, 2), 0b0100);
+    }
+
+    #[test]
+    fn with_every_path_carrying_a_repair_rotates_over_them() {
+        assert_eq!(repair_target(0b0011, 0b0011, 0), 0b0001);
+        assert_eq!(repair_target(0b0011, 0b0011, 1), 0b0010);
+    }
 }

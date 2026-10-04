@@ -426,7 +426,7 @@ export const persian: Record<string, string> = {
   'Relay routing mode': 'روش مسیریابی رله',
   Smart: 'هوشمند',
   Manual: 'دستی',
-  'Best two routes': 'دو مسیر برتر',
+  'Best two, more when unstable': 'دو مسیر برتر، بیشتر هنگام ناپایداری',
   'Every healthy route': 'همه مسیرهای سالم',
   'Start with Windows': 'اجرای هم‌زمان با ویندوز',
   'Open GamePath in the background after signing in.': 'پس از ورود به ویندوز، GamePath را در پس‌زمینه باز کنید.',
@@ -535,8 +535,8 @@ export const persian: Record<string, string> = {
   'Select the game .exe file': 'فایل .exe بازی را انتخاب کنید',
   'Setup complete': 'راه‌اندازی کامل شد',
   'Setup required': 'راه‌اندازی لازم است',
-  'Smart uses the best two healthy routes. Manual duplicates through every healthy enabled route. Changes apply when you next start a session.':
-    'حالت هوشمند از دو مسیر سالم برتر استفاده می‌کند. حالت دستی بسته‌ها را از همه مسیرهای سالم و فعال می‌فرستد. تغییرات از اتصال بعدی اعمال می‌شوند.',
+  'Smart uses the best two healthy routes and adds more while one of them is unstable. Manual duplicates through every healthy enabled route. Changes apply when you next start a session.':
+    'حالت هوشمند از دو مسیر سالم برتر استفاده می‌کند و وقتی یکی ناپایدار شود مسیرهای بیشتری اضافه می‌کند. حالت دستی بسته‌ها را از همه مسیرهای سالم و فعال می‌فرستد. تغییرات از اتصال بعدی اعمال می‌شوند.',
   'Something went wrong': 'مشکلی پیش آمد',
   'Stop resolving': 'توقف حل نام‌ها',
   'Target collection': 'مجموعه مقصدها',

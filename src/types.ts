@@ -341,7 +341,7 @@ export type AppState = {
   trafficMode: 'all' | 'split'
   remoteDns: boolean
   connectionMode: ConnectionMode
-  /** Smart uses the best two paths; manual duplicates across every healthy path. */
+  /** Smart uses the best two paths, more while one is unstable; manual duplicates across every healthy path. */
   routingStrategy: 'smart' | 'manual'
   lanProxy: LanProxySettings
   /** This PC's private IPv4 addresses, the likeliest first. */

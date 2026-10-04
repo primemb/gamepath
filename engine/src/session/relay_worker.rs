@@ -80,6 +80,11 @@ pub(crate) fn run_path(
     // soon as the path answers. An already-running redial stays owned until
     // it finishes, then is discarded if that recovery made it obsolete.
     let mut failures = 0_u32;
+    // Frames received from the relay as of the first probe of a failure run
+    // missing its deadline. Counting from there, not from the last answer,
+    // leaves out traffic from before the stall began, so a path declared down
+    // can say whether the relay kept reaching it while its probes did not.
+    let mut received_at_first_miss = 0_u64;
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut next_redial: Option<Instant> = None;
     // Set once this transport's own verdict has been acted on, so a socket that
@@ -549,6 +554,9 @@ pub(crate) fn run_path(
             repair.record_probe(index, Probe::Lost);
             let note = path.health_note();
             failures += 1;
+            if failures == 1 {
+                received_at_first_miss = statuses.lock().unwrap()[index].packets_received;
+            }
             schedule_redial(failures, backoff, &mut next_redial);
             if failures == HEALTH_FAILURE_THRESHOLD - 1 {
                 log_warn!(
@@ -560,10 +568,19 @@ pub(crate) fn run_path(
                         .unwrap_or_default()
                 );
             } else if failures == HEALTH_FAILURE_THRESHOLD {
+                let arrived = statuses.lock().unwrap()[index]
+                    .packets_received
+                    .saturating_sub(received_at_first_miss);
                 log_warn!(
                     "session {session_id} route {} unavailable after {failures} consecutive health \
-                     timeouts; dispatcher is using available alternatives{}",
+                     timeouts; dispatcher is using available alternatives; {arrived} relay frame(s) \
+                     arrived after its first missed probe ({}){}",
                     index + 1,
+                    if arrived > 0 {
+                        "the relay kept reaching this path, which points to upload loss"
+                    } else {
+                        "nothing arrived in either direction"
+                    },
                     note.as_deref()
                         .map(|note| format!(": {note}"))
                         .unwrap_or_default()

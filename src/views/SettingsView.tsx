@@ -101,14 +101,14 @@ export function SettingsView({
             <p>
               {direct
                 ? 'Available in relay mode. Direct mode always uses its one selected node.'
-                : 'Smart uses the best two healthy routes. Manual duplicates through every healthy enabled route. Changes apply when you next start a session.'}
+                : 'Smart uses the best two healthy routes and adds more while one of them is unstable. Manual duplicates through every healthy enabled route. Changes apply when you next start a session.'}
             </p>
           </div>
         </div>
         <div className="segmented-control" role="radiogroup" aria-label="Relay routing mode">
           {(
             [
-              ['smart', 'Smart', 'Best two routes'],
+              ['smart', 'Smart', 'Best two, more when unstable'],
               ['manual', 'Manual', 'Every healthy route'],
             ] as const
           ).map(([id, label, detail]) => (

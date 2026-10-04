@@ -15,6 +15,7 @@ mod icmp;
 mod ipc;
 mod netutil;
 mod session;
+mod teardown;
 
 #[cfg(windows)]
 mod proxy_identity;
@@ -198,10 +199,14 @@ fn handle_request(
         "socks-server-status" => Ok(proxy.status()),
         "stop-socks-server" => Ok(proxy.stop()),
         "stop-wireguard-session" => {
+            let _watch = teardown::watch("stopping the session");
             // Before the session: the proxy's thread takes the session lock
             // for every packet, and is joined here.
+            teardown::step("LAN proxy");
             proxy.stop();
+            teardown::step("packet capture");
             capture.stop();
+            teardown::step("waiting for the session lock");
             Ok(sessions.lock().unwrap().stop())
         }
         "scheduler-demo" => Ok(scheduler_demo()),

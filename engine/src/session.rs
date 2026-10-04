@@ -229,6 +229,10 @@ impl WireGuardSessionManager {
             repair.wake_flusher();
         }
         for worker in session.workers.drain(..) {
+            crate::teardown::step(format!(
+                "session thread {}",
+                worker.thread().name().unwrap_or("unnamed")
+            ));
             let _ = worker.join();
         }
         json!({ "state": "idle", "paths": [] })
