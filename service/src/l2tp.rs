@@ -17,6 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,6 +28,11 @@ use windows_sys::Win32::NetworkManagement::Rras::{
 };
 
 static L2TP_PROFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+
+/// Profiles are written into one shared phonebook by separate PowerShell
+/// processes, so creating them stays one at a time even though the dials that
+/// follow run in parallel.
+static L2TP_PROFILE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 pub(crate) struct NativeL2tpUsage {
@@ -206,6 +212,9 @@ fn create_l2tp_profile(
     split_tunneling: bool,
     allow_user_fallback: bool,
 ) -> Result<(PathBuf, bool), String> {
+    let _serial = L2TP_PROFILE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match run_l2tp_profile_script(name, server, pre_shared_key, true, split_tunneling) {
         Ok(()) => Ok((all_users_phonebook(), split_tunneling)),
         Err(all_users_error) => {
@@ -504,89 +513,123 @@ impl Drop for L2tpSession {
 /// failure is the session's. In relay mode a failed node is only marked:
 /// the engine skips that route with the reason and runs on the rest, the
 /// same as it does for a dead WireGuard or OpenVPN node.
+///
+/// Nodes dial in parallel. `RasDialW` blocks until Windows finishes IKE, and
+/// against a server that never answers that is about 40 seconds (RAS error
+/// 628), so dialing one after another made a single dead node delay every
+/// route behind it, and the whole session start, by that long.
 pub(crate) fn connect_l2tp_nodes(
     nodes: &mut [NodeSpec],
     relay: Option<Ipv4Addr>,
     split_tunneling: bool,
     tag: &str,
 ) -> Result<Vec<L2tpSession>, String> {
+    let results: Vec<Result<Option<L2tpSession>, String>> = thread::scope(|scope| {
+        let dials: Vec<_> = nodes
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, node)| matches!(node, NodeSpec::L2tp { .. }))
+            .map(|(index, node)| {
+                scope.spawn(move || connect_l2tp_node(node, index, relay, split_tunneling, tag))
+            })
+            .collect();
+        dials
+            .into_iter()
+            .map(|dial| {
+                dial.join()
+                    .unwrap_or_else(|_| Err("the L2TP dial thread panicked".into()))
+            })
+            .collect()
+    });
     let mut sessions = Vec::new();
-    for (index, node) in nodes.iter_mut().enumerate() {
-        let NodeSpec::L2tp {
-            server,
-            username,
-            password,
-            pre_shared_key,
-            runtime,
-            dial_error,
-            ..
-        } = node
-        else {
-            continue;
-        };
-        let profile_name = format!(
-            "GamePath-L2TP-{}-{}-{}",
-            std::process::id(),
-            index + 1,
-            L2TP_PROFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
-        let dialed = L2tpSession::dial(
-            profile_name,
-            server,
-            username,
-            password,
-            pre_shared_key,
-            split_tunneling,
-            false,
-        )
-        .and_then(|mut session| {
-            if let Some(relay) = relay {
-                session.add_route(&format!("{relay}/32"))?;
-            }
-            Ok(session)
-        });
-        let session = match dialed {
-            Ok(session) => session,
-            Err(error) if relay.is_some() => {
-                log_event(&format!(
-                    "{tag} route {}: {error}; continuing without it",
-                    index + 1
-                ));
-                pre_shared_key.clear();
-                *dial_error = Some(error);
-                continue;
-            }
-            Err(error) => return Err(format!("route {}: {error}", index + 1)),
-        };
-        if relay.is_some() {
-            // In relay mode this adapter exists only to carry GamePath's
-            // IPv4 frames to the relay, so an IPv6 default route picked up
-            // from the link's Router Advertisements is never wanted.
-            //
-            // A direct session is deliberately left alone. There Windows
-            // routes the user's own traffic through this adapter natively,
-            // and taking IPv6 off it would push that traffic onto the
-            // physical interface instead - turning a tunnelled protocol
-            // into a leak rather than fixing anything.
-            //
-            // Non-fatal either way: a session that carries traffic is worth
-            // more than this, and IPv6 exposure is reported separately.
-            if let Err(error) = netconfig::disable_ipv6_default_route(session.interface_index) {
-                log_event(&format!(
-                    "{tag} route {}: {error}; the L2TP adapter may keep an IPv6 default route",
-                    index + 1
-                ));
-            }
-        }
-        *runtime = Some(session.runtime(index + 1));
-        // Relay workers keep the login only inside the privileged engine
-        // child so they can redial a RAS connection after a real drop. The
-        // PSK is already sealed in the temporary Windows profile and does
-        // not cross the child-process boundary.
-        pre_shared_key.clear();
-        sessions.push(session);
+    for result in results {
+        sessions.extend(result?);
     }
     Ok(sessions)
+}
+
+/// Dials one node. `Ok(None)` is a relay-mode node that failed and was marked
+/// skipped.
+fn connect_l2tp_node(
+    node: &mut NodeSpec,
+    index: usize,
+    relay: Option<Ipv4Addr>,
+    split_tunneling: bool,
+    tag: &str,
+) -> Result<Option<L2tpSession>, String> {
+    let NodeSpec::L2tp {
+        server,
+        username,
+        password,
+        pre_shared_key,
+        runtime,
+        dial_error,
+        ..
+    } = node
+    else {
+        return Ok(None);
+    };
+    let profile_name = format!(
+        "GamePath-L2TP-{}-{}-{}",
+        std::process::id(),
+        index + 1,
+        L2TP_PROFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let dialed = L2tpSession::dial(
+        profile_name,
+        server,
+        username,
+        password,
+        pre_shared_key,
+        split_tunneling,
+        false,
+    )
+    .and_then(|mut session| {
+        if let Some(relay) = relay {
+            session.add_route(&format!("{relay}/32"))?;
+        }
+        Ok(session)
+    });
+    let session = match dialed {
+        Ok(session) => session,
+        Err(error) if relay.is_some() => {
+            log_event(&format!(
+                "{tag} route {}: {error}; continuing without it",
+                index + 1
+            ));
+            pre_shared_key.clear();
+            *dial_error = Some(error);
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("route {}: {error}", index + 1)),
+    };
+    if relay.is_some() {
+        // In relay mode this adapter exists only to carry GamePath's
+        // IPv4 frames to the relay, so an IPv6 default route picked up
+        // from the link's Router Advertisements is never wanted.
+        //
+        // A direct session is deliberately left alone. There Windows
+        // routes the user's own traffic through this adapter natively,
+        // and taking IPv6 off it would push that traffic onto the
+        // physical interface instead - turning a tunnelled protocol
+        // into a leak rather than fixing anything.
+        //
+        // Non-fatal either way: a session that carries traffic is worth
+        // more than this, and IPv6 exposure is reported separately.
+        if let Err(error) = netconfig::disable_ipv6_default_route(session.interface_index) {
+            log_event(&format!(
+                "{tag} route {}: {error}; the L2TP adapter may keep an IPv6 default route",
+                index + 1
+            ));
+        }
+    }
+    *runtime = Some(session.runtime(index + 1));
+    // Relay workers keep the login only inside the privileged engine
+    // child so they can redial a RAS connection after a real drop. The
+    // PSK is already sealed in the temporary Windows profile and does
+    // not cross the child-process boundary.
+    pre_shared_key.clear();
+    Ok(Some(session))
 }
 
 /// Splits an `a.b.c.d/len` prefix into the pair the routing API takes.
