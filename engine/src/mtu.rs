@@ -110,6 +110,22 @@ pub fn path_overhead_bytes(mode: SessionMode, kind: &str) -> u16 {
     outer + transport + overlay
 }
 
+fn path_packet_budget(mode: SessionMode, kind: &str, link_mtu: u16) -> u16 {
+    let budget = link_mtu.saturating_sub(path_overhead_bytes(mode, kind));
+    if kind != "wireguard" {
+        return budget;
+    }
+    // Peers pad encrypted IP packets to 16 bytes. BoringTun sends without
+    // padding, but replies from a standard peer still need that headroom.
+    let overlay = if mode == SessionMode::Relay {
+        RELAY_OVERLAY
+    } else {
+        0
+    };
+    let inner = link_mtu.saturating_sub(OUTER_IPV4_UDP + WIREGUARD_DATA);
+    (inner / 16 * 16).saturating_sub(overlay)
+}
+
 /// MTU for the relay's own TUN interface.
 ///
 /// Whatever the relay writes there is sealed and sent back to the client, so it
@@ -152,12 +168,23 @@ impl EffectiveMtu {
         link_mtu: u16,
     ) -> Self {
         let link_mtu = normalize_link_mtu(link_mtu);
-        let overhead = kinds
+        let (overhead, budget) = kinds
             .into_iter()
-            .map(|kind| path_overhead_bytes(mode, kind))
-            .max()
-            .unwrap_or_else(|| path_overhead_bytes(mode, ""));
-        let budget = link_mtu.saturating_sub(overhead);
+            .map(|kind| {
+                (
+                    path_overhead_bytes(mode, kind),
+                    path_packet_budget(mode, kind, link_mtu),
+                )
+            })
+            .reduce(|(overhead, budget), (next_overhead, next_budget)| {
+                (overhead.max(next_overhead), budget.min(next_budget))
+            })
+            .unwrap_or_else(|| {
+                (
+                    path_overhead_bytes(mode, ""),
+                    path_packet_budget(mode, "", link_mtu),
+                )
+            });
         // [`MIN_TUNNEL_MTU`] is a floor, not a preference: no session is ever
         // configured below it. Nested and mobile links can leave less than
         // that after encapsulation, and the alternative - advertising the
@@ -243,6 +270,31 @@ mod tests {
         let mtu = EffectiveMtu::for_session(SessionMode::Direct, ["wireguard"], LINK_MTU);
         assert_eq!(mtu.overhead, 60);
         assert_eq!(mtu.mtu, 1440);
+    }
+
+    #[test]
+    fn wireguard_replies_fit_after_peer_padding_on_a_measured_path() {
+        for link in 1400..=1500 {
+            for mode in [SessionMode::Direct, SessionMode::Relay] {
+                let mtu = EffectiveMtu::for_session(mode, ["wireguard"], link);
+                let overlay = if mode == SessionMode::Relay {
+                    RELAY_OVERLAY
+                } else {
+                    0
+                };
+                let inner = mtu.unfragmented() + overlay;
+                let padded = inner.div_ceil(16) * 16;
+                assert!(padded + WIREGUARD_DATA + OUTER_IPV4_UDP <= link);
+                assert!(
+                    (inner + 1).div_ceil(16) * 16 + WIREGUARD_DATA + OUTER_IPV4_UDP > link,
+                    "the largest safe packet should use the available budget"
+                );
+            }
+        }
+        let direct = EffectiveMtu::for_session(SessionMode::Direct, ["wireguard"], 1424);
+        assert_eq!((direct.mtu, direct.tcp_mss()), (1360, 1320));
+        let mixed = EffectiveMtu::for_session(SessionMode::Relay, ["socks5", "wireguard"], 1424);
+        assert_eq!(mixed.budget, 1261);
     }
 
     #[test]

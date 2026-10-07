@@ -166,7 +166,9 @@ impl WireGuardSessionManager {
     }
 
     pub(crate) fn effective_mtu(&self) -> Option<EffectiveMtu> {
-        self.active.as_ref().map(|session| session.mtu.current())
+        self.active
+            .as_ref()
+            .map(|session| session.mtu.for_capture())
     }
 
     /// What the LAN proxy needs to open flows of its own through this session.
