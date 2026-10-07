@@ -6,7 +6,7 @@ import { tr } from '../lib/localizeDom'
 import type { UsageReport, UsageRow } from '../types'
 import type { NoticeKind } from '../components/Toast'
 
-type Period = 'today' | 'week' | 'year' | 'all' | 'custom'
+type Period = 'today' | 'week' | 'month' | 'year' | 'all' | 'custom'
 
 /** Whose traffic the screen shows. The two are counted apart and never added together. */
 type Scope = 'game' | 'vpn'
@@ -23,6 +23,7 @@ function bounds(period: Period, from: string, to: string) {
     const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7))
     return { from: dateKey(monday), to: today }
   }
+  if (period === 'month') return { from: dateKey(new Date(now.getFullYear(), now.getMonth(), 1)), to: today }
   if (period === 'year') return { from: `${now.getFullYear()}-01-01`, to: today }
   if (period === 'all') return { from: '1970-01-01', to: '9999-12-31' }
   return { from, to }
@@ -203,11 +204,12 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
             </button>
           ))}
         </div>
-        <div className="usage-periods" aria-label="Statistics period">
+        <div className="usage-periods" role="group" aria-label="Statistics period">
           {(
             [
               ['today', 'Today'],
               ['week', 'This week'],
+              ['month', 'This month'],
               ['year', 'This year'],
               ['all', 'All time'],
               ['custom', 'Custom'],

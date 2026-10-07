@@ -11,6 +11,7 @@ import {
 import { formatRate } from '../../lib/format'
 import { formatUptime, useTicker, useVpnRates, vpnBusy, vpnLive, vpnOn, vpnStatusText } from '../../lib/vpn'
 import type { VpnState } from '../../types'
+import { VpnSessionUsage } from './VpnSessionUsage'
 
 /** The VPN's state at a glance, and its one switch. */
 export function VpnCommandCard({ vpn, onToggle, busy }: { vpn: VpnState; onToggle: () => void; busy: boolean }) {
@@ -87,6 +88,7 @@ export function VpnCommandCard({ vpn, onToggle, busy }: { vpn: VpnState; onToggl
           {text.pill}
         </span>
       </div>
+      <VpnSessionUsage session={session} />
     </section>
   )
 }

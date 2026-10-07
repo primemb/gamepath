@@ -95,6 +95,33 @@
   gap: 4px;
 }
 
+.vpn-session-usage {
+  position: relative;
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 32px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.vpn-session-usage > div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.vpn-session-usage span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.vpn-session-usage strong {
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.vpn-session-usage > div:first-child strong {
+  color: var(--vpn-accent);
+}
+
 .vpn-connect {
   color: #0d0a24;
   background: var(--vpn-accent);

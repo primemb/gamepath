@@ -85,7 +85,7 @@ cargo test --locked --manifest-path relay/Cargo.toml
 - Add any number of relay locations and enable zero or one at a time.
 - Provision or remove a Debian 13+ or Ubuntu 22.04+ VPS over password-authenticated SSH from the client; SSH passwords remain transient and host fingerprints are pinned after first use.
 - Start and monitor the Rust engine through private JSON-line IPC.
-- Review daily, weekly, yearly, all-time, or custom-date tunnel usage and reset its local history.
+- Review daily, weekly, monthly, yearly, all-time, or custom-date tunnel usage and reset its local history.
 - Detect the installed WireGuard client and active interfaces.
 - Validate complete session plans before any route mutation.
 - Compile application, folder, hostname, and IP targets into a process-aware WFP interception plan.
@@ -128,7 +128,7 @@ See `docs/relay-security.md` and `deploy/README.md` for the encrypted overlay an
 
 ### Usage statistics
 
-Statistics are stored locally in daily SQLite buckets under the client's app-data directory. Overall sent and received totals count each selected IPv4 packet once; each node reports the bytes carried by its own transport, including relay copies and protocol overhead. Node totals can therefore exceed the overall total. The statistics screen provides calendar-day, current-week, current-year, all-time, and custom date ranges, plus a reset action.
+Statistics are stored locally in daily SQLite buckets under the client's app-data directory. Overall sent and received totals count each selected IPv4 packet once; each node reports the bytes carried by its own transport, including relay copies and protocol overhead. Node totals can therefore exceed the overall total. The statistics screen provides calendar-day, current-week, current-month, current-year, all-time, and custom date ranges, plus a reset action. The VPN screen also shows the current session's total, uploaded, and downloaded bytes; these counters begin again when a new VPN session connects.
 
 Application totals come from process-owned split-tunnel flows. Traffic whose process cannot be identified is shown as **Unattributed**. All-traffic mode and native direct L2TP/IPsec do not identify individual applications. Direct L2TP totals come from Windows RAS connection counters, which can include connection overhead and any traffic on that VPN interface. Regular untunnelled traffic is never included; engine-managed totals are IPv4-only.
 
