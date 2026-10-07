@@ -285,25 +285,18 @@ function directSessionMessage(plan, node, dataPlane) {
  */
 const SESSION_POLL_MS = 3000
 
-/**
- * Consecutive failed polls before the session is given up.
- *
- * The service's lease is far longer than this many polls, so retrying costs
- * nothing and a transient loopback hiccup no longer ends a working session.
- * Tearing down on the first failure is what turned one bad reply into a
- * disconnect after thirty-seven minutes of clean play.
- */
-const SESSION_POLL_MAX_FAILURES = 3
-
 const logger = require('./logger.cjs')
 const { deriveJourney } = require('./journey.cjs')
+const { SessionLease } = require('./session-lease.cjs')
 
 let sessionKeepAlive = null
 let sessionPollInFlight = false
 // Only a change in the relay's view is worth a line; the poll runs every few
 // seconds and logging each one would bury everything else.
 let lastRuntimeState = null
-let sessionPollFailures = 0
+// When repeated status failures mean the session is really gone; see
+// session-lease.cjs for why an unanswered request is not enough.
+const sessionLease = new SessionLease()
 
 /**
  * Loss the session is experiencing right now, from the engine's smoothed
@@ -1360,7 +1353,8 @@ async function pollSessionStatus() {
       logger.info('session recovered')
     }
     lastRuntimeState = runtime.state
-    sessionPollFailures = 0
+    const ended = sessionLease.renewed()
+    if (ended) logger.info(`session status answered again after ${ended} failed request(s)`)
     if (runtime.state !== 'connected') {
       state.session.message =
         runtime.mode === 'direct'
@@ -1369,13 +1363,13 @@ async function pollSessionStatus() {
     }
   } catch (error) {
     if (!isCurrent()) return
-    sessionPollFailures += 1
-    if (sessionPollFailures < SESSION_POLL_MAX_FAILURES) {
+    if (!sessionLease.failed(error)) {
       // The paths are almost certainly still carrying traffic; only the status
       // request failed. Say so and let the next poll decide.
-      logger.warn(`session status failed (${sessionPollFailures}/${SESSION_POLL_MAX_FAILURES}): ${error.message}`)
+      logger.warn(`session status failed (${sessionLease.describe()}); keeping the session: ${error.message}`)
       return
     }
+    const lost = sessionLease.describe()
     await sessionExclusive(async () => {
       // Start/Stop may have replaced this session while cleanup was queued.
       if (!isCurrent()) return
@@ -1385,7 +1379,7 @@ async function pollSessionStatus() {
       state.session = { status: 'error', message: error.message }
       stopSessionKeepAlive()
       relayFailover.end()
-      logger.error(`session lost after ${sessionPollFailures} failed status requests: ${error.message}`)
+      logger.error(`session lost (${lost}): ${error.message}`)
     })
   } finally {
     sessionPollInFlight = false
@@ -1406,7 +1400,7 @@ async function pollSessionStatus() {
 function startSessionKeepAlive() {
   stopSessionKeepAlive()
   lastRuntimeState = null
-  sessionPollFailures = 0
+  sessionLease.reset()
   sessionKeepAlive = setInterval(pollSessionStatus, SESSION_POLL_MS)
   // Nothing should be kept alive by this timer alone at quit time.
   sessionKeepAlive.unref?.()

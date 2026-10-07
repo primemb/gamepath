@@ -75,7 +75,9 @@ class ServiceBridge {
           finish(new Error(`Invalid network service response: ${error.message}`))
         }
       })
-      socket.on('error', (error) => finish(transient(`Network service unavailable: ${error.message}`)))
+      socket.on('error', (error) =>
+        finish(Object.assign(transient(`Network service unavailable: ${error.message}`), { code: error.code })),
+      )
       socket.on('end', () => {
         if (!settled) finish(transient('Network service closed the connection'))
       })

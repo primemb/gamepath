@@ -16,8 +16,11 @@ use std::time::{Duration, Instant};
 /// client. The client renews this every few seconds from its main process;
 /// the window is wide enough that a stalled request or a busy engine cannot
 /// tear down a working session, and still short enough that routes do not
-/// outlive a client that has actually died.
-pub(crate) const SESSION_LEASE: Duration = Duration::from_secs(30);
+/// outlive a client that has actually died. Observed live: the service went
+/// unanswered for about 35 s mid-match while every path kept carrying the
+/// game, which a 30 s lease would have ended. The client waits out exactly
+/// this window (`SERVICE_LEASE_MS` in electron/session-lease.cjs).
+pub(crate) const SESSION_LEASE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlotId {

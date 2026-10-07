@@ -6,10 +6,10 @@ const {
   VpnSessionController,
   VpnConfigError,
   VPN_POLL_MS,
-  VPN_POLL_MAX_FAILURES,
   RECONNECT_DELAYS_MS,
   DEGRADED_RESTART_MS,
 } = require('./vpn-session.cjs')
+const { SERVICE_LEASE_MS, MAX_ANSWERED_FAILURES } = require('./session-lease.cjs')
 
 const node = { id: 'vpn-node', name: 'Home', kind: 'wireguard' }
 const request = {
@@ -135,7 +135,9 @@ test('connecting validates, starts in the vpn slot and begins renewing the lease
 test('the lease poll leaves the service lease plenty of headroom', () => {
   const slot = fs.readFileSync(path.join(__dirname, '..', 'service', 'src', 'slot.rs'), 'utf8')
   const leaseSeconds = Number(slot.match(/const SESSION_LEASE: Duration = Duration::from_secs\((\d+)\)/)[1])
-  assert.ok(VPN_POLL_MS * (VPN_POLL_MAX_FAILURES + 2) <= leaseSeconds * 1000)
+  // The client waits out exactly the lease the service enforces.
+  assert.equal(SERVICE_LEASE_MS, leaseSeconds * 1000)
+  assert.ok(VPN_POLL_MS * (MAX_ANSWERED_FAILURES + 2) <= SERVICE_LEASE_MS)
 })
 
 test('a configuration problem is reported and not retried', async () => {
@@ -234,19 +236,24 @@ test('the service pausing the slot itself is recognised from the status poll', a
   assert.equal(controller.snapshot().status, 'paused')
 })
 
-test('a few failed polls are tolerated; losing the service reconnects', async () => {
+test('an unanswered status keeps the VPN until the lease has run out, then reconnects', async () => {
   let fail = true
-  const { controller, timers } = harness({
+  const { controller, timers, advance, service } = harness({
     script: {
       'session-status': () =>
-        fail ? new Error('Network service request timed out') : { ...connectedPaths, state: 'connected' },
+        fail
+          ? Object.assign(new Error('Network service request timed out'), { transient: true })
+          : { ...connectedPaths, state: 'connected' },
     },
   })
   await controller.connect()
-  for (let index = 1; index < VPN_POLL_MAX_FAILURES; index += 1) {
+  for (let elapsed = 6000; elapsed < SERVICE_LEASE_MS; elapsed += 6000) {
+    advance(6000)
     await controller.poll()
     assert.equal(controller.snapshot().status, 'connected')
   }
+  assert.equal(service.calls.filter((call) => call.command === 'stop-session').length, 0)
+  advance(6000)
   await controller.poll()
   await controller.queue
   assert.equal(controller.snapshot().status, 'reconnecting')
@@ -254,6 +261,18 @@ test('a few failed polls are tolerated; losing the service reconnects', async ()
   timers.fire()
   await controller.queue
   assert.equal(controller.snapshot().status, 'connected')
+})
+
+test('errors the service answers with are given up on after a few in a row', async () => {
+  const { controller } = harness({ script: { 'session-status': new Error('native engine stopped unexpectedly') } })
+  await controller.connect()
+  for (let index = 1; index < MAX_ANSWERED_FAILURES; index += 1) {
+    await controller.poll()
+    assert.equal(controller.snapshot().status, 'connected')
+  }
+  await controller.poll()
+  await controller.queue
+  assert.equal(controller.snapshot().status, 'reconnecting')
 })
 
 test('a node degraded for too long is restarted; a brief drop is not', async () => {

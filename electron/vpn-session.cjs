@@ -2,14 +2,10 @@
 
 const crypto = require('node:crypto')
 const { pauseMessage, pauseReasonFromError } = require('./session-coordinator.cjs')
+const { SessionLease } = require('./session-lease.cjs')
 
-/**
- * How often the VPN's lease is renewed. Same headroom as the game's: the
- * service tears a slot down if it hears nothing for 30 s, and three failed
- * polls in a row are still well inside that.
- */
+/** How often the VPN's lease is renewed. Same cadence as the game's. */
 const VPN_POLL_MS = 3000
-const VPN_POLL_MAX_FAILURES = 3
 
 /**
  * Waits between reconnect attempts. Short at first, because most drops are a
@@ -72,7 +68,7 @@ class VpnSessionController {
     this.pollTimer = null
     this.reconnectTimer = null
     this.reconnectAttempt = 0
-    this.pollFailures = 0
+    this.lease = new SessionLease(now)
     this.pollInFlight = false
     this.degradedSince = null
   }
@@ -295,7 +291,7 @@ class VpnSessionController {
    */
   startPolling() {
     this.stopPolling()
-    this.pollFailures = 0
+    this.lease.reset()
     this.pollTimer = this.timers.setInterval(() => void this.poll(), VPN_POLL_MS)
     this.pollTimer.unref?.()
   }
@@ -319,7 +315,8 @@ class VpnSessionController {
       // Stopped or replaced while the request was out: the answer is about a
       // session that is gone, and applying it would bring it back to life.
       if (!this.isCurrent(polled)) return
-      this.pollFailures = 0
+      const ended = this.lease.renewed()
+      if (ended) this.log.info(`status answered again after ${ended} failed request(s)`)
       this.applyRuntime(runtime)
       this.recordUsage(runtime)
       this.trackHealth(runtime.state === 'connected')
@@ -364,12 +361,11 @@ class VpnSessionController {
       this.log.info(`paused by the service: ${pause}`)
       return
     }
-    this.pollFailures += 1
-    if (this.pollFailures < VPN_POLL_MAX_FAILURES) {
-      this.log.warn(`status failed (${this.pollFailures}/${VPN_POLL_MAX_FAILURES}): ${error.message}`)
+    if (!this.lease.failed(error)) {
+      this.log.warn(`status failed (${this.lease.describe()}); keeping the session: ${error.message}`)
       return
     }
-    this.log.error(`lost after ${this.pollFailures} failed status requests: ${error.message}`)
+    this.log.error(`lost (${this.lease.describe()}): ${error.message}`)
     void this.exclusive(async () => {
       await this.stopNow({ status: 'error', message: error.message, node: this.session.node }, 'lost')
       this.scheduleReconnect()
@@ -404,7 +400,6 @@ module.exports = {
   VpnSessionController,
   VpnConfigError,
   VPN_POLL_MS,
-  VPN_POLL_MAX_FAILURES,
   RECONNECT_DELAYS_MS,
   DEGRADED_RESTART_MS,
 }

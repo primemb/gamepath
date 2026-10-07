@@ -21,7 +21,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_service::{
     Result as ServiceResult, define_windows_service,
     service::{
@@ -51,6 +51,14 @@ const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// session; this is the ceiling that stops a local process opening threads
 /// without end.
 const MAX_CONCURRENT_REQUESTS: usize = 16;
+
+/// A request the client polls with that takes longer than this is logged
+/// with where the time went. The client waits 5 s for an answer.
+const SLOW_REQUEST: Duration = Duration::from_secs(1);
+
+/// The accept loop wakes every 50 ms; a gap this long means the whole
+/// service process was held up, not one request.
+const LISTENER_STALL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,6 +167,7 @@ fn cleanup_stale_routes() {
 }
 
 fn run_server(token_file: &Path, port: u16, stop: Arc<AtomicBool>) -> std::io::Result<()> {
+    raise_control_thread();
     let expected_token = fs::read_to_string(token_file)?.trim().to_owned();
     if expected_token.len() < 40 {
         return Err(std::io::Error::new(
@@ -174,13 +183,26 @@ fn run_server(token_file: &Path, port: u16, stop: Arc<AtomicBool>) -> std::io::R
         .map(|slot| {
             let registry = Arc::clone(&registry);
             let stop = Arc::clone(&stop);
-            thread::spawn(move || watch_lease(registry, slot, stop))
+            thread::spawn(move || {
+                raise_control_thread();
+                watch_lease(registry, slot, stop)
+            })
         })
         .collect();
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let mut last_turn = Instant::now();
     while !stop.load(Ordering::Acquire) {
+        let gap = last_turn.elapsed();
+        if gap >= LISTENER_STALL {
+            gamepath_engine::log_warn!(
+                "the request listener did not run for {:.1} s; the service process was held up",
+                gap.as_secs_f64()
+            );
+        }
+        last_turn = Instant::now();
         match listener.accept() {
             Ok((stream, _)) => {
+                let accepted = Instant::now();
                 // Refuse rather than spawn once the ceiling is reached: a
                 // rejected caller retries, a queued thread never leaves.
                 if in_flight.load(Ordering::Acquire) >= MAX_CONCURRENT_REQUESTS {
@@ -192,7 +214,8 @@ fn run_server(token_file: &Path, port: u16, stop: Arc<AtomicBool>) -> std::io::R
                 let registry = Arc::clone(&registry);
                 let in_flight = Arc::clone(&in_flight);
                 thread::spawn(move || {
-                    handle_connection(stream, &token, &registry);
+                    raise_control_thread();
+                    handle_connection(stream, &token, &registry, accepted);
                     in_flight.fetch_sub(1, Ordering::AcqRel);
                 });
             }
@@ -220,7 +243,30 @@ fn reject_overloaded(mut stream: TcpStream) {
     let _ = stream.write_all(b"\n");
 }
 
-fn handle_connection(mut stream: TcpStream, expected_token: &str, registry: &Arc<Registry>) {
+/// Runs the calling thread one step above normal. A game keeps every core
+/// busy with normal-priority threads, and these only ever answer the client's
+/// short control requests between waits on a socket, a lock or a child, which
+/// is the pattern Microsoft documents a raised priority for. Still below the
+/// engines' data-plane threads, which carry the game's packets.
+fn raise_control_thread() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    // A pseudo-handle with full access to the calling thread: nothing to close.
+    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } == 0 {
+        gamepath_engine::log_warn!(
+            "could not raise a service thread: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    expected_token: &str,
+    registry: &Arc<Registry>,
+    accepted: Instant,
+) {
     // The listener is non-blocking so the accept loop can poll `stop`, and
     // on Windows an accepted socket inherits that. Left alone, `read_line`
     // below fails the instant the request has not landed yet - which on
@@ -242,10 +288,25 @@ fn handle_connection(mut stream: TcpStream, expected_token: &str, registry: &Arc
     let read = BufReader::new(&stream)
         .take(MAX_REQUEST_BYTES)
         .read_line(&mut line);
+    let read_at = Instant::now();
     let response = match read {
         Ok(0) => return,
         Ok(_) => match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle_request(request, expected_token, registry),
+            Ok(request) => {
+                let command = request.command.clone();
+                let slot = SlotId::from_payload(&request.payload).map(SlotId::as_str);
+                let response = handle_request(request, expected_token, registry);
+                if answers_at_once(&command) && accepted.elapsed() >= SLOW_REQUEST {
+                    gamepath_engine::log_warn!(
+                        "{command} ({}) answered after {:.1} s: {:.1} s reading the request, {:.1} s handling it",
+                        slot.unwrap_or("unknown slot"),
+                        accepted.elapsed().as_secs_f64(),
+                        read_at.duration_since(accepted).as_secs_f64(),
+                        read_at.elapsed().as_secs_f64()
+                    );
+                }
+                response
+            }
             Err(error) => {
                 gamepath_engine::log_warn!("could not parse a request: {error}");
                 failure(0, format!("invalid request: {error}"))
@@ -259,6 +320,12 @@ fn handle_connection(mut stream: TcpStream, expected_token: &str, registry: &Arc
     let _ = serde_json::to_writer(&mut stream, &response);
     let _ = stream.write_all(b"\n");
     let _ = stream.flush();
+}
+
+/// Commands the client expects back at once; the others dial, stop or probe
+/// and are slow by nature.
+fn answers_at_once(command: &str) -> bool {
+    matches!(command, "status" | "session-status" | "validate-runtime")
 }
 
 fn handle_request(request: Request, expected_token: &str, registry: &Arc<Registry>) -> Response {
@@ -336,7 +403,7 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let registry = Registry::new();
             let started = Instant::now();
-            handle_connection(stream, "token", &registry);
+            handle_connection(stream, "token", &registry, Instant::now());
             started.elapsed()
         })
     }
@@ -370,7 +437,7 @@ mod tests {
                 Err(error) => panic!("accept failed: {error}"),
             }
         };
-        handle_connection(stream, "token", &Registry::new());
+        handle_connection(stream, "token", &Registry::new(), Instant::now());
         let response = client.join().unwrap();
         let parsed: Value = serde_json::from_str(&response).unwrap();
         // The id has to come back, or the client cannot match the reply to

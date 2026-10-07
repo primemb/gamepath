@@ -126,12 +126,21 @@ pub(crate) fn run_path(
         match dialing.as_mut().map(ReconnectAttempt::poll) {
             Some(ReconnectPoll::Finished(Ok(replacement))) => {
                 dialing = None;
+                let same_route = replacement.endpoint() == path.endpoint()
+                    && replacement.probe_deadline_floor() == path.probe_deadline_floor();
                 path = replacement;
                 reported_transport_failure = false;
                 publish_path_health(&telemetry.healthy_mask, index, false);
-                // A redial may fall back from UDP to TCP (or recover to UDP).
-                // Neither the old samples nor its deadline floor apply.
-                rtt = RttEstimator::with_floor(path.probe_deadline_floor());
+                // A redial may fall back from UDP to TCP (or recover to UDP) or
+                // land on another address; then neither the old samples nor
+                // their deadline floor apply. Otherwise they still describe the
+                // path, and dropping them left the new socket on the 1.5 s
+                // unmeasured deadline: observed live, two routes redialled in a
+                // 4 s uplink outage rejoined 0.4-0.9 s after the two that were
+                // not, each waiting out a probe lost during the outage.
+                if !same_route {
+                    rtt = RttEstimator::with_floor(path.probe_deadline_floor());
+                }
                 latency_watch.reset();
                 failures = 0;
                 // Opening a socket is not recovery. Repeated replacements

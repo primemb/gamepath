@@ -658,23 +658,27 @@ pub(crate) fn session_status(id: SlotId, registry: &Arc<Registry>) -> Result<Val
     if runtime.native_l2tp_direct {
         return Ok(native_l2tp_status(&mut runtime));
     }
-    let Some(engine) = runtime.engine.as_mut() else {
+    if runtime.engine.is_none() {
         return Err(match &runtime.stop_reason {
             Some(reason) => format!("no active network session ({reason})"),
             None => "no active network session".into(),
         });
-    };
+    }
+    // The request itself proves the client is alive. Renewing only after the
+    // engine answered let a slow engine reply expire a working session.
+    runtime.renew_lease();
+    let engine = runtime.engine.as_mut().ok_or("no active network session")?;
     let mut result = engine.request("wireguard-session-status", json!({}))?;
     let capture = engine.request("packet-capture-status", json!({}))?;
     if let Some(object) = result.as_object_mut() {
         object.insert("capture".into(), capture);
     }
     result["lanProxy"] = lan_proxy_status(&mut runtime);
-    runtime.renew_lease();
     Ok(result)
 }
 
 fn native_l2tp_status(runtime: &mut SessionSlot) -> Value {
+    runtime.renew_lease();
     let mut result = runtime.native_l2tp_status.clone();
     let ras_connected = runtime
         .l2tp_sessions
@@ -744,7 +748,6 @@ fn native_l2tp_status(runtime: &mut SessionSlot) -> Value {
         object.insert("capture".into(), capture);
     }
     result["lanProxy"] = lan_proxy_status(runtime);
-    runtime.renew_lease();
     result
 }
 

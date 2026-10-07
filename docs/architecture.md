@@ -187,6 +187,17 @@ throttled poll lets the lease expire a few minutes into play. The client renews
 every `SESSION_POLL_MS`, the service allows `SESSION_LEASE`, and a test asserts
 the first leaves several retries of headroom inside the second.
 
+A status request that goes unanswered says nothing about the tunnel, so the
+client keeps the session until the service's own lease would have run out
+(`electron/session-lease.cjs`, kept equal to `SESSION_LEASE` by a test). Observed
+live: the service went quiet for about 35 s mid-match while all four relay paths
+kept carrying the game, and giving up after three 5 s timeouts disconnected the
+player. Errors the service does answer with, and a refused connection (the
+service is not running, so its engines died with it), still end the session
+after three in a row. The service renews the lease as soon as `session-status`
+arrives, before asking the engine, logs any status request slower than a second
+with where the time went, and logs when its request listener itself stalls.
+
 ## Packet size
 
 A captured packet is not what leaves the machine, so the tunnel MTU is derived from what the selected transports actually add rather than fixed at a constant. `EffectiveMtu::for_session` costs the outer IPv4/UDP header, the transport's own framing, and — for a relay session — the inner IPv4/UDP datagram, the 40-byte GamePath header, its 16-byte AEAD tag and the 15-byte loss-repair reserve. Relay over WireGuard therefore costs 159 bytes and yields a 1341-byte MTU on a 1500-byte link; direct WireGuard costs 60 and yields 1440. A mixed route set takes the smallest, because the scheduler may move a packet onto any of them. The Wintun adapter is sized from this, and split mode clamps the TCP MSS to `mtu - 40` rather than to a fixed conservative value.
