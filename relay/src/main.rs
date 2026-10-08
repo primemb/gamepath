@@ -17,6 +17,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tun_rs::{DeviceBuilder, SyncDevice};
 
+mod client_registry;
+use client_registry::{
+    list_access, load_clients, read_records, reserved_addresses, revoke_access, start_reload,
+    write_secret,
+};
+
 const MAX_PACKET: usize = 65_535;
 const MAX_ENDPOINTS_PER_SESSION: usize = 8;
 const ENDPOINT_TTL: Duration = Duration::from_secs(45);
@@ -49,6 +55,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print machine-readable capabilities of this executable.
+    Capabilities,
+    Clients {
+        #[arg(long, default_value = "/etc/gamepath/clients")]
+        clients_dir: PathBuf,
+    },
+    Revoke {
+        #[arg(long)]
+        client_id: String,
+        #[arg(long, default_value = "/etc/gamepath/clients")]
+        clients_dir: PathBuf,
+    },
     Serve {
         #[arg(long, default_value = "0.0.0.0:51821")]
         bind: SocketAddr,
@@ -64,6 +82,8 @@ enum Command {
     Enroll {
         #[arg(long)]
         name: String,
+        #[arg(long)]
+        label: Option<String>,
         #[arg(long, default_value = "/etc/gamepath/clients")]
         clients_dir: PathBuf,
         #[arg(long)]
@@ -273,8 +293,14 @@ fn stateless_probe_reply(
 }
 
 fn main() {
+    let command = Cli::parse().command;
+    if matches!(command, Command::Capabilities) {
+        println!("live-client-reload-v1");
+        println!("client-access-management-v1");
+        return;
+    }
     gamepath_engine::log::init("relay", Some(gamepath_engine::log::log_path("relay")), true);
-    if let Err(error) = run() {
+    if let Err(error) = run(command) {
         gamepath_engine::log_error!("{error}");
         gamepath_engine::log::flush();
         std::process::exit(1);
@@ -282,8 +308,18 @@ fn main() {
     gamepath_engine::log::flush();
 }
 
-fn run() -> Result<(), String> {
-    match Cli::parse().command {
+fn run(command: Command) -> Result<(), String> {
+    match command {
+        Command::Capabilities => {
+            println!("live-client-reload-v1");
+            println!("client-access-management-v1");
+            Ok(())
+        }
+        Command::Clients { clients_dir } => print_access(list_access(&clients_dir)),
+        Command::Revoke {
+            client_id,
+            clients_dir,
+        } => print_access(revoke_access(&clients_dir, &client_id)),
         Command::Serve {
             bind,
             clients_dir,
@@ -294,15 +330,27 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string()),
         Command::Enroll {
             name,
+            label,
             clients_dir,
             output,
             virtual_ip,
-        } => enroll(&name, &clients_dir, &output, virtual_ip).map_err(|error| error.to_string()),
+        } => enroll(&name, label.as_deref(), &clients_dir, &output, virtual_ip)
+            .map_err(|error| error.to_string()),
     }
+}
+
+fn print_access(result: io::Result<Vec<client_registry::ClientAccess>>) -> Result<(), String> {
+    let clients = result.map_err(|error| error.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string(&clients).map_err(|error| error.to_string())?
+    );
+    Ok(())
 }
 
 fn enroll(
     name: &str,
+    label: Option<&str>,
     clients_dir: &Path,
     output: &Path,
     virtual_ip: Option<Ipv4Addr>,
@@ -313,10 +361,21 @@ fn enroll(
             "client name cannot be empty",
         ));
     }
+    let label = label.unwrap_or(name).trim();
+    if label.is_empty() || label.chars().count() > 120 || label.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "client label must contain 1-120 printable characters",
+        ));
+    }
     fs::create_dir_all(clients_dir)?;
     let records = read_records(clients_dir)?;
-    let virtual_ip = virtual_ip.unwrap_or_else(|| next_virtual_ip(&records));
-    if virtual_ip.octets()[..3] != [10, 203, 0] || virtual_ip.octets()[3] < 2 {
+    let reserved = reserved_addresses(clients_dir)?;
+    let virtual_ip = match virtual_ip {
+        Some(address) => address,
+        None => next_virtual_ip(&records, &reserved)?,
+    };
+    if virtual_ip.octets()[..3] != [10, 203, 0] || !(2..=254).contains(&virtual_ip.octets()[3]) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "virtual IP must be in 10.203.0.2/24",
@@ -331,9 +390,15 @@ fn enroll(
             "virtual IP is already enrolled",
         ));
     }
+    if reserved.contains(&virtual_ip) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "virtual IP is reserved for a revoked client",
+        ));
+    }
     let token = EnrollmentToken::generate(virtual_ip);
     let record = ClientRecord {
-        name: name.trim().into(),
+        name: label.into(),
         version: token.version,
         client_id: token.client_id.clone(),
         pre_shared_key: token.pre_shared_key.clone(),
@@ -353,6 +418,7 @@ fn enroll(
     write_secret(
         output,
         format!("{}\n", token.encode().map_err(io::Error::other)?).as_bytes(),
+        false,
     )?;
     println!(
         "Enrolled {name} as {virtual_ip}; token written to {}",
@@ -368,25 +434,12 @@ fn serve(
     tun_address: Ipv4Addr,
     tun_prefix: u8,
 ) -> io::Result<()> {
-    let records = read_records(clients_dir)?;
-    if records.is_empty() {
+    let clients = load_clients(clients_dir)?;
+    if clients.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "no enrolled clients found",
         ));
-    }
-    let mut clients = HashMap::new();
-    for record in records {
-        let (client_id, key) = record.token().material().map_err(io::Error::other)?;
-        clients.insert(
-            client_id,
-            RelayClient {
-                record,
-                client_id,
-                key,
-                sessions: HashMap::new(),
-            },
-        );
     }
     let clients = Arc::new(Mutex::new(clients));
     let socket = Arc::new(UdpSocket::bind(bind)?);
@@ -400,6 +453,7 @@ fn serve(
             .mtu(relay_tun_mtu(LINK_MTU))
             .build_sync()?,
     );
+    start_reload(clients_dir, Arc::clone(&clients))?;
     let stats_clients = Arc::clone(&clients);
     thread::Builder::new()
         .name("gamepath-relay-stats".into())
@@ -766,37 +820,18 @@ fn forward_reply(
     }
 }
 
-fn read_records(directory: &Path) -> io::Result<Vec<ClientRecord>> {
-    if !directory.exists() {
-        return Ok(Vec::new());
-    }
-    let mut records = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let source = fs::read(&path)?;
-        let record = serde_json::from_slice(&source).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: {error}", path.display()),
-            )
-        })?;
-        records.push(record);
-    }
-    Ok(records)
-}
-
-fn next_virtual_ip(records: &[ClientRecord]) -> Ipv4Addr {
+fn next_virtual_ip(
+    records: &[ClientRecord],
+    reserved: &std::collections::HashSet<Ipv4Addr>,
+) -> io::Result<Ipv4Addr> {
     let used: std::collections::HashSet<u8> = records
         .iter()
         .map(|record| record.virtual_ipv4.octets()[3])
         .collect();
     let host = (2..=254)
-        .find(|host| !used.contains(host))
-        .expect("client subnet is full");
-    Ipv4Addr::new(10, 203, 0, host)
+        .find(|host| !used.contains(host) && !reserved.contains(&Ipv4Addr::new(10, 203, 0, *host)))
+        .ok_or_else(|| io::Error::other("client subnet is full"))?;
+    Ok(Ipv4Addr::new(10, 203, 0, host))
 }
 
 fn ipv4_source(packet: &[u8]) -> Option<Ipv4Addr> {
@@ -821,20 +856,8 @@ fn write_secret_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     write_secret(
         path,
         &serde_json::to_vec_pretty(value).map_err(io::Error::other)?,
+        true,
     )
-}
-
-fn write_secret(path: &Path, contents: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -888,9 +911,11 @@ mod tests {
         }
         assert_eq!(client.sessions.len(), MAX_SESSIONS_PER_CLIENT);
         // The survivors are the most recent ones.
-        assert!(client.sessions.contains_key(
-            &(MAX_SESSIONS_PER_CLIENT as u64 * 4 - 1)
-        ));
+        assert!(
+            client
+                .sessions
+                .contains_key(&(MAX_SESSIONS_PER_CLIENT as u64 * 4 - 1))
+        );
         assert!(!client.sessions.contains_key(&0));
     }
 
@@ -914,6 +939,18 @@ mod tests {
         assert!(replay.accept(11));
         assert!(!replay.accept(11));
         assert!(!replay.accept(10));
+    }
+
+    #[test]
+    fn a_full_client_subnet_returns_an_error_instead_of_panicking() {
+        let records = (2..=254)
+            .map(|host| {
+                let mut record = relay_client().record;
+                record.virtual_ipv4 = Ipv4Addr::new(10, 203, 0, host);
+                record
+            })
+            .collect::<Vec<_>>();
+        assert!(next_virtual_ip(&records, &Default::default()).is_err());
     }
 
     /// Offers travel every path, so an older one arriving after a newer one

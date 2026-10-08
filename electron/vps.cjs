@@ -146,15 +146,20 @@ async function provisionRelay(projectRoot, input, onProgress = () => {}) {
       outputBuffer = outputBuffer.split(/\r?\n/).at(-1) ?? ''
     }
     onProgress({ stage: 'install', percent: 32, message: 'Starting relay installation' })
+    const enrollmentArgs = input.existingEnrollmentToken
+      ? '--no-enroll'
+      : `--client-name windows-client-${crypto.randomBytes(16).toString('hex')} --enrollment-output ${quote(enrollment)}`
     await rootCommand(
       connection,
-      `chmod +x ${quote(remoteRoot)}/deploy/install-relay.sh && bash ${quote(remoteRoot)}/deploy/install-relay.sh --port ${input.relayPort} --client-name windows-client --enrollment-output ${quote(enrollment)}`,
+      `chmod +x ${quote(remoteRoot)}/deploy/install-relay.sh && bash ${quote(remoteRoot)}/deploy/install-relay.sh --port ${input.relayPort} ${enrollmentArgs}`,
       input.password,
       isRoot,
       progressOutput,
     )
     onProgress({ stage: 'credential', percent: 96, message: 'Importing and protecting the enrollment credential' })
-    const token = (await rootCommand(connection, `cat ${quote(enrollment)}`, input.password, isRoot)).trim()
+    const token =
+      input.existingEnrollmentToken ??
+      (await rootCommand(connection, `cat ${quote(enrollment)}`, input.password, isRoot)).trim()
     if (!token.startsWith('gpe1_') || token.length < 80)
       throw new Error('The server returned an invalid enrollment credential')
     await rootCommand(connection, `rm -rf ${quote(remoteRoot)}`, input.password, isRoot)
@@ -165,24 +170,42 @@ async function provisionRelay(projectRoot, input, onProgress = () => {}) {
   }
 }
 
-// Enrols this PC on a relay that is already installed, without re-uploading or
-// recompiling it. The relay reads its client records only at startup, so the
-// service restarts once for the new credential to be accepted.
-const ENROLL_EXISTING_SCRIPT = `set -euo pipefail
+// Check the executable the service is actually running, rather than a newer
+// binary copied onto disk but not yet started. Never restart for enrollment.
+function existingEnrollmentScript(clientName, clientLabel) {
+  if (!/^[a-z0-9-]{1,80}$/.test(clientName)) throw new Error('Invalid enrollment client name')
+  if (
+    clientLabel !== undefined &&
+    (typeof clientLabel !== 'string' ||
+      !clientLabel.trim() ||
+      clientLabel.length > 80 ||
+      /[\x00-\x1f\x7f]/.test(clientLabel))
+  )
+    throw new Error('Invalid enrollment client label')
+  return `set -euo pipefail
 if [[ ! -x /usr/local/bin/gamepath-relay || ! -f /etc/gamepath/relay.env ]]; then
   echo "GamePath relay is not installed on this VPS. Turn off 'already installed' to run the full setup." >&2
   exit 3
+fi
+pid=$(systemctl show --property MainPID --value gamepath-relay.service)
+if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]] || ! "/proc/$pid/exe" capabilities 2>/dev/null | grep -Fx 'live-client-reload-v1' >/dev/null; then
+  echo "Update this VPS relay once to enable invitations without restarting. Use Update VPS between games; existing client credentials are preserved." >&2
+  exit 4
 fi
 . /etc/gamepath/relay.env
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 umask 077
-/usr/local/bin/gamepath-relay enroll --name windows-client --clients-dir "\${GAMEPATH_CLIENTS:-/etc/gamepath/clients}" --output "$dir/client.enroll" >/dev/null
+exec 9>/var/lock/gamepath-enrollment.lock
+flock -x 9
+label_args=()
+${clientLabel === undefined ? '' : `if "/proc/$pid/exe" capabilities 2>/dev/null | grep -Fx 'client-access-management-v1' >/dev/null; then label_args=(--label ${quote(clientLabel)}); fi`}
+"/proc/$pid/exe" enroll --name ${quote(clientName)} "\${label_args[@]}" --clients-dir "\${GAMEPATH_CLIENTS:-/etc/gamepath/clients}" --output "$dir/client.enroll" >/dev/null
 chmod 0640 "\${GAMEPATH_CLIENTS:-/etc/gamepath/clients}"/*.json
 chown root:gamepath "\${GAMEPATH_CLIENTS:-/etc/gamepath/clients}"/*.json
-systemctl restart gamepath-relay.service
 echo "GAMEPATH_BIND=\${GAMEPATH_BIND:-}"
 echo "GAMEPATH_TOKEN=$(cat "$dir/client.enroll")"`
+}
 
 function parseEnrollOutput(output) {
   const value = (key) => output.match(new RegExp(`^${key}=(.*)$`, 'm'))?.[1].trim() ?? ''
@@ -196,13 +219,29 @@ async function enrollExistingRelay(input, onProgress = () => {}) {
   try {
     const isRoot = (await execute(connection, 'id -u')).trim() === '0'
     onProgress({ stage: 'verify', percent: 30, message: 'SSH identity verified' })
-    onProgress({ stage: 'enrollment', percent: 60, message: 'Enrolling this PC on the existing relay' })
+    onProgress({
+      stage: 'enrollment',
+      percent: 60,
+      message: input.clientName ? 'Creating your friend’s relay access' : 'Enrolling this PC on the existing relay',
+    })
     const { token, port } = parseEnrollOutput(
-      await rootCommand(connection, ENROLL_EXISTING_SCRIPT, input.password, isRoot),
+      await rootCommand(
+        connection,
+        existingEnrollmentScript(
+          input.clientName ?? `windows-client-${crypto.randomBytes(16).toString('hex')}`,
+          input.clientLabel,
+        ),
+        input.password,
+        isRoot,
+      ),
     )
     if (!token.startsWith('gpe1_') || token.length < 80)
       throw new Error('The server returned an invalid enrollment credential')
-    onProgress({ stage: 'complete', percent: 100, message: 'This PC is enrolled on the relay' })
+    onProgress({
+      stage: 'complete',
+      percent: 100,
+      message: input.clientName ? 'Invitation ready' : 'This PC is enrolled on the relay',
+    })
     return { token, fingerprint, port: port ?? input.relayPort }
   } finally {
     connection.end()
@@ -230,4 +269,15 @@ async function removeRelay(projectRoot, input, onProgress = () => {}) {
   }
 }
 
-module.exports = { deploymentFiles, enrollExistingRelay, parseEnrollOutput, provisionRelay, removeRelay }
+module.exports = {
+  connectSsh,
+  execute,
+  rootCommand,
+  quote,
+  deploymentFiles,
+  enrollExistingRelay,
+  existingEnrollmentScript,
+  parseEnrollOutput,
+  provisionRelay,
+  removeRelay,
+}

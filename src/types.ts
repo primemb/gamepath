@@ -542,6 +542,23 @@ export type GamePathApi = {
   removeRelayLocal: (id: string) => Promise<AppState>
   configureRelay: (id: string, input: { address: string; port: number; enrollmentToken?: string }) => Promise<AppState>
   importRelayEnrollment: (id: string) => Promise<{ canceled: boolean; state?: AppState }>
+  createRelayShare: (
+    id: string,
+    input: VpsCredentials & { relayPort: number; recipientName: string },
+  ) => Promise<{ state: AppState; shareId: string; recipientName: string }>
+  copyRelayShare: (id: string) => Promise<void>
+  saveRelayShare: (id: string) => Promise<{ canceled: boolean }>
+  previewRelayInvite: (
+    source: 'clipboard' | 'file',
+  ) => Promise<{ canceled: boolean; invitationId?: string; details?: RelayInviteDetails }>
+  acceptRelayInvite: (id: string) => Promise<AppState>
+  openRelayAccess: (
+    id: string,
+    input: VpsCredentials & { relayPort: number },
+  ) => Promise<{ state: AppState; accessId: string; clients: RelayClientAccess[] }>
+  listRelayAccess: (id: string) => Promise<RelayClientAccess[]>
+  revokeRelayAccess: (id: string, clientId: string) => Promise<RelayClientAccess[]>
+  closeRelayAccess: (id: string) => Promise<void>
   testRelay: (
     id: string,
   ) => Promise<{ state: AppState; result: { reachable: boolean; latencyMs: number; virtualIpv4: string } }>
@@ -560,3 +577,7 @@ export type GamePathApi = {
 }
 
 export type VpsCredentials = { host: string; sshPort: number; username: string; password: string }
+
+export type RelayInviteDetails = { city: string; country: string; address: string; port: number; recipientName: string }
+
+export type RelayClientAccess = { clientId: string; name: string; virtualIpv4: string; isCurrentClient: boolean }

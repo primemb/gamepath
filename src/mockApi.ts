@@ -1,5 +1,7 @@
 import { createMockVpn, seedVpn } from './mockVpn'
-import type { AppState, GamePathApi, LanProxyStatus } from './types'
+import type { AppState, GamePathApi, LanProxyStatus, RelayClientAccess } from './types'
+
+let previewRelayClients: RelayClientAccess[] = []
 
 const mockLanProxyStartedAt = Date.now() - 600_000
 
@@ -397,6 +399,43 @@ export const mockApi: GamePathApi = {
     state.relays = state.relays.map((relay) => (relay.id === id ? { ...relay, latency: 31, status: 'ready' } : relay))
     return { state: snapshot(), result: { reachable: true, latencyMs: 31, virtualIpv4: '10.203.0.2' } }
   },
+  createRelayShare: async (_id, input) => ({
+    state: snapshot(),
+    shareId: 'preview-share',
+    recipientName: input.recipientName,
+  }),
+  copyRelayShare: async () => {
+    throw new Error('Copying a real invitation is available in the Windows app.')
+  },
+  saveRelayShare: async () => {
+    throw new Error('Saving a real invitation is available in the Windows app.')
+  },
+  previewRelayInvite: async () => ({
+    canceled: false,
+    invitationId: 'preview-invite',
+    details: {
+      city: 'Friend’s relay',
+      country: 'Germany',
+      address: 'relay.example.com',
+      port: 51821,
+      recipientName: 'My PC',
+    },
+  }),
+  acceptRelayInvite: async () => {
+    const relay = {
+      id: crypto.randomUUID(),
+      city: 'Friend’s relay',
+      country: 'Germany',
+      code: 'DE',
+      address: 'relay.example.com',
+      port: 51821,
+      hasEnrollmentToken: true,
+      status: 'ready' as const,
+    }
+    state.relays.push(relay)
+    if (!state.activeRelayId) state.activeRelayId = relay.id
+    return snapshot()
+  },
   provisionRelayVps: async (id, input) => {
     state.relays = state.relays.map((relay) =>
       relay.id === id
@@ -413,6 +452,22 @@ export const mockApi: GamePathApi = {
     state.activeRelayId = id
     return snapshot()
   },
+  openRelayAccess: async () => {
+    previewRelayClients = [
+      { clientId: 'preview-owner', name: 'My gaming PC', virtualIpv4: '10.203.0.2', isCurrentClient: true },
+      { clientId: 'preview-friend', name: 'Ali', virtualIpv4: '10.203.0.3', isCurrentClient: false },
+      { clientId: 'preview-friend-2', name: 'Sara', virtualIpv4: '10.203.0.4', isCurrentClient: false },
+    ]
+    return { state: snapshot(), accessId: 'preview-access', clients: structuredClone(previewRelayClients) }
+  },
+  listRelayAccess: async () => structuredClone(previewRelayClients),
+  revokeRelayAccess: async (_id, clientId) => {
+    if (previewRelayClients.some((client) => client.clientId === clientId && client.isCurrentClient))
+      throw new Error('You cannot revoke this PC from this dialog')
+    previewRelayClients = previewRelayClients.filter((client) => client.clientId !== clientId)
+    return structuredClone(previewRelayClients)
+  },
+  closeRelayAccess: async () => undefined,
   enrollRelayVps: async (id, input) => mockApi.provisionRelayVps(id, input),
   removeRelayVps: async (id) => {
     state.relays = state.relays.map((relay) =>

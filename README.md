@@ -83,6 +83,8 @@ cargo test --locked --manifest-path relay/Cargo.toml
 - Choose relay mode, which adaptively selects paths through a relay you own, or direct mode, which needs no VPS and routes through one WireGuard, OpenVPN or L2TP/IPsec node.
 - Configure and test an authenticated relay in a location you choose.
 - Add any number of relay locations and enable zero or one at a time.
+- Manage enrolled clients from **Game → Connection → Manage access** using the VPS's root or sudo SSH login. Revoke a selected client's credential without restarting the relay or interrupting other users; the recognized credential for this PC is protected against accidental revocation. New invitations retain the friend's display name on the server.
+- Share a relay with a friend using a personal invitation link or `.gprelay` file. In **Game → Connection**, the owner chooses **Share with a friend** and signs in to the VPS over SSH to create separate access; the friend chooses **Import shared relay**, imports from their clipboard or a file, and confirms the endpoint. Each friend still needs their own supported VPN/proxy nodes. New clients are loaded while existing sessions keep running. Older relays need a one-time **Update VPS** between games to enable this. Send invitations privately: they contain access credentials.
 - Provision or remove a Debian 13+ or Ubuntu 22.04+ VPS over password-authenticated SSH from the client; SSH passwords remain transient and host fingerprints are pinned after first use.
 - Start and monitor the Rust engine through private JSON-line IPC.
 - Review daily, weekly, monthly, yearly, all-time, or custom-date tunnel usage and reset its local history.

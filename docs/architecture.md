@@ -80,6 +80,25 @@ Neither of these removes the underlying cost of classifying in user space. That
 needs the WFP callout described under _Split-tunnel capture_; a plan built only
 from destination rules avoids it entirely.
 
+## Live relay enrollment
+
+The relay reads and validates its client directory every second on a separate
+thread. Disk access and credential parsing happen before taking the packet-path
+mutex. Applying a valid snapshot retains unchanged clients in place, preserving
+their replay windows, outbound sequences, authenticated endpoints, and repair
+buffers. Adding a client therefore does not restart the process, TUN device,
+or existing sessions. Removed or changed credentials affect only their owner.
+A malformed or unreadable snapshot keeps the last valid registry rather than
+dropping everyone during an incomplete administrative update. Client records
+are published atomically, and enrollment refuses to overwrite an existing name.
+The Windows enrollment helper serializes writers on the VPS to prevent two
+invitations assigning the same virtual address.
+
+Before enrolling, the helper checks the capabilities of the executable actually
+running in the systemd service through `/proc/<MainPID>/exe`. A binary newly
+copied to disk does not prove the running process can reload. An older relay
+requires an explicit one-time update; enrollment never silently restarts it.
+
 ## Replay window
 
 Every frame in a session is numbered from one counter, which is what lets the

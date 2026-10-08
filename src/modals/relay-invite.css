@@ -1,0 +1,235 @@
+.relay-invite-modal {
+  width: 540px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+.relay-invite-modal .modal-intro,
+.relay-invite-modal .field-label,
+.relay-invite-modal .field-label input,
+.relay-invite-modal .button {
+  font-size: 12px;
+}
+.relay-invite-modal .field-label input,
+.relay-invite-modal .button {
+  min-height: 44px;
+}
+.relay-invite-modal .icon-button {
+  min-width: 44px;
+  min-height: 44px;
+}
+.relay-invite-fields {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 12px;
+}
+.relay-invite-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-raised);
+}
+.relay-invite-symbol {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+  color: var(--cyan);
+  background: var(--cyan-soft);
+  border-radius: 12px;
+}
+.relay-invite-summary > div {
+  min-width: 0;
+}
+.relay-invite-summary strong,
+.relay-invite-summary small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.relay-invite-summary strong {
+  font-size: 14px;
+}
+.relay-invite-summary small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.relay-invite-badge {
+  margin-inline-start: auto;
+  padding: 5px 8px;
+  color: var(--cyan);
+  background: var(--cyan-soft);
+  border-radius: 6px;
+  font-size: 11px;
+}
+.relay-invite-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 16px 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.relay-invite-hint svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--cyan);
+}
+.relay-invite-note,
+.relay-invite-instructions {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid var(--violet);
+  border-radius: 10px;
+  background: var(--panel-raised);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.relay-invite-note p {
+  color: var(--muted);
+  margin: 4px 0 0;
+}
+.relay-invite-instructions ol {
+  padding-inline-start: 20px;
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+.relay-invite-instructions li + li {
+  margin-top: 6px;
+}
+.relay-invite-success {
+  display: grid;
+  justify-items: center;
+  padding: 16px;
+}
+.relay-invite-success h3 {
+  margin: 12px 0 6px;
+  font-size: 20px;
+}
+.relay-invite-success p {
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.relay-invite-export {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 16px 0;
+}
+.relay-invite-import-options {
+  display: grid;
+  gap: 12px;
+  margin: 20px 0;
+}
+.relay-invite-import-options button {
+  display: grid;
+  grid-template-columns: 32px 1fr;
+  gap: 4px 12px;
+  padding: 18px;
+  text-align: start;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-raised);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.relay-invite-import-options button:hover:not(:disabled) {
+  border-color: var(--cyan);
+  background: var(--cyan-soft);
+}
+.relay-invite-import-options svg {
+  grid-row: span 2;
+  color: var(--cyan);
+}
+.relay-invite-import-options strong {
+  font-size: 14px;
+}
+.relay-invite-import-options small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.relay-invite-details dl {
+  margin: 16px 0;
+}
+.relay-invite-details dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 12px 0;
+  font-size: 12px;
+}
+.relay-invite-details dt {
+  color: var(--muted);
+}
+.relay-invite-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.relay-invite-feedback,
+.relay-invite-progress {
+  color: var(--cyan);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.relay-invite-error {
+  color: #ffadb8;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.relay-invite-spinner {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  border: 2px solid var(--cyan-soft);
+  border-top-color: var(--cyan);
+  border-radius: 50%;
+  animation: relay-invite-spin 0.9s linear infinite;
+}
+.relay-invite-modal button:focus-visible,
+.relay-invite-modal [tabindex='0']:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+.relay-invite-modal button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.relay-intro-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+@keyframes relay-invite-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .relay-invite-spinner {
+    animation: none;
+  }
+}
+@media (max-width: 520px) {
+  .relay-invite-export {
+    grid-template-columns: 1fr;
+  }
+  .relay-invite-summary {
+    flex-wrap: wrap;
+  }
+  .relay-invite-badge {
+    margin-inline-start: 0;
+  }
+}

@@ -1,4 +1,15 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, powerMonitor, safeStorage, shell, Tray } = require('electron')
+const {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  Menu,
+  powerMonitor,
+  safeStorage,
+  shell,
+  Tray,
+} = require('electron')
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -16,6 +27,10 @@ const {
 const { EngineBridge } = require('./engine.cjs')
 const { ServiceBridge } = require('./service.cjs')
 const { enrollExistingRelay, provisionRelay, removeRelay } = require('./vps.cjs')
+const { registerRelaySharing } = require('./relay-sharing.cjs')
+const { registerRelayAccess } = require('./relay-access.cjs')
+const { connectRelayAccess } = require('./relay-access-ssh.cjs')
+const { validateEnrollmentToken } = require('./relay-invite.cjs')
 const { createIpCountryLookup } = require('./ip-country.cjs')
 const { createFileIconLookup } = require('./file-icon.cjs')
 const { UsageStore } = require('./usage.cjs')
@@ -978,8 +993,43 @@ function registerIpc() {
     return publicState()
   }
 
+  registerRelaySharing({
+    ipcMain,
+    dialog,
+    clipboard,
+    getState: () => state,
+    publicState,
+    saveState,
+    encryptConfig,
+    vpsSetupInput,
+    enrollExistingRelay,
+  })
+
+  registerRelayAccess({
+    ipcMain,
+    vpsSetupInput,
+    connectRelayAccess,
+    getState: () => state,
+    saveState,
+    publicState,
+    currentClientId: (id) => {
+      const encrypted = state.encryptedRelayTokens[id]
+      if (!encrypted) return null
+      try {
+        const token = safeStorage.decryptString(Buffer.from(encrypted, 'base64'))
+        validateEnrollmentToken(token)
+        return JSON.parse(Buffer.from(token.slice(5), 'base64url').toString('utf8')).clientId
+      } catch {
+        return null
+      }
+    },
+  })
+
   ipcMain.handle('relay:vps-provision', async (_event, id, input) => {
     const { relay, ...ssh } = vpsSetupInput(id, input)
+    if (relay.address === ssh.host && state.encryptedRelayTokens[id]) {
+      ssh.existingEnrollmentToken = safeStorage.decryptString(Buffer.from(state.encryptedRelayTokens[id], 'base64'))
+    }
     const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
     const progress = (update) => _event.sender.send('relay:vps-progress', { relayId: id, ...update })
     const result = await provisionRelay(projectRoot, ssh, progress)

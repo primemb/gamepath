@@ -1,11 +1,14 @@
 import { useState } from 'react'
-import { Check, Info, MapPin, Plus, Trash2 } from 'lucide-react'
+import { Check, Download, Info, MapPin, Plus, Share2, ShieldCheck, Trash2 } from 'lucide-react'
 import { api } from '../api'
 import { AddressWithCountry, CountryFlag, IpCountryFlag } from '../IpLocation'
 import { ConnectionModes } from '../components/ConnectionModes'
 import { errorMessage, type Notify } from '../components/Toast'
 import { AddRelayModal, RelayModal } from '../modals/RelayModal'
 import { VpsModal } from '../modals/VpsModal'
+import { RelayShareModal } from '../modals/RelayShareModal'
+import { RelayImportModal } from '../modals/RelayImportModal'
+import { RelayAccessModal } from '../modals/RelayAccessModal'
 import type { AppState, ConnectionMode, Relay } from '../types'
 
 function RelayCard({
@@ -16,6 +19,8 @@ function RelayCard({
   onConfigureVps,
   onManual,
   onRemoveVps,
+  onShare,
+  onAccess,
   onDelete,
 }: {
   relay: Relay
@@ -25,6 +30,8 @@ function RelayCard({
   onConfigureVps: () => void
   onManual: () => void
   onRemoveVps: () => void
+  onShare: () => void
+  onAccess: () => void
   onDelete: () => void
 }) {
   const ready = relay.status === 'ready'
@@ -72,6 +79,16 @@ function RelayCard({
           Manual
         </button>
         {ready && (
+          <button className="button secondary" onClick={onShare}>
+            <Share2 size={14} aria-hidden="true" /> Share with a friend
+          </button>
+        )}
+        {ready && (
+          <button className="button secondary" onClick={onAccess}>
+            <ShieldCheck size={14} aria-hidden="true" /> Manage access
+          </button>
+        )}
+        {ready && (
           <button className="button secondary" onClick={onRemoveVps}>
             Remove VPS
           </button>
@@ -95,6 +112,9 @@ export function ConnectionView({
 }) {
   const [showRelayModal, setShowRelayModal] = useState(false)
   const [showAddRelay, setShowAddRelay] = useState(false)
+  const [shareTarget, setShareTarget] = useState<Relay | null>(null)
+  const [accessTarget, setAccessTarget] = useState<Relay | null>(null)
+  const [showImportRelay, setShowImportRelay] = useState(false)
   const [vpsTarget, setVpsTarget] = useState<{ id: string; action: 'provision' | 'remove' } | null>(null)
 
   const guard = async (work: () => Promise<void>) => {
@@ -141,10 +161,15 @@ export function ConnectionView({
               {state.relays.length} server{state.relays.length === 1 ? '' : 's'}
             </h2>
             <p>Add your VPS locations and enable one relay at a time.</p>
-            <button className="button primary" onClick={() => setShowAddRelay(true)}>
-              <Plus size={16} />
-              Add VPS relay
-            </button>
+            <div className="relay-intro-buttons">
+              <button className="button primary" onClick={() => setShowAddRelay(true)}>
+                <Plus size={16} />
+                Add VPS relay
+              </button>
+              <button className="button secondary" onClick={() => setShowImportRelay(true)}>
+                <Download size={16} aria-hidden="true" /> Import shared relay
+              </button>
+            </div>
           </div>
           <div className="flag-orb">
             {relay ? (
@@ -176,6 +201,8 @@ export function ConnectionView({
                 })
               }
               onConfigureVps={() => setVpsTarget({ id: item.id, action: 'provision' })}
+              onShare={() => setShareTarget(item)}
+              onAccess={() => setAccessTarget(item)}
               onManual={() => {
                 setState({ ...state, activeRelayId: item.id })
                 setShowRelayModal(true)
@@ -211,6 +238,20 @@ export function ConnectionView({
               setShowRelayModal(false)
             })
           }
+        />
+      )}
+      {shareTarget && <RelayShareModal relay={shareTarget} onClose={() => setShareTarget(null)} setState={setState} />}
+      {accessTarget && (
+        <RelayAccessModal relay={accessTarget} onClose={() => setAccessTarget(null)} setState={setState} />
+      )}
+      {showImportRelay && (
+        <RelayImportModal
+          onClose={() => setShowImportRelay(false)}
+          onImported={(next) => {
+            setState(next)
+            setShowImportRelay(false)
+            notify('Shared relay added. Choose it and connect in Relay mode with your own nodes.', 'success')
+          }}
         />
       )}
       {showAddRelay && (

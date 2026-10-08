@@ -1,0 +1,96 @@
+.relay-access-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 20px 0 12px;
+}
+.relay-access-heading h3 {
+  font-size: 14px;
+  margin: 0;
+}
+.relay-access-heading h3 span {
+  margin-inline-start: 6px;
+  color: var(--muted);
+}
+.relay-access-list {
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.relay-access-client {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+}
+.relay-access-client + .relay-access-client {
+  border-top: 1px solid var(--line);
+}
+.relay-access-client > svg {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.relay-access-client > div {
+  min-width: 0;
+  flex: 1;
+}
+.relay-access-client strong,
+.relay-access-client small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.relay-access-client strong {
+  font-size: 13px;
+}
+.relay-access-client small {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.relay-access-client .button {
+  flex-shrink: 0;
+}
+.relay-access-client .button.danger {
+  color: #ffadb8;
+}
+.relay-access-confirm .button.danger {
+  color: #190d13;
+  background: #ffadb8;
+  border-color: #ffadb8;
+}
+.relay-access-confirm {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid #ffadb8;
+  border-radius: 12px;
+  background: var(--panel-raised);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.relay-access-confirm p {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  margin: 8px 0;
+}
+.relay-access-confirm .modal-actions {
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+.relay-access-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+@media (max-width: 520px) {
+  .relay-access-client {
+    flex-wrap: wrap;
+  }
+}

@@ -1,4 +1,7 @@
+import { relayInvitePersian } from './relayInvitePersian'
+
 export const persian: Record<string, string> = {
+  ...relayInvitePersian,
   'Names resolve through the game tunnel and never fall back to local DNS. Shared Windows lookups use the game; identifiable VPN apps can use their own VPN resolver.':
     'نام‌ها از طریق تونل بازی پیدا می‌شوند و هرگز به DNS محلی برنمی‌گردند. درخواست‌های مشترک ویندوز از بازی استفاده می‌کنند؛ برنامه‌های قابل‌شناسایی VPN می‌توانند از DNS همان VPN استفاده کنند.',
   'Names assigned to the VPN resolve through its node and never fall back to local DNS. While a game runs, shared Windows lookups use the game resolver.':

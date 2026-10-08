@@ -99,7 +99,7 @@ export function VpsModal({
         </div>
         <p className="modal-intro">
           {enrollOnly
-            ? 'GamePath signs in to your VPS, enrolls this PC on the relay that is already running there, and restarts it once. Nothing is reinstalled.'
+            ? 'GamePath signs in to your VPS and enrolls this PC while existing sessions keep running. Update older relays once to enable this.'
             : action === 'provision'
               ? "GamePath supports Debian 13+ and Ubuntu 22.04+. It uploads the relay source, installs dependencies, configures the service and firewall, then imports this PC's enrollment automatically."
               : 'This removes the GamePath service, firewall tables, configuration, clients, and binary from this server.'}{' '}
