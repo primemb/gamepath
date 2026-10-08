@@ -24,9 +24,10 @@ GamePath is alpha software. Multiple routes can help with individual path
 failures, but they still share your internet connection. It cannot guarantee
 lower ping or prevent interruptions when every available path is affected.
 
-The running app's taskbar and notification-area icons show both connections:
-a grey power symbol means both are off, a blue shield means VPN only, a green
-controller means Game only, and a shield with a controller means both are on.
+The running app keeps the original GamePath icon and adds a small status badge
+in the taskbar and notification area. A grey power badge means both are off,
+a blue shield means VPN only, a green controller means Game only, and a shield
+with a controller means both are on.
 A clock marks connecting or retrying, an amber warning marks unavailable paths,
 pause bars mark a VPN paused for Game, and a red cross marks a connection error.
 Hover over the tray icon or open its menu for the separate Game and VPN status.

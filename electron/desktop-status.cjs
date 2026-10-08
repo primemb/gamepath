@@ -82,7 +82,6 @@ function createDesktopIcons({
         !window.isDestroyed() &&
         (forceWindow || window !== lastWindow || status.tooltip !== lastWindowKey)
       ) {
-        window.setIcon(iconPath(status.key))
         if (platform === 'win32') window.setOverlayIcon(overlay(status.key), status.tooltip)
         lastWindow = window
         lastWindowKey = status.tooltip

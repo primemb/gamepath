@@ -72,14 +72,15 @@ test('updates both Windows surfaces without rebuilding icons on each lease poll'
   const off = desktopStatus()
   icons.update(off, tray, window)
   assert.equal(tray.calls.length, 2)
-  assert.equal(window.calls.length, 2)
+  assert.equal(window.calls.length, 1)
   icons.update(off, tray, window)
   assert.equal(tray.calls.length, 2)
-  assert.equal(window.calls.length, 2)
+  assert.equal(window.calls.length, 1)
   const both = desktopStatus(session('connected'), session('connected'))
   icons.update(both, tray, window)
   assert.match(tray.calls[2][1], /both-normal\.ico$/)
-  assert.equal(window.calls[3][2], both.tooltip)
+  assert.equal(window.calls[1][2], both.tooltip)
+  assert.ok(window.calls.every(([method]) => method === 'overlay'))
   assert.equal(loaded.length, 2)
   icons.update(off, tray, window)
   assert.equal(loaded.length, 2)
@@ -91,10 +92,10 @@ test('restored and recreated windows receive the current taskbar status', () => 
   const window = surface()
   icons.update(visual, null, window)
   icons.update(visual, null, window, true)
-  assert.equal(window.calls.length, 4)
+  assert.equal(window.calls.length, 2)
   const replacement = surface()
   icons.update(visual, null, replacement)
-  assert.equal(replacement.calls[1][2], visual.tooltip)
+  assert.equal(replacement.calls[0][2], visual.tooltip)
   const dead = { isDestroyed: () => true }
   assert.doesNotThrow(() => icons.update(visual, dead, dead))
 })
@@ -106,6 +107,40 @@ test('tooltip updates when a connecting VPN begins retrying with the same icon',
   icons.update(desktopStatus({}, session('reconnecting')), tray, null)
   assert.equal(tray.calls.filter(([method]) => method === 'image').length, 1)
   assert.equal(tray.calls[2][1], 'GamePath | Game: off | VPN: reconnecting')
+})
+
+test('window creation always uses the original GamePath icon', () => {
+  const main = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8')
+  const options = []
+  const app = { isPackaged: false }
+  const resourcesPath = path.join(__dirname, 'packaged-resources')
+  const context = vm.createContext({
+    app,
+    path,
+    __dirname,
+    process: { resourcesPath },
+    startInBackground: false,
+    mainWindow: null,
+    refreshDesktopStatus() {},
+    BrowserWindow: class {
+      constructor(config) {
+        options.push(config)
+        this.webContents = { setWindowOpenHandler() {} }
+      }
+      on() {}
+      loadURL() {}
+      loadFile() {}
+    },
+  })
+  const iconStart = main.indexOf('function appIconPath()')
+  const iconSource = main.slice(iconStart, main.indexOf('\n}\n', iconStart) + 3)
+  const windowSource = main.slice(main.indexOf('function createWindow()'), main.indexOf('// One client per user.'))
+  vm.runInContext(`${iconSource}\n${windowSource}`, context)
+  context.createWindow()
+  assert.equal(options[0].icon, path.join(__dirname, '..', 'build', 'icon.png'))
+  app.isPackaged = true
+  context.createWindow()
+  assert.equal(options[1].icon, path.join(resourcesPath, 'icon.png'))
 })
 
 test('every status ships a multi-size Windows icon and DPI-scaled overlay PNGs', () => {

@@ -63,6 +63,7 @@ app
     try {
       await window.loadURL('about:blank')
       const destination = path.join(__dirname, '..', 'electron', 'assets', 'status')
+      const brandImage = `data:image/png;base64,${fs.readFileSync(path.join(__dirname, '..', 'build', 'icon.png')).toString('base64')}`
       fs.mkdirSync(destination, { recursive: true })
       for (const mode of MODES) {
         for (const indicator of INDICATORS) {
@@ -71,17 +72,25 @@ app
           fs.writeFileSync(path.join(destination, `${key}.svg`), `${svg}\n`)
           const images = []
           for (const size of sizes) {
-            const pngUrl = await window.webContents.executeJavaScript(`(async () => {
+            const rendered = await window.webContents.executeJavaScript(`(async () => {
             const image = new Image()
             image.src = ${JSON.stringify(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`)}
             await image.decode()
             const canvas = document.createElement('canvas')
             canvas.width = canvas.height = ${size}
-            canvas.getContext('2d').drawImage(image, 0, 0, ${size}, ${size})
-            return canvas.toDataURL('image/png')
+            const context = canvas.getContext('2d')
+            context.drawImage(image, 0, 0, ${size}, ${size})
+            const overlay = canvas.toDataURL('image/png')
+            const brand = new Image()
+            brand.src = ${JSON.stringify(brandImage)}
+            await brand.decode()
+            context.clearRect(0, 0, ${size}, ${size})
+            context.drawImage(brand, 0, 0, ${size}, ${size})
+            context.drawImage(image, ${size / 2}, ${size / 2}, ${size / 2}, ${size / 2})
+            return { overlay, tray: canvas.toDataURL('image/png') }
           })()`)
-            const png = Buffer.from(pngUrl.split(',')[1], 'base64')
-            images.push({ size, png })
+            const png = Buffer.from(rendered.overlay.split(',')[1], 'base64')
+            images.push({ size, png: Buffer.from(rendered.tray.split(',')[1], 'base64') })
             if (dpi.has(size)) fs.writeFileSync(path.join(destination, `${key}${dpi.get(size)}.png`), png)
           }
           fs.writeFileSync(path.join(destination, `${key}.ico`), ico(images))

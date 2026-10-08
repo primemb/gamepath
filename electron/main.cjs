@@ -1473,6 +1473,10 @@ function currentDesktopStatus() {
   return desktopStatus(state?.session, vpnFeature?.controller.snapshot(), lastRuntimeState)
 }
 
+function appIconPath() {
+  return app.isPackaged ? path.join(process.resourcesPath, 'icon.png') : path.join(__dirname, '..', 'build', 'icon.png')
+}
+
 function refreshDesktopStatus(forceWindow = false) {
   try {
     const status = currentDesktopStatus()
@@ -1550,7 +1554,7 @@ function vpnChanged() {
 let startInBackground = launchedAtLogin(process.argv)
 
 function createWindow() {
-  const icon = desktopIcons.iconPath(currentDesktopStatus().key)
+  const icon = appIconPath()
   const window = new BrowserWindow({
     show: !startInBackground,
     width: 1360,
