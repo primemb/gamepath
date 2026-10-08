@@ -1,0 +1,109 @@
+.app-illustration {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  aspect-ratio: 1;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+}
+
+.command-companion {
+  position: relative;
+  display: block;
+  flex: 0 0 72px;
+  width: 72px;
+  height: 72px;
+}
+
+.command-companion .command-core {
+  position: absolute;
+  inset-block-end: 0;
+  inset-inline-end: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.command-bar .command-companion .command-core::after {
+  inset: -3px;
+  border-radius: 10px;
+}
+
+.illustrated-chart-empty {
+  align-content: center;
+  gap: 12px;
+  min-height: 220px;
+  padding: 18px;
+  background: radial-gradient(ellipse at center, var(--cyan-soft), transparent 70%);
+}
+
+.illustrated-chart-empty .app-illustration {
+  width: 140px;
+}
+
+.illustrated-chart-empty p {
+  max-width: 36ch;
+  margin: 0;
+  color: var(--muted);
+  text-align: center;
+  line-height: 1.6;
+}
+
+.vpn-first-node {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  align-items: center;
+  gap: 24px;
+  margin-top: 18px;
+}
+
+.vpn-first-node .vpn-kind-grid {
+  margin-top: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.usage-summary-card.total {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 80px;
+  align-items: center;
+  gap: 8px;
+}
+
+.usage-summary-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.usage-summary-copy svg {
+  flex-shrink: 0;
+}
+
+.usage-chart-empty {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 12px;
+  min-height: 215px;
+  padding: 20px;
+}
+
+.usage-chart-empty .app-illustration {
+  width: 112px;
+}
+
+.usage-chart-empty .usage-empty {
+  margin: 0;
+  text-align: center;
+  line-height: 1.6;
+}
+
+@media (max-width: 1250px) {
+  .usage-summary-card.total {
+    grid-template-columns: minmax(0, 1fr) 60px;
+  }
+}

@@ -1,6 +1,7 @@
 import { formatMetric, pathColors, type PathHistory } from '../lib/format'
 import type { PathMetric } from '../types'
 import { AnimatedLatencySeries, CHART_BOTTOM, CHART_HEIGHT, CHART_TOP, CHART_WIDTH } from './AnimatedLatencySeries'
+import { AppIllustration } from './AppIllustration'
 
 export function LatencyChart({ histories, paths }: { histories: PathHistory; paths: PathMetric[] }) {
   const series = paths.map((path, index) => ({
@@ -14,7 +15,13 @@ export function LatencyChart({ histories, paths }: { histories: PathHistory; pat
   const padding = Math.max((maximum - minimum) * 0.15, 4)
   const low = Math.max(0, minimum - padding)
   const high = maximum + padding
-  if (!series.length) return <p className="chart-empty">Route latency appears here as soon as a session is running.</p>
+  if (!series.length)
+    return (
+      <div className="chart-empty illustrated-chart-empty">
+        <AppIllustration variant="gamer-girl" />
+        <p>Route latency appears here as soon as a session is running.</p>
+      </div>
+    )
   return (
     <>
       <div className="chart-body">

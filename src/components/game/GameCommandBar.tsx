@@ -1,6 +1,7 @@
 import { Activity, ChevronRight, CircleGauge, Power, Route, Sparkles, Waypoints, Zap } from 'lucide-react'
 import { deriveReadiness } from '../../lib/readiness'
 import type { AppState } from '../../types'
+import { AppIllustration } from '../AppIllustration'
 
 /** The game session at a glance, and its one switch — above every Game tab. */
 export function GameCommandBar({
@@ -44,8 +45,11 @@ export function GameCommandBar({
   return (
     <section className={`command-bar ${connected ? 'is-live' : ''}`} aria-labelledby="game-headline">
       <div className="command-identity">
-        <span className="command-core">
-          <Zap size={22} fill="currentColor" />
+        <span className="command-companion" aria-hidden="true">
+          <AppIllustration variant="game" loading="eager" />
+          <span className="command-core">
+            <Zap size={12} fill="currentColor" />
+          </span>
         </span>
         <div>
           <span className="eyebrow">{direct ? 'Direct session' : 'Multipath session'}</span>

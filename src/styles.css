@@ -673,9 +673,11 @@ main {
   }
   .command-action {
     grid-column: 2;
+    grid-row: 1;
   }
   .command-stats {
     grid-column: 1 / -1;
+    grid-row: 2;
     justify-content: space-between;
     padding-top: 15px;
     border-top: 1px solid var(--line);

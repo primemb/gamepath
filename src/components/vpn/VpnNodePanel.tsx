@@ -4,6 +4,7 @@ import { AddressWithCountry } from '../../IpLocation'
 import { nodeKindLabels } from '../../lib/nodes'
 import { vpnNodeKinds } from '../../lib/vpn'
 import type { NodeKind, VpnNode, VpnSession } from '../../types'
+import { AppIllustration } from '../AppIllustration'
 
 const kindIcons: Record<NodeKind, typeof Server> = {
   wireguard: FileKey2,
@@ -168,13 +169,16 @@ export function VpnNodePanel({
         </>
       )}
       {(!nodes.length || adding) && (
-        <KindChooser
-          disabled={working}
-          onChoose={(kind) => {
-            setAdding(false)
-            onChoose(kind)
-          }}
-        />
+        <div className={!nodes.length ? 'vpn-first-node' : undefined}>
+          {!nodes.length && <AppIllustration variant="vpn-girl" />}
+          <KindChooser
+            disabled={working}
+            onChoose={(kind) => {
+              setAdding(false)
+              onChoose(kind)
+            }}
+          />
+        </div>
       )}
     </section>
   )

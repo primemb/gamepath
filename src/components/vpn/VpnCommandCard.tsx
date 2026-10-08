@@ -12,6 +12,7 @@ import { formatRate } from '../../lib/format'
 import { formatUptime, useTicker, useVpnRates, vpnBusy, vpnLive, vpnOn, vpnStatusText } from '../../lib/vpn'
 import type { VpnState } from '../../types'
 import { VpnSessionUsage } from './VpnSessionUsage'
+import { AppIllustration } from '../AppIllustration'
 
 /** The VPN's state at a glance, and its one switch. */
 export function VpnCommandCard({ vpn, onToggle, busy }: { vpn: VpnState; onToggle: () => void; busy: boolean }) {
@@ -27,8 +28,11 @@ export function VpnCommandCard({ vpn, onToggle, busy }: { vpn: VpnState; onToggl
   return (
     <section className={`command-bar vpn-command is-${session.status}`} aria-labelledby="vpn-headline">
       <div className="command-identity">
-        <span className="command-core">
-          <ShieldCheck size={22} />
+        <span className="command-companion" aria-hidden="true">
+          <AppIllustration variant="vpn" loading="eager" />
+          <span className="command-core">
+            <ShieldCheck size={12} />
+          </span>
         </span>
         <div>
           <span className="eyebrow">VPN · one node, direct</span>

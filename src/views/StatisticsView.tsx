@@ -5,6 +5,7 @@ import { formatBytes } from '../lib/format'
 import { tr } from '../lib/localizeDom'
 import type { UsageReport, UsageRow } from '../types'
 import type { NoticeKind } from '../components/Toast'
+import { AppIllustration } from '../components/AppIllustration'
 
 type Period = 'today' | 'week' | 'month' | 'year' | 'all' | 'custom'
 
@@ -260,11 +261,14 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
       )}
       <div className="usage-summary">
         <div className="usage-summary-card total">
-          <span>
-            <Database size={17} aria-hidden="true" /> Total carried
-          </span>
-          <strong>{formatBytes((total?.sent ?? 0) + (total?.received ?? 0))}</strong>
-          <small>{scope === 'vpn' ? 'Carried by the VPN' : 'Unique tunnelled IP traffic'}</small>
+          <div className="usage-summary-copy">
+            <span>
+              <Database size={17} aria-hidden="true" /> Total carried
+            </span>
+            <strong>{formatBytes((total?.sent ?? 0) + (total?.received ?? 0))}</strong>
+            <small>{scope === 'vpn' ? 'Carried by the VPN' : 'Unique tunnelled IP traffic'}</small>
+          </div>
+          <AppIllustration variant="statistics" />
         </div>
         <div className="usage-summary-card">
           <span>
@@ -332,7 +336,10 @@ export function StatisticsView({ notify }: { notify: (message: string, kind?: No
             ))}
           </div>
         ) : (
-          <p className="usage-empty">No traffic recorded in this range yet.</p>
+          <div className="usage-chart-empty">
+            <AppIllustration variant="statistics" />
+            <p className="usage-empty">No traffic recorded in this range yet.</p>
+          </div>
         )}
         {!!days.length && (
           <details className="usage-data-table">
