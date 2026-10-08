@@ -38,13 +38,13 @@ and an assigned address in `10.203.0.0/24`. Packet payloads use directional
 HKDF-SHA256 session keys and ChaCha20-Poly1305 authentication. Tokens and server
 records are never committed to Git.
 
-For sharing from the Windows UI, open **Game → Connection → Share with a friend**
+For sharing from the Windows UI, open **Game → Connection → Share**
 on a configured relay. Enter a friend name and the VPS SSH login, then create
 the invitation. GamePath enrolls a fresh client without replacing your own
 credential. Copy the invitation link or save its `.gprelay` file and send it
 privately to that friend. New clients are loaded automatically, without
 restarting the relay or interrupting existing sessions. For older relays,
-use **Update VPS** once between games to install this feature; updates preserve
+use **More → Update VPS** once between games to install this feature; updates preserve
 existing client credentials. Sharing checks the running relay and refuses to
 restart an older version automatically.
 
@@ -61,7 +61,7 @@ creation dialog for one hour. Save or send it before closing that dialog.
 Delete the plaintext file after import. Invitations are exported by Electron's
 main process; the renderer receives only the invitation ID and public metadata.
 
-To remove someone else's access, choose **Manage access** on that relay and
+To remove someone else's access, choose **More → Manage access** on that relay and
 sign in with the VPS's root or sudo SSH account. The dialog lists enrolled
 clients by name, tunnel address, and client ID. Select **Revoke**, review the
 specific client, and confirm **Revoke access**. Their sessions stop on the next

@@ -12,6 +12,7 @@ const source = main.slice(start, main.indexOf('\n/**', start))
 
 function fixture(request) {
   const effects = []
+  const desktopUpdates = []
   const clock = { now: 1_000 }
   const context = vm.createContext({
     state: { session: { status: 'connected' } },
@@ -23,11 +24,12 @@ function fixture(request) {
     recordUsage: () => effects.push('usage'),
     relayFailover: { observe: () => effects.push('observe'), end: () => effects.push('end') },
     stopSessionKeepAlive: () => effects.push('stop-polling'),
+    refreshDesktopStatus: () => desktopUpdates.push([context.state.session.status, context.lastRuntimeState]),
     logger: { warn() {}, info() {}, error() {} },
     sessionExclusive: async (work) => work(),
   })
   vm.runInContext(source, context)
-  return { context, effects, clock, poll: () => context.pollSessionStatus() }
+  return { context, effects, desktopUpdates, clock, poll: () => context.pollSessionStatus() }
 }
 
 /** Two answered errors: the next one gives the session up. */
@@ -56,6 +58,7 @@ test('a status reply for a replaced session does not change metrics or failover'
   assert.equal(f.context.state.session, replacement)
   assert.deepEqual(f.effects, [])
   assert.equal(f.context.sessionPollInFlight, false)
+  assert.deepEqual(f.desktopUpdates, [['connected', null]])
 })
 
 test('a late status failure cannot stop a replacement session', async () => {
@@ -115,6 +118,19 @@ test('three failed polls still clean up the session they belong to', async () =>
   assert.equal(f.context.state.session.status, 'error')
   assert.deepEqual(commands, ['session-status', 'session-status', 'session-status', 'stop-session'])
   assert.deepEqual(f.effects, ['stop-polling', 'end'])
+  assert.equal(f.desktopUpdates.at(-1)[0], 'error')
+})
+
+test('background polls refresh desktop status on degradation and recovery', async () => {
+  let runtimeState = 'degraded'
+  const f = fixture(async () => ({ state: runtimeState, mode: 'relay' }))
+  await f.poll()
+  runtimeState = 'connected'
+  await f.poll()
+  assert.deepEqual(f.desktopUpdates, [
+    ['connected', 'degraded'],
+    ['connected', 'connected'],
+  ])
 })
 
 const timedOut = () => Object.assign(new Error('Network service request timed out'), { transient: true })

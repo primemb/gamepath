@@ -5,6 +5,7 @@ const {
   dialog,
   ipcMain,
   Menu,
+  nativeImage,
   powerMonitor,
   safeStorage,
   shell,
@@ -40,6 +41,7 @@ const { ownHostnames } = require('./own-hostnames.cjs')
 const { startWithWindows, refreshStartWithWindows, setStartWithWindows, launchedAtLogin } = require('./startup.cjs')
 const { defaultVpn, selectedVpnNode, migrateVpnState } = require('./vpn-state.cjs')
 const { createVpnFeature } = require('./vpn-ipc.cjs')
+const { desktopStatus, createDesktopIcons } = require('./desktop-status.cjs')
 const { RelayFailoverController, normalizeRelayFailover, standbyRelayFor } = require('./relay-failover.cjs')
 const {
   defaultLanProxy,
@@ -50,6 +52,7 @@ const {
 } = require('./lan-proxy.cjs')
 
 const lookupIpCountry = createIpCountryLookup()
+const desktopIcons = createDesktopIcons({ nativeImage })
 const fileIconDataUrl = createFileIconLookup((filePath) => engineBridge.request('file-icon', { path: filePath }))
 
 const defaultState = () => ({
@@ -203,6 +206,7 @@ function saveState() {
   fs.mkdirSync(path.dirname(destination), { recursive: true })
   fs.writeFileSync(temporary, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 })
   fs.renameSync(temporary, destination)
+  refreshDesktopStatus()
 }
 
 function enabledRuleSpecs() {
@@ -1146,6 +1150,7 @@ function sessionExclusive(work) {
 
 /** The game session moved; the VPN steps aside for it or comes back. */
 function notifyVpnOfGame() {
+  refreshDesktopStatus()
   vpnFeature?.gameChanged().catch((error) => logger.warn(`VPN could not follow the game session: ${error.message}`))
 }
 
@@ -1267,6 +1272,8 @@ async function startSession({ relay: relayOverride = null, movedFrom = null, wat
     state.session = { status: 'error', message: 'Install and start the GamePath Network Service in Settings.' }
   } else {
     try {
+      state.session = { status: 'starting', mode }
+      refreshDesktopStatus()
       const rules = enabledRules
       const nodes = sessionNodes(enabledTunnels)
       // A relay session addresses and authenticates itself to the relay; a
@@ -1433,6 +1440,7 @@ async function pollSessionStatus() {
     })
   } finally {
     sessionPollInFlight = false
+    refreshDesktopStatus()
   }
 }
 
@@ -1461,8 +1469,18 @@ function stopSessionKeepAlive() {
   sessionKeepAlive = null
 }
 
-function appIconPath() {
-  return app.isPackaged ? path.join(process.resourcesPath, 'icon.png') : path.join(__dirname, '..', 'build', 'icon.png')
+function currentDesktopStatus() {
+  return desktopStatus(state?.session, vpnFeature?.controller.snapshot(), lastRuntimeState)
+}
+
+function refreshDesktopStatus(forceWindow = false) {
+  try {
+    const status = currentDesktopStatus()
+    desktopIcons.update(status, tray, mainWindow, forceWindow)
+    refreshTrayMenu(status)
+  } catch (error) {
+    logger.warn(`Could not update desktop status: ${error.message}`)
+  }
 }
 
 function showMainWindow() {
@@ -1475,7 +1493,7 @@ function showMainWindow() {
   mainWindow.focus()
 }
 
-let trayVpnLabel = null
+let trayMenuKey = null
 
 function trayVpnItem() {
   const status = vpnFeature?.controller.snapshot().status ?? 'idle'
@@ -1489,14 +1507,18 @@ function trayVpnItem() {
   }
 }
 
-function refreshTrayMenu() {
-  if (!tray) return
+function refreshTrayMenu(status = currentDesktopStatus()) {
+  if (!tray || tray.isDestroyed()) return
   const vpnItem = trayVpnItem()
-  if (vpnItem.label === trayVpnLabel) return
-  trayVpnLabel = vpnItem.label
+  const menuKey = JSON.stringify([vpnItem.label, vpnItem.enabled, status.tooltip])
+  if (menuKey === trayMenuKey) return
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: 'Open GamePath', click: showMainWindow },
+      { type: 'separator' },
+      { label: status.gameLabel, enabled: false },
+      { label: status.vpnLabel, enabled: false },
+      { type: 'separator' },
       vpnItem,
       { type: 'separator' },
       {
@@ -1508,19 +1530,19 @@ function refreshTrayMenu() {
       },
     ]),
   )
+  trayMenuKey = menuKey
 }
 
 function createTray() {
   if (tray) return
-  tray = new Tray(appIconPath())
-  tray.setToolTip('GamePath')
-  refreshTrayMenu()
+  tray = new Tray(desktopIcons.iconPath(currentDesktopStatus().key))
+  refreshDesktopStatus()
   tray.on('click', showMainWindow)
 }
 
 /** Pushes VPN changes to the window, which has no timer of its own for them. */
 function vpnChanged() {
-  refreshTrayMenu()
+  refreshDesktopStatus()
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:changed', vpnFeature.publicVpn())
 }
 
@@ -1528,7 +1550,7 @@ function vpnChanged() {
 let startInBackground = launchedAtLogin(process.argv)
 
 function createWindow() {
-  const icon = appIconPath()
+  const icon = desktopIcons.iconPath(currentDesktopStatus().key)
   const window = new BrowserWindow({
     show: !startInBackground,
     width: 1360,
@@ -1554,6 +1576,11 @@ function createWindow() {
     },
   })
   mainWindow = window
+  refreshDesktopStatus(true)
+  // Windows recreates the taskbar button when a hidden window is shown again.
+  for (const event of ['ready-to-show', 'show', 'restore']) {
+    window.on(event, () => refreshDesktopStatus(true))
+  }
   startInBackground = false
 
   window.on('close', async (event) => {

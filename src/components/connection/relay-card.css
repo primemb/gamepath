@@ -1,0 +1,247 @@
+.relay-grid {
+  container-type: inline-size;
+  container-name: relay-list;
+}
+.relay-card {
+  min-width: 0;
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 24px;
+  background: color-mix(in srgb, var(--panel) 50%, transparent);
+}
+.relay-card.selected {
+  border-color: color-mix(in srgb, var(--cyan) 28%, transparent);
+  background: linear-gradient(110deg, var(--cyan-soft), transparent 70%);
+}
+.relay-choice {
+  min-width: 0;
+  min-height: 52px;
+  padding: 0;
+  border: 0;
+  display: grid;
+  grid-template-columns: 22px 44px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  color: inherit;
+  background: transparent;
+  text-align: start;
+  cursor: pointer;
+  border-radius: 8px;
+}
+.relay-radio {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--muted);
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--bg);
+}
+.relay-card.selected .relay-radio {
+  border-color: var(--cyan);
+  background: var(--cyan);
+}
+.relay-location-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  color: var(--violet);
+  background: color-mix(in srgb, var(--violet) 10%, transparent);
+}
+.relay-location {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+.relay-name-row {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.relay-name-row > strong {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.relay-endpoint {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.relay-endpoint .address-with-country {
+  max-width: 100%;
+}
+.relay-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 8%, transparent);
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.relay-status i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.relay-status.enabled {
+  color: var(--cyan);
+  background: var(--cyan-soft);
+}
+.relay-status.setup {
+  color: var(--violet);
+  background: color-mix(in srgb, var(--violet) 10%, transparent);
+}
+.relay-stat {
+  min-width: 70px;
+  padding-inline: 18px;
+  border-inline: 1px solid var(--line);
+  display: grid;
+  gap: 4px;
+}
+.relay-stat small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.relay-stat strong {
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.relay-stat em {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 500;
+}
+.relay-actions {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.relay-actions > .button {
+  min-height: 44px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.relay-actions > .relay-share {
+  color: var(--cyan);
+  border-color: color-mix(in srgb, var(--cyan) 22%, transparent);
+  background: var(--cyan-soft);
+}
+.relay-menu {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  width: min(244px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-raised);
+  color: inherit;
+  box-shadow: 0 16px 40px #0006;
+}
+.relay-menu-heading {
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.relay-menu button {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: start;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.relay-menu button svg {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.relay-menu button:hover,
+.relay-menu button:focus-visible {
+  background: color-mix(in srgb, var(--muted) 10%, transparent);
+}
+.relay-menu button.relay-menu-danger,
+.relay-menu .relay-menu-danger svg {
+  color: #ffadb8;
+}
+.relay-menu-separator {
+  height: 1px;
+  margin: 6px;
+  background: var(--line);
+}
+.relay-choice:focus-visible,
+.relay-menu button:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+.relay-test-spinner {
+  animation: relay-test-spin 1s linear infinite;
+}
+@keyframes relay-test-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@container relay-list (max-width: 640px) {
+  .relay-card {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 16px;
+  }
+  .relay-name-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .relay-actions {
+    grid-column: 1 / -1;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+  .relay-stat {
+    border-inline-end: 0;
+    padding-inline-end: 0;
+  }
+}
+@media (max-width: 1120px) {
+  .relay-card {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 16px;
+  }
+  .relay-actions {
+    grid-column: 1 / -1;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .relay-test-spinner {
+    animation: none;
+  }
+}

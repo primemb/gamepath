@@ -24,6 +24,14 @@ GamePath is alpha software. Multiple routes can help with individual path
 failures, but they still share your internet connection. It cannot guarantee
 lower ping or prevent interruptions when every available path is affected.
 
+The running app's taskbar and notification-area icons show both connections:
+a grey power symbol means both are off, a blue shield means VPN only, a green
+controller means Game only, and a shield with a controller means both are on.
+A clock marks connecting or retrying, an amber warning marks unavailable paths,
+pause bars mark a VPN paused for Game, and a red cross marks a connection error.
+Hover over the tray icon or open its menu for the separate Game and VPN status.
+These indicators keep updating when the app is minimized or hidden in the tray.
+
 ## Requirements
 
 - Windows x64, with administrator access for the network service and packet capture.
@@ -50,6 +58,11 @@ Build the Windows installer with:
 ```powershell
 npm run package:windows
 ```
+
+Packaging removes its temporary staging files after success or failure. Before
+packaging, it also clears GamePath build folders older than 24 hours, skipping
+folders owned by a running build. Electron and builder download caches are kept
+so repeat builds do not need to download them again.
 
 The installer is written to `release\GamePath-Setup-<version>.exe`. It installs
 and starts the network service automatically, and the application requests
@@ -83,8 +96,8 @@ cargo test --locked --manifest-path relay/Cargo.toml
 - Choose relay mode, which adaptively selects paths through a relay you own, or direct mode, which needs no VPS and routes through one WireGuard, OpenVPN or L2TP/IPsec node.
 - Configure and test an authenticated relay in a location you choose.
 - Add any number of relay locations and enable zero or one at a time.
-- Manage enrolled clients from **Game → Connection → Manage access** using the VPS's root or sudo SSH login. Revoke a selected client's credential without restarting the relay or interrupting other users; the recognized credential for this PC is protected against accidental revocation. New invitations retain the friend's display name on the server.
-- Share a relay with a friend using a personal invitation link or `.gprelay` file. In **Game → Connection**, the owner chooses **Share with a friend** and signs in to the VPS over SSH to create separate access; the friend chooses **Import shared relay**, imports from their clipboard or a file, and confirms the endpoint. Each friend still needs their own supported VPN/proxy nodes. New clients are loaded while existing sessions keep running. Older relays need a one-time **Update VPS** between games to enable this. Send invitations privately: they contain access credentials.
+- Manage enrolled clients from **Game → Connection → More → Manage access** using the VPS's root or sudo SSH login. Revoke a selected client's credential without restarting the relay or interrupting other users; the recognized credential for this PC is protected against accidental revocation. New invitations retain the friend's display name on the server.
+- Share a relay with a friend using a personal invitation link or `.gprelay` file. In **Game → Connection**, the owner chooses **Share** and signs in to the VPS over SSH to create separate access; the friend chooses **Import shared relay**, imports from their clipboard or a file, and confirms the endpoint. Each friend still needs their own supported VPN/proxy nodes. New clients are loaded while existing sessions keep running. Older relays need a one-time **More → Update VPS** between games to enable this. Send invitations privately: they contain access credentials.
 - Provision or remove a Debian 13+ or Ubuntu 22.04+ VPS over password-authenticated SSH from the client; SSH passwords remain transient and host fingerprints are pinned after first use.
 - Start and monitor the Rust engine through private JSON-line IPC.
 - Review daily, weekly, monthly, yearly, all-time, or custom-date tunnel usage and reset its local history.

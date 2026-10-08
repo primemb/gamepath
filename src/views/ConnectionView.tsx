@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { Check, Download, Info, MapPin, Plus, Share2, ShieldCheck, Trash2 } from 'lucide-react'
+import { Download, Info, Plus } from 'lucide-react'
 import { api } from '../api'
-import { AddressWithCountry, CountryFlag, IpCountryFlag } from '../IpLocation'
+import { CountryFlag, IpCountryFlag } from '../IpLocation'
 import { ConnectionModes } from '../components/ConnectionModes'
+import { RelayCard } from '../components/connection/RelayCard'
 import { errorMessage, type Notify } from '../components/Toast'
 import { AddRelayModal, RelayModal } from '../modals/RelayModal'
 import { VpsModal } from '../modals/VpsModal'
@@ -10,96 +11,6 @@ import { RelayShareModal } from '../modals/RelayShareModal'
 import { RelayImportModal } from '../modals/RelayImportModal'
 import { RelayAccessModal } from '../modals/RelayAccessModal'
 import type { AppState, ConnectionMode, Relay } from '../types'
-
-function RelayCard({
-  relay,
-  selected,
-  onSelect,
-  onTest,
-  onConfigureVps,
-  onManual,
-  onRemoveVps,
-  onShare,
-  onAccess,
-  onDelete,
-}: {
-  relay: Relay
-  selected: boolean
-  onSelect: () => void
-  onTest: () => void
-  onConfigureVps: () => void
-  onManual: () => void
-  onRemoveVps: () => void
-  onShare: () => void
-  onAccess: () => void
-  onDelete: () => void
-}) {
-  const ready = relay.status === 'ready'
-  return (
-    <article className={`relay-card ${selected ? 'selected' : ''}`}>
-      <button className="relay-choice" onClick={onSelect}>
-        <span className="relay-radio">{selected && <Check size={14} />}</span>
-        <div className="relay-location">
-          <span>
-            <MapPin size={19} />
-          </span>
-          <div>
-            <strong data-no-translate>{relay.city}</strong>
-            <small>
-              {relay.address ? (
-                <AddressWithCountry value={relay.address} suffix={`:${relay.port}`} />
-              ) : (
-                `${relay.country} · VPS not configured`
-              )}
-            </small>
-          </div>
-        </div>
-        <div className="relay-stat">
-          <small>Latency</small>
-          <strong>
-            {relay.latency ?? '—'}
-            <em> ms</em>
-          </strong>
-        </div>
-        <div className={`relay-status ${relay.status}`}>
-          <i />
-          {selected ? 'Enabled' : ready ? 'Disabled' : 'Setup required'}
-        </div>
-      </button>
-      <div className="relay-actions">
-        {ready && (
-          <button className="button secondary" onClick={onTest}>
-            Test
-          </button>
-        )}
-        <button className="button primary" onClick={onConfigureVps}>
-          {ready ? 'Update VPS' : 'Auto-configure VPS'}
-        </button>
-        <button className="button secondary relay-configure" onClick={onManual}>
-          Manual
-        </button>
-        {ready && (
-          <button className="button secondary" onClick={onShare}>
-            <Share2 size={14} aria-hidden="true" /> Share with a friend
-          </button>
-        )}
-        {ready && (
-          <button className="button secondary" onClick={onAccess}>
-            <ShieldCheck size={14} aria-hidden="true" /> Manage access
-          </button>
-        )}
-        {ready && (
-          <button className="button secondary" onClick={onRemoveVps}>
-            Remove VPS
-          </button>
-        )}
-        <button className="icon-button danger" aria-label={`Delete ${relay.city}`} onClick={onDelete}>
-          <Trash2 size={16} />
-        </button>
-      </div>
-    </article>
-  )
-}
 
 export function ConnectionView({
   state,
@@ -110,7 +21,7 @@ export function ConnectionView({
   setState: (next: AppState) => void
   notify: Notify
 }) {
-  const [showRelayModal, setShowRelayModal] = useState(false)
+  const [manualTarget, setManualTarget] = useState<string | null>(null)
   const [showAddRelay, setShowAddRelay] = useState(false)
   const [shareTarget, setShareTarget] = useState<Relay | null>(null)
   const [accessTarget, setAccessTarget] = useState<Relay | null>(null)
@@ -134,6 +45,7 @@ export function ConnectionView({
   const recommendedMode: ConnectionMode | null =
     relay?.status === 'ready' ? 'relay' : routingNodes > 0 ? 'direct' : null
   const vpsRelay = vpsTarget && state.relays.find((item) => item.id === vpsTarget.id)
+  const manualRelay = state.relays.find((item) => item.id === manualTarget)
 
   return (
     <section className="page-section">
@@ -203,10 +115,7 @@ export function ConnectionView({
               onConfigureVps={() => setVpsTarget({ id: item.id, action: 'provision' })}
               onShare={() => setShareTarget(item)}
               onAccess={() => setAccessTarget(item)}
-              onManual={() => {
-                setState({ ...state, activeRelayId: item.id })
-                setShowRelayModal(true)
-              }}
+              onManual={() => setManualTarget(item.id)}
               onRemoveVps={() => setVpsTarget({ id: item.id, action: 'remove' })}
               onDelete={() => guard(async () => setState(await api.removeRelayLocal(item.id)))}
             />
@@ -222,20 +131,20 @@ export function ConnectionView({
         </div>
       </div>
 
-      {showRelayModal && relay && (
+      {manualRelay && (
         <RelayModal
-          relay={relay}
-          onClose={() => setShowRelayModal(false)}
+          relay={manualRelay}
+          onClose={() => setManualTarget(null)}
           onImport={() =>
             guard(async () => {
-              const result = await api.importRelayEnrollment(relay.id)
+              const result = await api.importRelayEnrollment(manualRelay.id)
               if (result.state) setState(result.state)
             })
           }
           onSave={(input) =>
             guard(async () => {
-              setState(await api.configureRelay(relay.id, input))
-              setShowRelayModal(false)
+              setState(await api.configureRelay(manualRelay.id, input))
+              setManualTarget(null)
             })
           }
         />

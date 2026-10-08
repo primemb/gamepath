@@ -1,4 +1,9 @@
 export const relayInvitePersian: Record<string, string> = {
+  Share: 'اشتراک',
+  More: 'بیشتر',
+  'Relay options': 'گزینه‌های رله',
+  'Manual configuration': 'تنظیم دستی',
+  'Remove from app': 'حذف از برنامه',
   'Manage access': 'مدیریت دسترسی',
   'Manage relay access': 'مدیریت دسترسی رله',
   'VPS administration': 'مدیریت VPS',
