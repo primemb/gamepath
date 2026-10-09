@@ -16,6 +16,7 @@
 
 :root {
   font-family: 'Inter Variable', Inter, system-ui, sans-serif;
+  color-scheme: dark;
   color: #f4f7fb;
   background: #080b12;
   font-synthesis: none;
@@ -166,6 +167,10 @@ button,
 input,
 select {
   font: inherit;
+}
+select option {
+  color: inherit;
+  background: var(--panel-raised);
 }
 button {
   color: inherit;

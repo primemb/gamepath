@@ -70,19 +70,8 @@ const defaultState = () => ({
   connectionMode: 'relay',
   routingStrategy: 'smart',
   lanProxy: defaultLanProxy(),
-  relays: [
-    {
-      id: 'tr-istanbul-01',
-      city: 'Istanbul',
-      country: 'Turkey',
-      code: 'TR',
-      address: '',
-      port: 51821,
-      status: 'setup-required',
-      hasEnrollmentToken: false,
-    },
-  ],
-  activeRelayId: 'tr-istanbul-01',
+  relays: [],
+  activeRelayId: null,
   // Off unless the user asks: moving a session changes its public address.
   relayFailover: normalizeRelayFailover(null),
   session: { status: 'idle' },
