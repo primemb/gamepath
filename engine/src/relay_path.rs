@@ -95,6 +95,11 @@ pub enum NodeSpec {
         /// with that reason instead of taking the whole session down with it.
         #[serde(default, rename = "dialError", skip_serializing_if = "Option::is_none")]
         dial_error: Option<String>,
+        /// The service is still dialling this node. The session starts without
+        /// it and the runtime follows through `attach-l2tp-route`, so a RAS
+        /// negotiation that takes tens of seconds no longer holds the others.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pending: bool,
     },
 }
 
@@ -146,6 +151,9 @@ impl NodeSpec {
                 dial_error: Some(error),
                 ..
             } => Err(error.clone()),
+            Self::L2tp { pending: true, .. } => {
+                Err("the Windows service is still dialling this L2TP node".into())
+            }
             Self::L2tp {
                 server,
                 username,
@@ -412,6 +420,83 @@ impl NodeSpec {
             Self::OpenVpn { .. } => "OpenVPN configuration".to_owned(),
         }
     }
+
+    /// An L2TP node the service has not finished dialling.
+    pub fn awaits_service_dial(&self) -> bool {
+        matches!(self, Self::L2tp { pending: true, .. })
+    }
+
+    /// The node once the service's dial has finished, either way.
+    pub fn with_service_dial(&self, dial: Result<L2tpRuntime, String>) -> Self {
+        let mut node = self.clone();
+        if let Self::L2tp {
+            runtime,
+            dial_error,
+            pending,
+            ..
+        } = &mut node
+        {
+            *pending = false;
+            match dial {
+                Ok(dialled) => *runtime = Some(dialled),
+                Err(error) => *dial_error = Some(error),
+            }
+        }
+        node
+    }
+
+    /// Every IPv4 address this node's transport may dial, resolved before it
+    /// opens.
+    ///
+    /// A route that joins a running session has to be routed around that
+    /// session's capture before its first packet, or its own handshake would
+    /// be captured into the tunnel it is meant to carry. Every record is kept
+    /// because the dial resolves again and may land on any of them.
+    pub fn endpoint_ipv4s(&self) -> Vec<Ipv4Addr> {
+        let mut addresses = match self {
+            Self::WireGuard { config, .. } => {
+                crate::userspace_wireguard::configured_endpoint(config)
+                    .map(resolve_all_ipv4)
+                    .unwrap_or_default()
+            }
+            Self::Socks5 { .. } if self.is_loopback_proxy() => Vec::new(),
+            Self::Socks5 { host, port, .. } => resolve_all_ipv4((host.trim(), *port)),
+            Self::L2tp {
+                server, runtime, ..
+            } => {
+                let mut addresses = resolve_all_ipv4((server.trim(), 0));
+                addresses.extend(runtime.as_ref().map(|runtime| runtime.server_address));
+                addresses
+            }
+            #[cfg(feature = "openvpn")]
+            Self::OpenVpn { config, .. } => crate::openvpn::OpenVpnConfig::parse(config)
+                .map(|parsed| {
+                    parsed
+                        .remotes
+                        .iter()
+                        .flat_map(|remote| resolve_all_ipv4((remote.host.as_str(), remote.port)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses
+    }
+}
+
+fn resolve_all_ipv4(target: impl std::net::ToSocketAddrs) -> Vec<Ipv4Addr> {
+    target
+        .to_socket_addrs()
+        .map(|addresses| {
+            addresses
+                .filter_map(|address| match address.ip() {
+                    IpAddr::V4(ip) => Some(ip),
+                    IpAddr::V6(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Two paths that share an identity cannot run at the same time, or gain
@@ -1054,6 +1139,44 @@ mod tests {
         )
     }
 
+    /// What a joining route is routed around the capture by, before it dials.
+    #[test]
+    fn a_node_names_the_addresses_it_will_dial_before_it_opens() {
+        let private = STANDARD.encode([3_u8; 32]);
+        let wireguard = NodeSpec::WireGuard {
+            config: wireguard_config(&private, "198.51.100.4:51820"),
+            label: None,
+        };
+        assert_eq!(
+            wireguard.endpoint_ipv4s(),
+            vec![Ipv4Addr::new(198, 51, 100, 4)]
+        );
+        let socks = |host: &str| NodeSpec::Socks5 {
+            host: host.into(),
+            port: 1080,
+            username: None,
+            password: None,
+            label: None,
+        };
+        assert_eq!(
+            socks(" 198.51.100.9 ").endpoint_ipv4s(),
+            vec![Ipv4Addr::new(198, 51, 100, 9)]
+        );
+        // Reached over loopback, so there is nothing to route around.
+        assert!(socks("127.0.0.1").endpoint_ipv4s().is_empty());
+        let l2tp = NodeSpec::L2tp {
+            server: "203.0.113.20".into(),
+            username: "player".into(),
+            password: "secret".into(),
+            pre_shared_key: String::new(),
+            label: None,
+            runtime: None,
+            dial_error: None,
+            pending: true,
+        };
+        assert_eq!(l2tp.endpoint_ipv4s(), vec![Ipv4Addr::new(203, 0, 113, 20)]);
+    }
+
     #[test]
     fn identical_wireguard_identities_collide_and_distinct_ones_do_not() {
         let private = STANDARD.encode([3_u8; 32]);
@@ -1163,6 +1286,7 @@ mod tests {
             label: None,
             runtime: None,
             dial_error: None,
+            pending: false,
         };
         assert!(l2tp.supports_direct());
         assert_eq!(l2tp.kind(), KIND_L2TP);
@@ -1214,6 +1338,33 @@ mod tests {
         let round_trip: NodeSpec =
             serde_json::from_value(serde_json::to_value(&failed).unwrap()).unwrap();
         assert!(round_trip.open(relay).is_err());
+
+        // A node the service is still dialling waits for it, and never reaches
+        // the RAS code with no runtime to open.
+        let mut pending = l2tp.clone();
+        if let NodeSpec::L2tp {
+            pre_shared_key,
+            pending,
+            ..
+        } = &mut pending
+        {
+            pre_shared_key.clear();
+            *pending = true;
+        }
+        assert!(pending.awaits_service_dial());
+        assert!(pending.open(relay).is_err());
+        let wire = serde_json::to_value(&pending).unwrap();
+        assert_eq!(wire["pending"], true);
+        let finished = pending.with_service_dial(Err("RAS error 628".into()));
+        assert!(!finished.awaits_service_dial());
+        assert_eq!(finished.open(relay).err().as_deref(), Some("RAS error 628"));
+        // Absent on the wire for every node that is not waiting.
+        assert!(
+            serde_json::to_value(&finished)
+                .unwrap()
+                .get("pending")
+                .is_none()
+        );
 
         // An OpenVPN node routes IP packets just as a WireGuard one does, so it
         // is offered for direct mode too. Opening it would dial a server, which

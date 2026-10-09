@@ -550,7 +550,7 @@ pub(crate) fn connect_l2tp_nodes(
 
 /// Dials one node. `Ok(None)` is a relay-mode node that failed and was marked
 /// skipped.
-fn connect_l2tp_node(
+pub(crate) fn connect_l2tp_node(
     node: &mut NodeSpec,
     index: usize,
     relay: Option<Ipv4Addr>,
@@ -593,10 +593,8 @@ fn connect_l2tp_node(
     let session = match dialed {
         Ok(session) => session,
         Err(error) if relay.is_some() => {
-            log_event(&format!(
-                "{tag} route {}: {error}; continuing without it",
-                index + 1
-            ));
+            // The caller says whether it is retried or left out.
+            log_event(&format!("{tag} route {}: {error}", index + 1));
             pre_shared_key.clear();
             *dial_error = Some(error);
             return Ok(None);

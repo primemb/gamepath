@@ -342,6 +342,11 @@ fn decode_key(value: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "WireGuard key must contain 32 bytes".into())
 }
 
+/// The peer's `Endpoint` as written, before it is resolved.
+pub fn configured_endpoint(source: &str) -> Option<&str> {
+    section_value(source, "peer", "endpoint")
+}
+
 fn required_value<'a>(source: &'a str, section: &str, key: &str) -> Result<&'a str, String> {
     section_value(source, section, key)
         .ok_or_else(|| format!("WireGuard configuration is missing {section} {key}"))

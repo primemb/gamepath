@@ -168,6 +168,8 @@ export type PathMetric = {
    * has recovered stops reporting the loss it once had.
    */
   lossPercent?: number
+  /** Still connecting: the session started without this route and it joins once it opens. */
+  joining?: boolean
   lastError: string | null
 }
 

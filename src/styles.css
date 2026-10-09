@@ -1202,6 +1202,9 @@ main {
   color: #ff7783;
   font-size: 7px;
 }
+.node-error.joining {
+  color: var(--muted);
+}
 .connections-card {
   margin-top: 12px;
   padding: 4px 14px 6px;

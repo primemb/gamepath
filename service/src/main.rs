@@ -16,6 +16,8 @@ mod engine_process;
 #[cfg(windows)]
 mod l2tp;
 #[cfg(windows)]
+mod l2tp_join;
+#[cfg(windows)]
 mod registry;
 #[cfg(windows)]
 mod server;

@@ -185,6 +185,7 @@ fn handle_request(
                 status
             })
         }
+        "attach-l2tp-route" => sessions.lock().unwrap().attach_l2tp_route(request.payload),
         "wireguard-session-status" => Ok(sessions.lock().unwrap().status()),
         "probe-data-plane" => sessions.lock().unwrap().probe_data_plane(),
         "start-packet-capture" => capture.start(request.payload, Arc::clone(sessions)),

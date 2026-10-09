@@ -7,6 +7,7 @@ use crate::l2tp::{
     direct_l2tp_prefixes, native_l2tp_result, probe_direct_l2tp, sample_l2tp_usage,
     validate_direct_l2tp_rules,
 };
+use crate::l2tp_join::{L2tpDials, next_generation};
 use crate::registry::{Registry, STOPPED_FOR_GAME_ALL_TRAFFIC, SlotSummary};
 use crate::slot::{SessionSlot, SlotId};
 use crate::validate::{ValidateRequest, carries_direct};
@@ -196,33 +197,42 @@ fn start_slot(
             lan_proxy,
         );
     }
-    // Starting the engine child and dialling L2TP do not depend on each
-    // other, and the dial is the long pole in bringing a session up: IKE
-    // negotiation plus waiting for the RAS adapter to appear takes seconds
-    // during which the engine would not even have been spawned yet. The
-    // child only has to exist before it is asked to start the session, so
-    // the two run together and the session begins roughly one of them
-    // sooner.
+    runtime.generation = next_generation();
+    // The engine child and the L2TP dials do not depend on each other, so the
+    // two run together. A relay session no longer waits for the dials at all:
+    // it starts on whatever else is ready, and each L2TP route joins it once
+    // Windows has connected it.
     let engine_start = thread::spawn(move || EngineProcess::start(id));
-    let l2tp_sessions = match connect_l2tp_nodes(&mut nodes, relay_address, true, &runtime.tag) {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            // `EngineProcess` kills its child when dropped, so collecting
-            // the thread here is what stops a failed dial from leaving an
-            // orphaned engine behind.
-            drop(engine_start.join());
-            return Err(error);
+    let mut l2tp_dials = None;
+    if let Some(relay) = relay_address {
+        l2tp_dials = Some(L2tpDials::begin(&mut nodes, relay, &runtime.tag));
+    } else {
+        match connect_l2tp_nodes(&mut nodes, None, true, &runtime.tag) {
+            Ok(sessions) => runtime.l2tp_sessions = sessions,
+            Err(error) => {
+                // `EngineProcess` kills its child when dropped, so collecting
+                // the thread here is what stops a failed dial from leaving an
+                // orphaned engine behind.
+                drop(engine_start.join());
+                return Err(error);
+            }
         }
-    };
-    runtime.l2tp_sessions = l2tp_sessions;
-    payload["nodes"] = serde_json::to_value(&nodes)
-        .map_err(|error| format!("could not prepare L2TP runtime: {error}"))?;
+    }
     let engine = engine_start
         .join()
         .map_err(|_| "the native engine panicked while starting".to_owned())??;
     runtime.log("native engine child ready");
-    let engine = runtime.engine.insert(engine);
-    let paths = engine.request("start-wireguard-session", payload.clone())?;
+    runtime.engine = Some(engine);
+    let paths = match l2tp_dials.as_mut() {
+        Some(dials) => start_relay_engine(payload, runtime, &mut nodes, dials)?,
+        None => {
+            payload["nodes"] = serde_json::to_value(&nodes)
+                .map_err(|error| format!("could not prepare L2TP runtime: {error}"))?;
+            let engine = runtime.engine.as_mut().ok_or("no active network session")?;
+            engine.request("start-wireguard-session", payload.clone())?
+        }
+    };
+    let engine = runtime.engine.as_mut().ok_or("no active network session")?;
     let bypass = engine_bypass(&paths);
     let path_count = paths["paths"].as_array().map_or(0, Vec::len);
     let data_plane = engine.request("probe-data-plane", json!({}))?;
@@ -253,12 +263,64 @@ fn start_slot(
     runtime.renew_lease();
     runtime.lan_proxy = lan_proxy_status.clone();
     registry.publish(runtime.id, summary_of(runtime, "connected", bypass));
+    if let Some(dials) = l2tp_dials {
+        dials.join_in_background(runtime.id, runtime.generation, Arc::clone(registry));
+    }
     Ok(json!({
         "paths": paths,
         "dataPlane": data_plane,
         "capture": capture,
         "lanProxy": lan_proxy_status,
     }))
+}
+
+/// Whether the engine can open `node` without waiting for the service.
+fn opens_in_engine(node: &NodeSpec) -> bool {
+    !node.awaits_service_dial()
+        && !matches!(
+            node,
+            NodeSpec::L2tp {
+                dial_error: Some(_),
+                ..
+            }
+        )
+}
+
+/// Starts a relay session on whatever is ready while L2TP routes dial.
+///
+/// The engine needs one route it can open. When every node is L2TP, or the
+/// others all fail, that is the first L2TP route Windows connects, so this
+/// waits for that one - not for all of them, which is what used to hold the
+/// session for the slowest RAS negotiation.
+fn start_relay_engine(
+    payload: &mut Value,
+    runtime: &mut SessionSlot,
+    nodes: &mut [NodeSpec],
+    dials: &mut L2tpDials,
+) -> Result<Value, String> {
+    loop {
+        dials.collect(nodes, &mut runtime.l2tp_sessions);
+        // Connected or not, the engine is asked next: with nothing to open it
+        // fails naming each route's reason, and the wait below ends the start.
+        if !nodes.iter().any(opens_in_engine) && dials.outstanding() {
+            dials.wait_for_connected(nodes, &mut runtime.l2tp_sessions);
+        }
+        payload["nodes"] = serde_json::to_value(&*nodes)
+            .map_err(|error| format!("could not prepare L2TP runtime: {error}"))?;
+        let engine = runtime.engine.as_mut().ok_or("no active network session")?;
+        match engine.request("start-wireguard-session", payload.clone()) {
+            Ok(paths) => return Ok(paths),
+            Err(error) if dials.outstanding() => {
+                runtime.log(&format!(
+                    "no route is up yet ({error}); waiting for an L2TP/IPsec route"
+                ));
+                if !dials.wait_for_connected(nodes, &mut runtime.l2tp_sessions) {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn start_native_l2tp(

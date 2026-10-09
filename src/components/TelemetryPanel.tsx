@@ -79,7 +79,7 @@ function NodeQualityCard({
         </div>
         <span className={`route-health ${path.reachable ? 'online' : ''}`}>
           <i />
-          {path.reachable ? (carryingTraffic ? 'Active' : 'Standby') : 'Offline'}
+          {path.reachable ? (carryingTraffic ? 'Active' : 'Standby') : path.joining ? 'Connecting' : 'Offline'}
         </span>
       </div>
       <div className="node-primary">
@@ -119,7 +119,7 @@ function NodeQualityCard({
           <small>{formatBytes(path.bytesReceived)} total</small>
         </span>
       </div>
-      {path.lastError && <p className="node-error">{path.lastError}</p>}
+      {path.lastError && <p className={path.joining ? 'node-error joining' : 'node-error'}>{path.lastError}</p>}
     </article>
   )
 }

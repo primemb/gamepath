@@ -9,12 +9,14 @@ use super::repair::LossRepair;
 use super::worker::PathTelemetry;
 use gamepath_engine::auth::SessionCrypto;
 use gamepath_engine::fec::Decoder;
+use gamepath_engine::l2tp::L2tpRuntime;
 use gamepath_engine::protocol::{FLAG_CONTROL, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader};
 use gamepath_engine::relay_path::SessionMode;
 use gamepath_engine::replay::ReplayWindow;
 use gamepath_engine::scheduler::{PathMetrics, Strategy};
 use gamepath_engine::timer::HighResolutionTimer;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -28,6 +30,9 @@ pub(crate) struct PathSessionStatus {
     pub(crate) label: String,
     pub(crate) endpoint: String,
     pub(crate) reachable: bool,
+    /// Still dialling: the session started without this route and it joins
+    /// once its transport opens.
+    pub(crate) joining: bool,
     pub(crate) latency_ms: Option<f64>,
     /// One-time cost of establishing this path's transport. Not a hop
     /// latency: see `handshake_round_trips`.
@@ -77,6 +82,7 @@ pub(crate) fn initial_status(
         label,
         endpoint,
         reachable: false,
+        joining: false,
         latency_ms: None,
         handshake_ms: None,
         handshake_round_trips: None,
@@ -118,7 +124,11 @@ pub(crate) struct ActiveWireGuardSession {
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) paths: Arc<Mutex<Vec<PathSessionStatus>>>,
     pub(crate) workers: Vec<JoinHandle<()>>,
-    pub(crate) skipped_routes: Vec<SkippedRoute>,
+    /// Shared with the path workers: a route that fails to join after the
+    /// session started is added here by its worker.
+    pub(crate) skipped_routes: Arc<Mutex<Vec<SkippedRoute>>>,
+    /// L2TP routes the service is still dialling, by route number.
+    pub(crate) service_dials: HashMap<usize, mpsc::Sender<Result<L2tpRuntime, String>>>,
     pub(crate) dispatch: Arc<Dispatch>,
     /// Relay sessions only: a direct node cannot decode repairs.
     pub(crate) loss_repair: Option<Arc<LossRepair>>,
@@ -139,6 +149,19 @@ pub(crate) struct ActiveWireGuardSession {
     // Held for the session so the path workers wake on a millisecond timer
     // instead of Windows' default ~15.6 ms one.
     pub(crate) timer: HighResolutionTimer,
+}
+
+impl ActiveWireGuardSession {
+    /// Routes that will not carry this session: they failed to open, or
+    /// failed to join after it started.
+    pub(crate) fn skipped_route_numbers(&self) -> Vec<usize> {
+        self.skipped_routes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|skipped| skipped.route)
+            .collect()
+    }
 }
 
 /// Shared by the path workers: admit the first authenticated copy before it

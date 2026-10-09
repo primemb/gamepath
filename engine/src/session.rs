@@ -11,6 +11,7 @@ mod dialer;
 mod direct_worker;
 mod dispatch;
 mod health;
+mod join;
 mod latency;
 mod local_tap;
 mod monitors;
@@ -42,6 +43,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct L2tpAttachRequest {
+    route: usize,
+    #[serde(default)]
+    runtime: Option<gamepath_engine::l2tp::L2tpRuntime>,
+    #[serde(default)]
+    dial_error: Option<String>,
+}
 
 pub(crate) struct LocalStackBinding {
     pub(crate) tap: Arc<LocalTap>,
@@ -193,12 +204,19 @@ impl WireGuardSessionManager {
         self.active.as_ref().and_then(|session| session.socks_proxy)
     }
 
+    /// Whether every route that has joined answers. Routes still dialling are
+    /// not waited for: they join the running session when they open.
     fn all_paths_reachable(&self) -> bool {
         self.active
             .as_ref()
             .map(|session| {
+                let skipped = session.skipped_route_numbers();
                 let paths = session.paths.lock().unwrap();
-                !paths.is_empty() && paths.iter().all(|path| path.reachable)
+                let mut joined = paths
+                    .iter()
+                    .filter(|path| !path.joining && !skipped.contains(&path.route))
+                    .peekable();
+                joined.peek().is_some() && joined.all(|path| path.reachable)
             })
             .unwrap_or(false)
     }
@@ -215,6 +233,26 @@ impl WireGuardSessionManager {
                     .any(|path| path.reachable)
             })
             .unwrap_or(false)
+    }
+
+    /// Hands an L2TP route the service has finished dialling to the session,
+    /// which opens it on the route's own worker and lets it join.
+    pub(crate) fn attach_l2tp_route(&mut self, payload: Value) -> Result<Value, String> {
+        let request: L2tpAttachRequest = serde_json::from_value(payload)
+            .map_err(|error| format!("invalid L2TP attach request: {error}"))?;
+        let session = self.active.as_mut().ok_or("no active network session")?;
+        let dial = session
+            .service_dials
+            .remove(&request.route)
+            .ok_or_else(|| format!("route {} is not waiting for an L2TP dial", request.route))?;
+        let result = match (request.runtime, request.dial_error) {
+            (Some(runtime), _) => Ok(runtime),
+            (None, Some(error)) => Err(error),
+            (None, None) => Err("the service finished dialling without a result".into()),
+        };
+        // The route's dial thread only goes once the session is gone.
+        let _ = dial.send(result);
+        Ok(json!({ "route": request.route }))
     }
 
     pub(crate) fn stop(&mut self) -> Value {

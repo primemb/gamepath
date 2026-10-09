@@ -282,11 +282,24 @@ and a quick restart, and no longer. `invalidate_route_mtu_cache` drops it
 outright for anything that knows the uplink changed.
 
 Dialling L2TP/IPsec and starting the privileged engine child do not depend on
-each other, so the service runs them concurrently: RAS negotiation is the long
-pole in bringing a session up, and the child only has to exist before it is
-asked to start the session. A failed dial still joins the thread, because
-`EngineProcess` kills its child when dropped and an orphaned engine would
-outlive the session that failed.
+each other, so the service runs them concurrently. In a relay session the
+service does not wait for the dials at all (`l2tp_join.rs`): RAS negotiation is
+the long pole, and measured live a failing node (RAS error 628) held a session
+for 40 s while three WireGuard routes had been ready the whole time. Each L2TP
+node goes to the engine marked `pending`, without its pre-shared key, and the
+engine starts on the other routes. As each dial finishes, the service hands its
+runtime (or its error) to the running engine with `attach-l2tp-route`. Only
+when nothing else can carry the session — every node is L2TP, or the others all
+failed — does the start wait, and then for the first L2TP route rather than
+all of them. A dial that finishes after its session stopped or was replaced is
+hung up: the slot's `generation` says which session it was dialled for.
+
+A failed RAS dial is retried up to five times, waiting 2, 4, 8 and 16 s between
+attempts, except for a refused login (RAS error 691): repeating that fails the
+same way and can lock the account at the provider. Retries run in the
+background once the session is up; a start with nothing else to run on waits
+for them for at most `START_WAIT` (40 s), inside the client's 60 s. Stopping or
+replacing the session cancels whatever is still waiting to retry.
 
 ### Picking the default route
 
@@ -1060,11 +1073,53 @@ Neither of these repairs the uplink. What they remove is GamePath's own
 contribution to the problem, which was measurable: a local outage used to turn
 into several minutes of reconnect churn after the link itself had recovered.
 
+## Joining a running session
+
+Every node of a relay session dials on its own thread (`session/join.rs`), and
+the session starts as soon as one route is open, instead of after every node
+has dialled one after another. Before that change the start took the _sum_ of
+every dial: an OpenVPN node tries each `remote` over UDP and then TCP with up to
+30 s per attempt, so one dead provider could hold the session past the client's
+own start timeout.
+
+A route still dialling gets its worker straight away. The worker waits in
+`await_join` and, once the dial finishes, takes the transport and continues as a
+route that has just reconnected: its first answered probe puts it into the
+scheduler's pick. Until then it is in no dispatch mask, and status reports it
+with `joining: true`.
+
+A failed dial is retried before the route is given up: `JOIN_ATTEMPTS` (5)
+attempts, waiting 1, 2, 4 and 8 s between them, with each failure shown on the
+route as "attempt N of 5 failed". On a filtered uplink a provider that refuses
+one handshake is often back seconds later. While another route is open the
+retries never hold the start; when none is, the start waits for them for at
+most `START_RETRY_WINDOW` (10 s), inside the client's own timeout. A session
+stop ends the retries at once. A route whose attempts run out is reported in
+`skippedRoutes`, as one that failed before the start used to be. L2TP nodes are
+retried by the service instead (below), since only it can redial Windows RAS.
+
+Three things are settled for every route _before_ the session starts, because
+they cannot change once capture is running:
+
+- **Its endpoints.** Every node's addresses are resolved first
+  (`NodeSpec::endpoint_ipv4s`, every record of every remote) and all of them go
+  into `bypass_ips`. A joining route's handshake therefore already leaves
+  outside the capture; without that, all-traffic mode would route it into the
+  tunnel it is meant to carry. A route whose dial lands on an address the
+  session did not route around is refused rather than tunnelled through itself.
+- **The capture MTU.** Overhead, provider caps and the measured path MTU include
+  the joining routes, so a narrower route arriving later still fits.
+- **Identity.** Duplicates are refused at join time against the routes already
+  in the session (`JoinGate`), so whichever copy opens first is the one kept.
+
+Readiness (`wait_until_ready`) counts only routes that have joined, so a route
+still dialling does not cost every start the settling window.
+
 ## Route retry
 
-A route is dialled once when the session starts and its transport is then owned
-by that route's worker. Three things can go wrong with it, and they are handled
-separately:
+A route is dialled once when the session starts (or when it joins, above) and
+its transport is then owned by that route's worker. Three things can go wrong
+with it, and they are handled separately:
 
 - **It fails to dial.** The route is recorded in `skippedRoutes` with the reason
   and the session starts on the rest. Only every route failing is a start

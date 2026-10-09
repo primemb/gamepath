@@ -37,6 +37,19 @@ impl WireGuardSessionManager {
             .filter(|(index, _)| effective & 1_u64.checked_shl(*index as u32).unwrap_or(0) != 0)
             .map(|(_, path)| path.route)
             .collect::<Vec<_>>();
+        // A route that failed to join after the session started is reported
+        // where one that failed before it is: among the skipped, not the paths.
+        // Filtered only after the masks are read, which are indexed by worker.
+        let skipped_routes = session.skipped_routes.lock().unwrap().clone();
+        paths.retain(|path| {
+            !skipped_routes
+                .iter()
+                .any(|skipped| skipped.route == path.route)
+        });
+        let selected_routes = selected_routes
+            .into_iter()
+            .filter(|route| paths.iter().any(|path| path.route == *route))
+            .collect::<Vec<_>>();
         let degraded_routes = paths
             .iter()
             .filter(|path| !path.reachable)
@@ -79,7 +92,7 @@ impl WireGuardSessionManager {
             "userBytesSent": session.user_bytes_sent.load(Ordering::Relaxed),
             "userBytesReceived": session.data_receiver.user_bytes_received.load(Ordering::Relaxed),
             "paths": paths,
-            "skippedRoutes": session.skipped_routes,
+            "skippedRoutes": skipped_routes,
             "strategy": match session.mode {
                 SessionMode::Relay => session.strategy.as_str(),
                 // One path cannot be scheduled between, so nothing is chosen.

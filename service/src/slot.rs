@@ -61,6 +61,9 @@ pub(crate) struct SessionSlot {
     /// `[game]` or `[vpn vpn-3f9a1c]`: the prefix on every log line about
     /// this slot, carrying the client's session id once one is running.
     pub(crate) tag: String,
+    /// Which session this is, from `l2tp_join::next_generation`; zero while
+    /// idle. A late L2TP dial joins only the session it was dialled for.
+    pub(crate) generation: u64,
     pub(crate) session_status: String,
     pub(crate) route_count: usize,
     pub(crate) traffic_mode: String,
@@ -97,6 +100,7 @@ impl SessionSlot {
         Self {
             id,
             tag: format!("[{}]", id.as_str()),
+            generation: 0,
             session_status: "idle".into(),
             route_count: 0,
             traffic_mode: String::new(),

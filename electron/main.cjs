@@ -286,7 +286,12 @@ function relaySessionMessage(plan, paths, dataPlane) {
         .map((route) => `${route.label} (${route.reason})`)
         .join('; ')}.`
     : ''
-  return `Session ${plan.planId} is keeping ${paths.paths.length} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${note}`
+  // The session starts on the first route that opens; the slower ones join it.
+  const joining = paths.paths.filter((path) => path.joining).length
+  const joiningNote = joining
+    ? ` ${joining} more node${joining === 1 ? ' is' : 's are'} still connecting and will join without a restart.`
+    : ''
+  return `Session ${plan.planId} is keeping ${paths.paths.length - joining} encrypted paths connected; benchmark packet loop verified in ${Math.round(dataPlane.latencyMs)} ms.${joiningNote}${note}`
 }
 
 function directSessionMessage(plan, node, dataPlane) {

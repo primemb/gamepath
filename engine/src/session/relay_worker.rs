@@ -11,6 +11,7 @@ use super::health::{
     record_path_receive, record_path_send, remember_expired_probe, take_late_probe_reply,
     update_path_status, update_scheduler_probe,
 };
+use super::join::{JoinGate, RouteTransport, await_join};
 use super::latency::{LatencyEvent, LatencyWatch};
 use super::local_tap::InboundSink;
 use super::repair::{LossRepair, Probe};
@@ -30,7 +31,7 @@ use std::time::{Duration, Instant};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_path(
-    mut path: Box<dyn RelayPath>,
+    transport: RouteTransport,
     index: usize,
     sequences: Arc<AtomicU64>,
     client_id: [u8; 16],
@@ -47,7 +48,8 @@ pub(crate) fn run_path(
     fallback_mask: u64,
     strategy: Strategy,
     telemetry: PathTelemetry,
-    dialer: PathDialer,
+    mut dialer: PathDialer,
+    gate: Arc<JoinGate>,
     route_count: usize,
 ) {
     use gamepath_engine::auth::SessionCrypto;
@@ -58,6 +60,22 @@ pub(crate) fn run_path(
 
     let Ok(crypto) = SessionCrypto::new(&key, session_id) else {
         return;
+    };
+    let mut path = match transport {
+        RouteTransport::Open(path) => path,
+        RouteTransport::Joining(dial) => match await_join(
+            dial,
+            index,
+            &stop,
+            &commands,
+            &telemetry,
+            &statuses,
+            &gate,
+            &mut dialer.node,
+        ) {
+            Some(path) => path,
+            None => return,
+        },
     };
     let mut next_probe = Instant::now();
     let mut pending_probe: Option<(u64, Instant)> = None;

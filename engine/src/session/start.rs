@@ -10,30 +10,107 @@
 use super::dialer::PathDialer;
 use super::direct_worker::run_direct_path;
 use super::dispatch::Dispatch;
+use super::join::{JoinGate, RouteStart, RouteTransport, START_RETRY_WINDOW, dial_routes};
 use super::local_tap::{InboundSink, LocalTap};
 use super::monitors::{spawn_session_summary, spawn_uplink_monitor};
 use super::path_mtu::SessionMtu;
 use super::relay_worker::run_path;
 use super::repair::{LossRepair, spawn_flusher};
 use super::state::{
-    ActiveWireGuardSession, DataReceiver, RelayIngress, SessionOverlay, SkippedRoute,
-    initial_status,
+    ActiveWireGuardSession, DataReceiver, PathSessionStatus, RelayIngress, SessionOverlay,
+    SkippedRoute, initial_status,
 };
 use super::worker::{INBOUND_QUEUE_DEPTH, PATH_QUEUE_DEPTH, PathTelemetry};
 use super::{WireGuardSessionManager, unix_time_millis};
 use crate::ipc::SessionRequest;
 use crate::netutil::{link_mtu_for_endpoints, resolve_ipv4, warn_if_below_link_budget};
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
+use gamepath_engine::l2tp::L2tpRuntime;
 use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::relay_path::{NodeSpec, RelayPath, SessionMode};
 use gamepath_engine::scheduler::{PathMetrics, Strategy};
 use gamepath_engine::thread_priority;
 use gamepath_engine::timer::HighResolutionTimer;
 use gamepath_engine::{log_info, log_warn};
-use std::net::SocketAddrV4;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+
+/// One route of a relay session, open or still joining.
+struct SessionRoute {
+    route: usize,
+    label: String,
+    node: NodeSpec,
+    transport: RouteTransport,
+    /// Every address the route's dial may use, resolved before it opened.
+    endpoints: Vec<Ipv4Addr>,
+    /// The last failed attempt of a route that is still retrying.
+    retrying: Option<String>,
+    service_dial: Option<mpsc::Sender<Result<L2tpRuntime, String>>>,
+}
+
+impl SessionRoute {
+    fn open_path(&self) -> Option<&dyn RelayPath> {
+        match &self.transport {
+            RouteTransport::Open(path) => Some(path.as_ref()),
+            RouteTransport::Joining(_) => None,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.open_path().is_some()
+    }
+
+    fn kind(&self) -> &'static str {
+        self.open_path()
+            .map_or_else(|| self.node.kind(), |path| path.kind())
+    }
+
+    /// The outer address its traffic leaves by: the one it opened on, or each
+    /// one it may open on.
+    fn link_endpoints(&self) -> Vec<Ipv4Addr> {
+        match self.open_path() {
+            Some(path) => path.bypass_ipv4().into_iter().collect(),
+            None => self.endpoints.clone(),
+        }
+    }
+
+    /// A stream-carried path never sends a datagram the link has to fit.
+    fn measured_endpoints(&self) -> Vec<Ipv4Addr> {
+        match self.open_path() {
+            Some(path) if path.carried_by_stream() => Vec::new(),
+            _ => self.link_endpoints(),
+        }
+    }
+
+    fn initial_status(&self) -> PathSessionStatus {
+        match self.open_path() {
+            Some(path) => {
+                initial_status(self.route, path.kind(), self.label.clone(), path.endpoint())
+            }
+            None => {
+                let mut status = initial_status(
+                    self.route,
+                    self.node.kind(),
+                    self.label.clone(),
+                    self.node.describe(),
+                );
+                status.joining = true;
+                status.last_error = Some(match &self.retrying {
+                    Some(note) => note.clone(),
+                    None if self.node.awaits_service_dial() => {
+                        "Windows is still connecting L2TP/IPsec; joins the session when it is up"
+                            .into()
+                    }
+                    None => "still connecting; joins the session when it opens".into(),
+                });
+                status
+            }
+        }
+    }
+}
 
 impl WireGuardSessionManager {
     /// Brings up a relay session: every node carries sealed frames to the
@@ -48,36 +125,17 @@ impl WireGuardSessionManager {
         let relay_ip = resolve_ipv4(&input.relay_host, input.relay_port)?;
         let relay = SocketAddrV4::new(relay_ip, input.relay_port);
         let strategy = input.strategy;
-        let mut paths: Vec<(usize, String, NodeSpec, Box<dyn RelayPath>)> = Vec::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut routes: Vec<SessionRoute> = Vec::new();
         let mut skipped_routes = Vec::new();
-        for (index, node) in nodes.iter().enumerate() {
+        let mut identities = Vec::new();
+        // A SOCKS5 node dials its proxy and an OpenVPN node completes a
+        // handshake, so this is where a dead provider shows up. One node
+        // failing costs its own route, and one still dialling joins later.
+        for dialled in dial_routes(nodes, relay, &stop, START_RETRY_WINDOW)? {
+            let index = dialled.index;
             let route = index + 1;
-            // A SOCKS5 node dials its proxy here and an OpenVPN node completes
-            // a handshake, so this is where a dead provider shows up. One node
-            // failing costs its own route: the session runs on the rest, and
-            // the worker set does not include a path that was never opened.
-            let path = match node.open(relay) {
-                Ok(path) => path,
-                Err(error) => {
-                    skipped_routes.push(SkippedRoute {
-                        route,
-                        label: node.describe(),
-                        reason: error,
-                    });
-                    continue;
-                }
-            };
-            if paths
-                .iter()
-                .any(|(_, _, _, current)| current.identity() == path.identity())
-            {
-                skipped_routes.push(SkippedRoute {
-                    route,
-                    label: node.describe(),
-                    reason: "another enabled route already uses this endpoint and key".into(),
-                });
-                continue;
-            }
+            let node = &nodes[index];
             let label = node
                 .label()
                 .or_else(|| {
@@ -88,8 +146,46 @@ impl WireGuardSessionManager {
                         .filter(|label| !label.is_empty())
                 })
                 .unwrap_or_else(|| node.default_label(route));
-            paths.push((route, label, node.clone(), path));
+            let (transport, node, service_dial) = match dialled.start {
+                RouteStart::Failed(reason) => {
+                    skipped_routes.push(SkippedRoute {
+                        route,
+                        label: node.describe(),
+                        reason,
+                    });
+                    continue;
+                }
+                RouteStart::Open(joined) => {
+                    let identity = joined.path.identity();
+                    if identities.contains(&identity) {
+                        skipped_routes.push(SkippedRoute {
+                            route,
+                            label: node.describe(),
+                            reason: "another enabled route already uses this endpoint and key"
+                                .into(),
+                        });
+                        continue;
+                    }
+                    identities.push(identity);
+                    (RouteTransport::Open(joined.path), joined.node, None)
+                }
+                RouteStart::Joining(dial) => (
+                    RouteTransport::Joining(dial.result),
+                    node.clone(),
+                    dial.service_dial,
+                ),
+            };
+            routes.push(SessionRoute {
+                route,
+                label,
+                node,
+                transport,
+                endpoints: dialled.endpoints,
+                retrying: dialled.retrying,
+                service_dial,
+            });
         }
+        let paths = routes;
         for skipped in &skipped_routes {
             // A route silently missing from the session is the thing nobody can
             // explain later, so each one says why on its own line.
@@ -102,44 +198,45 @@ impl WireGuardSessionManager {
         }
         // Every node failed to dial. There is no session to degrade into, so
         // this reports each one rather than a bare timeout.
-        if paths.is_empty() {
+        if !paths.iter().any(SessionRoute::is_open) {
+            // Routes still retrying have nothing left to join.
+            stop.store(true, Ordering::Release);
+            let still_trying = paths.iter().map(|route| {
+                let reason = route.retrying.as_deref().unwrap_or("still connecting");
+                (route.route, route.label.as_str(), reason)
+            });
             return Err(format!(
                 "no route could be opened: {}",
                 skipped_routes
                     .iter()
-                    .map(|skipped| format!(
-                        "route {} ({}): {}",
-                        skipped.route, skipped.label, skipped.reason
+                    .map(|skipped| (
+                        skipped.route,
+                        skipped.label.as_str(),
+                        skipped.reason.as_str()
                     ))
+                    .chain(still_trying)
+                    .map(|(route, label, reason)| format!("route {route} ({label}): {reason}"))
                     .collect::<Vec<_>>()
                     .join("; ")
             ));
         }
-        // One capture adapter serves every selected path. Its MTU must fit the
-        // smallest actual outer route and the strictest provider tunnel cap.
-        let link_mtu = link_mtu_for_endpoints(
-            paths
-                .iter()
-                .filter_map(|(_, _, _, path)| path.bypass_ipv4()),
-        );
+        // One capture adapter serves every selected path, including the ones
+        // still joining: its MTU must fit the smallest outer route and the
+        // strictest provider tunnel cap of every route that may carry traffic,
+        // because it cannot change once capture has started.
+        let link_mtu = link_mtu_for_endpoints(paths.iter().flat_map(SessionRoute::link_endpoints));
         let provider_mtu = paths
             .iter()
-            .filter_map(|(_, _, node, _)| node.configured_tunnel_mtu())
+            .filter_map(|route| route.node.configured_tunnel_mtu())
             .min();
-        let kinds = paths
-            .iter()
-            .map(|(_, _, _, path)| path.kind())
-            .collect::<Vec<_>>();
+        let kinds = paths.iter().map(SessionRoute::kind).collect::<Vec<_>>();
         let effective_mtu =
             EffectiveMtu::for_session(SessionMode::Relay, kinds.iter().copied(), link_mtu)
                 .with_tunnel_limit(provider_mtu);
         let session_mtu = SessionMtu::measure(
             effective_mtu,
             link_mtu,
-            paths
-                .iter()
-                .filter(|(_, _, _, path)| !path.carried_by_stream())
-                .filter_map(|(_, _, _, path)| path.bypass_ipv4()),
+            paths.iter().flat_map(SessionRoute::measured_endpoints),
             move |link_mtu| {
                 EffectiveMtu::for_session(SessionMode::Relay, kinds, link_mtu)
                     .with_tunnel_limit(provider_mtu)
@@ -147,15 +244,25 @@ impl WireGuardSessionManager {
         );
         let route_summary = paths
             .iter()
-            .map(|(route, label, _, path)| format!("{route}:{label}/{}", path.kind()))
+            .map(|route| {
+                format!(
+                    "{}:{}/{}{}",
+                    route.route,
+                    route.label,
+                    route.kind(),
+                    if route.is_open() { "" } else { " (joining)" }
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
+        // Every address a route may dial, not only the one it opened on: a
+        // joining route's first packet and a redial to another remote must
+        // both leave outside the capture.
         let mut bypass_ips = vec![relay_ip];
-        bypass_ips.extend(
-            paths
-                .iter()
-                .filter_map(|(_, _, _, path)| path.bypass_ipv4()),
-        );
+        for route in &paths {
+            bypass_ips.extend(route.link_endpoints());
+            bypass_ips.extend(route.endpoints.iter().copied());
+        }
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
 
@@ -163,13 +270,10 @@ impl WireGuardSessionManager {
         let timer = HighResolutionTimer::raise();
         let session_id = rand::random::<u64>();
         let crypto = Arc::new(SessionCrypto::new(&key, session_id)?);
-        let stop = Arc::new(AtomicBool::new(false));
         let sequences = Arc::new(AtomicU64::new(1));
         let initial_statuses = paths
             .iter()
-            .map(|(route, label, _, path)| {
-                initial_status(*route, path.kind(), label.clone(), path.endpoint())
-            })
+            .map(SessionRoute::initial_status)
             .collect::<Vec<_>>();
         let statuses = Arc::new(Mutex::new(initial_statuses));
         let route_count = paths.len();
@@ -178,11 +282,15 @@ impl WireGuardSessionManager {
                 .map(|index| PathMetrics::new(index.to_string()))
                 .collect::<Vec<_>>(),
         ));
-        let initial_mask = if route_count >= 64 {
-            u64::MAX
-        } else {
-            (1_u64 << route_count) - 1
-        };
+        // Only the routes that are open: a joining one has nothing to carry a
+        // packet with, and enters the pick through its first answered probe.
+        let initial_mask = paths
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| route.is_open())
+            .fold(0_u64, |mask, (index, _)| {
+                mask | 1_u64.checked_shl(index as u32).unwrap_or(0)
+            });
         let decision_mask = Arc::new(AtomicU64::new(initial_mask));
         let telemetry = PathTelemetry::new(route_count);
         let mut workers = Vec::with_capacity(route_count + 1);
@@ -210,9 +318,15 @@ impl WireGuardSessionManager {
             session_id,
             Arc::clone(&telemetry.packet_diagnostics),
         ));
-        for (index, ((_, _, node, path), command_rx)) in
-            paths.into_iter().zip(receivers).enumerate()
-        {
+        let skipped_count = skipped_routes.len();
+        let skipped_routes = Arc::new(Mutex::new(skipped_routes));
+        let gate = Arc::new(JoinGate::new(
+            bypass_ips.clone(),
+            identities,
+            Arc::clone(&skipped_routes),
+        ));
+        let mut service_dials = HashMap::new();
+        for (index, (route, command_rx)) in paths.into_iter().zip(receivers).enumerate() {
             let status_index = index;
             let worker_stop = Arc::clone(&stop);
             let worker_statuses = Arc::clone(&statuses);
@@ -223,19 +337,24 @@ impl WireGuardSessionManager {
             let worker_metrics = Arc::clone(&scheduler_metrics);
             let worker_decision = Arc::clone(&decision_mask);
             let worker_telemetry = telemetry.clone();
+            let worker_gate = Arc::clone(&gate);
+            let worker_kind = route.kind();
+            if let Some(dial) = route.service_dial {
+                service_dials.insert(route.route, dial);
+            }
             let worker_dialer = PathDialer {
-                node,
+                node: route.node,
                 relay,
                 cheap_reopen: Arc::new(AtomicBool::new(true)),
             };
-            let worker_kind = path.kind();
+            let transport = route.transport;
             workers.push(
                 thread::Builder::new()
                     .name(format!("gamepath-{worker_kind}-{}", index + 1))
                     .spawn(move || {
                         thread_priority::raise_current_for_data_plane();
                         run_path(
-                            path,
+                            transport,
                             status_index,
                             worker_sequences,
                             client_id,
@@ -253,6 +372,7 @@ impl WireGuardSessionManager {
                             strategy,
                             worker_telemetry,
                             worker_dialer,
+                            worker_gate,
                             route_count,
                         )
                     })
@@ -279,10 +399,9 @@ impl WireGuardSessionManager {
         workers.extend(summary);
         log_info!(
             "relay session {session_id} up: {route_count} route(s) [{route_summary}], \
-             uplink mtu {link_mtu}, tunnel mtu {} overhead {}, {} skipped",
+             uplink mtu {link_mtu}, tunnel mtu {} overhead {}, {skipped_count} skipped",
             effective_mtu.mtu,
             effective_mtu.overhead,
-            skipped_routes.len()
         );
         warn_if_below_link_budget(effective_mtu, link_mtu);
         self.active = Some(ActiveWireGuardSession {
@@ -296,6 +415,7 @@ impl WireGuardSessionManager {
             paths: statuses,
             workers,
             skipped_routes,
+            service_dials,
             dispatch,
             loss_repair: Some(loss_repair),
             ingress: Some(ingress),
@@ -411,7 +531,8 @@ impl WireGuardSessionManager {
             stop,
             paths: statuses,
             workers,
-            skipped_routes: Vec::new(),
+            skipped_routes: Arc::default(),
+            service_dials: HashMap::new(),
             dispatch: Arc::new(Dispatch {
                 commands: vec![command_tx],
                 telemetry: dispatch_telemetry,
