@@ -291,6 +291,7 @@ impl WireGuardSessionManager {
             .fold(0_u64, |mask, (index, _)| {
                 mask | 1_u64.checked_shl(index as u32).unwrap_or(0)
             });
+        let initial_mask = super::health::initial_selection(initial_mask, strategy);
         let decision_mask = Arc::new(AtomicU64::new(initial_mask));
         let telemetry = PathTelemetry::new(route_count);
         let mut workers = Vec::with_capacity(route_count + 1);

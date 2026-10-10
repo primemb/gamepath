@@ -28,6 +28,7 @@ pub mod netconfig;
 pub mod openvpn;
 pub mod packet_diagnostics;
 pub mod path_mtu;
+pub mod path_policy;
 pub mod policy;
 pub mod protocol;
 pub mod relay_path;

@@ -945,6 +945,39 @@ mod tests {
     }
 
     #[test]
+    fn smart_expands_to_four_and_releases_each_extra_after_recovery() {
+        let mut paths = [
+            steady("0", 50.0),
+            steady("1", 51.0),
+            steady("2", 52.0),
+            steady("3", 53.0),
+        ];
+        let mut incumbent = carried(&paths, &[]);
+        assert_eq!(incumbent.len(), 2);
+        paths[0].record_probe(170.0);
+        let ids: Vec<_> = incumbent.iter().map(String::as_str).collect();
+        incumbent = carried(&paths, &ids);
+        assert_eq!(incumbent.len(), 3);
+        paths[2].record_loss();
+        let ids: Vec<_> = incumbent.iter().map(String::as_str).collect();
+        incumbent = carried(&paths, &ids);
+        assert_eq!(incumbent.len(), 4);
+
+        for _ in 0..PROBES_TO_SETTLE {
+            paths[2].record_probe(52.0);
+            let ids: Vec<_> = incumbent.iter().map(String::as_str).collect();
+            incumbent = carried(&paths, &ids);
+        }
+        assert_eq!(incumbent.len(), 3);
+        for _ in 0..PROBES_TO_SETTLE {
+            paths[0].record_probe(50.0);
+            let ids: Vec<_> = incumbent.iter().map(String::as_str).collect();
+            incumbent = carried(&paths, &ids);
+        }
+        assert_eq!(incumbent.len(), 2);
+    }
+
+    #[test]
     fn the_extra_route_stays_until_the_pair_has_settled_again() {
         let mut paths = [steady("0", 50.0), steady("1", 51.0), steady("2", 52.0)];
         paths[0].record_probe(170.0);

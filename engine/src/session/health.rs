@@ -135,6 +135,22 @@ pub(crate) fn selected_paths(decision: u64, healthy: u64) -> u64 {
     }
 }
 
+pub(crate) fn initial_selection(open: u64, strategy: Strategy) -> u64 {
+    let limit = match strategy {
+        Strategy::AllPaths => 64,
+        Strategy::FastestPath => 1,
+        Strategy::Adaptive | Strategy::Duplicate => 2,
+    };
+    let mut remaining = open;
+    let mut selected = 0;
+    for _ in 0..limit {
+        let bit = remaining & remaining.wrapping_neg();
+        selected |= bit;
+        remaining &= !bit;
+    }
+    selected
+}
+
 pub(crate) fn update_scheduler_probe(
     metrics: &Mutex<Vec<PathMetrics>>,
     decision_mask: &AtomicU64,
@@ -334,6 +350,16 @@ mod tests {
     use super::*;
     use crate::session::state::initial_status;
     use gamepath_engine::scheduler::choose_paths;
+
+    #[test]
+    fn smart_starts_with_two_open_routes_while_manual_starts_with_all() {
+        assert_eq!(initial_selection(0b11111, Strategy::Adaptive), 0b11);
+        assert_eq!(initial_selection(0b11110, Strategy::Adaptive), 0b110);
+        assert_eq!(initial_selection(0b10000, Strategy::Adaptive), 0b10000);
+        assert_eq!(initial_selection(0, Strategy::Adaptive), 0);
+        assert_eq!(initial_selection(0b11111, Strategy::AllPaths), 0b11111);
+        assert_eq!(initial_selection(0b11111, Strategy::FastestPath), 0b1);
+    }
 
     #[test]
     fn failed_sends_do_not_inflate_node_usage() {

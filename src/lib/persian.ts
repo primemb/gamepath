@@ -535,6 +535,8 @@ export const persian: Record<string, string> = {
   'Removing…': 'در حال حذف…',
   'Rename group': 'تغییر نام گروه',
   'Route quality': 'کیفیت مسیر',
+  'Update the relay to make Smart downloads follow the active routes.':
+    'رله را به‌روزرسانی کنید تا دانلود در حالت هوشمند فقط از مسیرهای فعال انجام شود.',
   'Routes, traffic mode, relay and the current path chain': 'مسیرها، حالت ترافیک، رله و زنجیره مسیر فعلی',
   'Save changes': 'ذخیره تغییرات',
   'Saving…': 'در حال ذخیره…',

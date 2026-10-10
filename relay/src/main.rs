@@ -18,14 +18,16 @@ use std::time::{Duration, Instant};
 use tun_rs::{DeviceBuilder, SyncDevice};
 
 mod client_registry;
+mod endpoints;
+#[cfg(test)]
+mod path_policy_tests;
 use client_registry::{
     list_access, load_clients, read_records, reserved_addresses, revoke_access, start_reload,
     write_secret,
 };
+use endpoints::Endpoints;
 
 const MAX_PACKET: usize = 65_535;
-const MAX_ENDPOINTS_PER_SESSION: usize = 8;
-const ENDPOINT_TTL: Duration = Duration::from_secs(45);
 
 /// How long a session survives without authenticated traffic. A client that
 /// reconnects gets a new session id, so without this every reconnect would
@@ -123,7 +125,7 @@ struct RelayClient {
 
 struct SessionState {
     replay: ReplayWindow,
-    endpoints: Vec<(SocketAddr, Instant)>,
+    endpoints: Endpoints,
     outbound_sequence: u64,
     last_seen: Instant,
     /// Frames the replay window turned away. Duplicates from a second path are
@@ -187,7 +189,7 @@ impl SessionState {
     fn new() -> Self {
         Self {
             replay: ReplayWindow::default(),
-            endpoints: Vec::new(),
+            endpoints: Endpoints::default(),
             outbound_sequence: fresh_outbound_sequence(),
             last_seen: Instant::now(),
             rejected_frames: 0,
@@ -195,8 +197,8 @@ impl SessionState {
         }
     }
 
-    /// Seals `payload` as the next reply-direction frame and sends it to every
-    /// endpoint this session has been seen from recently. Returns the sequence
+    /// Seals `payload` as the next reply-direction frame and sends it to the
+    /// client's selected live endpoints. Returns the sequence
     /// used, or `None` when there is nowhere left to send it.
     fn fan_out(
         &mut self,
@@ -207,10 +209,8 @@ impl SessionState {
         flags: u8,
         payload: &[u8],
     ) -> Option<u64> {
-        let now = Instant::now();
-        self.endpoints
-            .retain(|(_, seen)| now.duration_since(*seen) <= ENDPOINT_TTL);
-        if self.endpoints.is_empty() {
+        let mut endpoints = self.endpoints.targets(Instant::now()).peekable();
+        if endpoints.peek().is_none() {
             return None;
         }
         self.outbound_sequence = self.outbound_sequence.wrapping_add(1);
@@ -221,7 +221,7 @@ impl SessionState {
             sequence: self.outbound_sequence,
         };
         let frame = crypto.seal_server(header, payload).ok()?;
-        for (endpoint, _) in &self.endpoints {
+        for endpoint in endpoints {
             let _ = socket.send_to(&frame, endpoint);
         }
         Some(header.sequence)
@@ -229,21 +229,7 @@ impl SessionState {
 
     fn observe_endpoint(&mut self, endpoint: SocketAddr) {
         let now = Instant::now();
-        self.endpoints
-            .retain(|(_, seen)| now.duration_since(*seen) <= ENDPOINT_TTL);
-        if let Some(existing) = self
-            .endpoints
-            .iter_mut()
-            .find(|(address, _)| *address == endpoint)
-        {
-            existing.1 = now;
-        } else {
-            if self.endpoints.len() >= MAX_ENDPOINTS_PER_SESSION {
-                self.endpoints.sort_by_key(|(_, seen)| *seen);
-                self.endpoints.remove(0);
-            }
-            self.endpoints.push((endpoint, now));
-        }
+        self.endpoints.observe(endpoint, now);
         self.last_seen = now;
     }
 }
@@ -568,6 +554,16 @@ fn serve(
             continue;
         }
         if verified_header.flags & FLAG_CONTROL != 0 {
+            if apply_path_policy(
+                session,
+                &socket,
+                &crypto,
+                &verified_header,
+                &plaintext,
+                endpoint,
+            ) {
+                continue;
+            }
             if let Some(offer) = fec::parse_offer(&plaintext) {
                 apply_repair_offer(
                     session,
@@ -631,6 +627,34 @@ fn serve(
 /// a repair of a reply near that size would not fit the client's link.
 fn reply_repair_limit(offer: Offer) -> usize {
     usize::from(offer.mtu.min(relay_tun_mtu(LINK_MTU)))
+}
+
+fn apply_path_policy(
+    session: &mut SessionState,
+    socket: &UdpSocket,
+    crypto: &SessionCrypto,
+    header: &FrameHeader,
+    plaintext: &[u8],
+    endpoint: SocketAddr,
+) -> bool {
+    let Some(policy) = gamepath_engine::path_policy::PathPolicy::parse(plaintext) else {
+        return false;
+    };
+    session
+        .endpoints
+        .apply(endpoint, policy, header.sequence, Instant::now());
+    session.outbound_sequence = session.outbound_sequence.wrapping_add(1);
+    let response_header = FrameHeader {
+        flags: FLAG_CONTROL | FLAG_SERVER_TO_CLIENT,
+        sequence: session.outbound_sequence,
+        ..*header
+    };
+    if let Ok(response) =
+        crypto.seal_server(response_header, gamepath_engine::path_policy::accept())
+    {
+        let _ = socket.send_to(&response, endpoint);
+    }
+    true
 }
 
 /// Applies the group size and MTU a client asked its replies to be protected

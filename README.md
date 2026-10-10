@@ -153,6 +153,8 @@ Application totals come from process-owned split-tunnel flows. Traffic whose pro
 **Relay mode** keeps eligible enabled nodes connected to a relay you run. The
 adaptive scheduler proactively duplicates sealed packets across the two best
 suitable routes, so backup copies are already travelling when a path fails.
+Smart adds suitable routes while a carrying route is unstable, then returns
+to two after clean probes confirm recovery. Manual uses every healthy enabled route.
 Latency, jitter, and probe loss affect selection; a severely slower backup or
 substantial degradation on both candidates reduces outbound traffic to one
 route. The latency and loss shown for a route are current smoothed measures
@@ -162,8 +164,11 @@ The first authenticated copy wins in each direction, without waiting for the
 other paths. Return copies are deduplicated before entering the client queue;
 a reply can still rescue a lost packet even if its path is no longer selected
 for outgoing traffic. Multiple enabled nodes do not mean every outbound packet
-travels through every node. The relay currently sends replies to every recently
-authenticated endpoint, including endpoints kept alive by probes. This mode
+travels through every node. Updated relays send replies and downlink repairs
+only to the client's selected routes. Standby paths keep health probes and may
+carry an uplink loss-repair packet, so their traffic counters need not be zero.
+Older relays still fan replies out to every recently authenticated endpoint;
+update the VPS to apply Smart selection in both directions. This mode
 needs a VPS and adds bandwidth overhead for redundancy.
 
 Relay mode also sends **loss repair** in both directions: a small repair packet

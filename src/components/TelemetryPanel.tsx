@@ -136,7 +136,6 @@ export function TelemetryPanel({
   const metrics = state.session.metrics
   const capture = state.session.capture?.diagnostics
   const paths = state.session.pathMetrics ?? []
-  const degradedRoutes = state.session.degradedRoutes ?? []
   const live = state.session.status === 'connected'
   // Derived once in the main process from the route carrying traffic. Its RTT
   // is an actual GamePath probe, not a VPN/WireGuard setup duration.
@@ -148,6 +147,20 @@ export function TelemetryPanel({
     .filter((path) => path.reachable && path.latencyMs != null)
     .sort((a, b) => (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity))[0]
   const direct = (state.session.mode ?? state.connectionMode) === 'direct'
+  const carryingCount = paths.filter(
+    (path) => state.session.selectedRoutes?.includes(path.route) ?? path.reachable,
+  ).length
+  const needsReplySelectionUpdate =
+    live &&
+    !direct &&
+    state.session.strategy === 'adaptive' &&
+    paths.some(
+      (path) =>
+        path.reachable &&
+        state.session.selectedRoutes?.includes(path.route) &&
+        path.returnPathSelection === false &&
+        (path.probesReceived ?? 0) >= 10,
+    )
   const stages: JourneyStage[] = [
     [
       direct ? 'You → benchmark via VPN node' : 'You → relay via VPN node',
@@ -234,15 +247,12 @@ export function TelemetryPanel({
           <h3>{direct ? 'Node quality' : 'Route quality'}</h3>
         </div>
         <small>
-          {direct
-            ? 'One node, no duplication'
-            : degradedRoutes.length
-              ? // The session runs on the routes that answered rather than
-                // failing outright, so say which ones it is running without.
-                `${paths.length - degradedRoutes.length} of ${paths.length} routes carrying traffic`
-              : `${paths.length} active route${paths.length === 1 ? '' : 's'}`}
+          {direct ? 'One node, no duplication' : `${carryingCount} of ${paths.length} routes carrying traffic`}
         </small>
       </div>
+      {needsReplySelectionUpdate && (
+        <p className="node-empty">Update the relay to make Smart downloads follow the active routes.</p>
+      )}
       {paths.length ? (
         <div className="node-grid">
           {paths.map((path, index) => (

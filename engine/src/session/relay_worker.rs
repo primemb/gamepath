@@ -8,8 +8,8 @@ use super::dialer::{
 };
 use super::health::{
     HEALTH_FAILURE_THRESHOLD, PROBE_INTERVAL_DEGRADED, healthy_probe_interval, publish_path_health,
-    record_path_receive, record_path_send, remember_expired_probe, take_late_probe_reply,
-    update_path_status, update_scheduler_probe,
+    record_path_receive, record_path_send, remember_expired_probe, selected_paths,
+    take_late_probe_reply, update_path_status, update_scheduler_probe,
 };
 use super::join::{JoinGate, RouteTransport, await_join};
 use super::latency::{LatencyEvent, LatencyWatch};
@@ -79,6 +79,12 @@ pub(crate) fn run_path(
     };
     let mut next_probe = Instant::now();
     let mut pending_probe: Option<(u64, Instant)> = None;
+    let mut announced_selection = None;
+    let mut next_selection_refresh = Instant::now();
+    let selection_started = Instant::now();
+    let mut return_path_selection = false;
+    let mut relay_answered = false;
+    let mut warned_legacy_selection = false;
     // Probes already written off, kept briefly so a reply that arrives after
     // the deadline can still tell the estimator how slow this path really is.
     let mut expired_probes: Vec<(u64, Instant)> = Vec::new();
@@ -147,6 +153,7 @@ pub(crate) fn run_path(
                 let same_route = replacement.endpoint() == path.endpoint()
                     && replacement.probe_deadline_floor() == path.probe_deadline_floor();
                 path = replacement;
+                announced_selection = None;
                 reported_transport_failure = false;
                 publish_path_health(&telemetry.healthy_mask, index, false);
                 // A redial may fall back from UDP to TCP (or recover to UDP) or
@@ -255,6 +262,49 @@ pub(crate) fn run_path(
             }
         }
         pass.bookkeeping = iteration_started.elapsed();
+        let own_bit = 1_u64.checked_shl(index as u32).unwrap_or(0);
+        let carrying = selected_paths(
+            decision_mask.load(Ordering::Acquire),
+            telemetry.healthy_mask.load(Ordering::Acquire),
+        ) & own_bit
+            != 0;
+        // Announce before draining data and repeat while idle: download-only
+        // games still need selection changes to reach the relay. A lost update
+        // is repaired by the next refresh without affecting health probing.
+        if announced_selection != Some(carrying) || Instant::now() >= next_selection_refresh {
+            let header = FrameHeader {
+                flags: FLAG_CONTROL,
+                client_id,
+                session_id,
+                sequence: sequences.fetch_add(1, Ordering::Relaxed),
+            };
+            let policy = gamepath_engine::path_policy::PathPolicy {
+                path: index as u8,
+                selected: carrying,
+            };
+            let result = crypto
+                .seal_client(header, &policy.request())
+                .and_then(|frame| path.send_probe(&frame));
+            announced_selection = Some(carrying);
+            next_selection_refresh = Instant::now()
+                + if result.is_ok() {
+                    healthy_probe_interval(carrying)
+                } else {
+                    PROBE_INTERVAL_DEGRADED
+                };
+        }
+        if relay_answered
+            && !warned_legacy_selection
+            && selection_started.elapsed() >= Duration::from_secs(10)
+            && !return_path_selection
+        {
+            warned_legacy_selection = true;
+            log_warn!(
+                "route {} relay has not confirmed reply selection; update the relay to keep \
+                 Smart-mode downloads off standby paths",
+                index + 1
+            );
+        }
         let (mut socket_send, mut status_lock, mut frames_sent) =
             (Duration::ZERO, Duration::ZERO, 0);
         drain_send_queue(
@@ -401,6 +451,11 @@ pub(crate) fn run_path(
                         }
                         if header.flags & FLAG_CONTROL != 0 {
                             if header.flags & FLAG_SERVER_TO_CLIENT != 0 {
+                                if gamepath_engine::path_policy::accepted(&plaintext) {
+                                    return_path_selection = true;
+                                    statuses.lock().unwrap()[index].return_path_selection = true;
+                                    continue;
+                                }
                                 if let Some(group) = fec::accepted_group(&plaintext) {
                                     repair.accepted(group);
                                     continue;
@@ -438,6 +493,7 @@ pub(crate) fn run_path(
                                     warned_legacy_probes = true;
                                 }
                                 pending_probe = None;
+                                relay_answered = true;
                                 let elapsed = started.elapsed();
                                 rtt.record(elapsed);
                                 let latency = elapsed.as_secs_f64() * 1000.0;

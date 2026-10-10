@@ -30,6 +30,7 @@ pub(crate) struct PathSessionStatus {
     pub(crate) label: String,
     pub(crate) endpoint: String,
     pub(crate) reachable: bool,
+    pub(crate) return_path_selection: bool,
     /// Still dialling: the session started without this route and it joins
     /// once its transport opens.
     pub(crate) joining: bool,
@@ -82,6 +83,7 @@ pub(crate) fn initial_status(
         label,
         endpoint,
         reachable: false,
+        return_path_selection: false,
         joining: false,
         latency_ms: None,
         handshake_ms: None,

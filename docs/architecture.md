@@ -512,7 +512,21 @@ Each distinct imported configuration creates an independent user-space WireGuard
 
 The direct ISP path is always available alongside provider routes. If two files resolve to the same endpoint and reuse the same client identity, their WireGuard handshakes would replace one another at the provider. GamePath detects that conflict, keeps one live, and holds the overlap as standby. Distinct endpoint/key pairs become additional live paths.
 
-Authenticated GamePath frames are wrapped in an inner IPv4/UDP packet addressed to the relay, then encrypted independently by each WireGuard instance. Packets receive a session ID and monotonically increasing sequence number before adaptive scheduling sends them on one or two routes. The relay sees two authenticated endpoints and fans replies back across both.
+Authenticated GamePath frames are wrapped in an inner IPv4/UDP packet addressed to the relay, then encrypted independently by each WireGuard instance. Packets receive a session ID and monotonically increasing sequence number before adaptive scheduling sends them on selected routes. The relay learns authenticated endpoints and fans replies back across the client's selected routes.
+
+`engine/src/path_policy.rs` carries a per-worker path index and selected flag in
+an authenticated control message. Workers announce changes before draining
+their send queues and refresh at the health-probe cadence, including while
+the game only receives traffic. The relay orders policy updates by frame
+sequence per path, replaces old endpoints on NAT rebind/redial, and applies
+the same selection to replies and downlink repairs. Probes and uplink repairs
+keep standby endpoints warm without selecting them for replies. If selection
+updates are lost or all selected endpoints expire, one recently authenticated
+endpoint carries replies until the next refresh. Old clients retain the original
+all-endpoint fan-out; old relays ignore the new control messages and keep
+answering unchanged probes. The client reports an update reminder when a live
+relay has not acknowledged selection. Smart's initial data mask contains at
+most two already-open routes; every open path still probes independently.
 
 Direct and WireGuard workers share one atomic sequence allocator, so control traffic and data traffic never reuse an authenticated nonce or fall behind the relay replay window. The client sends one encrypted data frame to every selected path and accepts the first authenticated reply; later copies are discarded by sequence number.
 

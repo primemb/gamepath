@@ -150,6 +150,7 @@ export type PathMetric = {
   label: string
   endpoint: string
   reachable: boolean
+  returnPathSelection?: boolean
   latencyMs: number | null
   /** One-time cost of establishing this path's transport, not a hop latency. */
   handshakeMs: number | null
