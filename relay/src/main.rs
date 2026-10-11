@@ -3,7 +3,7 @@ use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::fec::{self, Decoder, Encoder, Offer};
 use gamepath_engine::mtu::{LINK_MTU, relay_tun_mtu};
 use gamepath_engine::protocol::{
-    FLAG_CONTROL, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader, HEADER_LEN,
+    FLAG_CONTROL, FLAG_PATH_UNHEALTHY, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader, HEADER_LEN,
 };
 use gamepath_engine::replay::ReplayWindow;
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,7 @@ struct SessionState {
     replay: ReplayWindow,
     endpoints: Endpoints,
     outbound_sequence: u64,
+    repair_turn: u64,
     last_seen: Instant,
     /// Frames the replay window turned away. Duplicates from a second path are
     /// expected and counted here too; a count climbing far faster than the
@@ -191,6 +192,7 @@ impl SessionState {
             replay: ReplayWindow::default(),
             endpoints: Endpoints::default(),
             outbound_sequence: fresh_outbound_sequence(),
+            repair_turn: 0,
             last_seen: Instant::now(),
             rejected_frames: 0,
             repair: None,
@@ -198,8 +200,9 @@ impl SessionState {
     }
 
     /// Seals `payload` as the next reply-direction frame and sends it to the
-    /// client's selected live endpoints. Returns the sequence
-    /// used, or `None` when there is nowhere left to send it.
+    /// client's selected live endpoints. Repairs take one spare path when
+    /// available, so a carrying-path stall need not lose its repair too.
+    /// Returns the sequence used, or `None` when there is nowhere to send it.
     fn fan_out(
         &mut self,
         socket: &UdpSocket,
@@ -209,7 +212,15 @@ impl SessionState {
         flags: u8,
         payload: &[u8],
     ) -> Option<u64> {
-        let mut endpoints = self.endpoints.targets(Instant::now()).peekable();
+        let now = Instant::now();
+        let repair_target = if flags & FLAG_REPAIR != 0 {
+            let target = self.endpoints.repair_target(now, self.repair_turn);
+            self.repair_turn = self.repair_turn.wrapping_add(1);
+            target
+        } else {
+            None
+        };
+        let mut endpoints = self.endpoints.targets(now).peekable();
         if endpoints.peek().is_none() {
             return None;
         }
@@ -221,8 +232,12 @@ impl SessionState {
             sequence: self.outbound_sequence,
         };
         let frame = crypto.seal_server(header, payload).ok()?;
-        for endpoint in endpoints {
+        if let Some(endpoint) = repair_target {
             let _ = socket.send_to(&frame, endpoint);
+        } else {
+            for endpoint in endpoints {
+                let _ = socket.send_to(&frame, endpoint);
+            }
         }
         Some(header.sequence)
     }
@@ -640,9 +655,13 @@ fn apply_path_policy(
     let Some(policy) = gamepath_engine::path_policy::PathPolicy::parse(plaintext) else {
         return false;
     };
-    session
-        .endpoints
-        .apply(endpoint, policy, header.sequence, Instant::now());
+    session.endpoints.apply(
+        endpoint,
+        policy,
+        header.flags & FLAG_PATH_UNHEALTHY == 0,
+        header.sequence,
+        Instant::now(),
+    );
     session.outbound_sequence = session.outbound_sequence.wrapping_add(1);
     let response_header = FrameHeader {
         flags: FLAG_CONTROL | FLAG_SERVER_TO_CLIENT,

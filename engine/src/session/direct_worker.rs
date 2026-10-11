@@ -31,12 +31,12 @@ const DIRECT_LOSS_LIMIT: u64 = 3;
 /// count as carrying traffic regardless of what the ICMP probes say.
 const DIRECT_LIVENESS_WINDOW: Duration = Duration::from_secs(5);
 
-/// Probe interval through a SOCKS5 proxy. Each probe is a real connection the
-/// proxy opens to the probe target, so once a second cost about 86,000
-/// connections a day through the user's own proxy server, and measured nothing
-/// a slower probe misses: a proxy on this machine grants a connection before
-/// it reaches anything, and traffic it carries proves the path alive anyway.
+/// Each SOCKS5 probe opens a connection and asks DNS through it. Keep that
+/// extra work out of the packet path and modest on the user's proxy server.
 const SOCKS5_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+// DNS can need its own upstream dial and retry; the datagram RTT deadline
+// would call a working but slow resolver dead on a restricted connection.
+const SOCKS5_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Probe interval once a node has shown it will not answer ICMP. Slow enough
 /// to be free, frequent enough that a node which starts answering is noticed.
@@ -52,6 +52,10 @@ fn take_matching_probe(pending: &mut Option<(u16, Instant)>, sequence: u16) -> O
     } else {
         None
     }
+}
+
+fn probe_outage(requires_probe: bool, answered: bool, losses: u64, carrying: bool) -> bool {
+    (requires_probe || answered) && losses >= DIRECT_LOSS_LIMIT && (requires_probe || !carrying)
 }
 
 /// Carries a direct session's traffic through its single node.
@@ -80,7 +84,8 @@ pub(crate) fn run_direct_path(
     // `drain_send_queue`.
     let max_age = (path.kind() != gamepath_engine::relay_path::KIND_SOCKS5)
         .then_some(super::worker::PATH_QUEUE_MAX_AGE);
-    let probe_interval = if path.kind() == gamepath_engine::relay_path::KIND_SOCKS5 {
+    let requires_probe = path.kind() == gamepath_engine::relay_path::KIND_SOCKS5;
+    let probe_interval = if requires_probe {
         SOCKS5_PROBE_INTERVAL
     } else {
         PROBE_INTERVAL
@@ -141,7 +146,9 @@ pub(crate) fn run_direct_path(
         // the benchmark target is being filtered somewhere past it.
         let carrying =
             last_authenticated_receive.is_some_and(|seen| seen.elapsed() <= DIRECT_LIVENESS_WINDOW);
-        let losing = icmp_answered && consecutive_losses >= DIRECT_LOSS_LIMIT && !carrying;
+        // SOCKS5 generates SYN/ACK, resets and SERVFAIL locally; those packets
+        // cannot disprove an outage beyond the proxy's listener.
+        let losing = probe_outage(requires_probe, icmp_answered, consecutive_losses, carrying);
         let reachable = handshake.is_some() && !losing;
         if reachable != published_healthy {
             publish_path_health(&telemetry.healthy_mask, 0, reachable);
@@ -216,7 +223,7 @@ pub(crate) fn run_direct_path(
                     // Until one probe is answered nothing is published, so a
                     // node that filters ICMP never reports probes it did send
                     // and never looks totally lossy because of it.
-                    if icmp_answered {
+                    if icmp_answered || requires_probe {
                         statuses.lock().unwrap()[0].probes_sent += 1;
                     }
                     pending_probe = Some((probe_sequence, Instant::now()));
@@ -255,7 +262,7 @@ pub(crate) fn run_direct_path(
                             let mut current = statuses.lock().unwrap();
                             // The probe this answers was sent before ICMP was
                             // known to work, so it was not counted then.
-                            current[0].probes_sent += u64::from(first);
+                            current[0].probes_sent += u64::from(first && !requires_probe);
                             current[0].probes_received += 1;
                             current[0].latency_ms = Some(latency);
                         }
@@ -328,9 +335,14 @@ pub(crate) fn run_direct_path(
                  PrivateKey and Peer PublicKey"
             ));
         }
-        if pending_probe.is_some_and(|(_, started)| started.elapsed() > rtt.timeout()) {
+        let probe_timeout = if requires_probe {
+            SOCKS5_PROBE_TIMEOUT
+        } else {
+            rtt.timeout()
+        };
+        if pending_probe.is_some_and(|(_, started)| started.elapsed() > probe_timeout) {
             pending_probe = None;
-            if icmp_answered {
+            if icmp_answered || requires_probe {
                 consecutive_losses += 1;
                 statuses.lock().unwrap()[0].probes_lost += 1;
                 scheduler_metrics.lock().unwrap()[0].record_loss();
@@ -365,6 +377,17 @@ mod tests {
         assert_eq!(take_matching_probe(&mut pending, 10), Some(started));
         assert_eq!(pending, None);
         assert_eq!(take_matching_probe(&mut pending, 10), None);
+    }
+
+    #[test]
+    fn local_proxy_replies_cannot_hide_failed_dns_probes() {
+        assert!(probe_outage(true, true, DIRECT_LOSS_LIMIT, true));
+        assert!(probe_outage(true, false, DIRECT_LOSS_LIMIT, true));
+        assert!(!probe_outage(true, true, DIRECT_LOSS_LIMIT - 1, true));
+        assert!(!probe_outage(true, true, 0, false));
+        assert!(!probe_outage(false, true, DIRECT_LOSS_LIMIT, true));
+        assert!(!probe_outage(false, false, DIRECT_LOSS_LIMIT, false));
+        assert!(probe_outage(false, true, DIRECT_LOSS_LIMIT, false));
     }
 
     /// A WireGuard peer that answers ICMP echoes through the tunnel, and stops

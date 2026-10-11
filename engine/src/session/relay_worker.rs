@@ -55,7 +55,7 @@ pub(crate) fn run_path(
     use gamepath_engine::auth::SessionCrypto;
     use gamepath_engine::fec;
     use gamepath_engine::protocol::{
-        FLAG_CONTROL, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader,
+        FLAG_CONTROL, FLAG_PATH_UNHEALTHY, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader,
     };
 
     let Ok(crypto) = SessionCrypto::new(&key, session_id) else {
@@ -77,6 +77,7 @@ pub(crate) fn run_path(
             None => return,
         },
     };
+    scheduler_metrics.lock().unwrap()[index].endpoint_ipv4 = path.bypass_ipv4();
     let mut next_probe = Instant::now();
     let mut pending_probe: Option<(u64, Instant)> = None;
     let mut announced_selection = None;
@@ -153,6 +154,7 @@ pub(crate) fn run_path(
                 let same_route = replacement.endpoint() == path.endpoint()
                     && replacement.probe_deadline_floor() == path.probe_deadline_floor();
                 path = replacement;
+                scheduler_metrics.lock().unwrap()[index].endpoint_ipv4 = path.bypass_ipv4();
                 announced_selection = None;
                 reported_transport_failure = false;
                 publish_path_health(&telemetry.healthy_mask, index, false);
@@ -263,17 +265,18 @@ pub(crate) fn run_path(
         }
         pass.bookkeeping = iteration_started.elapsed();
         let own_bit = 1_u64.checked_shl(index as u32).unwrap_or(0);
-        let carrying = selected_paths(
-            decision_mask.load(Ordering::Acquire),
-            telemetry.healthy_mask.load(Ordering::Acquire),
-        ) & own_bit
-            != 0;
+        let healthy_mask = telemetry.healthy_mask.load(Ordering::Acquire);
+        let path_healthy = healthy_mask & own_bit != 0;
+        let carrying =
+            selected_paths(decision_mask.load(Ordering::Acquire), healthy_mask) & own_bit != 0;
         // Announce before draining data and repeat while idle: download-only
         // games still need selection changes to reach the relay. A lost update
         // is repaired by the next refresh without affecting health probing.
-        if announced_selection != Some(carrying) || Instant::now() >= next_selection_refresh {
+        if announced_selection != Some((carrying, path_healthy))
+            || Instant::now() >= next_selection_refresh
+        {
             let header = FrameHeader {
-                flags: FLAG_CONTROL,
+                flags: FLAG_CONTROL | if path_healthy { 0 } else { FLAG_PATH_UNHEALTHY },
                 client_id,
                 session_id,
                 sequence: sequences.fetch_add(1, Ordering::Relaxed),
@@ -285,7 +288,7 @@ pub(crate) fn run_path(
             let result = crypto
                 .seal_client(header, &policy.request())
                 .and_then(|frame| path.send_probe(&frame));
-            announced_selection = Some(carrying);
+            announced_selection = Some((carrying, path_healthy));
             next_selection_refresh = Instant::now()
                 + if result.is_ok() {
                     healthy_probe_interval(carrying)

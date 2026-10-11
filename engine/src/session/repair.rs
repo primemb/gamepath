@@ -141,11 +141,15 @@ impl LossRepair {
         self.dispatch.telemetry.healthy_mask.load(Ordering::Acquire)
     }
 
-    /// Read per packet from the health mask, so the moment a second path comes
-    /// back the next group is already sized for multipath.
+    /// Only actual data copies provide redundancy. Healthy standby paths do
+    /// not justify a four-packet group when the scheduler uses a single route.
     fn desired_group(&self) -> u8 {
+        let healthy = self.healthy();
+        let carrying =
+            super::health::selected_paths(self.decision_mask.load(Ordering::Acquire), healthy)
+                & healthy;
         fec::group_size_for(
-            self.healthy().count_ones(),
+            carrying.count_ones(),
             self.multipath_group.load(Ordering::Acquire),
         )
     }
@@ -403,7 +407,45 @@ pub(crate) fn spawn_flusher(
 
 #[cfg(test)]
 mod tests {
-    use super::repair_target;
+    use super::*;
+    use crate::session::worker::PathTelemetry;
+    use std::sync::mpsc;
+
+    #[test]
+    fn group_size_counts_selected_healthy_copies_instead_of_standbys() {
+        let decision = Arc::new(AtomicU64::new(0b0011));
+        let telemetry = PathTelemetry::new(4);
+        telemetry.healthy_mask.store(0b1111, Ordering::Release);
+        let dispatch = Arc::new(Dispatch {
+            commands: (0..4).map(|_| mpsc::sync_channel(1).0).collect(),
+            telemetry,
+        });
+        let repair = LossRepair::new(
+            Arc::new(SessionCrypto::new(&[1; 32], 1).unwrap()),
+            [1; 16],
+            1,
+            Arc::new(AtomicU64::new(1)),
+            Arc::clone(&dispatch),
+            Arc::clone(&decision),
+            1341,
+        );
+        assert_eq!(repair.desired_group(), fec::MULTIPATH_GROUP);
+        decision.store(0b0001, Ordering::Release);
+        assert_eq!(repair.desired_group(), fec::SINGLE_PATH_GROUP);
+        decision.store(0b0011, Ordering::Release);
+        dispatch
+            .telemetry
+            .healthy_mask
+            .store(0b1101, Ordering::Release);
+        assert_eq!(repair.desired_group(), fec::SINGLE_PATH_GROUP);
+        dispatch.telemetry.healthy_mask.store(0, Ordering::Release);
+        assert_eq!(repair.desired_group(), fec::SINGLE_PATH_GROUP);
+        dispatch
+            .telemetry
+            .healthy_mask
+            .store(0b0011, Ordering::Release);
+        assert_eq!(repair.desired_group(), fec::MULTIPATH_GROUP);
+    }
 
     #[test]
     fn a_repair_takes_exactly_one_path() {

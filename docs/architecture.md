@@ -519,8 +519,13 @@ an authenticated control message. Workers announce changes before draining
 their send queues and refresh at the health-probe cadence, including while
 the game only receives traffic. The relay orders policy updates by frame
 sequence per path, replaces old endpoints on NAT rebind/redial, and applies
-the same selection to replies and downlink repairs. Probes and uplink repairs
-keep standby endpoints warm without selecting them for replies. If selection
+selection to data replies. The control header's `FLAG_PATH_UNHEALTHY` marks
+unproven or failed transports; older relays ignore this flag. Downlink repairs
+rotate over one healthy standby, or one carrying path when none is available,
+using endpoints authenticated in the last three seconds. This gives recovery
+a path beyond the pair that lost the data without duplicating repairs across
+every node. Probes and uplink repairs keep standby endpoints warm without
+selecting them for data replies. If selection
 updates are lost or all selected endpoints expire, one recently authenticated
 endpoint carries replies until the next refresh. Old clients retain the original
 all-endpoint fan-out; old relays ignore the new control messages and keep
@@ -546,11 +551,13 @@ rebuilds it from the repair and the members that arrived, and admits it
 through the same replay window as a delivered frame, so the original arriving
 late by a slower path is discarded as a duplicate.
 
-- **Group size follows the healthy paths.** With two or more healthy paths
+- **Group size follows the healthy carrying paths.** With two or more healthy carrying paths
   duplication already covers a path failing, so one repair per
   `MULTIPATH_GROUP` (4) packets is enough for the loss both copies share, at a
-  quarter of the bandwidth. With one healthy path every packet gets its own
-  repair (`SINGLE_PATH_GROUP`, 1). The client reads the health mask for every
+  quarter of the bandwidth. With one healthy carrying path every packet gets its own
+  repair (`SINGLE_PATH_GROUP`, 1). A healthy standby does not supply a second
+  data copy and does not justify a four-packet group. The client reads the
+  selection and health masks for every
   packet it sends, so the size changes on the next packet when a path fails or
   comes back, and a group already open is closed first so nothing in it goes
   unprotected.
@@ -730,6 +737,15 @@ fallback steady during a total outage, where two equally dead routes could
 otherwise alternate on every timeout.
 
 ### Escalating past two routes
+
+Smart prefers a second VPN server IPv4 address within the existing delivery
+delay budget over another tunnel to the first server. The worker publishes the
+resolved transport address after opening and after each redial, so this requires
+no DNS lookup in the scheduler. Different addresses can still share a provider
+or ISP; equal addresses positively identify a shared server. Settled tunnels to
+one address count as one failure domain when deciding whether to add extras.
+When only same-server or far slower alternatives exist, the normal ranking
+and congestion limits still apply.
 
 Two copies protect a packet only while both routes behave. On a live four-route
 session every route spiked from ~52 ms to 100-470 ms every few seconds, usually
@@ -1323,15 +1339,18 @@ Lookups to a LAN resolver are redirected whichever process sent them: Chromium-b
 resolve with their own DNS client, not the system's. One thread and one `mio` poll
 drive all of it.
 
-A connection is answered only once the proxy has opened its far end: the SYN is held, then fed to smoltcp
-or refused with a reset. Answering first would make every connection look open while the proxy is down, and
-the direct worker treats any packet back from the path as proof it is alive. A TCP reset while that SYN is
+A connection is answered only once the proxy accepts its CONNECT: the SYN is held, then fed to smoltcp
+or refused with a reset. A local proxy can accept before its far end opens, so locally generated TCP replies
+and DNS failures do not prove the remote path is alive. A TCP reset while that SYN is
 held cancels the outstanding proxy stream immediately, rather than letting an abandoned dial finish and
 return a SYN/ACK for an application socket that no longer exists. ICMP cannot cross a proxy, so
-the worker's echo to the benchmark target is answered by a real `CONNECT` to it on port 53: the session's
-health and latency measure the proxy's acceptance of that connection. A local proxy can accept before its
-remote connection completes, so this can report a local round trip even while DNS queries time out beyond
-the proxy; it is not a measurement of game-server ping or successful DNS delivery.
+the worker's echo to the benchmark target opens a real `CONNECT` to it on port 53 and sends a fresh DNS
+question immediately. Only a complete matching success or NXDOMAIN response answers the echo; acceptance,
+silence, SERVFAIL and refusal do not. Three missed probes report the SOCKS5 path down even while its local
+stack produces packets. Probes continue every five seconds, including when none has ever answered, so a
+recovered DNS path is detected without treating SOCKS5 as an ICMP-filtering VPN. This measures the proxy's
+DNS response path, not game-server ping: a proxy that synthesizes DNS locally can still answer while its
+remote transport is unavailable. Remote DNS remains fail closed during an outage.
 
 A stream to the proxy watches writability only while something is waiting to be written. A connected socket
 is writable at once, and mio re-arms a socket every time an operation on it would block, so a stream that kept

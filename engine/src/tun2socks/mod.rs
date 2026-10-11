@@ -12,6 +12,7 @@
 
 mod handshake;
 mod packet;
+mod probe;
 mod stack;
 
 use crate::socks5::{Socks5NodeConfig, negotiate_method, resolve_proxy};

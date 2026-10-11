@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
 const SMOOTHING: f64 = 0.2;
 
@@ -45,6 +46,8 @@ fn incumbency_margin(path: &PathMetrics) -> f64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathMetrics {
     pub id: String,
+    #[serde(default)]
+    pub endpoint_ipv4: Option<Ipv4Addr>,
     pub active: bool,
     pub samples: u64,
     pub latency_ms: f64,
@@ -64,6 +67,7 @@ impl PathMetrics {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            endpoint_ipv4: None,
             active: true,
             samples: 0,
             latency_ms: 0.0,
@@ -122,6 +126,23 @@ impl PathMetrics {
         }
         self.latency_ms + (self.jitter_ms * 2.0) + (self.loss_ratio * 200.0)
     }
+
+    fn shares_endpoint(&self, other: &Self) -> bool {
+        self.endpoint_ipv4.is_some() && self.endpoint_ipv4 == other.endpoint_ipv4
+    }
+}
+
+fn settled_path_count(paths: &[&PathMetrics]) -> usize {
+    paths
+        .iter()
+        .enumerate()
+        .filter(|(index, path)| {
+            path.is_settled()
+                && !paths[..*index]
+                    .iter()
+                    .any(|other| other.is_settled() && path.shares_endpoint(other))
+        })
+        .count()
 }
 
 fn ewma(previous: f64, sample: f64) -> f64 {
@@ -194,7 +215,7 @@ pub fn choose_paths_with_incumbent(
         .filter(|path| path.active && path.last_latency_ms.is_some())
         .collect();
     healthy.sort_by(|left, right| ranked(left).total_cmp(&ranked(right)));
-    let Some(best) = healthy.first() else {
+    let Some(&best) = healthy.first() else {
         // Keep one previously proven route armed through a total outage. A
         // Drop here becomes the dispatcher's all-path startup fallback, which
         // would multiply traffic precisely when every route is struggling.
@@ -247,8 +268,6 @@ pub fn choose_paths_with_incumbent(
     // Mild loss on both providers is not evidence of a shared uplink outage.
     // Only substantial degradation on both reduces the extra outbound load.
     let degraded = |path: &PathMetrics| path.loss_ratio >= 0.5 || path.jitter_ms >= 50.0;
-    let candidates = healthy.iter().take(2).collect::<Vec<_>>();
-    let all_degraded = candidates.iter().all(|path| degraded(path));
     // Latency alone is not enough here.  A path whose EWMA still looks close
     // can already have enough variation to deliver a duplicate hundreds of
     // milliseconds late, so compare the same latency-plus-jitter delivery
@@ -263,6 +282,21 @@ pub fn choose_paths_with_incumbent(
     let within_budget = |path: &PathMetrics| {
         delivery_delay(path) <= quickest_delivery + ADAPTIVE_DUPLICATE_DELAY_BUDGET_MS
     };
+    // Separate credentials on one VPN server share its stalls. Prefer a
+    // comparable second server before duplicating both directions onto that
+    // same failure domain; keep the same-server backup when it is all we have.
+    if strategy == Strategy::Adaptive && best.shares_endpoint(healthy[1]) {
+        if let Some(index) = healthy.iter().position(|path| {
+            path.id != best.id
+                && !best.shares_endpoint(path)
+                && within_budget(path)
+                && !degraded(path)
+        }) {
+            let backup = healthy.remove(index);
+            healthy.insert(1, backup);
+        }
+    }
+    let all_degraded = healthy.iter().take(2).all(|path| degraded(path));
     // Any second route in budget, not just the runner-up: an incumbent that
     // just spiked can hold second place by its margin, and judging only it
     // dropped the session to one route at the worst moment.
@@ -285,12 +319,11 @@ pub fn choose_paths_with_incumbent(
         // upload queue, and more copies would only deepen it. Congestion
         // reaches the routes one probe at a time rather than all at once, so
         // this counts every route instead of judging only the newest spike.
-        let independent =
-            healthy.iter().filter(|path| path.is_settled()).count() >= SETTLED_ROUTES_WANTED;
+        let independent = settled_path_count(&healthy) >= SETTLED_ROUTES_WANTED;
         let mut chosen: Vec<&PathMetrics> = Vec::new();
-        let mut settled = 0;
         for &path in &healthy {
-            let enough = chosen.len() >= 2 && (!independent || settled >= SETTLED_ROUTES_WANTED);
+            let enough = chosen.len() >= 2
+                && (!independent || settled_path_count(&chosen) >= SETTLED_ROUTES_WANTED);
             if enough {
                 break;
             }
@@ -298,9 +331,6 @@ pub fn choose_paths_with_incumbent(
                 continue;
             }
             chosen.push(path);
-            if path.is_settled() {
-                settled += 1;
-            }
         }
         // No delay budget here: the spike that unsettled the route is also
         // what would put it over, and a late duplicate costs only bandwidth.
@@ -327,6 +357,69 @@ mod tests {
         let mut path = PathMetrics::new(id);
         path.record_probe(latency);
         path
+    }
+
+    #[test]
+    fn smart_prefers_a_comparable_distinct_server_over_a_same_server_incumbent() {
+        let mut paths = vec![
+            measured("a", 48.0),
+            measured("b", 49.0),
+            measured("c", 50.0),
+        ];
+        paths[0].endpoint_ipv4 = Some(Ipv4Addr::new(192, 0, 2, 1));
+        paths[1].endpoint_ipv4 = paths[0].endpoint_ipv4;
+        paths[2].endpoint_ipv4 = Some(Ipv4Addr::new(192, 0, 2, 2));
+        assert_eq!(
+            choose_paths_with_incumbent(&paths, Strategy::Adaptive, &["a", "b"]),
+            Decision::Duplicate {
+                path_ids: vec!["a".into(), "c".into()]
+            }
+        );
+        assert_eq!(
+            choose_paths_with_incumbent(&paths, Strategy::Adaptive, &["a", "c"]),
+            Decision::Duplicate {
+                path_ids: vec!["a".into(), "c".into()]
+            }
+        );
+        paths[2].active = false;
+        assert_eq!(
+            choose_paths(&paths, Strategy::Adaptive),
+            Decision::Duplicate {
+                path_ids: vec!["a".into(), "b".into()]
+            }
+        );
+        paths[2] = measured("c", 400.0);
+        paths[2].endpoint_ipv4 = Some(Ipv4Addr::new(192, 0, 2, 2));
+        assert_eq!(
+            choose_paths(&paths, Strategy::Adaptive),
+            Decision::Duplicate {
+                path_ids: vec!["a".into(), "b".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn same_server_tunnels_do_not_count_as_two_settled_failure_domains() {
+        let mut paths = vec![
+            measured("a", 40.0),
+            measured("b", 41.0),
+            measured("c", 42.0),
+        ];
+        paths[0].endpoint_ipv4 = Some(Ipv4Addr::new(192, 0, 2, 1));
+        paths[1].endpoint_ipv4 = paths[0].endpoint_ipv4;
+        paths[2].endpoint_ipv4 = Some(Ipv4Addr::new(192, 0, 2, 2));
+        paths[2].record_loss();
+        assert_eq!(settled_path_count(&paths.iter().collect::<Vec<_>>()), 1);
+        let Decision::Duplicate { path_ids } =
+            choose_paths_with_incumbent(&paths, Strategy::Adaptive, &["a", "c"])
+        else {
+            panic!("expected duplication")
+        };
+        assert_eq!(
+            path_ids.len(),
+            2,
+            "shared stalls must not grow the upload load"
+        );
     }
 
     /// A path whose score is exactly `score`, for replaying figures recorded in

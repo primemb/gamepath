@@ -155,6 +155,8 @@ adaptive scheduler proactively duplicates sealed packets across the two best
 suitable routes, so backup copies are already travelling when a path fails.
 Smart adds suitable routes while a carrying route is unstable, then returns
 to two after clean probes confirm recovery. Manual uses every healthy enabled route.
+Smart prefers comparable routes to different VPN server IPv4 addresses, since
+two configurations on the same server can share its stalls.
 Latency, jitter, and probe loss affect selection; a severely slower backup or
 substantial degradation on both candidates reduces outbound traffic to one
 route. The latency and loss shown for a route are current smoothed measures
@@ -164,9 +166,10 @@ The first authenticated copy wins in each direction, without waiting for the
 other paths. Return copies are deduplicated before entering the client queue;
 a reply can still rescue a lost packet even if its path is no longer selected
 for outgoing traffic. Multiple enabled nodes do not mean every outbound packet
-travels through every node. Updated relays send replies and downlink repairs
-only to the client's selected routes. Standby paths keep health probes and may
-carry an uplink loss-repair packet, so their traffic counters need not be zero.
+travels through every node. Updated relays send data replies only to the client's
+selected routes. Loss repairs in either direction take one healthy standby
+when available, otherwise one carrying route. Standby paths keep health probes
+and may carry a loss-repair packet, so their traffic counters need not be zero.
 Older relays still fan replies out to every recently authenticated endpoint;
 update the VPS to apply Smart selection in both directions. This mode
 needs a VPS and adds bandwidth overhead for redundancy.
@@ -174,8 +177,8 @@ needs a VPS and adds bandwidth overhead for redundancy.
 Relay mode also sends **loss repair** in both directions: a small repair packet
 that lets the other end rebuild a packet lost on every path, including the
 common case where one Wi-Fi or ISP hiccup takes both duplicate copies. With two
-or more healthy routes there is one repair per four packets, or per two when
-every route has been losing packets for a while; with one healthy route every
+or more healthy routes actually carrying data there is one repair per four packets, or per two when
+every carrying route has been losing packets for a while; with one carrying route every
 packet gets its own. The size switches on the next packet when a route fails or
 recovers, while the four-to-two step waits until the loss is sustained and
 steps back only after a longer clean spell. Packets are never delayed to build repairs; only a
@@ -375,6 +378,11 @@ proxy to avoid needing to restart that app after disconnecting.
 
 IPv6 is not carried, as for the game: on a dual-stack connection, a selected app can still reach a site over
 IPv6 directly. `npm run vpn:coexist-test` checks both sessions together on a real machine.
+
+SOCKS5 VPN health probes require a matching DNS response through the proxy, rather than just acceptance of
+a local SOCKS connection. Three missed probes report an outage; remote DNS stays inside the VPN until you
+disconnect or the path recovers. A proxy that synthesizes DNS locally can still answer while its remote
+transport is down, so this is not a guarantee that every website or game is reachable.
 
 ## CI and tagged releases
 

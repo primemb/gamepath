@@ -17,6 +17,7 @@ use super::packet::{
     PROTOCOL_TCP, PROTOCOL_UDP, build_echo_reply, build_tcp_reset, build_udp, is_echo_request,
     parse_ipv4, parse_tcp, parse_udp,
 };
+use super::probe::DnsProbe;
 use crate::{log_info, log_warn};
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
@@ -377,6 +378,7 @@ struct DnsQuery {
 struct Probe {
     upstream: Upstream,
     request: Vec<u8>,
+    dns: DnsProbe,
     started: Instant,
 }
 
@@ -855,6 +857,7 @@ impl Stack {
                 Probe {
                     upstream,
                     request,
+                    dns: DnsProbe::new(),
                     started: Instant::now(),
                 },
             );
@@ -1123,11 +1126,32 @@ impl Stack {
             return;
         };
         probe.upstream.flush();
-        let (data, finished) = probe.upstream.read(4096, &mut self.buffer);
-        let reply = match probe.upstream.advance(&data) {
-            Ok(Some(_)) => parse_ipv4(&probe.request).map(|request| build_echo_reply(&request)),
-            Ok(None) if !finished && !probe.upstream.closed => return,
-            _ => None,
+        let (data, finished) = probe.upstream.read(65_537, &mut self.buffer);
+        let answered = if probe.upstream.handshake.is_some() {
+            match probe.upstream.advance(&data) {
+                Ok(Some((_, leftover))) => {
+                    // Local proxies can accept CONNECT while their upstream is
+                    // dead. Send DNS immediately so sing-box sniffs it as DNS.
+                    probe
+                        .upstream
+                        .outgoing
+                        .extend_from_slice(&probe.dns.framed());
+                    probe.upstream.flush();
+                    probe.dns.receive(&leftover)
+                }
+                Ok(None) => None,
+                Err(_) => Some(false),
+            }
+        } else {
+            probe.dns.receive(&data)
+        };
+        if answered.is_none() && !finished && !probe.upstream.closed {
+            return;
+        }
+        let reply = if answered == Some(true) {
+            parse_ipv4(&probe.request).map(|request| build_echo_reply(&request))
+        } else {
+            None
         };
         if let Some(mut probe) = self.probes.remove(&id) {
             probe.upstream.deregister(self.poll.registry());

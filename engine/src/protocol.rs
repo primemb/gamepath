@@ -6,6 +6,9 @@ pub const FLAG_CONTROL: u8 = 1;
 pub const FLAG_SERVER_TO_CLIENT: u8 = 2;
 /// A loss-repair frame: the XOR of recent data frames, see [`crate::fec`].
 pub const FLAG_REPAIR: u8 = 4;
+/// Path-policy controls mark unproven or unhealthy transports so the relay
+/// prefers proven routes for its repair copy.
+pub const FLAG_PATH_UNHEALTHY: u8 = 8;
 
 /// Echo the request identity in the payload, not the encrypted frame sequence:
 /// server sequences are independent and must remain unique for AEAD nonces.

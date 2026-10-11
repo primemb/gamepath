@@ -24,18 +24,31 @@ fn spawn_proxy(accept_login: bool) -> SocketAddr {
 }
 
 fn spawn_proxy_with_dns_sniff(accept_login: bool, sniff_dns: bool) -> SocketAddr {
+    spawn_proxy_with_probe_answer(accept_login, sniff_dns, Some(0))
+}
+
+fn spawn_proxy_with_probe_answer(
+    accept_login: bool,
+    sniff_dns: bool,
+    probe_rcode: Option<u8>,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
-            thread::spawn(move || serve(stream, accept_login, sniff_dns));
+            thread::spawn(move || serve(stream, accept_login, sniff_dns, probe_rcode));
         }
     });
     address
 }
 
-fn serve(mut stream: std::net::TcpStream, accept_login: bool, sniff_dns: bool) {
+fn serve(
+    mut stream: std::net::TcpStream,
+    accept_login: bool,
+    sniff_dns: bool,
+    probe_rcode: Option<u8>,
+) {
     let mut greeting = [0_u8; 2];
     if stream.read_exact(&mut greeting).is_err() {
         return;
@@ -108,6 +121,13 @@ fn serve(mut stream: std::net::TcpStream, accept_login: bool, sniff_dns: bool) {
             // sing-box closes the stream when a lookup fails.
             if message.windows(7).any(|label| label == b"\x06failed") {
                 return;
+            }
+            if message.windows(3).any(|label| label == b"gp-") {
+                let Some(rcode) = probe_rcode else {
+                    while stream.read(&mut buffer).is_ok_and(|read| read > 0) {}
+                    return;
+                };
+                message[3] = (message[3] & 0xf0) | rcode;
             }
             message[2] |= 0x80;
             if !recognised {
@@ -552,9 +572,7 @@ fn a_lookup_that_times_out_is_answered_with_servfail() {
     panic!("the timed-out lookup was left unanswered");
 }
 
-#[test]
-fn the_session_health_probe_is_answered_only_through_the_proxy() {
-    let mut app = App::new(spawn_proxy(true));
+fn health_probe_packet() -> Vec<u8> {
     let mut message = vec![8, 0, 0, 0, 0xab, 0xcd, 0, 1];
     let checksum = !message
         .chunks(2)
@@ -565,7 +583,41 @@ fn the_session_health_probe_is_answered_only_through_the_proxy() {
     packet.extend_from_slice(&CLIENT_ADDRESS.octets());
     packet.extend_from_slice(&RESOLVER.octets());
     packet.extend_from_slice(&message);
-    app.stack.send_packet(&packet).unwrap();
+    packet
+}
+
+#[test]
+fn the_session_health_probe_is_answered_only_through_the_proxy() {
+    let mut app = App::new(spawn_proxy(true));
+    app.stack.send_packet(&health_probe_packet()).unwrap();
+    assert!(app.until(|app| {
+        app.other.iter().any(|packet| {
+            let ip = parse_ipv4(packet).unwrap();
+            ip.protocol == 1 && ip.source == RESOLVER && ip.payload[0] == 0
+        })
+    }));
+}
+
+#[test]
+fn accepting_socks_connect_without_answering_dns_does_not_answer_a_health_probe() {
+    for rcode in [None, Some(2), Some(5)] {
+        let mut app = App::new(spawn_proxy_with_probe_answer(true, false, rcode));
+        app.stack.send_packet(&health_probe_packet()).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            app.step();
+        }
+        assert!(
+            app.other.is_empty(),
+            "SOCKS acceptance or failed DNS was credited as a healthy path: {rcode:?}"
+        );
+    }
+}
+
+#[test]
+fn a_valid_negative_dns_response_answers_the_health_probe() {
+    let mut app = App::new(spawn_proxy_with_probe_answer(true, true, Some(3)));
+    app.stack.send_packet(&health_probe_packet()).unwrap();
     assert!(app.until(|app| {
         app.other.iter().any(|packet| {
             let ip = parse_ipv4(packet).unwrap();

@@ -4,11 +4,13 @@ use std::time::{Duration, Instant};
 
 const CAPACITY: usize = 8;
 const TTL: Duration = Duration::from_secs(45);
+const REPAIR_FRESHNESS: Duration = Duration::from_secs(3);
 
 struct Endpoint {
     address: SocketAddr,
     seen: Instant,
     policy: Option<PathPolicy>,
+    healthy: bool,
 }
 
 pub(crate) struct Endpoints {
@@ -54,6 +56,7 @@ impl Endpoints {
                 address,
                 seen: now,
                 policy: None,
+                healthy: true,
             });
         }
     }
@@ -62,6 +65,7 @@ impl Endpoints {
         &mut self,
         address: SocketAddr,
         policy: PathPolicy,
+        healthy: bool,
         sequence: u64,
         now: Instant,
     ) {
@@ -77,11 +81,37 @@ impl Endpoints {
             entry.address == address || !entry.policy.is_some_and(|old| old.path == policy.path)
         });
         self.observe(address, now);
-        self.entries
+        let entry = self
+            .entries
             .iter_mut()
             .find(|entry| entry.address == address)
-            .unwrap()
-            .policy = Some(policy);
+            .unwrap();
+        entry.policy = Some(policy);
+        entry.healthy = healthy;
+    }
+
+    pub(crate) fn repair_target(&mut self, now: Instant, turn: u64) -> Option<SocketAddr> {
+        self.prune(now);
+        if !self.selective {
+            return None;
+        }
+        let fresh = |entry: &&Endpoint| {
+            entry.healthy
+                && now.duration_since(entry.seen) <= REPAIR_FRESHNESS
+                && entry.policy.is_some()
+        };
+        let spare = |entry: &&Endpoint| entry.policy.is_some_and(|policy| !policy.selected);
+        let has_spare = self.entries.iter().filter(fresh).any(|entry| spare(&entry));
+        let eligible = |entry: &&Endpoint| fresh(entry) && (!has_spare || spare(entry));
+        let count = self.entries.iter().filter(eligible).count();
+        if count == 0 {
+            return self.targets(now).next();
+        }
+        self.entries
+            .iter()
+            .filter(eligible)
+            .nth((turn % count as u64) as usize)
+            .map(|entry| entry.address)
     }
 
     pub(crate) fn targets(&mut self, now: Instant) -> impl Iterator<Item = SocketAddr> + '_ {
@@ -134,6 +164,7 @@ mod tests {
                     path,
                     selected: path < 2,
                 },
+                true,
                 u64::from(path) + 1,
                 now,
             );
@@ -148,6 +179,7 @@ mod tests {
                 path: 2,
                 selected: true,
             },
+            true,
             6,
             now,
         );
@@ -158,6 +190,7 @@ mod tests {
                 path: 2,
                 selected: false,
             },
+            true,
             7,
             now,
         );
@@ -176,6 +209,7 @@ mod tests {
                 path: 2,
                 selected: true,
             },
+            true,
             6,
             now,
         );
@@ -199,6 +233,7 @@ mod tests {
                     path,
                     selected: true,
                 },
+                true,
                 u64::from(path) + 1,
                 now,
             );
@@ -221,10 +256,10 @@ mod tests {
             selected: true,
         };
         let mut endpoints = Endpoints::default();
-        endpoints.apply(address(0), policy, 1, now);
-        endpoints.apply(address(1), policy, 2, now);
+        endpoints.apply(address(0), policy, true, 1, now);
+        endpoints.apply(address(1), policy, true, 2, now);
         endpoints.observe(address(0), now);
-        endpoints.apply(address(0), policy, 1, now);
+        endpoints.apply(address(0), policy, true, 1, now);
         assert_eq!(endpoints.targets(now).collect::<Vec<_>>(), vec![address(1)]);
     }
 
@@ -239,6 +274,7 @@ mod tests {
                     path,
                     selected: false,
                 },
+                true,
                 u64::from(path) + 1,
                 now,
             );
@@ -250,10 +286,75 @@ mod tests {
                 path: 3,
                 selected: true,
             },
+            true,
             6,
             now,
         );
         assert_eq!(endpoints.targets(now).collect::<Vec<_>>(), vec![address(3)]);
+    }
+
+    #[test]
+    fn repairs_rotate_over_healthy_standbys_without_adding_data_copies() {
+        let now = Instant::now();
+        let mut endpoints = Endpoints::default();
+        for path in 0..5 {
+            endpoints.apply(
+                address(path),
+                PathPolicy {
+                    path,
+                    selected: path < 2,
+                },
+                path != 2,
+                u64::from(path) + 1,
+                now,
+            );
+        }
+        assert_eq!(endpoints.repair_target(now, 0), Some(address(3)));
+        assert_eq!(endpoints.repair_target(now, 1), Some(address(4)));
+        assert_eq!(endpoints.repair_target(now, 2), Some(address(3)));
+        assert_eq!(
+            endpoints.targets(now).collect::<Vec<_>>(),
+            vec![address(0), address(1)]
+        );
+
+        // Old health announcements must not resurrect a failed spare.
+        let policy = PathPolicy {
+            path: 3,
+            selected: false,
+        };
+        endpoints.apply(address(3), policy, false, 10, now);
+        endpoints.apply(address(3), policy, true, 9, now);
+        assert_eq!(endpoints.repair_target(now, 0), Some(address(4)));
+
+        let later = now + REPAIR_FRESHNESS + Duration::from_millis(1);
+        endpoints.observe(address(0), later);
+        endpoints.observe(address(1), later);
+        assert_eq!(endpoints.repair_target(later, 0), Some(address(0)));
+        assert_eq!(endpoints.repair_target(later, 1), Some(address(1)));
+    }
+
+    #[test]
+    fn legacy_repairs_keep_fanout_and_missing_health_uses_one_fallback() {
+        let now = Instant::now();
+        let mut endpoints = Endpoints::default();
+        endpoints.observe(address(0), now);
+        endpoints.observe(address(1), now);
+        assert_eq!(endpoints.repair_target(now, 0), None);
+        endpoints.apply(
+            address(0),
+            PathPolicy {
+                path: 0,
+                selected: true,
+            },
+            false,
+            1,
+            now,
+        );
+        assert_eq!(endpoints.repair_target(now, 0), Some(address(0)));
+        assert_eq!(
+            endpoints.repair_target(now + TTL + Duration::from_secs(1), 0),
+            None
+        );
     }
 
     #[test]
