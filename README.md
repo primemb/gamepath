@@ -375,6 +375,31 @@ everything else keeps the normal connection.
   menu has a **Connect VPN** / **Disconnect VPN** item for use while a game is fullscreen.
 - Its traffic is counted apart from the game's, under **VPN** on the Statistics screen.
 
+### Direct sites
+
+**VPN → Direct sites** lets local sites skip the VPN and use the normal connection, as Throne's **Bypass Iran**
+route profile does. Domestic sites then load at local speed, and services that refuse foreign visitors (banks,
+payment gateways, government sites) keep working while everything else uses the VPN.
+
+- **Downloaded lists, not bundled data.** **Download** fetches the two lists Throne uses, from
+  [Chocolate4U/Iran-clash-rules](https://github.com/Chocolate4U/Iran-clash-rules) in plain text:
+  **Iran IP ranges** (`geoip:ir`, about 2,200 IPv4 ranges) and **Iranian websites** (`geosite:category-ir`,
+  every `.ir` name plus about 57,000 Iranian sites on other domains). jsDelivr is tried first, then GitHub.
+  A download that is not a real list, such as a filter's block page, is rejected and the previous copy is
+  kept. **Update** fetches a fresh copy, and lists in use refresh themselves once they are a week old. If
+  every mirror is filtered, turn the VPN on in all-traffic mode and download again.
+- **Your own sites and addresses.** Add a website (it includes its subdomains), a pasted link (only its site
+  is kept), or an IPv4 address or range.
+- **Live.** Turning the feature, a list or an entry on or off applies to a running VPN without reconnecting.
+- **All-traffic mode** routes the listed ranges around the tunnel through the physical gateway, so direct
+  traffic never leaves the kernel. **Split mode** leaves listed destinations out of the apps the VPN carries.
+- **Names still resolve through the VPN.** A listed website's addresses become direct as its answer arrives.
+  A connection already open through the VPN stays on it, so nothing is cut mid-transfer.
+- **The game is never affected.** Only the VPN has a direct list; the game's capture still takes what it
+  selects first.
+- L2TP/IPsec nodes are routed by Windows and cannot leave sites out; use a WireGuard, OpenVPN or SOCKS5 node.
+  A site sharing a CDN address with a listed site also goes direct; IPv6 is not carried either way.
+
 Turning the VPN off ends its existing TCP connections so apps can reconnect over your normal route.
 If a SOCKS5 proxy returns fake-IP DNS answers, an app's own DNS cache can retain them; use real-IP DNS in the
 proxy to avoid needing to restart that app after disconnecting.

@@ -641,9 +641,69 @@ export const persian: Record<string, string> = {
   'Signed Wintun library is ready': 'کتابخانه امضاشده Wintun آماده است',
   'Signed WFP capture runtime is ready': 'سامانه رهگیری امضاشده WFP آماده است',
   'Remove VPS': 'حذف VPS',
+  'Direct sites': 'سایت‌های مستقیم',
+  'Skip the VPN for local sites': 'سایت‌های داخلی بدون VPN',
+  'Listed sites use your normal connection. They load at full local speed, and banks, payment pages and government services that refuse foreign visitors keep working.':
+    'سایت‌های فهرست‌شده از اتصال عادی شما استفاده می‌کنند. با تمام سرعت اینترنت داخلی باز می‌شوند و بانک‌ها، درگاه‌های پرداخت و خدمات دولتی که بازدیدکننده خارجی را نمی‌پذیرند همچنان کار می‌کنند.',
+  'Use direct sites': 'استفاده از سایت‌های مستقیم',
+  'Stop using direct sites': 'توقف استفاده از سایت‌های مستقیم',
+  'Every app except your game skips the VPN for these sites. Changes apply at once, without reconnecting.':
+    'همه برنامه‌ها به‌جز بازی، این سایت‌ها را بدون VPN باز می‌کنند. تغییرات بی‌درنگ و بدون اتصال دوباره اعمال می‌شوند.',
+  'Apps that use the VPN skip it for these sites. Changes apply at once, without reconnecting.':
+    'برنامه‌هایی که از VPN استفاده می‌کنند، این سایت‌ها را بدون VPN باز می‌کنند. تغییرات بی‌درنگ و بدون اتصال دوباره اعمال می‌شوند.',
+  'Everything the VPN carries goes through the node.': 'هرچه VPN منتقل می‌کند از طریق گره می‌رود.',
+  Lists: 'فهرست‌ها',
+  'Update all': 'به‌روزرسانی همه',
+  Update: 'به‌روزرسانی',
+  Working: 'در حال انجام',
+  'Downloading…': 'در حال دانلود…',
+  'Not downloaded yet': 'هنوز دانلود نشده',
+  'Updated just now': 'همین حالا به‌روز شد',
+  'Iran IP ranges': 'محدوده‌های IP ایران',
+  'Iranian websites': 'وب‌سایت‌های ایرانی',
+  'Every address registered in Iran, plus Iranian messengers such as Eitaa and Rubika.':
+    'همه نشانی‌های ثبت‌شده در ایران، به‌همراه پیام‌رسان‌های ایرانی مانند ایتا و روبیکا.',
+  'Every .ir site, and Iranian sites on .com, .net and other domains.':
+    'همه سایت‌های ‎.ir و سایت‌های ایرانی روی ‎.com، ‎.net و دامنه‌های دیگر.',
+  "The same lists Throne uses to bypass Iran, from Chocolate4U's Iran rules. They are downloaded to this PC and refresh once a week. Name lookups still go through the VPN; a listed site turns direct as soon as it is looked up. Your game session is never affected.":
+    'همان فهرست‌هایی که Throne برای عبور ایران از VPN به کار می‌برد، از قوانین ایران Chocolate4U. روی همین رایانه دانلود می‌شوند و هر هفته به‌روز می‌شوند. پیدا کردن نام‌ها همچنان از طریق VPN انجام می‌شود و هر سایت فهرست‌شده به محض پیدا شدن، مستقیم می‌شود. اتصال بازی شما هرگز تحت تأثیر قرار نمی‌گیرد.',
+  'Your own sites and addresses': 'سایت‌ها و نشانی‌های خودتان',
+  'Direct sites are off': 'سایت‌های مستقیم خاموش است',
+  'Website or IP address': 'وب‌سایت یا نشانی IP',
+  'A website includes its subdomains. Paste a link and only its site is kept.':
+    'هر وب‌سایت زیردامنه‌هایش را هم شامل می‌شود. اگر پیوندی بچسبانید، فقط نام سایت آن نگه داشته می‌شود.',
+  'No sites of your own yet': 'هنوز سایتی از خودتان اضافه نکرده‌اید',
+  'Add a site the lists miss, such as your workplace, your bank or a local game server.':
+    'سایتی را که در فهرست‌ها نیست اضافه کنید، مانند محل کار، بانک یا یک سرور بازی داخلی.',
+  'Address or range': 'نشانی یا محدوده',
+  'Site and its subdomains': 'سایت و زیردامنه‌هایش',
+  'Let local sites skip the VPN and use your normal connection, the way Throne bypasses Iran.':
+    'سایت‌های داخلی را بدون VPN و با اتصال عادی باز کنید، همان‌طور که Throne ایران را مستقیم می‌کند.',
+  'Enter a website such as digikala.com, or an IPv4 address or range such as 185.143.232.0/22.':
+    'یک وب‌سایت مانند digikala.com، یا یک نشانی یا محدوده IPv4 مانند 185.143.232.0/22 وارد کنید.',
+  'An L2TP/IPsec VPN is routed by Windows, so it cannot leave sites out. Use a WireGuard, OpenVPN or SOCKS5 node for direct sites.':
+    'مسیر VPN با L2TP/IPsec را ویندوز تعیین می‌کند، پس نمی‌تواند سایتی را مستثنا کند. برای سایت‌های مستقیم از گره WireGuard، OpenVPN یا SOCKS5 استفاده کنید.',
 }
 
 const dynamic: [RegExp, (...parts: string[]) => string][] = [
+  [/^([\d,]+) ranges$/, (count) => `${count} محدوده`],
+  [/^([\d,]+) sites$/, (count) => `${count} سایت`],
+  [/^Updated (\d+) min ago$/, (count) => `${count} دقیقه پیش به‌روز شد`],
+  [/^Updated (\d+) h ago$/, (count) => `${count} ساعت پیش به‌روز شد`],
+  [/^Updated (\d+) days? ago$/, (count) => `${count} روز پیش به‌روز شد`],
+  [/^(\d+) on$/, (count) => `${count} روشن`],
+  [/^Download the (.+) list$/, (name) => `دانلود فهرست ${translatePersian(name)}`],
+  [/^Update the (.+) list$/, (name) => `به‌روزرسانی فهرست ${translatePersian(name)}`],
+  [/^Stop using the (.+) list$/, (name) => `توقف استفاده از فهرست ${translatePersian(name)}`],
+  [/^Use the (.+) list$/, (name) => `استفاده از فهرست ${translatePersian(name)}`],
+  [/^Stop sending (.+) directly$/, (name) => `توقف ارسال مستقیم ${name}`],
+  [/^Send (.+) directly$/, (name) => `ارسال مستقیم ${name}`],
+  [/^(.+) is already on the direct list\.$/, (value) => `${value} از قبل در فهرست مستقیم است.`],
+  [
+    /^Could not download (.+) from any mirror\. If these sites are filtered on your connection, turn the VPN on in all-traffic mode and try again\.$/,
+    (name) =>
+      `دانلود ${name} از هیچ منبعی ممکن نشد. اگر این سایت‌ها روی اتصال شما فیلتر هستند، VPN را در حالت همه ترافیک روشن کنید و دوباره تلاش کنید.`,
+  ],
   [/^(\d+) selected$/, (count) => `${count} انتخاب‌شده`],
   [
     /^Logged in to (.+) in (\d+) ms, and reached the Internet through it in (\d+) ms\.$/,

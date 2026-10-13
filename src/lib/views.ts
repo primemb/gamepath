@@ -8,11 +8,12 @@ import {
   Route,
   Server,
   ShieldCheck,
+  Signpost,
 } from 'lucide-react'
 
 export type View = 'game' | 'vpn' | 'statistics' | 'settings' | 'info'
 export type GameTab = 'overview' | 'routes' | 'split' | 'connection' | 'sharing'
-export type VpnTab = 'overview' | 'node' | 'split'
+export type VpnTab = 'overview' | 'node' | 'split' | 'direct'
 
 type Icon = typeof Gamepad2
 
@@ -70,6 +71,12 @@ export const vpnTabs: TabDefinition<VpnTab>[] = [
     label: 'Split tunnel',
     icon: AppWindow,
     description: 'Choose which apps and websites use the VPN, and how it behaves when the node goes quiet.',
+  },
+  {
+    id: 'direct',
+    label: 'Direct sites',
+    icon: Signpost,
+    description: 'Let local sites skip the VPN and use your normal connection, the way Throne bypasses Iran.',
   },
 ]
 

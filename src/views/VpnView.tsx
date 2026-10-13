@@ -4,6 +4,8 @@ import { PageTabs, TabPanel, type TabExtras } from '../components/PageTabs'
 import { errorMessage, type Notify } from '../components/Toast'
 import { VpnCoexistence } from '../components/vpn/VpnCoexistence'
 import { VpnCommandCard } from '../components/vpn/VpnCommandCard'
+import { VpnDirectCard } from '../components/vpn/VpnDirectCard'
+import { VpnDirectEntries } from '../components/vpn/VpnDirectEntries'
 import { VpnNodePanel } from '../components/vpn/VpnNodePanel'
 import { VpnOverview } from '../components/vpn/VpnOverview'
 import { VpnTargetList } from '../components/vpn/VpnTargetList'
@@ -127,7 +129,9 @@ export function VpnView({
       badge: vpn.trafficMode === 'split' ? vpn.rules.filter((rule) => rule.enabled).length : null,
       dot: Object.keys(vpn.limitations).length ? 'warning' : null,
     },
+    direct: { dot: vpn.direct.enabled && vpn.direct.limitation ? 'warning' : null },
   }
+  const runDirect = async (work: () => Promise<AppState>) => guard(work)
 
   return (
     <div className="vpn-page">
@@ -169,6 +173,12 @@ export function VpnView({
               onToggle={(id, enabled) => void guard(() => api.vpn.setRuleEnabled(id, enabled))}
               onRemove={(id) => void guard(() => api.vpn.removeRule(id))}
             />
+          </div>
+        )}
+        {tab === 'direct' && (
+          <div className="vpn-columns">
+            <VpnDirectCard vpn={vpn} run={runDirect} />
+            <VpnDirectEntries vpn={vpn} run={runDirect} setState={setState} />
           </div>
         )}
       </TabPanel>

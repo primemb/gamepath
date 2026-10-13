@@ -136,6 +136,20 @@ class VpnSessionController {
     return capture
   }
 
+  /**
+   * Applies a new direct list to a running session without reconnecting.
+   * Throws if the service rejects it, so the caller can keep the old one.
+   */
+  async applyDirect(direct) {
+    if (!LIVE.has(this.session.status)) return null
+    const capture = await this.service.request('update-session-direct', { slot: 'vpn', direct })
+    this.log.info(
+      `direct list updated live: networks=${direct?.networks.length ?? 0} domains=${direct?.domains.length ?? 0}`,
+    )
+    this.onChange()
+    return capture
+  }
+
   /** Quitting: stop now, but remember the user wanted it, for next launch. */
   shutdown() {
     this.cancelReconnect()

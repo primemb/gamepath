@@ -11,6 +11,7 @@ const { nodeSpec } = require('./node-spec.cjs')
 const { ownHostnames } = require('./own-hostnames.cjs')
 const { vpnPauseReason } = require('./session-coordinator.cjs')
 const { VpnSessionController, VpnConfigError } = require('./vpn-session.cjs')
+const { createVpnDirect } = require('./vpn-direct-ipc.cjs')
 const {
   vpnRuleSpecs,
   ruleLimitation,
@@ -43,6 +44,7 @@ function createVpnFeature({
   logger,
   usage,
   onChange,
+  directLists,
 }) {
   const state = () => getState()
   const vpn = () => state().vpn
@@ -53,6 +55,8 @@ function createVpnFeature({
   let offeredOpenVpnFile = null
   let ruleQueue = Promise.resolve()
   let nodeQueue = Promise.resolve()
+  // Assigned once the controller exists; read only when a session starts.
+  let direct = null
 
   function changeNodes(change) {
     const operation = nodeQueue.then(change)
@@ -97,6 +101,7 @@ function createVpnFeature({
         remoteDns: settings.remoteDns,
         ownHostnames: ownHostnames(state()),
         killSwitch: settings.killSwitch,
+        direct: direct.spec(),
         nodes: [nodeSpec(node, secret)],
       },
     }
@@ -109,6 +114,16 @@ function createVpnFeature({
     pauseReason,
     usage,
     onChange,
+  })
+
+  direct = createVpnDirect({
+    ipcMain,
+    vpn,
+    saveState,
+    publicState,
+    controller,
+    store: directLists,
+    logger,
   })
 
   function publicVpn() {
@@ -126,6 +141,7 @@ function createVpnFeature({
       conflicts: ruleConflicts(settings.rules, activeGameRules(state().rules, state().ruleGroups)),
       limitations,
       canSelectApps: !(node?.kind === 'l2tp' && settings.trafficMode === 'split'),
+      direct: direct.publicDirect(node),
     }
   }
 
@@ -217,6 +233,7 @@ function createVpnFeature({
   }
 
   function register() {
+    direct.register()
     ipcMain.handle('vpn:import-wireguard', async () => {
       const result = await dialog.showOpenDialog({
         title: 'Choose a WireGuard configuration for the VPN',
@@ -420,7 +437,10 @@ function createVpnFeature({
     },
     setWanted,
     onPowerResume: () => controller.onResume(),
-    shutdown: () => controller.shutdown(),
+    shutdown: () => {
+      direct.shutdown()
+      return controller.shutdown()
+    },
   }
 }
 

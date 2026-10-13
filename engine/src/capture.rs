@@ -49,6 +49,9 @@ struct WindowsPacketCapture {
     /// Host routes keeping the other session's tunnel off this one, replaced
     /// as that session comes and goes.
     foreign_routes: Vec<InstalledRoute>,
+    /// The VPN's direct list, routed around the tunnel. Never the game's: it
+    /// would sweep the VPN's routes, and the game has no direct list.
+    direct: Option<crate::direct_routes::DirectRoutes>,
 }
 
 #[cfg(windows)]
@@ -324,6 +327,7 @@ impl PacketCaptureManager {
                     reset_existing: gamepath_engine::role::Role::current()
                         == gamepath_engine::role::Role::Vpn
                         && !input.other_session_active,
+                    direct: input.direct.clone(),
                 },
             )?;
             let target_count = split.target_count();
@@ -412,13 +416,35 @@ impl PacketCaptureManager {
                 )
             })
             .map_err(|error| format!("could not start Wintun uplink: {error}"))?;
+        // Before the downlink starts, so answers for direct names are learned
+        // from the first lookup on.
+        let direct = (gamepath_engine::role::Role::current() == gamepath_engine::role::Role::Vpn)
+            .then(|| {
+                let mut protected = gamepath_engine::dns::FALLBACK_RESOLVERS.to_vec();
+                protected.push(gamepath_engine::BENCHMARK_TARGET);
+                crate::direct_routes::DirectRoutes::start(
+                    &input.direct,
+                    default_gateway,
+                    default_interface,
+                    protected,
+                )
+            });
+        let direct_router = direct
+            .as_ref()
+            .map(crate::direct_routes::DirectRoutes::router);
         let downlink_stop = Arc::clone(&stop);
         let downlink_session = Arc::clone(&session);
         let downlink = thread::Builder::new()
             .name("gamepath-wintun-downlink".into())
             .spawn(move || {
                 gamepath_engine::thread_priority::raise_current_for_data_plane();
-                run_wintun_downlink(downlink_session, data_receiver, downlink_stop, diagnostics)
+                run_wintun_downlink(
+                    downlink_session,
+                    data_receiver,
+                    downlink_stop,
+                    diagnostics,
+                    direct_router,
+                )
             })
             .map_err(|error| format!("could not start Wintun downlink: {error}"))?;
 
@@ -433,6 +459,7 @@ impl PacketCaptureManager {
             default_gateway,
             default_interface,
             foreign_routes: Vec::new(),
+            direct,
         };
         capture.set_foreign_bypass(&input.foreign_bypass)?;
         for address in bypass_ips {
@@ -590,6 +617,47 @@ impl PacketCaptureManager {
         Err("packet capture is available only on Windows".into())
     }
 
+    /// Replaces the direct list of a running capture. All-traffic mode only
+    /// changes the routes that differ; split mode reopens its kernel filter,
+    /// keeping the session and its flows exactly as a live rule edit does.
+    #[cfg(windows)]
+    pub(crate) fn set_direct(
+        &mut self,
+        payload: Value,
+        sessions: Arc<Mutex<WireGuardSessionManager>>,
+    ) -> Result<Value, String> {
+        let spec: gamepath_engine::direct_list::DirectSpec =
+            serde_json::from_value(payload["direct"].clone())
+                .map_err(|error| format!("invalid direct list: {error}"))?;
+        let Some(mut request) = self.last_request.clone() else {
+            return Ok(json!({ "state": "idle" }));
+        };
+        request["direct"] = payload["direct"].clone();
+        if let Some(capture) = self.active.as_mut() {
+            let routes = capture
+                .direct
+                .as_mut()
+                .ok_or("this session has no direct list")?;
+            routes.replace(&spec);
+            self.last_request = Some(request);
+            return Ok(self.status());
+        }
+        if self.active_split.is_some() {
+            return self.start(request, sessions);
+        }
+        self.last_request = Some(request);
+        Ok(json!({ "state": "idle" }))
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn set_direct(
+        &mut self,
+        _payload: Value,
+        _sessions: Arc<Mutex<WireGuardSessionManager>>,
+    ) -> Result<Value, String> {
+        Err("packet capture is available only on Windows".into())
+    }
+
     pub(crate) fn status(&self) -> Value {
         #[cfg(windows)]
         if let Some(capture) = &self.active {
@@ -597,6 +665,7 @@ impl PacketCaptureManager {
                 "state": "capturing",
                 "backend": "wintun",
                 "adapterIndex": capture.adapter_index,
+                "direct": capture.direct.as_ref().map(crate::direct_routes::DirectRoutes::status),
             });
         }
         #[cfg(windows)]
@@ -723,6 +792,7 @@ impl Drop for WindowsPacketCapture {
             }
             gamepath_engine::netconfig::flush_dns_cache();
         }
+        drop(self.direct.take());
         for route in self.foreign_routes.iter().chain(self.routes.iter()).rev() {
             remove_ipv4_route(route);
         }
@@ -769,6 +839,7 @@ fn run_wintun_downlink(
     data_receiver: Arc<DataReceiver>,
     stop: Arc<AtomicBool>,
     diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
+    direct: Option<Arc<crate::direct_routes::DirectRouter>>,
 ) {
     while !stop.load(Ordering::Acquire) {
         let reply = match data_receiver.receive(Duration::from_millis(250)) {
@@ -789,6 +860,11 @@ fn run_wintun_downlink(
                 &reply,
             );
             continue;
+        }
+        // Before delivery, so the route exists by the time the application
+        // connects to the address it was just given.
+        if let Some(direct) = &direct {
+            direct.learn(&reply);
         }
         match session.allocate_send_packet(reply.len() as u16) {
             Ok(mut packet) => {

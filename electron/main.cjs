@@ -10,6 +10,7 @@ const {
   safeStorage,
   shell,
   Tray,
+  net,
 } = require('electron')
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
@@ -41,6 +42,7 @@ const { ownHostnames } = require('./own-hostnames.cjs')
 const { startWithWindows, refreshStartWithWindows, setStartWithWindows, launchedAtLogin } = require('./startup.cjs')
 const { defaultVpn, selectedVpnNode, migrateVpnState } = require('./vpn-state.cjs')
 const { createVpnFeature } = require('./vpn-ipc.cjs')
+const { DirectListStore } = require('./direct-lists.cjs')
 const { desktopStatus, createDesktopIcons } = require('./desktop-status.cjs')
 const { RelayFailoverController, normalizeRelayFailover, standbyRelayFor } = require('./relay-failover.cjs')
 const {
@@ -1690,6 +1692,12 @@ app.whenReady().then(async () => {
     logger,
     usage: usageStore?.session('vpn-') ?? null,
     onChange: vpnChanged,
+    // Chromium's stack, so a system proxy the user relies on is honoured.
+    directLists: new DirectListStore({
+      directory: path.join(app.getPath('userData'), 'direct-lists'),
+      fetch: (url, init) => net.fetch(url, init),
+      logger,
+    }),
   })
   vpnFeature.register()
   createWindow()

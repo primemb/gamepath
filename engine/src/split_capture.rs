@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 use crate::session::{DataReceiver, SenderCache, WireGuardSessionManager};
+use gamepath_engine::direct_list::{DirectList, DirectSpec, MAX_LEARNED};
 use gamepath_engine::fragment_router::{
     Action as FragmentAction, FragmentRouter, Route as FragmentRoute, Ticket as FragmentTicket,
 };
@@ -567,6 +568,13 @@ struct Registry {
     /// carries is shown and counted as that site rather than as an anonymous
     /// "matched destination".
     destination_labels: RwLock<HashMap<Ipv4Addr, Arc<str>>>,
+    /// The VPN's direct list. A destination on it is never selected, except
+    /// for a flow the tunnel already carries; see `run_selected_capture`.
+    direct: DirectList,
+    /// Addresses answered for direct names, with the name each was for.
+    direct_learned: RwLock<HashMap<Ipv4Addr, Arc<str>>>,
+    /// Packets a rule selected that left directly because of the list.
+    direct_packets: AtomicU64,
     fake_ip_packets: AtomicU64,
     handles: Mutex<Vec<Arc<Handle>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
@@ -699,6 +707,8 @@ pub struct SplitOptions {
     /// End the selected applications' connections that opened before this
     /// capture, so they reconnect through it; see [`crate::tcp_reset`].
     pub reset_existing: bool,
+    /// See `PacketCaptureRequest::direct`.
+    pub direct: DirectSpec,
 }
 
 /// What a replaced capture hands its successor. A rule edit, or the other
@@ -713,6 +723,7 @@ pub struct CarriedFlows {
     app_usage: HashMap<String, Arc<AppUsage>>,
     fragments: FragmentRouter<Address>,
     destination_labels: HashMap<Ipv4Addr, Arc<str>>,
+    direct_learned: HashMap<Ipv4Addr, Arc<str>>,
 }
 
 impl CarriedFlows {
@@ -854,27 +865,44 @@ impl SplitPacketCapture {
             own_hostnames,
             carried,
             reset_existing,
+            direct,
         } = options;
         let plan = compile("split", rules)?;
-        let (capture_id, carried_paths, carried_handled, carried_usage, fragments, labels) =
-            match carried {
-                Some(flows) => (
-                    flows.capture_id,
-                    flows.return_paths,
-                    flows.handled_connections,
-                    flows.app_usage,
-                    flows.fragments,
-                    flows.destination_labels,
-                ),
-                None => (
-                    NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
-                    HashMap::new(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    FragmentRouter::default(),
-                    HashMap::new(),
-                ),
-            };
+        let direct = DirectList::compile(&direct);
+        let (
+            capture_id,
+            carried_paths,
+            carried_handled,
+            carried_usage,
+            fragments,
+            labels,
+            direct_learned,
+        ) = match carried {
+            Some(flows) => (
+                flows.capture_id,
+                flows.return_paths,
+                flows.handled_connections,
+                flows.app_usage,
+                flows.fragments,
+                flows.destination_labels,
+                flows.direct_learned,
+            ),
+            None => (
+                NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                FragmentRouter::default(),
+                HashMap::new(),
+                HashMap::new(),
+            ),
+        };
+        // Learned addresses outlive a list edit only while the list still
+        // names what they were learned for.
+        let direct_learned = direct_learned
+            .into_iter()
+            .filter(|(address, name)| direct.matches_name(name) && !direct.contains(*address))
+            .collect();
         let socks_proxy = sessions.lock().unwrap().socks_proxy();
         let proxy_fake_ips = socks_proxy.is_some();
         let registry = Arc::new(Registry {
@@ -898,6 +926,9 @@ impl SplitPacketCapture {
                 .collect(),
             fake_ip_packets: AtomicU64::new(0),
             destination_labels: RwLock::new(HashMap::new()),
+            direct,
+            direct_learned: RwLock::new(direct_learned),
+            direct_packets: AtomicU64::new(0),
             handles: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
             selector_state: Mutex::new(SelectorState::default()),
@@ -970,7 +1001,7 @@ impl SplitPacketCapture {
                 Arc::clone(&stop),
             )?;
         }
-        if !plan.hostnames.is_empty() {
+        if !plan.hostnames.is_empty() || registry.direct.has_domains() {
             spawn_dns_tracker(
                 plan.hostnames.clone(),
                 Arc::clone(&registry),
@@ -1279,6 +1310,12 @@ impl SplitPacketCapture {
             "returnInjectionErrors": self.registry.return_injection_errors.load(Ordering::Relaxed),
             "driverQueueTimeMs": 100,
         });
+        status["direct"] = serde_json::json!({
+            "ranges": self.registry.direct.range_count(),
+            "domains": self.registry.direct.domain_count(),
+            "learned": self.registry.direct_learned.read().unwrap().len(),
+            "packets": self.registry.direct_packets.load(Ordering::Relaxed),
+        });
         status["fragments"] = serde_json::json!({
             "reassembledReturns": self.registry.reassembled_return_packets.load(Ordering::Relaxed),
             "fragmentationNeededSent": self.registry.fragmentation_needed_sent.load(Ordering::Relaxed),
@@ -1304,6 +1341,7 @@ impl SplitPacketCapture {
             app_usage: std::mem::take(&mut *registry.app_usage.lock().unwrap()),
             fragments: std::mem::take(&mut *registry.fragments.lock().unwrap()),
             destination_labels: std::mem::take(&mut *registry.destination_labels.write().unwrap()),
+            direct_learned: std::mem::take(&mut *registry.direct_learned.write().unwrap()),
         }
     }
 }
@@ -1549,6 +1587,10 @@ fn run_selected_capture(
             Some((application, process_id)) => (true, application.map(Cow::Borrowed), process_id),
             None => (false, None, None),
         };
+        // Name resolution is never direct: remote DNS fails closed, and the
+        // list only learns its names from answers that come back.
+        let direct = !(matches!(fields.protocol, 6 | 17) && fields.destination_port == 53)
+            && registry.is_direct(fields.destination);
         let mut application = application;
         let mut uncertain_dns_owner = false;
         if !selected && matches!(fields.protocol, 6 | 17) && fields.destination_port == 53 {
@@ -1579,6 +1621,7 @@ fn run_selected_capture(
         // learned the ISP address; later voice packets used the VPN address.
         // Resolve ownership before that first datagram can leave directly.
         if !selected
+            && !direct
             && fields.protocol == 17
             && (!registry.applications.is_empty() || !registry.folders.is_empty())
             && (crate::netutil::is_globally_routable_ipv4(fields.destination)
@@ -1724,7 +1767,7 @@ fn run_selected_capture(
         }
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
-        if !selected && !dns_packet && first_fragment.is_none() && is_tcp_syn(packet) {
+        if !selected && !direct && !dns_packet && first_fragment.is_none() && is_tcp_syn(packet) {
             if let Some((matched_process_id, path)) =
                 tcp_socket_process(fields, &registry.applications, &registry.folders)
             {
@@ -1791,6 +1834,21 @@ fn run_selected_capture(
         {
             selected = false;
             registry.local_destinations.fetch_add(1, Ordering::Relaxed);
+        }
+        // A flow the tunnel already carries stays there: an address learned
+        // mid-connection, or a list edit, would otherwise move it to another
+        // source address and the far end would reset it.
+        if selected
+            && direct
+            && !fake_ip
+            && redirect.is_none()
+            && !return_paths
+                .lock()
+                .unwrap()
+                .contains_key(&ReturnKey::outbound(fields))
+        {
+            selected = false;
+            registry.direct_packets.fetch_add(1, Ordering::Relaxed);
         }
         if !selected {
             reinject(&handle, &bypass, &registry, packet, address);
@@ -1982,6 +2040,38 @@ const LOOKUP_PORT_TTL: Duration = Duration::from_secs(2);
 const LOOKUP_PROCESS_TTL: Duration = Duration::from_secs(60);
 
 impl Registry {
+    fn is_direct(&self, destination: Ipv4Addr) -> bool {
+        self.direct.contains(destination)
+            || (self.direct.has_domains()
+                && self
+                    .direct_learned
+                    .read()
+                    .unwrap()
+                    .contains_key(&destination))
+    }
+
+    fn learn_direct(&self, packet: &[u8]) {
+        if !self.direct.has_domains() || !gamepath_engine::direct_list::is_dns_reply(packet) {
+            return;
+        }
+        let addresses = self.direct.answered_addresses(packet);
+        if addresses.is_empty() {
+            return;
+        }
+        let name: Arc<str> = gamepath_engine::direct_list::reply_question(packet)
+            .unwrap_or_default()
+            .into();
+        let mut learned = self.direct_learned.write().unwrap();
+        for address in addresses {
+            if crate::netutil::is_globally_routable_ipv4(address)
+                && !self.direct.contains(address)
+                && (learned.len() < MAX_LEARNED || learned.contains_key(&address))
+            {
+                learned.insert(address, Arc::clone(&name));
+            }
+        }
+    }
+
     /// Whether the UDP socket on `port` belongs to an ordinary application,
     /// one installed outside Windows' own folder. Windows' DNS Client (svchost)
     /// and other system processes are not.
@@ -2804,6 +2894,7 @@ fn spawn_dns_tracker(
                 for (address, hostname) in dns_addresses(&packet, &hostnames) {
                     add_hostname_address(&worker_registry, address, hostname);
                 }
+                worker_registry.learn_direct(&packet);
             }
         })
         .map_err(|error| format!("could not start hostname tracker: {error}"))?;
@@ -2848,6 +2939,9 @@ fn run_reply_injector(
                 .fetch_add(1, Ordering::Relaxed);
             packet = datagram;
         }
+        // Before the reply is delivered, so the application's first
+        // connection to the address already leaves directly.
+        registry.learn_direct(&packet);
         let Some(fields) = ipv4_fields(&packet) else {
             registry.return_not_ipv4.fetch_add(1, Ordering::Relaxed);
             registry

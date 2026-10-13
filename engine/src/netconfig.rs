@@ -793,6 +793,42 @@ pub fn remove_route_via(
     unsafe { DeleteIpForwardEntry2(&row) };
 }
 
+/// The metric offset of the VPN's direct routes, and nothing else's.
+///
+/// A metric only ranks routes of equal prefix length, so the value changes no
+/// routing decision; it is chosen to be unusual so that it identifies the
+/// rows. Windows does not document whether `CreateIpForwardEntry2` routes
+/// outlive the process or a reboot, and a direct list is thousands of them,
+/// so leftovers from a killed engine are swept by this marker before the next
+/// install and when the service starts.
+pub const DIRECT_ROUTE_METRIC: u32 = 4729;
+
+/// Removes every IPv4 route carrying the metric offset `metric`, and says how
+/// many there were. Used with a metric reserved as a marker, so routes left by
+/// a process that was killed before its teardown ran can still be found.
+pub fn remove_routes_with_metric(metric: u32) -> usize {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    if unsafe { GetIpForwardTable2(AF_INET, &mut table) } != NO_ERROR || table.is_null() {
+        return 0;
+    }
+    // SAFETY: as in `default_ipv4_route_candidates`; the matching rows are
+    // copied out before the table is freed.
+    let stale: Vec<MIB_IPFORWARD_ROW2> = unsafe {
+        let count = (*table).NumEntries as usize;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), count)
+            .iter()
+            .filter(|row| row.Metric == metric)
+            .copied()
+            .collect();
+        FreeMibTable(table.cast());
+        rows
+    };
+    stale
+        .iter()
+        .filter(|row| unsafe { DeleteIpForwardEntry2(*row) } == NO_ERROR)
+        .count()
+}
+
 /// Points an adapter at `servers`, in order, for IPv4 name resolution.
 /// Replaces `netsh interface ipv4 set dnsservers`.
 ///

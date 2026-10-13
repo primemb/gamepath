@@ -75,6 +75,9 @@ pub(crate) struct SessionSlot {
     /// capture leaves alone.
     pub(crate) own_hostnames: Vec<String>,
     pub(crate) session_rules: Value,
+    /// The VPN's direct list, kept so a rule edit or the other session
+    /// reopening the capture keeps it. `Null` for the game.
+    pub(crate) direct: Value,
     pub(crate) engine: Option<EngineProcess>,
     pub(crate) l2tp_sessions: Vec<L2tpSession>,
     pub(crate) native_l2tp_direct: bool,
@@ -108,6 +111,7 @@ impl SessionSlot {
             kill_switch: false,
             own_hostnames: Vec::new(),
             session_rules: Value::Null,
+            direct: Value::Null,
             engine: None,
             l2tp_sessions: Vec::new(),
             native_l2tp_direct: false,
@@ -147,6 +151,7 @@ impl SessionSlot {
     /// down. The caller does the slow part after releasing the slot's lock.
     pub(crate) fn take_for_teardown(&mut self, reason: Option<&str>) -> Teardown {
         let teardown = Teardown {
+            sweep_direct_routes: self.id == SlotId::Vpn && self.engine.is_some(),
             engine: self.engine.take(),
             l2tp_sessions: std::mem::take(&mut self.l2tp_sessions),
             bypass_routes: self.bypass_routes.take(),
@@ -161,6 +166,9 @@ impl SessionSlot {
 /// What a stopped slot still owns. Dropping it in order removes the engine's
 /// capture and routes first, then the RAS connections the engine sent through.
 pub(crate) struct Teardown {
+    /// An engine that was killed at its deadline never removed its routes,
+    /// and the game must never start all-traffic over the VPN's direct ones.
+    sweep_direct_routes: bool,
     engine: Option<EngineProcess>,
     l2tp_sessions: Vec<L2tpSession>,
     bypass_routes: Option<BypassRoutes>,
@@ -170,6 +178,16 @@ impl Teardown {
     pub(crate) fn run(self) {
         if let Some(engine) = self.engine {
             engine.shut_down();
+        }
+        if self.sweep_direct_routes {
+            let swept = gamepath_engine::netconfig::remove_routes_with_metric(
+                gamepath_engine::netconfig::DIRECT_ROUTE_METRIC,
+            );
+            if swept > 0 {
+                gamepath_engine::log_warn!(
+                    "removed {swept} direct route(s) the VPN engine left behind"
+                );
+            }
         }
         drop(self.l2tp_sessions);
         drop(self.bypass_routes);

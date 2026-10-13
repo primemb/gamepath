@@ -4,7 +4,8 @@
 use crate::l2tp::probe_l2tp_node;
 use crate::registry::{Registry, watch_lease};
 use crate::session::{
-    session_status, start_session, stop_session, update_lan_proxy, update_session_rules,
+    session_status, start_session, stop_session, update_lan_proxy, update_session_direct,
+    update_session_rules,
 };
 use crate::slot::SlotId;
 use crate::validate::validate_runtime;
@@ -156,6 +157,12 @@ fn run_service() -> ServiceResult<()> {
 /// Removes what a previous service process left behind if it died without
 /// tearing down. `GamePath*` covers both slots' adapters.
 fn cleanup_stale_routes() {
+    let swept = gamepath_engine::netconfig::remove_routes_with_metric(
+        gamepath_engine::netconfig::DIRECT_ROUTE_METRIC,
+    );
+    if swept > 0 {
+        gamepath_engine::log_info!("removed {swept} direct route(s) left by an earlier run");
+    }
     let script = "$i=@(Get-NetAdapter -Name 'GamePath*' -ErrorAction SilentlyContinue|Select-Object -ExpandProperty ifIndex);if($i.Count){Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue|Where-Object {$_.InterfaceIndex -in $i -and $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1')}|Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue};Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue|Where-Object {$_.Name -like 'GamePath-L2TP-*'}|ForEach-Object {& rasdial.exe $_.Name /disconnect 2>$null|Out-Null;Remove-VpnConnection -Name $_.Name -AllUserConnection -Force -ErrorAction SilentlyContinue}";
     let _ = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -342,6 +349,7 @@ fn handle_request(request: Request, expected_token: &str, registry: &Arc<Registr
         "probe-l2tp-node" => probe_l2tp_node(request.payload),
         "start-session" => start_session(request.payload, slot, registry),
         "update-session-rules" => update_session_rules(request.payload, slot, registry),
+        "update-session-direct" => update_session_direct(request.payload, slot, registry),
         "update-lan-proxy" => update_lan_proxy(request.payload, slot, registry),
         "session-status" => session_status(slot, registry),
         "stop-session" => Ok(stop_session(slot, registry, None)),

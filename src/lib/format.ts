@@ -52,3 +52,14 @@ export const formatClockTime = (secondsSinceEpoch: number) =>
     minute: '2-digit',
     second: '2-digit',
   })
+
+/** How long ago `milliseconds` was, in the words the UI translates. */
+export function formatAge(milliseconds: number, now = Date.now()) {
+  const minutes = Math.max(0, Math.floor((now - milliseconds) / 60_000))
+  if (minutes < 1) return 'just now'
+  if (minutes < 60) return `${minutes} min ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} h ago`
+  const days = Math.floor(hours / 24)
+  return days === 1 ? '1 day ago' : `${days} days ago`
+}

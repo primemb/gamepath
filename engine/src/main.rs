@@ -8,6 +8,8 @@
 mod capture;
 mod commands;
 #[cfg(windows)]
+mod direct_routes;
+#[cfg(windows)]
 mod dns_guard;
 #[cfg(windows)]
 mod file_icon;
@@ -193,6 +195,7 @@ fn handle_request(
         "start-native-dns" => capture.start_native_dns(request.payload),
         "update-packet-capture" => capture.update(request.payload, Arc::clone(sessions)),
         "set-foreign-bypass" => capture.set_foreign_bypass(request.payload, Arc::clone(sessions)),
+        "set-direct" => capture.set_direct(request.payload, Arc::clone(sessions)),
         "set-other-session-active" => Ok(capture.set_other_session_active(&request.payload)),
         "packet-capture-status" => Ok(capture.status()),
         "stop-packet-capture" => Ok(capture.stop()),

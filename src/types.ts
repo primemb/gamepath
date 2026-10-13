@@ -254,6 +254,36 @@ export type VpnRule = {
   enabled: boolean
 }
 
+/** A downloadable list of sites or addresses that keep the normal connection. */
+export type DirectListInfo = {
+  id: string
+  /** ISO country code the list belongs to. */
+  country: string
+  kind: 'ip' | 'domain'
+  title: string
+  /** Its name in Throne and sing-box, such as `geoip:ir`. */
+  tag: string
+  description: string
+  /** Entries in the copy on this PC; 0 before the first download. */
+  count: number
+  /** Milliseconds since the epoch, or null before the first download. */
+  updatedAt: number | null
+  downloading: boolean
+}
+
+export type DirectEntry = { id: string; kind: 'ip' | 'domain'; value: string; enabled: boolean }
+
+/** Sites and addresses that skip the VPN and use the normal connection. */
+export type VpnDirect = {
+  enabled: boolean
+  /** Ids of the downloaded lists in use. */
+  lists: string[]
+  entries: DirectEntry[]
+  catalog: DirectListInfo[]
+  /** Why the selected node cannot leave sites out, or null. */
+  limitation: string | null
+}
+
 export type VpnSessionStatus = 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'degraded' | 'paused' | 'error'
 
 export type VpnSession = {
@@ -303,6 +333,7 @@ export type VpnState = {
   limitations: Record<string, string>
   /** False for an L2TP node in split mode, which routes by address only. */
   canSelectApps: boolean
+  direct: VpnDirect
 }
 
 export type VpnProxyProbe = { reachable: boolean; proxy: string; setupLatencyMs: number; latencyMs: number }
@@ -326,6 +357,16 @@ export type VpnApi = {
   addRule: (input: Pick<VpnRule, 'kind' | 'value' | 'label'>) => Promise<AppState>
   setRuleEnabled: (id: string, enabled: boolean) => Promise<AppState>
   removeRule: (id: string) => Promise<AppState>
+  /** Turning it on the first time downloads the lists it starts with. */
+  setDirectEnabled: (enabled: boolean) => Promise<AppState>
+  /** Downloads the list first if this PC has no copy yet. */
+  setDirectList: (id: string, enabled: boolean) => Promise<AppState>
+  /** Fresh copies of the given lists, or of every list. */
+  updateDirectLists: (ids?: string[]) => Promise<AppState>
+  /** A website, a link to one, or an IPv4 address or range. */
+  addDirectEntry: (value: string) => Promise<AppState>
+  setDirectEntryEnabled: (id: string, enabled: boolean) => Promise<AppState>
+  removeDirectEntry: (id: string) => Promise<AppState>
   connect: () => Promise<AppState>
   disconnect: () => Promise<AppState>
   status: () => Promise<AppState>

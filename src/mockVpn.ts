@@ -1,4 +1,34 @@
-import type { AppState, VpnApi, VpnNode, VpnRule, VpnSession, VpnState } from './types'
+import type { AppState, DirectListInfo, VpnApi, VpnNode, VpnRule, VpnSession, VpnState } from './types'
+
+/** The lists the desktop app downloads, as they look before the first download. */
+const directCatalog = (): DirectListInfo[] => [
+  {
+    id: 'ir-ip',
+    country: 'IR',
+    kind: 'ip',
+    title: 'Iran IP ranges',
+    tag: 'geoip:ir',
+    description: 'Every address registered in Iran, plus Iranian messengers such as Eitaa and Rubika.',
+    count: 0,
+    updatedAt: null,
+    downloading: false,
+  },
+  {
+    id: 'ir-sites',
+    country: 'IR',
+    kind: 'domain',
+    title: 'Iranian websites',
+    tag: 'geosite:category-ir',
+    description: 'Every .ir site, and Iranian sites on .com, .net and other domains.',
+    count: 0,
+    updatedAt: null,
+    downloading: false,
+  },
+]
+
+const DOWNLOADED_COUNTS: Record<string, number> = { 'ir-ip': 2225, 'ir-sites': 57554 }
+const L2TP_DIRECT_LIMITATION =
+  'An L2TP/IPsec VPN is routed by Windows, so it cannot leave sites out. Use a WireGuard, OpenVPN or SOCKS5 node for direct sites.'
 
 /** Saved VPN nodes and targets, for exploring the screen in a browser. */
 export function seedVpn(): VpnState {
@@ -48,6 +78,7 @@ export function seedVpn(): VpnState {
     conflicts: [],
     limitations: {},
     canSelectApps: true,
+    direct: { enabled: false, lists: [], entries: [], catalog: directCatalog(), limitation: null },
   }
 }
 
@@ -146,6 +177,7 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
     state.nodes = state.nodes.map((node) => ({ ...node, enabled: node.id === state.selectedNodeId }))
     state.node = state.nodes.find((node) => node.enabled) ?? null
     state.canSelectApps = !(state.node?.kind === 'l2tp' && state.trafficMode === 'split')
+    state.direct.limitation = state.node?.kind === 'l2tp' ? L2TP_DIRECT_LIMITATION : null
     state.limitations = {}
     if (!state.canSelectApps) {
       for (const rule of state.rules) {
@@ -179,6 +211,19 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
       animate()
     }, CONNECT_DELAY_MS)
   }
+
+  const download = async (ids: string[]) => {
+    for (const id of ids) {
+      const list = vpn().direct.catalog.find((item) => item.id === id)
+      if (!list) throw new Error('That list no longer exists.')
+      list.downloading = true
+      emit()
+      await new Promise((resolve) => window.setTimeout(resolve, 900))
+      Object.assign(list, { downloading: false, count: DOWNLOADED_COUNTS[id] ?? 1000, updatedAt: Date.now() })
+    }
+  }
+
+  const missing = (ids: string[]) => ids.filter((id) => !vpn().direct.catalog.find((list) => list.id === id)?.updatedAt)
 
   const addNode = (node: VpnNode) =>
     mutate((state) => {
@@ -283,6 +328,52 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
         if (rule) rule.enabled = enabled
       }),
     removeRule: async (id) => mutate((state) => void (state.rules = state.rules.filter((rule) => rule.id !== id))),
+    setDirectEnabled: async (enabled) => {
+      const direct = vpn().direct
+      const lists =
+        enabled && !direct.lists.length && !direct.entries.length ? direct.catalog.map((list) => list.id) : direct.lists
+      if (enabled) await download(missing(lists))
+      return mutate((state) => {
+        state.direct.enabled = enabled
+        state.direct.lists = lists
+      })
+    },
+    setDirectList: async (id, enabled) => {
+      if (enabled) await download(missing([id]))
+      return mutate((state) => {
+        const others = state.direct.lists.filter((item) => item !== id)
+        state.direct.lists = enabled ? [...others, id] : others
+      })
+    },
+    updateDirectLists: async (ids) => {
+      await download(ids ?? vpn().direct.catalog.map((list) => list.id))
+      return mutate(() => {})
+    },
+    addDirectEntry: async (input) => {
+      const text = input.trim().toLowerCase()
+      const host = text
+        .replace(/^[a-z]+:\/\//, '')
+        .split(/[/?#:]/)[0]
+        .replace(/^www\./, '')
+      const ip = /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(text)
+      if (!ip && !/^([a-z0-9-]+\.)+[a-z0-9-]{2,}$/.test(host)) {
+        throw new Error('Enter a website such as digikala.com, or an IPv4 address or range such as 185.143.232.0/22.')
+      }
+      const value = ip ? text : host
+      if (vpn().direct.entries.some((entry) => entry.value === value)) {
+        throw new Error(`${value} is already on the direct list.`)
+      }
+      return mutate((state) => {
+        state.direct.entries.push({ id: crypto.randomUUID(), kind: ip ? 'ip' : 'domain', value, enabled: true })
+      })
+    },
+    setDirectEntryEnabled: async (id, enabled) =>
+      mutate((state) => {
+        const entry = state.direct.entries.find((item) => item.id === id)
+        if (entry) entry.enabled = enabled
+      }),
+    removeDirectEntry: async (id) =>
+      mutate((state) => void (state.direct.entries = state.direct.entries.filter((entry) => entry.id !== id))),
     connect: async () => {
       if (!vpn().node) throw new Error('Add a VPN node first.')
       vpn().wantConnected = true

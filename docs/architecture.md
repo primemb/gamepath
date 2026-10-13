@@ -1369,6 +1369,44 @@ them, so with a SOCKS5 node the VPN carries every packet to that range whichever
 engines treat it as not globally routable. With remote DNS on, this means every app that resolves a name
 uses the proxy for it; turn fake DNS off in the proxy for a strict split tunnel.
 
+### The VPN's direct list
+
+The VPN can leave a list of destinations on the normal connection: a country's registered ranges and its
+domestic sites, the way Throne's Bypass Iran profile does. The client downloads the lists (Chocolate4U's
+`ircidr.txt` and `ir.txt`, the text form of the `geoip-ir` and `geosite-category-ir` rule-sets Throne uses)
+and sends `direct: { networks, domains }` with the VPN's capture request. `gamepath_engine::direct_list`
+compiles it: ranges are merged so a lookup is one binary search, domains are a suffix set walked one label at
+a time, and malformed, IPv6 or wider-than-`/8` entries are skipped rather than failing the session. A `/1`
+would tie the tunnel's own half-default on length and win on metric. Only the VPN slot carries a list; the
+service drops one sent for the game.
+
+- **All-traffic mode routes it.** The ranges become routes via the physical gateway (`direct_routes.rs`), so
+  direct traffic never reaches user space. Iran is about 2,200 prefixes, installed on a background thread
+  after capture is up and diffed on a live edit, so unchanged prefixes never lose their route. The tunnel's
+  resolvers are carved out of the ranges: a direct `8.8.8.8` would send every lookup past the tunnel, where
+  the DNS guard drops it. Windows does not document whether `CreateIpForwardEntry2` routes outlive a killed
+  process, so every direct route carries metric offset `DIRECT_ROUTE_METRIC` as a marker. It is swept before
+  each install, after every VPN teardown (an engine killed at its deadline never removed its own), and when
+  the service starts. The VPN is always stopped before a game takes all traffic, so the game never starts
+  over the VPN's direct routes.
+- **Split mode classifies it.** A destination on the list is never selected, even for an app rule, unless a
+  return path shows the tunnel already carries that flow.
+- **Names are learned, never resolved locally.** Remote DNS still applies, and DNS packets are never direct.
+  A reply for a listed name, including one whose CNAME chain reaches a listed name, adds its A records:
+  a `/32` route in all-traffic mode, a learned address in split mode (at most `MAX_LEARNED`). Replies from the
+  VPN's own tunnel are learned before delivery, so the first connection is already direct. Replies that
+  return through the game's tunnel are only sniffed, so the game's lookups never wait; the first connection
+  to such an address may still use the VPN.
+- **Live connections keep their path.** Windows sends with the strong host model, so a socket bound to the
+  tunnel address keeps leaving through the tunnel after a route is added; split mode gets the same from the
+  return-path check. A list edit (`update-session-direct` → engine `set-direct`) therefore never resets an
+  open connection.
+
+Addresses are what routes and classifiers see, so a non-domestic site sharing an address with a learned
+domestic one (a shared CDN edge) also goes direct. Per-connection sniffing would avoid that, but needs a
+proxy stack in every path. L2TP/IPsec is routed by Windows RAS with no GamePath capture, so it has no direct
+list.
+
 ## Remote DNS and the router's resolver
 
 Windows sends a lookup to every adapter's resolvers at once and takes the first answer (smart multi-homed

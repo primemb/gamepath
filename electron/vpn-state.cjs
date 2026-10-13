@@ -9,6 +9,8 @@
  * which `publicState()` strips with every other `encrypted*` field.
  */
 
+const { defaultDirect, normalizeDirect } = require('./vpn-direct-state.cjs')
+
 const RULE_KINDS = ['application', 'folder', 'hostname', 'ip']
 const NODE_KINDS = ['wireguard', 'openvpn', 'l2tp', 'socks5']
 
@@ -22,6 +24,8 @@ function defaultVpn() {
     remoteDns: true,
     killSwitch: false,
     rules: [],
+    /** Sites and addresses that keep the normal connection. */
+    direct: defaultDirect(),
     wantConnected: false,
   }
 }
@@ -75,6 +79,7 @@ function normalizeVpn(saved) {
       }
     }
   }
+  vpn.direct = normalizeDirect(saved.direct)
   vpn.wantConnected = saved.wantConnected === true && vpn.selectedNodeId !== null
   return vpn
 }

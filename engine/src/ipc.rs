@@ -4,6 +4,7 @@
 //! shape of the protocol is readable in one place rather than spread across
 //! the handlers that act on it.
 
+use gamepath_engine::direct_list::DirectSpec;
 use gamepath_engine::policy::RuleSpec;
 use gamepath_engine::relay_path::{NodeSpec, SessionMode};
 use gamepath_engine::scheduler::Strategy;
@@ -162,6 +163,19 @@ pub(crate) struct PacketCaptureRequest {
     /// machine's name lookups to the game and redirects only its own apps'.
     #[serde(default)]
     pub(crate) other_session_active: bool,
+    /// Destinations that keep the normal connection, see
+    /// [`gamepath_engine::direct_list`]. Only the VPN sends one.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub(crate) direct: DirectSpec,
+}
+
+/// A field sent as `null` means the same as one left out.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 const fn enabled() -> bool {
@@ -206,6 +220,26 @@ mod tests {
             request.foreign_bypass,
             [std::net::Ipv4Addr::new(198, 51, 100, 7)]
         );
+    }
+
+    /// The game's capture request carries no direct list, and a `null` one
+    /// must not fail a capture start either.
+    #[test]
+    fn a_missing_or_null_direct_list_is_empty() {
+        for request in [
+            json!({ "trafficMode": "split" }),
+            json!({ "trafficMode": "split", "direct": null }),
+        ] {
+            let request: PacketCaptureRequest = serde_json::from_value(request).unwrap();
+            assert_eq!(request.direct, DirectSpec::default());
+        }
+        let request: PacketCaptureRequest = serde_json::from_value(json!({
+            "trafficMode": "all",
+            "direct": { "networks": ["2.144.0.0/14"], "domains": ["*.ir"] },
+        }))
+        .unwrap();
+        assert_eq!(request.direct.networks, ["2.144.0.0/14"]);
+        assert_eq!(request.direct.domains, ["*.ir"]);
     }
 
     #[test]

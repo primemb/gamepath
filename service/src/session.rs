@@ -65,7 +65,7 @@ fn engine_bypass(paths: &Value) -> Vec<Ipv4Addr> {
 /// while it runs the VPN leaves the machine's name lookups to the game.
 fn capture_request(slot: &SessionSlot, rules: &Value, foreign: &SlotSummary) -> Value {
     let remote_dns = slot.remote_dns;
-    json!({
+    let mut request = json!({
         "trafficMode": slot.traffic_mode,
         "rules": rules,
         "remoteDns": remote_dns,
@@ -74,7 +74,35 @@ fn capture_request(slot: &SessionSlot, rules: &Value, foreign: &SlotSummary) -> 
         "foreignBypass": foreign.bypass,
         "otherSessionActive": foreign.is_active(),
         "otherSessionAppDns": foreign.app_dns_rules,
-    })
+    });
+    if !slot.direct.is_null() {
+        request["direct"] = slot.direct.clone();
+    }
+    request
+}
+
+/// The VPN's direct list from a request, bounded the way the engine bounds
+/// it so a malformed request cannot make every packet pay for a huge set.
+/// The game has none: whatever it leaves out of its tunnel is its own rules.
+fn direct_list(id: SlotId, payload: &Value) -> Value {
+    use gamepath_engine::direct_list::{MAX_DOMAINS, MAX_NETWORKS};
+    if id != SlotId::Vpn {
+        return Value::Null;
+    }
+    let bounded = |key: &str, limit: usize| {
+        payload["direct"][key]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|entry| !entry.is_empty() && entry.len() <= 253)
+                    .take(limit)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    json!({ "networks": bounded("networks", MAX_NETWORKS), "domains": bounded("domains", MAX_DOMAINS) })
 }
 
 /// The client's list of its own hostnames, bounded so a malformed request
@@ -180,6 +208,7 @@ fn start_slot(
     runtime.remote_dns = remote_dns;
     runtime.kill_switch = id == SlotId::Vpn && payload["killSwitch"].as_bool() == Some(true);
     runtime.own_hostnames = own_hostnames(payload);
+    runtime.direct = direct_list(id, payload);
     // Published before anything is opened: a game taking all traffic stops
     // the VPN now, before its own routes go in.
     registry.publish(id, summary_of(runtime, "starting", Vec::new()));
@@ -649,6 +678,49 @@ pub(crate) fn update_session_rules(
     Ok(capture)
 }
 
+/// Replaces the VPN's direct list without reconnecting it. Native L2TP
+/// routes through Windows RAS and has no engine capture to apply it to.
+pub(crate) fn update_session_direct(
+    payload: Value,
+    id: SlotId,
+    registry: &Arc<Registry>,
+) -> Result<Value, String> {
+    if id != SlotId::Vpn {
+        return Err("only the VPN has a direct list".into());
+    }
+    let direct = direct_list(id, &payload);
+    let mut runtime = registry.slot(id).lock().unwrap();
+    if !runtime.is_connected() {
+        return Err("live direct list updates require a connected VPN".into());
+    }
+    if runtime.native_l2tp_direct {
+        return Err("an L2TP/IPsec VPN is routed by Windows and has no direct list".into());
+    }
+    let previous = std::mem::replace(&mut runtime.direct, direct.clone());
+    let engine = runtime.engine.as_mut().ok_or("no active network session")?;
+    match engine.request("set-direct", json!({ "direct": direct })) {
+        Ok(capture) => {
+            runtime.renew_lease();
+            runtime.log(&format!(
+                "direct list updated without reconnecting: networks={} domains={}",
+                direct["networks"].as_array().map_or(0, Vec::len),
+                direct["domains"].as_array().map_or(0, Vec::len)
+            ));
+            Ok(capture)
+        }
+        Err(error) => {
+            let rollback = engine.request("set-direct", json!({ "direct": previous }));
+            runtime.direct = previous;
+            match rollback {
+                Ok(_) => Err(format!("could not apply the direct list: {error}")),
+                Err(rollback_error) => Err(format!(
+                    "could not apply the direct list: {error}; restoring the previous one also failed: {rollback_error}"
+                )),
+            }
+        }
+    }
+}
+
 /// Read the latest summary only after acquiring the destination slot. A
 /// notification can wait through a long dial and arrive after newer changes.
 pub(crate) fn reconcile_other_session(id: SlotId, registry: &Arc<Registry>) {
@@ -877,6 +949,34 @@ mod tests {
         let bypass = engine_bypass(&json!({ "bypassIps": ["198.51.100.7", "nope", 4, "::1"] }));
         assert_eq!(bypass, [Ipv4Addr::new(198, 51, 100, 7)]);
         assert!(engine_bypass(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn only_the_vpn_capture_carries_a_direct_list() {
+        let payload = json!({
+            "direct": { "networks": ["2.144.0.0/14", 7, ""], "domains": ["*.ir"] },
+        });
+        assert_eq!(direct_list(SlotId::Game, &payload), Value::Null);
+        let direct = direct_list(SlotId::Vpn, &payload);
+        assert_eq!(
+            direct,
+            json!({ "networks": ["2.144.0.0/14"], "domains": ["*.ir"] })
+        );
+        let foreign = SlotSummary::default();
+        let mut game = SessionSlot::new(SlotId::Game);
+        assert!(
+            capture_request(&game, &json!([]), &foreign)
+                .get("direct")
+                .is_none()
+        );
+        game.direct = direct.clone();
+        let mut vpn = SessionSlot::new(SlotId::Vpn);
+        vpn.direct = direct;
+        assert_eq!(
+            capture_request(&vpn, &json!([]), &foreign)["direct"]["domains"],
+            json!(["*.ir"])
+        );
+        assert_eq!(direct_list(SlotId::Vpn, &json!({}))["networks"], json!([]));
     }
 
     #[test]

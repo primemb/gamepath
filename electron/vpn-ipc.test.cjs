@@ -3,7 +3,31 @@ const test = require('node:test')
 const { createVpnFeature } = require('./vpn-ipc.cjs')
 const { defaultVpn } = require('./vpn-state.cjs')
 
-function harness({ service: script = {}, game = { status: 'idle' }, gameMode = 'split', saved = {} } = {}) {
+/** Lists as if already downloaded; `downloads` records what was fetched. */
+function listStore(lists = {}) {
+  const downloads = []
+  const present = new Set(Object.keys(lists))
+  return {
+    downloads,
+    describe: () => [],
+    has: (id) => present.has(id),
+    isStale: () => false,
+    entries: (id) => lists[id] ?? [],
+    download: async (id) => {
+      downloads.push(id)
+      present.add(id)
+      lists[id] ??= id === 'ir-ip' ? ['2.144.0.0/14'] : ['*.ir']
+    },
+  }
+}
+
+function harness({
+  service: script = {},
+  game = { status: 'idle' },
+  gameMode = 'split',
+  saved = {},
+  lists = listStore(),
+} = {}) {
   const handlers = new Map()
   const state = {
     session: game,
@@ -44,11 +68,12 @@ function harness({ service: script = {}, game = { status: 'idle' }, gameMode = '
     logger: { ...quiet, scope: () => quiet },
     usage: null,
     onChange: () => {},
+    directLists: lists,
   })
   feature.register()
   // Electron turns a handler that throws into a rejected invoke, so this does too.
   const invoke = async (channel, ...args) => handlers.get(channel)({}, ...args)
-  return { feature, state, calls, invoke, saves: () => saves }
+  return { feature, state, calls, invoke, lists, saves: () => saves }
 }
 
 const socks5 = { address: 'proxy.example:1080', label: 'Proxy' }
@@ -324,4 +349,53 @@ test('switching while paused keeps the VPN out of the games way and resumes the 
   await feature.gameChanged()
   assert.equal(calls.at(-1).payload.nodes[0].host, 'second.example')
   assert.ok(calls.every((call) => call.payload.slot === 'vpn'))
+})
+
+test('turning direct sites on downloads the Iran lists and sends them with the next start', async () => {
+  const { invoke, calls, lists } = harness()
+  await invoke('vpn:add-socks5', socks5)
+  await invoke('vpn:set-traffic-mode', 'all')
+  const result = await invoke('vpn:set-direct-enabled', true)
+  assert.deepEqual(lists.downloads, ['ir-ip', 'ir-sites'])
+  assert.deepEqual(result.vpn.direct.lists, ['ir-ip', 'ir-sites'])
+  await invoke('vpn:add-direct-entry', 'https://www.digikala.com/cart')
+  await invoke('vpn:connect')
+  const start = calls.find((call) => call.command === 'start-session').payload
+  assert.deepEqual(start.direct, { networks: ['2.144.0.0/14'], domains: ['*.ir', '*.digikala.com'] })
+})
+
+test('a direct list edit reaches the running VPN live, and a rejected one is not kept', async () => {
+  const script = {}
+  const { invoke, calls, state } = harness({ service: script })
+  await invoke('vpn:add-socks5', socks5)
+  await invoke('vpn:set-traffic-mode', 'all')
+  await invoke('vpn:connect')
+  await invoke('vpn:set-direct-enabled', true)
+  const live = calls.filter((call) => call.command === 'update-session-direct')
+  assert.equal(live.length, 1)
+  assert.equal(live[0].payload.slot, 'vpn')
+  assert.deepEqual(live[0].payload.direct.networks, ['2.144.0.0/14'])
+  // Never by reconnecting.
+  assert.equal(calls.filter((call) => call.command === 'start-session').length, 1)
+  script['update-session-direct'] = new Error('engine refused')
+  await assert.rejects(invoke('vpn:add-direct-entry', 'aparat.com'), /engine refused/)
+  assert.deepEqual(state.vpn.direct.entries, [])
+  await assert.rejects(invoke('vpn:add-direct-entry', 'not a site'), /Enter a website/)
+})
+
+test('the same direct site cannot be added twice', async () => {
+  const { invoke } = harness()
+  await invoke('vpn:add-socks5', socks5)
+  await invoke('vpn:add-direct-entry', 'digikala.com')
+  await assert.rejects(invoke('vpn:add-direct-entry', 'https://digikala.com/'), /already on the direct list/)
+})
+
+test('an L2TP VPN is told it cannot leave sites out, and sends no direct list', async () => {
+  const { invoke, calls } = harness()
+  await invoke('vpn:add-l2tp', l2tp)
+  await invoke('vpn:set-traffic-mode', 'all')
+  const result = await invoke('vpn:set-direct-enabled', true)
+  assert.match(result.vpn.direct.limitation, /routed by Windows/)
+  await invoke('vpn:connect')
+  assert.equal(calls.find((call) => call.command === 'start-session').payload.direct, null)
 })
