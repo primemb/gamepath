@@ -54,10 +54,13 @@ const OUTER_IPV4_UDP: u16 = 20 + 8;
 /// WireGuard's transport-data message: 16-byte header plus the Poly1305 tag.
 const WIREGUARD_DATA: u16 = 16 + 16;
 
-/// OpenVPN worst case: opcode/key-id and peer-id, a 16-byte cipher IV, the
-/// 8-byte packet id, a 32-byte SHA-256 auth tag, and the 2-byte record length
-/// that stream mode puts in front of every packet.
-const OPENVPN_DATA: u16 = 4 + 16 + 8 + 32 + 2;
+/// OpenVPN's AES-CBC with HMAC-SHA1, the costliest data channel providers
+/// ship: opcode/peer-id, the HMAC, a 16-byte IV, the 4-byte packet id and up
+/// to 16 bytes of padding, plus the 2-byte record length stream mode adds.
+/// AEAD costs 26. A wider `auth` digest over UDP exceeds this by its extra
+/// bytes; raising the budget for that rare case would cut the relay MTU for
+/// everyone, because OpenVPN would overtake L2TP as the dearest transport.
+const OPENVPN_DATA: u16 = 4 + 20 + 16 + 4 + 16 + 2;
 
 /// IPv4 plus a TCP header carrying the options a long-lived stream negotiates,
 /// timestamps above all.

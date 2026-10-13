@@ -5,7 +5,7 @@
 //! data-channel keys are derived from, then a push of the tunnel's settings.
 //! Only after all four does a packet get to move.
 
-use super::config::{DataCipher, OpenVpnConfig, Protocol, Remote};
+use super::config::{DataCipher, Digest, OpenVpnConfig, Protocol, Remote};
 use super::control::{ControlChannel, Received, is_data, opcode_of};
 use super::crypto::{DataChannel, KeyMaterial, KeySource};
 use super::link::{Link, Urgency};
@@ -60,6 +60,8 @@ pub struct Pushed {
     /// The far end of the tunnel, used when a route needs a gateway.
     pub gateway: Option<Ipv4Addr>,
     pub cipher: DataCipher,
+    /// The data-channel HMAC, which only a CBC cipher uses.
+    pub digest: Digest,
     pub peer_id: Option<u32>,
     /// How often the server expects to hear from us when nothing is flowing.
     pub keepalive: Option<Duration>,
@@ -99,6 +101,10 @@ pub struct Session {
     control_messages: Vec<u8>,
     /// Whether the server's half of the random material has been read.
     server_material: bool,
+    /// The `cipher` and `auth` the server's options string names: what a
+    /// server that pushes no `cipher` actually runs.
+    server_cipher: Option<String>,
+    server_digest: Option<String>,
     last_push_request: Option<Instant>,
     last_inbound: Instant,
     last_keepalive: Instant,
@@ -141,6 +147,8 @@ impl Session {
             pushed: None,
             control_messages: Vec::new(),
             server_material: false,
+            server_cipher: None,
+            server_digest: None,
             last_push_request: None,
             last_inbound: now,
             last_keepalive: now,
@@ -488,6 +496,10 @@ impl Session {
             let mut server_random2 = [0_u8; 32];
             server_random1.copy_from_slice(&self.control_messages[5..37]);
             server_random2.copy_from_slice(&self.control_messages[37..69]);
+            let server_options =
+                String::from_utf8_lossy(&self.control_messages[FIXED..FIXED + options_len]);
+            self.server_cipher = options_value(&server_options, "cipher");
+            self.server_digest = options_value(&server_options, "auth");
             let client_sid = self.control.session_id();
             let server_sid = self
                 .control
@@ -555,6 +567,7 @@ impl Session {
         self.channels.push(DataChannel::new(
             material,
             pushed.cipher,
+            pushed.digest,
             pushed.peer_id,
             key_id,
         )?);
@@ -570,7 +583,7 @@ impl Session {
     fn read_push(&self, options: &str) -> Result<Pushed, String> {
         let mut address = None;
         let mut gateway = None;
-        let mut cipher = self.config.first_cipher();
+        let mut cipher = None;
         let mut peer_id = None;
         let mut ping = None;
         for option in options.split(',') {
@@ -581,14 +594,7 @@ impl Session {
                     gateway = words.next().and_then(|value| value.parse().ok());
                 }
                 Some("cipher") => {
-                    let name = words.next().unwrap_or_default();
-                    cipher = DataCipher::parse(name).ok_or_else(|| {
-                        format!(
-                            "the OpenVPN server chose the `{name}` cipher, which GamePath does not \
-                             implement. Ask the provider for a configuration using AES-256-GCM, \
-                             AES-128-GCM or CHACHA20-POLY1305."
-                        )
-                    })?;
+                    cipher = Some(implemented_cipher(words.next().unwrap_or_default())?);
                 }
                 Some("peer-id") => peer_id = words.next().and_then(|value| value.parse().ok()),
                 Some("ping") => {
@@ -600,6 +606,19 @@ impl Session {
                 _ => {}
             }
         }
+        // A server that does not negotiate pushes no `cipher` and runs the one
+        // its own options string names, so that is the one to use; the file's
+        // own choice is the last resort for a server that names neither.
+        let cipher = match (cipher, self.server_cipher.as_deref()) {
+            (Some(pushed), _) => pushed,
+            (None, Some(name)) => implemented_cipher(name)?,
+            (None, None) => self.config.fallback_cipher,
+        };
+        let digest = self
+            .server_digest
+            .as_deref()
+            .and_then(Digest::parse)
+            .unwrap_or(self.config.digest);
         Ok(Pushed {
             address: address.ok_or(
                 "the OpenVPN server did not push a tunnel address, so there is nothing for inner \
@@ -607,6 +626,7 @@ impl Session {
             )?,
             gateway,
             cipher,
+            digest,
             peer_id,
             keepalive: ping,
         })
@@ -666,6 +686,26 @@ fn write_string(buffer: &mut Vec<u8>, value: Option<&str>) {
         }
         _ => buffer.extend_from_slice(&0_u16.to_be_bytes()),
     }
+}
+
+fn implemented_cipher(name: &str) -> Result<DataCipher, String> {
+    DataCipher::parse(name).ok_or_else(|| {
+        format!(
+            "the OpenVPN server uses the `{name}` cipher, which GamePath does not implement. Ask \
+             the provider for a configuration using AES-GCM, CHACHA20-POLY1305 or AES-CBC."
+        )
+    })
+}
+
+/// The argument of one `name value` entry in an options string.
+fn options_value(options: &str, name: &str) -> Option<String> {
+    options
+        .trim_end_matches('\0')
+        .split(',')
+        .find_map(|option| {
+            let (key, value) = option.split_once(' ')?;
+            (key == name).then(|| value.trim().to_owned())
+        })
 }
 
 /// Turns a server's refusal into something a user can act on.
@@ -767,5 +807,27 @@ mod tests {
     fn another_refusal_is_passed_through_so_nothing_is_hidden() {
         let message = describe_refusal("RESTART,connection reset");
         assert!(message.contains("RESTART,connection reset"), "{message}");
+    }
+
+    /// What a MikroTik server sends: it pushes no `cipher`, so these two
+    /// entries are the only statement of what its data channel runs.
+    #[test]
+    fn a_servers_own_cipher_and_digest_are_read_from_its_options_string() {
+        let options = "V4,dev-type tun,link-mtu 1559,tun-mtu 1500,proto TCPv4_SERVER,\
+                       cipher AES-256-CBC,auth SHA1,keysize 256,key-method 2,tls-server\0";
+        assert_eq!(
+            options_value(options, "cipher").as_deref(),
+            Some("AES-256-CBC")
+        );
+        assert_eq!(options_value(options, "auth").as_deref(), Some("SHA1"));
+        assert_eq!(options_value(options, "keysize").as_deref(), Some("256"));
+        assert_eq!(options_value(options, "comp-lzo"), None);
+    }
+
+    #[test]
+    fn a_cipher_the_data_channel_lacks_is_named_in_the_error() {
+        let error = implemented_cipher("BF-CBC").unwrap_err();
+        assert!(error.contains("BF-CBC"), "{error}");
+        assert_eq!(implemented_cipher("aes-256-cbc"), Ok(DataCipher::Aes256Cbc));
     }
 }

@@ -99,6 +99,7 @@ impl KeyDirection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Digest {
+    Md5,
     Sha1,
     Sha256,
     Sha512,
@@ -107,14 +108,16 @@ pub enum Digest {
 impl Digest {
     pub fn output_len(self) -> usize {
         match self {
+            Self::Md5 => 16,
             Self::Sha1 => 20,
             Self::Sha256 => 32,
             Self::Sha512 => 64,
         }
     }
 
-    fn parse(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_uppercase().replace('-', "").as_str() {
+            "MD5" => Some(Self::Md5),
             "SHA1" => Some(Self::Sha1),
             "SHA256" => Some(Self::Sha256),
             "SHA512" => Some(Self::Sha512),
@@ -124,6 +127,7 @@ impl Digest {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Md5 => "MD5",
             Self::Sha1 => "SHA1",
             Self::Sha256 => "SHA256",
             Self::Sha512 => "SHA512",
@@ -133,14 +137,18 @@ impl Digest {
 
 /// The data-channel ciphers this client implements.
 ///
-/// All three are AEAD. OpenVPN's older CBC-plus-HMAC construction is
-/// deliberately absent: it is deprecated upstream, no current provider needs
-/// it, and supporting it would double the size of the data channel for nothing.
+/// AEAD is what any negotiating server picks. AES-CBC with an HMAC is kept for
+/// servers that cannot negotiate -- MikroTik RouterOS above all -- which run
+/// exactly the `cipher`/`auth` pair in the file and hang up on a client whose
+/// options string names anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataCipher {
     Aes256Gcm,
     Aes128Gcm,
     ChaCha20Poly1305,
+    Aes256Cbc,
+    Aes192Cbc,
+    Aes128Cbc,
 }
 
 impl DataCipher {
@@ -149,14 +157,26 @@ impl DataCipher {
             Self::Aes256Gcm => "AES-256-GCM",
             Self::Aes128Gcm => "AES-128-GCM",
             Self::ChaCha20Poly1305 => "CHACHA20-POLY1305",
+            Self::Aes256Cbc => "AES-256-CBC",
+            Self::Aes192Cbc => "AES-192-CBC",
+            Self::Aes128Cbc => "AES-128-CBC",
         }
     }
 
     pub fn key_len(self) -> usize {
         match self {
-            Self::Aes256Gcm | Self::ChaCha20Poly1305 => 32,
-            Self::Aes128Gcm => 16,
+            Self::Aes256Gcm | Self::ChaCha20Poly1305 | Self::Aes256Cbc => 32,
+            Self::Aes192Cbc => 24,
+            Self::Aes128Gcm | Self::Aes128Cbc => 16,
         }
+    }
+
+    /// Whether the cipher authenticates by itself. The others need `--auth`.
+    pub fn is_aead(self) -> bool {
+        matches!(
+            self,
+            Self::Aes256Gcm | Self::Aes128Gcm | Self::ChaCha20Poly1305
+        )
     }
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -164,10 +184,16 @@ impl DataCipher {
             "AES-256-GCM" => Some(Self::Aes256Gcm),
             "AES-128-GCM" => Some(Self::Aes128Gcm),
             "CHACHA20-POLY1305" | "CHACHA20POLY1305" => Some(Self::ChaCha20Poly1305),
+            "AES-256-CBC" => Some(Self::Aes256Cbc),
+            "AES-192-CBC" => Some(Self::Aes192Cbc),
+            "AES-128-CBC" => Some(Self::Aes128Cbc),
             _ => None,
         }
     }
 }
+
+const SUPPORTED_CIPHERS: &str =
+    "AES-256-GCM, AES-128-GCM, CHACHA20-POLY1305 and AES-128/192/256-CBC";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -224,7 +250,11 @@ pub struct OpenVpnConfig {
     pub control_auth: ControlAuth,
     /// The ciphers to offer, most preferred first.
     pub data_ciphers: Vec<DataCipher>,
-    /// `--auth`, which sizes the `--tls-auth` HMAC.
+    /// What a server that does not negotiate runs: `--cipher`, else the first
+    /// of `data_ciphers`. It is also the cipher the options string names.
+    pub fallback_cipher: DataCipher,
+    /// `--auth`, which sizes the `--tls-auth` HMAC and authenticates a CBC
+    /// data channel.
     pub digest: Digest,
     /// True when the server expects a username and password.
     pub wants_credentials: bool,
@@ -249,6 +279,7 @@ impl std::fmt::Debug for OpenVpnConfig {
             )
             .field("control_auth", &self.control_auth)
             .field("data_ciphers", &self.data_ciphers)
+            .field("fallback_cipher", &self.fallback_cipher)
             .field("digest", &self.digest)
             .field("wants_credentials", &self.wants_credentials)
             .field("server_name", &self.server_name)
@@ -265,9 +296,10 @@ impl OpenVpnConfig {
 
     /// The options string the two ends exchange after the TLS handshake. It has
     /// to describe the same session the server thinks it is building, or a
-    /// server running `--opt-verify` hangs up.
+    /// server running `--opt-verify` -- or MikroTik, which always checks the
+    /// cipher and digest -- hangs up.
     pub fn options_string(&self, protocol: Protocol) -> String {
-        let cipher = self.first_cipher();
+        let cipher = self.fallback_cipher;
         let mut options = String::from("V4,dev-type tun,link-mtu 1549");
         let _ = write!(options, ",tun-mtu {}", self.tun_mtu);
         let _ = write!(options, ",proto {}", protocol.options_name());
@@ -276,13 +308,6 @@ impl OpenVpnConfig {
         let _ = write!(options, ",keysize {}", cipher.key_len() * 8);
         options.push_str(",key-method 2,tls-client");
         options
-    }
-
-    pub fn first_cipher(&self) -> DataCipher {
-        self.data_ciphers
-            .first()
-            .copied()
-            .unwrap_or(DataCipher::Aes256Gcm)
     }
 
     /// The `IV_` block that tells a modern server what this client supports.
@@ -451,7 +476,7 @@ impl Parser {
                 if ciphers.is_empty() {
                     return Err(format!(
                         "none of the ciphers in `data-ciphers {list}` are implemented by GamePath, \
-                         which supports AES-256-GCM, AES-128-GCM and CHACHA20-POLY1305"
+                         which supports {SUPPORTED_CIPHERS}"
                     ));
                 }
                 self.ciphers = Some(ciphers);
@@ -633,7 +658,8 @@ impl Parser {
         };
         // `--data-ciphers` is the negotiated list. When a file carries only the
         // older `--cipher`, that one is offered first and the rest are still
-        // advertised so a current server can choose better.
+        // advertised so a current server can choose better: it picks by its
+        // own preference, so offering CBC first does not downgrade it.
         let data_ciphers = match (self.ciphers, self.legacy_cipher) {
             (Some(list), _) => list,
             (None, Some(cipher)) => {
@@ -648,6 +674,10 @@ impl Parser {
             }
             (None, None) => DEFAULT_CIPHERS.to_vec(),
         };
+        let fallback_cipher = self
+            .legacy_cipher
+            .or_else(|| data_ciphers.first().copied())
+            .unwrap_or(DataCipher::Aes256Gcm);
         let default_protocol = self.protocol.unwrap_or(Protocol::Udp);
         let remotes = self
             .remotes
@@ -668,6 +698,7 @@ impl Parser {
             client_key: self.client_key,
             control_auth,
             data_ciphers,
+            fallback_cipher,
             digest,
             wants_credentials: self.wants_credentials,
             server_name: self.server_name,

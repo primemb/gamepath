@@ -7,8 +7,9 @@
 //! doubt one of these offsets does not have to re-derive it.
 
 use super::config::{DataCipher, Digest, KeyDirection, StaticKey};
-use aes::Aes256;
-use aes::cipher::{KeyIvInit as _, StreamCipher as _};
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyIvInit as _, StreamCipher as _};
+use aes::{Aes128, Aes192, Aes256};
 use aes_gcm::aead::{AeadInPlace as _, KeyInit as _};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -162,6 +163,10 @@ impl KeyMaterial {
         &self.0[index * 128..index * 128 + length]
     }
 
+    fn hmac_key(&self, index: usize, length: usize) -> &[u8] {
+        &self.0[index * 128 + 64..index * 128 + 64 + length]
+    }
+
     /// The implicit half of an AEAD nonce.
     ///
     /// It is the front of the key's HMAC material, not of its cipher material,
@@ -195,6 +200,9 @@ impl Sealer {
             DataCipher::ChaCha20Poly1305 => Self::ChaCha20(Box::new(
                 ChaCha20Poly1305::new_from_slice(key).map_err(wrong)?,
             )),
+            DataCipher::Aes256Cbc | DataCipher::Aes192Cbc | DataCipher::Aes128Cbc => {
+                return Err(format!("{} is not an AEAD cipher", cipher.as_str()));
+            }
         })
     }
 
@@ -224,6 +232,177 @@ impl Sealer {
             Self::ChaCha20(cipher) => cipher.decrypt_in_place_detached(nonce, aad, buffer, tag),
         }
         .map_err(|_| "an OpenVPN data packet did not authenticate".to_owned())
+    }
+}
+
+const CBC_BLOCK: usize = 16;
+
+/// The AES block cipher under OpenVPN's CBC data channel.
+///
+/// The chaining is done here rather than through a `cbc` crate: it is a dozen
+/// lines over the `aes` crate the engine already carries, which keeps the
+/// dependency tree unchanged.
+enum CbcCipher {
+    Aes128(Box<Aes128>),
+    Aes192(Box<Aes192>),
+    Aes256(Box<Aes256>),
+}
+
+impl CbcCipher {
+    fn new(cipher: DataCipher, key: &[u8]) -> Result<Self, String> {
+        let wrong = |_| "the derived data-channel key is the wrong length".to_owned();
+        Ok(match cipher {
+            DataCipher::Aes128Cbc => {
+                Self::Aes128(Box::new(Aes128::new_from_slice(key).map_err(wrong)?))
+            }
+            DataCipher::Aes192Cbc => {
+                Self::Aes192(Box::new(Aes192::new_from_slice(key).map_err(wrong)?))
+            }
+            DataCipher::Aes256Cbc => {
+                Self::Aes256(Box::new(Aes256::new_from_slice(key).map_err(wrong)?))
+            }
+            other => return Err(format!("{} is not a CBC cipher", other.as_str())),
+        })
+    }
+
+    /// Encrypts whole blocks in place.
+    fn encrypt(&self, iv: &[u8; CBC_BLOCK], buffer: &mut [u8]) {
+        match self {
+            Self::Aes128(cipher) => cbc_encrypt(cipher.as_ref(), iv, buffer),
+            Self::Aes192(cipher) => cbc_encrypt(cipher.as_ref(), iv, buffer),
+            Self::Aes256(cipher) => cbc_encrypt(cipher.as_ref(), iv, buffer),
+        }
+    }
+
+    /// Decrypts whole blocks in place.
+    fn decrypt(&self, iv: &[u8; CBC_BLOCK], buffer: &mut [u8]) {
+        match self {
+            Self::Aes128(cipher) => cbc_decrypt(cipher.as_ref(), iv, buffer),
+            Self::Aes192(cipher) => cbc_decrypt(cipher.as_ref(), iv, buffer),
+            Self::Aes256(cipher) => cbc_decrypt(cipher.as_ref(), iv, buffer),
+        }
+    }
+}
+
+fn cbc_encrypt<C: BlockEncrypt>(cipher: &C, iv: &[u8; CBC_BLOCK], buffer: &mut [u8]) {
+    let mut previous = *iv;
+    for block in buffer.chunks_exact_mut(CBC_BLOCK) {
+        block
+            .iter_mut()
+            .zip(previous)
+            .for_each(|(byte, chain)| *byte ^= chain);
+        cipher.encrypt_block(GenericArray::from_mut_slice(block));
+        previous.copy_from_slice(block);
+    }
+}
+
+fn cbc_decrypt<C: BlockDecrypt>(cipher: &C, iv: &[u8; CBC_BLOCK], buffer: &mut [u8]) {
+    let mut previous = *iv;
+    for block in buffer.chunks_exact_mut(CBC_BLOCK) {
+        let mut ciphertext = [0_u8; CBC_BLOCK];
+        ciphertext.copy_from_slice(block);
+        cipher.decrypt_block(GenericArray::from_mut_slice(block));
+        block
+            .iter_mut()
+            .zip(previous)
+            .for_each(|(byte, chain)| *byte ^= chain);
+        previous = ciphertext;
+    }
+}
+
+/// A pre-keyed `--auth` HMAC, cloned per packet so the key schedule is paid
+/// once per key generation rather than once per packet.
+enum PacketMac {
+    Md5(Hmac<Md5>),
+    Sha1(Hmac<Sha1>),
+    Sha256(Hmac<Sha256>),
+    Sha512(Hmac<Sha512>),
+}
+
+macro_rules! with_mac {
+    ($mac:expr, $keyed:ident => $body:expr) => {
+        match $mac {
+            PacketMac::Md5($keyed) => $body,
+            PacketMac::Sha1($keyed) => $body,
+            PacketMac::Sha256($keyed) => $body,
+            PacketMac::Sha512($keyed) => $body,
+        }
+    };
+}
+
+impl PacketMac {
+    fn new(digest: Digest, key: &[u8]) -> Self {
+        const ANY_LENGTH: &str = "HMAC accepts a key of any length";
+        match digest {
+            Digest::Md5 => Self::Md5(Mac::new_from_slice(key).expect(ANY_LENGTH)),
+            Digest::Sha1 => Self::Sha1(Mac::new_from_slice(key).expect(ANY_LENGTH)),
+            Digest::Sha256 => Self::Sha256(Mac::new_from_slice(key).expect(ANY_LENGTH)),
+            Digest::Sha512 => Self::Sha512(Mac::new_from_slice(key).expect(ANY_LENGTH)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Md5(_) => Digest::Md5,
+            Self::Sha1(_) => Digest::Sha1,
+            Self::Sha256(_) => Digest::Sha256,
+            Self::Sha512(_) => Digest::Sha512,
+        }
+        .output_len()
+    }
+
+    fn sign(&self, parts: &[&[u8]]) -> Vec<u8> {
+        with_mac!(self, keyed => {
+            let mut mac = keyed.clone();
+            parts.iter().for_each(|part| mac.update(part));
+            mac.finalize().into_bytes().to_vec()
+        })
+    }
+
+    /// Constant-time comparison, through `Mac::verify_slice`.
+    fn verify(&self, parts: &[&[u8]], tag: &[u8]) -> bool {
+        with_mac!(self, keyed => {
+            let mut mac = keyed.clone();
+            parts.iter().for_each(|part| mac.update(part));
+            mac.verify_slice(tag).is_ok()
+        })
+    }
+}
+
+/// How one direction of one key generation protects its packets.
+enum Protection {
+    /// The packet id travels in the clear and, with the opcode header, is the
+    /// associated data; the nonce is the packet id and an implicit IV.
+    Aead {
+        sealer: Sealer,
+        implicit_iv: [u8; 8],
+    },
+    /// `HMAC(IV || ciphertext) || IV || ciphertext`, where the ciphertext
+    /// covers the packet id and the payload, PKCS#7 padded. Unlike AEAD the
+    /// opcode and peer id in front are not authenticated -- the reference
+    /// implementation does not cover them either.
+    Cbc { cipher: CbcCipher, mac: PacketMac },
+}
+
+impl Protection {
+    fn new(
+        material: &KeyMaterial,
+        index: usize,
+        cipher: DataCipher,
+        digest: Digest,
+    ) -> Result<Self, String> {
+        let key = material.cipher_key(index, cipher.key_len());
+        Ok(if cipher.is_aead() {
+            Self::Aead {
+                sealer: Sealer::new(cipher, key)?,
+                implicit_iv: material.implicit_iv(index),
+            }
+        } else {
+            Self::Cbc {
+                cipher: CbcCipher::new(cipher, key)?,
+                mac: PacketMac::new(digest, material.hmac_key(index, digest.output_len())),
+            }
+        })
     }
 }
 
@@ -270,10 +449,8 @@ impl ReplayWindow {
 
 /// The established data channel: keys, packet ids and replay state.
 pub struct DataChannel {
-    seal: Sealer,
-    open: Sealer,
-    seal_iv: [u8; 8],
-    open_iv: [u8; 8],
+    seal: Protection,
+    open: Protection,
     peer_id: Option<u32>,
     key_id: u8,
     next_packet_id: u32,
@@ -290,19 +467,21 @@ impl DataChannel {
     /// opposite of what the direction handling in OpenVPN's own source suggests
     /// for a client, and it was established by trying every combination against
     /// real inbound packets; only this one authenticates.
+    ///
+    /// `digest` only matters to a CBC cipher, whose HMAC key comes from the
+    /// same half of the material that gives an AEAD cipher its implicit IV.
     pub fn new(
         material: &KeyMaterial,
         cipher: DataCipher,
+        digest: Digest,
         peer_id: Option<u32>,
         key_id: u8,
     ) -> Result<Self, String> {
         const SEND: usize = 0;
         const RECEIVE: usize = 1;
         Ok(Self {
-            seal: Sealer::new(cipher, material.cipher_key(SEND, cipher.key_len()))?,
-            open: Sealer::new(cipher, material.cipher_key(RECEIVE, cipher.key_len()))?,
-            seal_iv: material.implicit_iv(SEND),
-            open_iv: material.implicit_iv(RECEIVE),
+            seal: Protection::new(material, SEND, cipher, digest)?,
+            open: Protection::new(material, RECEIVE, cipher, digest)?,
             peer_id,
             key_id,
             // Packet id 0 is never sent: the replay window treats it as invalid
@@ -321,33 +500,51 @@ impl DataChannel {
 
     /// Wraps one inner IP packet for the wire.
     ///
-    /// The layout is header, packet id, authentication tag, ciphertext -- the
-    /// tag comes before the ciphertext it covers, which is the detail most
-    /// easily got backwards.
+    /// The AEAD layout is header, packet id, authentication tag, ciphertext --
+    /// the tag comes before the ciphertext it covers, which is the detail most
+    /// easily got backwards. CBC is described on [`Protection::Cbc`].
     pub fn seal(&mut self, packet: &[u8]) -> Result<Vec<u8>, String> {
         let packet_id = self.next_packet_id;
         self.next_packet_id = self.next_packet_id.checked_add(1).ok_or(
             "this OpenVPN session has sent as many packets as its keys allow and has to be \
              renegotiated",
         )?;
-        let mut header = Vec::with_capacity(8);
+        let mut framed = Vec::with_capacity(packet.len() + 96);
         match self.peer_id {
             Some(peer_id) => {
                 let word =
                     (u32::from((P_DATA_V2 << 3) | self.key_id) << 24) | (peer_id & 0xff_ffff);
-                header.extend_from_slice(&word.to_be_bytes());
+                framed.extend_from_slice(&word.to_be_bytes());
             }
-            None => header.push((P_DATA_V1 << 3) | self.key_id),
+            None => framed.push((P_DATA_V1 << 3) | self.key_id),
         }
-        header.extend_from_slice(&packet_id.to_be_bytes());
-        let mut body = packet.to_vec();
-        let tag = self
-            .seal
-            .seal(&Self::nonce(&self.seal_iv, packet_id), &header, &mut body)?;
-        let mut framed = Vec::with_capacity(header.len() + TAG_LEN + body.len());
-        framed.extend_from_slice(&header);
-        framed.extend_from_slice(&tag);
-        framed.extend_from_slice(&body);
+        match &self.seal {
+            Protection::Aead {
+                sealer,
+                implicit_iv,
+            } => {
+                framed.extend_from_slice(&packet_id.to_be_bytes());
+                let mut body = packet.to_vec();
+                let tag = sealer.seal(&Self::nonce(implicit_iv, packet_id), &framed, &mut body)?;
+                framed.extend_from_slice(&tag);
+                framed.extend_from_slice(&body);
+            }
+            Protection::Cbc { cipher, mac } => {
+                use rand::Rng as _;
+                let mut iv = [0_u8; CBC_BLOCK];
+                rand::rng().fill(&mut iv);
+                let plain_len = 4 + packet.len();
+                let padding = CBC_BLOCK - plain_len % CBC_BLOCK;
+                let mut body = Vec::with_capacity(plain_len + padding);
+                body.extend_from_slice(&packet_id.to_be_bytes());
+                body.extend_from_slice(packet);
+                body.resize(plain_len + padding, padding as u8);
+                cipher.encrypt(&iv, &mut body);
+                framed.extend_from_slice(&mac.sign(&[&iv, &body]));
+                framed.extend_from_slice(&iv);
+                framed.extend_from_slice(&body);
+            }
+        }
         Ok(framed)
     }
 
@@ -357,28 +554,58 @@ impl DataChannel {
     /// packet that fails its replay check.
     pub fn open(&mut self, packet: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let opcode = packet.first().ok_or("an OpenVPN data packet was empty")? >> 3;
-        let header_len = match opcode {
-            P_DATA_V2 => 8,
-            P_DATA_V1 => 5,
+        let opcode_len = match opcode {
+            P_DATA_V2 => 4,
+            P_DATA_V1 => 1,
             other => return Err(format!("opcode {other} is not an OpenVPN data packet")),
         };
-        if packet.len() < header_len + TAG_LEN {
-            return Err("an OpenVPN data packet was truncated".into());
-        }
-        let packet_id = u32::from_be_bytes(
-            packet[header_len - 4..header_len]
-                .try_into()
-                .expect("four bytes"),
-        );
-        let (header, rest) = packet.split_at(header_len);
-        let (tag, ciphertext) = rest.split_at(TAG_LEN);
-        let mut body = ciphertext.to_vec();
-        self.open.open(
-            &Self::nonce(&self.open_iv, packet_id),
-            header,
-            tag,
-            &mut body,
-        )?;
+        const TRUNCATED: &str = "an OpenVPN data packet was truncated";
+        let (packet_id, body) = match &self.open {
+            Protection::Aead {
+                sealer,
+                implicit_iv,
+            } => {
+                let header_len = opcode_len + 4;
+                if packet.len() < header_len + TAG_LEN {
+                    return Err(TRUNCATED.into());
+                }
+                let packet_id = read_u32(&packet[opcode_len..header_len]);
+                let (header, rest) = packet.split_at(header_len);
+                let (tag, ciphertext) = rest.split_at(TAG_LEN);
+                let mut body = ciphertext.to_vec();
+                sealer.open(&Self::nonce(implicit_iv, packet_id), header, tag, &mut body)?;
+                (packet_id, body)
+            }
+            Protection::Cbc { cipher, mac } => {
+                let rest = &packet[opcode_len..];
+                let tag_len = mac.len();
+                let ciphertext_len = rest.len().saturating_sub(tag_len + CBC_BLOCK);
+                if ciphertext_len < CBC_BLOCK || ciphertext_len % CBC_BLOCK != 0 {
+                    return Err(TRUNCATED.into());
+                }
+                let (tag, rest) = rest.split_at(tag_len);
+                let (iv, ciphertext) = rest.split_at(CBC_BLOCK);
+                if !mac.verify(&[iv, ciphertext], tag) {
+                    return Err("an OpenVPN data packet did not authenticate".into());
+                }
+                let mut body = ciphertext.to_vec();
+                cipher.decrypt(iv.try_into().expect("one block"), &mut body);
+                let padding = usize::from(*body.last().expect("at least one block"));
+                if padding == 0
+                    || padding > CBC_BLOCK
+                    || body.len() < 4 + padding
+                    || body[body.len() - padding..]
+                        .iter()
+                        .any(|byte| usize::from(*byte) != padding)
+                {
+                    return Err("an OpenVPN data packet had invalid padding".into());
+                }
+                body.truncate(body.len() - padding);
+                let packet_id = read_u32(&body[..4]);
+                body.drain(..4);
+                (packet_id, body)
+            }
+        };
         // The replay check runs after authentication so that an unauthenticated
         // packet cannot advance the window and squeeze out real traffic.
         if !self.replay.accept(packet_id) {
@@ -401,9 +628,14 @@ impl DataChannel {
     }
 }
 
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes(bytes[..4].try_into().expect("four bytes"))
+}
+
 /// The HMAC used by `--tls-auth`, and by `tls-crypt` at a fixed SHA-256.
 pub fn hmac(digest: Digest, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     let mac: Keyed = match digest {
+        Digest::Md5 => hmac_md5,
         Digest::Sha1 => hmac_sha1,
         Digest::Sha256 => hmac_sha256,
         Digest::Sha512 => hmac_sha512,
@@ -514,9 +746,8 @@ mod tests {
     /// key and opening with the receive key only round trips if the mapping is
     /// swapped -- which is what a peer would do.
     fn peer_of(material: &KeyMaterial, cipher: DataCipher, peer_id: Option<u32>) -> DataChannel {
-        let mut channel = DataChannel::new(material, cipher, peer_id, 0).unwrap();
+        let mut channel = DataChannel::new(material, cipher, Digest::Sha1, peer_id, 0).unwrap();
         std::mem::swap(&mut channel.seal, &mut channel.open);
-        std::mem::swap(&mut channel.seal_iv, &mut channel.open_iv);
         channel
     }
 
@@ -538,7 +769,8 @@ mod tests {
                 &[4; 8],
                 &[3; 8],
             );
-            let mut client = DataChannel::new(&material, cipher, Some(42), 0).unwrap();
+            let mut client =
+                DataChannel::new(&material, cipher, Digest::Sha1, Some(42), 0).unwrap();
             let mut server = peer_of(&material, cipher, Some(42));
             let sealed = client.seal(b"an inner packet").unwrap();
             assert_eq!(sealed[0] >> 3, P_DATA_V2);
@@ -562,7 +794,8 @@ mod tests {
             &[4; 8],
             &[3; 8],
         );
-        let mut client = DataChannel::new(&material, DataCipher::Aes256Gcm, None, 0).unwrap();
+        let mut client =
+            DataChannel::new(&material, DataCipher::Aes256Gcm, Digest::Sha1, None, 0).unwrap();
         let mut server = peer_of(&material, DataCipher::Aes256Gcm, None);
         let sealed = client.seal(b"payload").unwrap();
         assert_eq!(sealed[0] >> 3, P_DATA_V1);
@@ -582,7 +815,8 @@ mod tests {
             &[1; 8],
             &[2; 8],
         );
-        let mut client = DataChannel::new(&material, DataCipher::Aes256Gcm, Some(1), 0).unwrap();
+        let mut client =
+            DataChannel::new(&material, DataCipher::Aes256Gcm, Digest::Sha1, Some(1), 0).unwrap();
         let mut server = peer_of(&material, DataCipher::Aes256Gcm, Some(1));
         let sealed = client.keepalive().unwrap();
         assert_eq!(server.open(&sealed).unwrap(), None);
@@ -601,12 +835,92 @@ mod tests {
             &[1; 8],
             &[2; 8],
         );
-        let mut client = DataChannel::new(&material, DataCipher::Aes256Gcm, Some(7), 0).unwrap();
+        let mut client =
+            DataChannel::new(&material, DataCipher::Aes256Gcm, Digest::Sha1, Some(7), 0).unwrap();
         let mut server = peer_of(&material, DataCipher::Aes256Gcm, Some(7));
         let mut sealed = client.seal(b"payload").unwrap();
         // The peer id lives in the header, which is covered as associated data.
         sealed[3] ^= 0x01;
         assert!(server.open(&sealed).is_err());
+    }
+
+    fn cbc_pair(
+        cipher: DataCipher,
+        digest: Digest,
+        peer_id: Option<u32>,
+    ) -> (DataChannel, DataChannel) {
+        let material = KeyMaterial::derive(
+            &KeySource {
+                pre_master: [3; 48],
+                random1: [4; 32],
+                random2: [5; 32],
+            },
+            &[6; 32],
+            &[7; 32],
+            &[8; 8],
+            &[9; 8],
+        );
+        let client = DataChannel::new(&material, cipher, digest, peer_id, 0).unwrap();
+        let mut server = DataChannel::new(&material, cipher, digest, peer_id, 0).unwrap();
+        std::mem::swap(&mut server.seal, &mut server.open);
+        (client, server)
+    }
+
+    #[test]
+    fn a_cbc_packet_round_trips_at_every_length_around_a_block() {
+        for cipher in [
+            DataCipher::Aes128Cbc,
+            DataCipher::Aes192Cbc,
+            DataCipher::Aes256Cbc,
+        ] {
+            for digest in [Digest::Md5, Digest::Sha1, Digest::Sha256, Digest::Sha512] {
+                for peer_id in [None, Some(17)] {
+                    let (mut client, mut server) = cbc_pair(cipher, digest, peer_id);
+                    // Lengths that leave the padding at 16, 1 and in between.
+                    for length in [1, 11, 12, 13, 28, 1400] {
+                        let packet = vec![0x45; length];
+                        let sealed = client.seal(&packet).unwrap();
+                        let opcode_len = if peer_id.is_some() { 4 } else { 1 };
+                        assert_eq!(
+                            (sealed.len() - opcode_len - digest.output_len()) % CBC_BLOCK,
+                            0,
+                            "IV and ciphertext are whole blocks"
+                        );
+                        assert_eq!(
+                            server.open(&sealed).unwrap(),
+                            Some(packet),
+                            "{cipher:?} {digest:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cbc_keepalive_is_swallowed_and_a_tampered_packet_is_rejected() {
+        let (mut client, mut server) = cbc_pair(DataCipher::Aes256Cbc, Digest::Sha1, Some(17));
+        assert_eq!(server.open(&client.keepalive().unwrap()).unwrap(), None);
+        let mut sealed = client.seal(b"payload").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        assert!(server.open(&sealed).is_err());
+        assert!(
+            server.open(&sealed[..20]).is_err(),
+            "a short packet is an error, not a panic"
+        );
+    }
+
+    #[test]
+    fn two_cbc_packets_with_the_same_payload_do_not_look_alike() {
+        let (mut client, _) = cbc_pair(DataCipher::Aes256Cbc, Digest::Sha1, None);
+        let first = client.seal(b"same").unwrap();
+        let second = client.seal(b"same").unwrap();
+        assert_ne!(
+            first[21..37],
+            second[21..37],
+            "every packet gets a fresh IV"
+        );
     }
 
     #[test]

@@ -267,6 +267,9 @@ What a configuration may contain:
 - Inline `<ca>`, and either `auth-user-pass` or an inline `<cert>` and `<key>`.
 - `tls-auth` or `tls-crypt`, inline, with either key direction.
 - `AES-256-GCM`, `AES-128-GCM` or `CHACHA20-POLY1305`, negotiated or named.
+- `AES-128-CBC`, `AES-192-CBC` or `AES-256-CBC` with `auth` `MD5`, `SHA1`, `SHA256` or `SHA512`,
+  for servers that cannot negotiate a cipher, such as MikroTik RouterOS. When the server pushes
+  no `cipher`, GamePath runs the cipher and digest the server announces in its options string.
 
 What is refused, by name and with the reason:
 
