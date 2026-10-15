@@ -15,6 +15,7 @@ mod join;
 mod latency;
 mod local_tap;
 mod monitors;
+mod nodes;
 mod path_mtu;
 mod relay_worker;
 mod repair;
@@ -30,11 +31,11 @@ mod failover_tests;
 #[cfg(test)]
 pub(crate) use local_tap::Diversion;
 pub(crate) use local_tap::{LocalStackSink, LocalTap, Protocol};
+pub(crate) use nodes::SessionNodes;
 pub(crate) use state::DataReceiver;
 
 use crate::ipc::SessionRequest;
 use gamepath_engine::log_info;
-use gamepath_engine::mtu::EffectiveMtu;
 use gamepath_engine::relay_path::SessionMode;
 pub(crate) use sender::{DataSender, SenderCache};
 use serde_json::{Value, json};
@@ -176,12 +177,6 @@ impl WireGuardSessionManager {
         self.active.as_ref().map(DataSender::of)
     }
 
-    pub(crate) fn effective_mtu(&self) -> Option<EffectiveMtu> {
-        self.active
-            .as_ref()
-            .map(|session| session.mtu.for_capture())
-    }
-
     /// What the LAN proxy needs to open flows of its own through this session.
     pub(crate) fn local_stack_binding(&self) -> Option<LocalStackBinding> {
         self.active.as_ref().map(|session| LocalStackBinding {
@@ -200,8 +195,11 @@ impl WireGuardSessionManager {
             .unwrap_or_default()
     }
 
-    pub(crate) fn socks_proxy(&self) -> Option<std::net::SocketAddr> {
-        self.active.as_ref().and_then(|session| session.socks_proxy)
+    /// The nodes capture can pin a flow to; see [`SessionNodes`].
+    pub(crate) fn nodes(&self) -> Option<Arc<SessionNodes>> {
+        self.active
+            .as_ref()
+            .map(|session| Arc::clone(&session.nodes))
     }
 
     /// Whether every route that has joined answers. Routes still dialling are
@@ -339,13 +337,13 @@ mod tests {
             false,
         );
         let mut cache = SenderCache::new(Arc::clone(&sessions));
-        cache.send(&packet).unwrap();
+        cache.send(&packet, 0).unwrap();
 
         // A status poll holding the lock for as long as it likes.
         let held = sessions.lock().unwrap();
         let sender = thread::spawn(move || {
             (0..100)
-                .all(|_| cache.send(&packet).is_ok())
+                .all(|_| cache.send(&packet, 0).is_ok())
                 .then_some(cache)
         });
         let mut cache = sender.join().unwrap().expect("sent without the lock");
@@ -360,6 +358,6 @@ mod tests {
             2,
             false,
         );
-        assert!(cache.send(&probe).is_err());
+        assert!(cache.send(&probe, 0).is_err());
     }
 }

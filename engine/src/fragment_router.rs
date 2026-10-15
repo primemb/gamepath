@@ -12,7 +12,9 @@ const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Route {
-    Tunnel(Option<Ipv4Addr>),
+    /// Into the tunnel: the resolver a redirected lookup was sent to, and the
+    /// node its first fragment took.
+    Tunnel(Option<Ipv4Addr>, u8),
     Bypass,
     Drop,
 }
@@ -235,18 +237,18 @@ mod tests {
         let waiting = router
             .lock()
             .unwrap()
-            .finish(ticket, Route::Tunnel(None), now);
+            .finish(ticket, Route::Tunnel(None, 0), now);
         assert_eq!(waiting, vec![(packet(1, true), 7)]);
         assert!(matches!(
             router.lock().unwrap().later(&packet(1, true), 8, now),
-            Action::Route(Route::Tunnel(None))
+            Action::Route(Route::Tunnel(None, 0))
         ));
     }
 
     #[test]
     fn later_before_first_follows_the_dns_redirect_or_known_bypass() {
         for route in [
-            Route::Tunnel(Some(Ipv4Addr::new(192, 168, 1, 1))),
+            Route::Tunnel(Some(Ipv4Addr::new(192, 168, 1, 1)), 0),
             Route::Bypass,
         ] {
             let mut router = FragmentRouter::default();
@@ -281,7 +283,7 @@ mod tests {
             router.later(&packet(1, true), (), now),
             Action::Held
         ));
-        assert_eq!(router.finish(newer, Route::Tunnel(None), now).len(), 1);
+        assert_eq!(router.finish(newer, Route::Tunnel(None, 0), now).len(), 1);
     }
 
     #[test]
@@ -314,7 +316,11 @@ mod tests {
             router.later(&packet(1, true), (), now),
             Action::Route(Route::Drop)
         ));
-        assert!(router.finish(ticket, Route::Tunnel(None), now).is_empty());
+        assert!(
+            router
+                .finish(ticket, Route::Tunnel(None, 0), now)
+                .is_empty()
+        );
         assert_eq!(router.pending_bytes, 0);
         assert_eq!(router.take_discarded(), MAX_PIECES as u64);
     }
@@ -333,7 +339,11 @@ mod tests {
             router.later(&large, (), now),
             Action::Route(Route::Drop)
         ));
-        assert!(router.finish(ticket, Route::Tunnel(None), now).is_empty());
+        assert!(
+            router
+                .finish(ticket, Route::Tunnel(None, 0), now)
+                .is_empty()
+        );
         assert_eq!(router.pending_bytes, 0);
         assert_eq!(router.take_discarded(), 16);
     }

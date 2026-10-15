@@ -82,6 +82,7 @@ contextBridge.exposeInMainWorld('gamepath', {
     browseTarget: (kind) => ipcRenderer.invoke('vpn:browse-target', kind),
     addRule: (input) => ipcRenderer.invoke('vpn:add-rule', input),
     setRuleEnabled: (id, enabled) => ipcRenderer.invoke('vpn:set-rule-enabled', id, enabled),
+    setRuleNode: (id, nodeId) => ipcRenderer.invoke('vpn:set-rule-node', id, nodeId),
     removeRule: (id) => ipcRenderer.invoke('vpn:remove-rule', id),
     setDirectEnabled: (enabled) => ipcRenderer.invoke('vpn:set-direct-enabled', enabled),
     setDirectList: (id, enabled) => ipcRenderer.invoke('vpn:set-direct-list', id, enabled),

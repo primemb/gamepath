@@ -1,3 +1,4 @@
+import { nodeNames } from './lib/vpn'
 import type { AppState, DirectListInfo, VpnApi, VpnNode, VpnRule, VpnSession, VpnState } from './types'
 
 /** The lists the desktop app downloads, as they look before the first download. */
@@ -70,16 +71,33 @@ export function seedVpn(): VpnState {
         value: 'C:\\Program Files\\Chat\\chat.exe',
         label: 'chat.exe',
         enabled: true,
+        nodeId: 'vpn-backup',
       },
-      { id: 'vpn-rule-2', kind: 'hostname', value: 'news.example.com', label: 'news.example.com', enabled: true },
+      {
+        id: 'vpn-rule-2',
+        kind: 'hostname',
+        value: 'news.example.com',
+        label: 'news.example.com',
+        enabled: true,
+        nodeId: null,
+      },
     ],
     wantConnected: false,
     session: { status: 'idle' },
     conflicts: [],
     limitations: {},
+    nodeLimitation: null,
     canSelectApps: true,
     direct: { enabled: false, lists: [], entries: [], catalog: directCatalog(), limitation: null },
   }
+}
+
+/** The default node first, then the nodes enabled targets name, as the desktop app connects them. */
+function sessionNodes(state: VpnState) {
+  if (!state.node) return []
+  if (state.trafficMode !== 'split') return [state.node]
+  const used = new Set(state.rules.filter((rule) => rule.enabled && rule.nodeId).map((rule) => rule.nodeId))
+  return [state.node, ...state.nodes.filter((node) => node.id !== state.node!.id && used.has(node.id))]
 }
 
 const CONNECT_DELAY_MS = 900
@@ -103,39 +121,63 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
 
   const gameHoldsAllTraffic = () => get().session.status === 'connected' && get().trafficMode === 'all'
 
-  const connected = (): VpnSession => ({
-    status: 'connected',
-    sessionId: 'vpn-3f9a1c',
-    node: vpn().node ? { id: vpn().node!.id, name: vpn().node!.name, kind: vpn().node!.kind } : undefined,
-    startedAt: Date.now(),
-    trafficMode: vpn().trafficMode,
-    killSwitch: vpn().killSwitch,
-    message: `Connected through ${vpn().node?.name}.`,
-    metrics: { latencyMs: 58, lossPercent: 0, bytesSent: 0, bytesReceived: 0, sampledAt: Date.now() },
-    capture: {
-      state: 'capturing',
-      backend: 'windivert',
+  const connected = (): VpnSession => {
+    const nodes = sessionNodes(vpn()).map(({ id, name, kind }) => ({ id, name, kind }))
+    return {
+      status: 'connected',
+      sessionId: `vpn-${nodes.map((node) => node.id).join('-')}`,
+      node: nodes[0],
+      nodes,
+      nodeIds: nodes.map((node) => node.id),
+      nodeHealth: nodes.map((node, index) => ({
+        id: node.id,
+        name: node.name,
+        reachable: true,
+        latencyMs: 58 + index * 31,
+        error: null,
+      })),
+      startedAt: Date.now(),
       trafficMode: vpn().trafficMode,
-      diagnostics: {
-        matchedSockets: 2,
-        captureFilterCount: 2,
-        capturedPackets: 0,
-        capturedBytes: 0,
-        relayedPackets: 0,
-        bypassedPackets: 0,
-        handledConnections: [
-          {
-            application: 'chat.exe',
-            path: 'C:\\Program Files\\Chat\\chat.exe',
-            destinationIp: '203.0.113.40',
-            destinationPort: 443,
-            protocol: 'TCP',
-            startedAt: Math.floor(Date.now() / 1000) - 30,
-          },
-        ],
+      killSwitch: vpn().killSwitch,
+      message: `Connected through ${nodeNames(nodes)}.`,
+      metrics: { latencyMs: 58, lossPercent: 0, bytesSent: 0, bytesReceived: 0, sampledAt: Date.now() },
+      capture: {
+        state: 'capturing',
+        backend: 'windivert',
+        trafficMode: vpn().trafficMode,
+        diagnostics: {
+          matchedSockets: 2,
+          captureFilterCount: 2,
+          capturedPackets: 0,
+          capturedBytes: 0,
+          relayedPackets: 0,
+          bypassedPackets: 0,
+          handledConnections: [
+            {
+              application: 'chat.exe',
+              path: 'C:\\Program Files\\Chat\\chat.exe',
+              destinationIp: '203.0.113.40',
+              destinationPort: 443,
+              protocol: 'TCP',
+              startedAt: Math.floor(Date.now() / 1000) - 30,
+              node: Math.max(
+                0,
+                nodes.findIndex((node) => node.id === 'vpn-backup'),
+              ),
+            },
+            {
+              application: 'news.example.com',
+              destinationIp: '198.51.100.12',
+              destinationPort: 443,
+              protocol: 'TCP',
+              startedAt: Math.floor(Date.now() / 1000) - 12,
+              node: 0,
+            },
+          ],
+        },
       },
-    },
-  })
+    }
+  }
 
   const animate = () => {
     window.clearInterval(timer)
@@ -195,7 +237,7 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
   const start = () => {
     window.clearTimeout(connectTimer)
     window.clearInterval(timer)
-    setSession({ status: 'connecting', message: `Connecting to ${vpn().node?.name}…` })
+    setSession({ status: 'connecting', message: `Connecting to ${nodeNames(sessionNodes(vpn()))}…` })
     connectTimer = window.setTimeout(() => {
       if (!vpn().wantConnected) return
       setSession(
@@ -300,6 +342,7 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
         if (!state.nodes.some((node) => node.id === id)) throw new Error('That VPN node no longer exists.')
         const selected = state.selectedNodeId === id
         state.nodes = state.nodes.filter((node) => node.id !== id)
+        state.rules = state.rules.map((rule) => (rule.nodeId === id ? { ...rule, nodeId: null } : rule))
         if (selected) {
           window.clearTimeout(connectTimer)
           window.clearInterval(timer)
@@ -319,8 +362,18 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
     browseTarget: async () => ({ canceled: true }),
     addRule: async (input) =>
       mutate((state) => {
-        const rule: VpnRule = { id: `vpn-rule-${Date.now()}`, enabled: true, ...input }
+        const rule: VpnRule = { id: `vpn-rule-${Date.now()}`, enabled: true, ...input, nodeId: input.nodeId ?? null }
         state.rules.push(rule)
+        if (state.wantConnected && rule.nodeId) start()
+      }),
+    setRuleNode: async (id, nodeId) =>
+      mutate((state) => {
+        const rule = state.rules.find((item) => item.id === id)
+        if (!rule) throw new Error('That target no longer exists.')
+        const before = sessionNodes(state).length
+        rule.nodeId = nodeId
+        // A node joining or leaving reconnects, as it does in the desktop app.
+        if (state.wantConnected && sessionNodes(state).length !== before) start()
       }),
     setRuleEnabled: async (id, enabled) =>
       mutate((state) => {

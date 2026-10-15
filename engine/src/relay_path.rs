@@ -806,6 +806,17 @@ impl DirectPath {
         false
     }
 
+    /// Whether a link that stopped answering needs a new dial to come back.
+    /// WireGuard renegotiates from its own timers and a SOCKS5 stack dials the
+    /// proxy per connection; an OpenVPN link that dropped stays dropped.
+    pub fn needs_redial_when_lost(&self) -> bool {
+        #[cfg(feature = "openvpn")]
+        if let Self::OpenVpn(_) = self {
+            return true;
+        }
+        false
+    }
+
     /// Health probes must survive the stream queue's realtime shedding.
     pub fn send_probe(&mut self, packet: &[u8]) -> Result<(), String> {
         match self {

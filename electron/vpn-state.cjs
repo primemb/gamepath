@@ -13,6 +13,8 @@ const { defaultDirect, normalizeDirect } = require('./vpn-direct-state.cjs')
 
 const RULE_KINDS = ['application', 'folder', 'hostname', 'ip']
 const NODE_KINDS = ['wireguard', 'openvpn', 'l2tp', 'socks5']
+/** Most nodes one VPN session runs; the service's `MAX_VPN_NODES`. */
+const MAX_VPN_NODES = 8
 
 function defaultVpn() {
   return {
@@ -42,6 +44,8 @@ function normalizeRule(rule) {
     value,
     label: typeof rule.label === 'string' && rule.label ? rule.label : value,
     enabled: rule.enabled !== false,
+    // Null is the default node, so the target follows it when it changes.
+    nodeId: typeof rule.nodeId === 'string' && rule.nodeId ? rule.nodeId : null,
   }
 }
 
@@ -75,7 +79,7 @@ function normalizeVpn(saved) {
     for (const rule of saved.rules.map(normalizeRule)) {
       if (rule && !seen.has(rule.id)) {
         seen.add(rule.id)
-        vpn.rules.push(rule)
+        vpn.rules.push({ ...rule, nodeId: nodeIds.has(rule.nodeId) ? rule.nodeId : null })
       }
     }
   }
@@ -102,9 +106,46 @@ function migrateVpnState(state) {
   delete state.encryptedVpnConfig
 }
 
-/** The rule list the service compiles. */
-function vpnRuleSpecs(vpn) {
-  return vpn.rules.filter((rule) => rule.enabled).map(({ kind, value }) => ({ kind, value }))
+/** The node that carries `rule`: the one it names, or the default node. */
+function ruleNode(vpn, rule) {
+  return vpn.nodes.find((node) => node.id === rule.nodeId) ?? selectedVpnNode(vpn)
+}
+
+/**
+ * The nodes a session connects, the default node first. The others join only
+ * for enabled targets that name them, and only in split mode: all-traffic
+ * mode sends everything through the default node.
+ */
+function sessionNodes(vpn) {
+  const fallback = selectedVpnNode(vpn)
+  if (!fallback) return []
+  if (vpn.trafficMode !== 'split') return [fallback]
+  const used = new Set(vpn.rules.filter((rule) => rule.enabled).map((rule) => ruleNode(vpn, rule).id))
+  return [fallback, ...vpn.nodes.filter((node) => node.id !== fallback.id && used.has(node.id))]
+}
+
+/**
+ * The rule list the service compiles. Each target names its node by its
+ * place in `nodes`, the list the session connects.
+ */
+function vpnRuleSpecs(vpn, nodes = sessionNodes(vpn)) {
+  const place = new Map(nodes.map((node, index) => [node.id, index]))
+  return vpn.rules
+    .filter((rule) => rule.enabled)
+    .map((rule) => ({ kind: rule.kind, value: rule.value, node: place.get(ruleNode(vpn, rule)?.id) ?? 0 }))
+}
+
+/** Why `nodes` cannot run together as one VPN session, or null. */
+function nodeSetLimitation(nodes) {
+  if (nodes.length <= 1) return null
+  if (nodes.length > MAX_VPN_NODES) {
+    return `The VPN can use up to ${MAX_VPN_NODES} nodes at once. Move some targets to a node that is already in use.`
+  }
+  const l2tp = nodes.find((node) => node.kind === 'l2tp')
+  if (l2tp) {
+    return `${l2tp.name} is an L2TP/IPsec node, which Windows routes for the whole VPN, so it cannot share the VPN with other nodes. Send every target through one node, or use a WireGuard, OpenVPN or SOCKS5 node.`
+  }
+  return null
 }
 
 /**
@@ -125,11 +166,14 @@ function ruleLimitation(node, trafficMode, kind, value) {
   return null
 }
 
-/** Rules of the saved set that the current node cannot route. */
+/** Why `rule` cannot be routed by the node it is assigned, or null. */
+function assignedLimitation(vpn, rule) {
+  return ruleLimitation(ruleNode(vpn, rule), vpn.trafficMode, rule.kind, rule.value)
+}
+
+/** Rules of the saved set that their node cannot route. */
 function unroutableRules(vpn) {
-  return vpn.rules.filter(
-    (rule) => rule.enabled && ruleLimitation(selectedVpnNode(vpn), vpn.trafficMode, rule.kind, rule.value),
-  )
+  return vpn.rules.filter((rule) => rule.enabled && assignedLimitation(vpn, rule))
 }
 
 function createRule(input, id) {
@@ -138,7 +182,8 @@ function createRule(input, id) {
   const value = String(input?.value ?? '').trim()
   if (!value) throw new Error('A target is required')
   const label = String(input?.label ?? '').trim()
-  return { id, kind, value, label: label || value.split(/[\\/]/).pop() || value, enabled: true }
+  const nodeId = typeof input?.nodeId === 'string' && input.nodeId ? input.nodeId : null
+  return { id, kind, value, label: label || value.split(/[\\/]/).pop() || value, enabled: true, nodeId }
 }
 
 const sameTarget = (left, right) =>
@@ -173,14 +218,20 @@ function activeGameRules(rules, ruleGroups) {
 
 module.exports = {
   RULE_KINDS,
+  MAX_VPN_NODES,
   defaultVpn,
   normalizeVpn,
   selectedVpnNode,
   migrateVpnState,
+  ruleNode,
+  sessionNodes,
   vpnRuleSpecs,
+  nodeSetLimitation,
   ruleLimitation,
+  assignedLimitation,
   unroutableRules,
   createRule,
+  sameTarget,
   ruleConflicts,
   activeGameRules,
 }

@@ -1321,6 +1321,47 @@ own GUID) and raises its data-plane threads one step less than the game's, to `T
 so under a busy CPU the game's packets go first. Every service line about a slot is tagged `[game]` or
 `[vpn vpn-3f9a1c]`; the id is the client's and appears in `client.log` too.
 
+### A node per target
+
+The VPN connects a default node and, in split mode, any other node an enabled target names, up to eight
+(`MAX_DIRECT_NODES`, kept equal to the service's and client's limits by a test). All of them run in the one VPN
+engine. An engine per node would mean more service slots, and every unselected packet would pay one extra
+user-space round trip per engine on its way through the WinDivert priority chain; one engine classifies each
+packet once.
+
+Each rule carries the index of its node (`RuleSpec::node`, 0 for the default). Capture looks the flow up as
+before and also takes its node: a flow's node comes from its owning process's application or folder rule (an
+application rule outranks the folder it sits in), and a destination rule's node wins over both, because a
+website or IP rule applies in whichever app opens it. Destination ranges are layered rather than merged, so a
+`/32` keeps its own node inside a wider range on another. The node is recorded on the flow's return path and
+kept for the flow's life, so moving a target between nodes never moves a live connection to another source
+address. Each node has its own tunnel address, and two nodes may share one (providers commonly give every
+client `10.2.0.2`): replies are matched by the flow, not by the address. Each node clamps TCP MSS to its own
+MTU, so a SOCKS5 flow is not held to WireGuard's.
+
+A pinned packet goes to its node alone (`DataSender::send`). The relay's dispatch narrows the pick to healthy
+paths and falls back to any healthy one; doing that here would quietly carry an app through a node the user did
+not choose, from an address its server has never seen.
+
+**Name resolution follows the node too.** A lookup whose name falls under a hostname rule resolves through that
+rule's node from any app; an application's own lookup (Chromium apps send their own) through the application's
+node; everything else, Windows' resolver included, through the default node. Windows' DNS Client does not say
+which app asked, so per-app resolution for apps that use it is not possible; the alternatives are worse. NRPT
+policy is per name, not per app, and it makes Chromium fall back to the system resolver. Fake-IP addresses go
+to the proxy the flow is already pinned to, or to the first SOCKS5 node. Two proxies that both hand out fake IPs
+would hand out the same ones, so the engine warns when a session has more than one.
+
+**A node failing costs its own targets.** A node that does not open at session start is dialled again by its
+worker, with the usual backoff, while the others carry on; the session fails only if none opens. An OpenVPN node
+that stops answering is redialled the same way (`DirectPath::needs_redial_when_lost`); WireGuard renegotiates
+from its own timers and SOCKS5 dials per connection, so neither needs it. The client reports one node down on
+its own targets and restarts the session only when every node has been down for `DEGRADED_RESTART_MS`, since a
+restart for one node would cut every app on the nodes that work. Rule edits that keep the same nodes in use are
+applied live; a node joining or leaving opens or closes a tunnel, so that reconnects the VPN.
+
+L2TP/IPsec cannot be one of several nodes: Windows routes it for the whole VPN by address, with no GamePath
+capture to pin flows. All-traffic mode uses the default node alone.
+
 ### SOCKS5 as the VPN's node
 
 A proxy cannot be handed captured packets, so the VPN engine puts a smoltcp stack in front of it

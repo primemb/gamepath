@@ -155,3 +155,11 @@ test('a server-level error reaches the caller instead of a bare mismatch', async
   const bridge = new ServiceBridge({ tokenFile, port: server.address().port })
   await assert.rejects(() => bridge.request('session-status'), /service is busy; retry/)
 })
+
+test('the client, service and engine agree on how many nodes one VPN runs', () => {
+  const { MAX_VPN_NODES } = require('./vpn-state.cjs')
+  const limit = (source, name) => Number(source.match(new RegExp(`const ${name}: usize = (\\d+);`))[1])
+  const engine = fs.readFileSync(path.join(__dirname, '..', 'engine', 'src', 'session', 'nodes.rs'), 'utf8')
+  assert.equal(limit(serviceFile('validate.rs'), 'MAX_VPN_NODES'), MAX_VPN_NODES)
+  assert.equal(limit(engine, 'MAX_DIRECT_NODES'), MAX_VPN_NODES)
+})

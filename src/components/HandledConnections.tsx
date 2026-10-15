@@ -18,9 +18,12 @@ type CaptureDiagnostics = NonNullable<NonNullable<AppState['session']['capture']
 export function HandledConnections({
   capture,
   emptyText = 'Start the game to see each executable and destination IP handled by GamePath.',
+  nodeOf,
 }: {
   capture: CaptureDiagnostics | undefined
   emptyText?: string
+  /** The node carrying a connection, for a VPN that uses more than one. */
+  nodeOf?: (connection: HandledConnection) => string | undefined
 }) {
   const [open, setOpen] = useState(true)
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
@@ -77,6 +80,10 @@ export function HandledConnections({
                 const isExpanded = expanded.has(group.key)
                 const protocols = Array.from(new Set(group.connections.map((connection) => connection.protocol)))
                 const latestStartedAt = Math.max(...group.connections.map((connection) => connection.startedAt))
+                // An app can use two nodes when a website rule sends one of its sites elsewhere.
+                const nodes = nodeOf
+                  ? Array.from(new Set(group.connections.map(nodeOf).filter((name): name is string => Boolean(name))))
+                  : []
                 const detailsId = `application-connections-${groupIndex}`
                 return (
                   <div className="connection-app" key={group.key}>
@@ -90,6 +97,11 @@ export function HandledConnections({
                         <ChevronRight className="connection-app-chevron" size={14} aria-hidden="true" />
                         <AppIcon path={group.connections.find((connection) => connection.path)?.path} />
                         <strong>{group.application}</strong>
+                        {nodes.length > 0 && (
+                          <span className="connection-node" data-no-translate>
+                            {nodes.join(', ')}
+                          </span>
+                        )}
                       </span>
                       <span className="connection-count">
                         <strong>{group.connections.length}</strong>

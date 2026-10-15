@@ -33,6 +33,14 @@ const defaultTimers = { setInterval, clearInterval, setTimeout, clearTimeout }
 /** A configuration problem that retrying cannot fix. */
 class VpnConfigError extends Error {}
 
+/** "Home", "Home, Proxy", "Home +2": names, with nothing to translate between them. */
+function throughNodes(nodes) {
+  const [first, ...rest] = nodes.filter(Boolean)
+  if (!first) return 'the VPN node'
+  if (!rest.length) return first.name
+  return rest.length === 1 ? `${first.name}, ${rest[0].name}` : `${first.name} +${rest.length}`
+}
+
 /**
  * Runs the VPN session in the service's `vpn` slot.
  *
@@ -123,6 +131,17 @@ class VpnSessionController {
   }
 
   /**
+   * Whether the session already connects exactly `nodeIds`, in order, so a
+   * rule edit can be applied to it live. With nothing running there is
+   * nothing to reconnect.
+   */
+  carriesNodes(nodeIds) {
+    if (!ACTIVE.has(this.session.status)) return true
+    const current = this.session.nodeIds ?? []
+    return current.length === nodeIds.length && current.every((id, index) => id === nodeIds[index])
+  }
+
+  /**
    * Applies new split rules to a running session without reconnecting.
    * Throws if the service rejects them, so the caller can keep the old ones.
    */
@@ -187,16 +206,19 @@ class VpnSessionController {
     const sessionId = `vpn-${this.randomId()}`
     const log = this.logger.scope(`vpn ${sessionId}`)
     const { request, node } = built
+    const nodes = (built.nodes ?? [node]).map(({ id, name, kind }) => ({ id, name, kind }))
     const retrying = this.reconnectAttempt > 0
     this.session = {
       status: retrying ? 'reconnecting' : 'connecting',
       sessionId,
       node: { id: node.id, name: node.name, kind: node.kind },
-      message: `${retrying ? 'Reconnecting' : 'Connecting'} to ${node.name}…`,
+      nodes,
+      nodeIds: nodes.map((item) => item.id),
+      message: `${retrying ? 'Reconnecting' : 'Connecting'} to ${throughNodes(nodes)}…`,
     }
     this.onChange()
     log.info(
-      `starting: node=${node.kind} traffic=${request.trafficMode} rules=${request.rules.length} ` +
+      `starting: node=${nodes.map((item) => item.kind).join('+')} traffic=${request.trafficMode} rules=${request.rules.length} ` +
         `dns=${request.remoteDns ? 'remote' : 'local'} killSwitch=${request.killSwitch ? 'on' : 'off'}` +
         (retrying ? ` attempt=${this.reconnectAttempt + 1}` : ''),
     )
@@ -219,15 +241,20 @@ class VpnSessionController {
         status: 'connected',
         sessionId,
         node: this.session.node,
+        nodes,
+        nodeIds: this.session.nodeIds,
         startedAt: this.now(),
         trafficMode: request.trafficMode,
         killSwitch: request.killSwitch,
-        message: `Connected through ${node.name}.`,
+        message: `Connected through ${throughNodes(nodes)}.`,
       }
       this.applyRuntime({ ...started.paths, capture: started.capture })
       this.reconnectAttempt = 0
       this.degradedSince = null
-      this.usage?.start(sessionId, [{ id: node.id, name: node.name }])
+      this.usage?.start(
+        sessionId,
+        nodes.map(({ id, name }) => ({ id, name })),
+      )
       this.recordUsage({ ...started.paths, capture: started.capture })
       this.startPolling()
       log.info(
@@ -333,7 +360,7 @@ class VpnSessionController {
       if (ended) this.log.info(`status answered again after ${ended} failed request(s)`)
       this.applyRuntime(runtime)
       this.recordUsage(runtime)
-      this.trackHealth(runtime.state === 'connected')
+      this.trackHealth(runtime)
     } catch (error) {
       if (this.isCurrent(polled)) this.pollFailed(error)
     } finally {
@@ -342,14 +369,29 @@ class VpnSessionController {
     }
   }
 
-  trackHealth(healthy) {
-    if (healthy) {
-      if (this.session.status === 'degraded') this.log.info('recovered')
-      this.session.status = 'connected'
-      this.session.message = `Connected through ${this.session.node?.name ?? 'the VPN node'}.`
+  /**
+   * One node down is reported on its own and left to the engine, which keeps
+   * dialling it; reconnecting the whole VPN for it would cut every app on the
+   * nodes that are fine. Only every node down at once restarts the session.
+   */
+  trackHealth(runtime) {
+    if (runtime.state === 'connected') {
+      const down = (this.session.nodeHealth ?? []).filter((node) => !node.reachable)
+      const names = down.map((node) => node.name).join(', ')
+      if (down.length && this.session.downNodes !== names) {
+        this.log.warn(`${down.length} of ${this.session.nodeHealth.length} nodes not answering`)
+      } else if (!down.length && (this.session.downNodes || this.session.status === 'degraded')) {
+        this.log.info('recovered')
+      }
+      this.session.downNodes = names || null
+      this.session.status = down.length ? 'degraded' : 'connected'
+      this.session.message = down.length
+        ? `${names} ${down.length === 1 ? 'is' : 'are'} not answering. Apps assigned to ${down.length === 1 ? 'it' : 'them'} reconnect when ${down.length === 1 ? 'it is' : 'they are'} back.`
+        : `Connected through ${throughNodes(this.session.nodes ?? [this.session.node])}.`
       this.degradedSince = null
       return
     }
+    this.session.downNodes = null
     if (this.session.status !== 'degraded') this.log.warn('the node stopped answering')
     this.session.status = 'degraded'
     this.session.message = this.session.killSwitch
@@ -390,6 +432,14 @@ class VpnSessionController {
     const paths = runtime.paths ?? []
     const path = paths[0]
     this.session.pathMetrics = paths
+    // The engine reports one path per node, in the order they were sent.
+    this.session.nodeHealth = (this.session.nodes ?? []).map((node, index) => ({
+      id: node.id,
+      name: node.name,
+      reachable: paths[index]?.reachable !== false,
+      latencyMs: paths[index]?.latencyMs ?? null,
+      error: paths[index]?.reachable === false ? (paths[index]?.lastError ?? null) : null,
+    }))
     if (runtime.capture) this.session.capture = runtime.capture
     this.session.metrics = {
       latencyMs: path?.latencyMs ?? null,

@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use crate::session::{DataReceiver, SenderCache, WireGuardSessionManager};
+use crate::session::{DataReceiver, SenderCache, SessionNodes, WireGuardSessionManager};
 use gamepath_engine::direct_list::{DirectList, DirectSpec, MAX_LEARNED};
 use gamepath_engine::fragment_router::{
     Action as FragmentAction, FragmentRouter, Route as FragmentRoute, Ticket as FragmentTicket,
@@ -305,6 +305,9 @@ struct ReturnPath {
     last_seen: Instant,
     /// Set for a redirected lookup: replies are rewritten to come from it.
     resolver: Option<Ipv4Addr>,
+    /// The node carrying the flow. It keeps it until the flow ends, so a
+    /// rule edit never moves a live connection to another source address.
+    node: u8,
 }
 
 #[derive(Default)]
@@ -326,6 +329,8 @@ struct HandledConnection {
     path: Option<String>,
     #[serde(skip)]
     process_id: Option<u32>,
+    /// The node carrying it, so the window can say which one each app uses.
+    node: u8,
 }
 
 /// A packet that is not ours, waiting to be put back on the network stack.
@@ -424,9 +429,9 @@ struct PendingSyn {
 /// cheaper than paying for the scan on every packet.
 #[derive(Default)]
 struct SelectorTable {
-    /// Destination ranges, sorted by their first address and merged so at most
-    /// one range can contain any given address.
-    destinations: Vec<(u32, u32)>,
+    /// Destination ranges with the node that carries each, sorted by their
+    /// first address and disjoint, so at most one range contains any address.
+    destinations: Vec<(u32, u32, u8)>,
     /// Keyed by the exact tuple a packet presents, so both the port-specific
     /// and the any-port form of a flow selector are direct lookups.
     flows: HashMap<(u8, u16, Option<u16>), Selection>,
@@ -437,6 +442,113 @@ struct SelectorTable {
 struct Selection {
     application: Option<String>,
     process_id: Option<u32>,
+    node: u8,
+}
+
+/// What a packet the table selects is: the application it belongs to, when a
+/// flow matched, and the node that carries it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Match<'a> {
+    application: Option<&'a str>,
+    process_id: Option<u32>,
+    node: u8,
+}
+
+/// Which node of a direct session carries each target. A session with one
+/// node answers 0, the default node, for everything.
+#[derive(Default)]
+struct TargetNodes {
+    applications: HashMap<String, u8>,
+    /// Longest first, so the first folder that matches is the most specific.
+    folders: Vec<(String, u8)>,
+    hostnames: Vec<(String, u8)>,
+}
+
+impl TargetNodes {
+    fn of(plan: &InterceptionPlan) -> Self {
+        let mut folders = plan
+            .folder_prefixes
+            .iter()
+            .map(|folder| (folder.clone(), plan.node_of(folder)))
+            .collect::<Vec<_>>();
+        folders.sort_by_key(|(folder, _)| std::cmp::Reverse(folder.len()));
+        Self {
+            applications: plan
+                .application_paths
+                .iter()
+                .map(|path| (path.clone(), plan.node_of(path)))
+                .collect(),
+            folders,
+            hostnames: plan
+                .hostnames
+                .iter()
+                .map(|hostname| (hostname.clone(), plan.node_of(hostname)))
+                .collect(),
+        }
+    }
+
+    /// An application rule outranks the folder it sits in.
+    fn for_path(&self, path: &str) -> u8 {
+        if let Some(node) = self.applications.get(path) {
+            return *node;
+        }
+        self.folders
+            .iter()
+            .find(|(folder, _)| folder_contains(folder, path))
+            .map_or(0, |(_, node)| *node)
+    }
+
+    /// The node of the hostname rule `name` falls under, if any.
+    fn for_name(&self, name: &str) -> Option<u8> {
+        let rule = most_specific_rule(name, self.hostnames.iter().map(|(rule, _)| rule))?;
+        self.for_rule(rule)
+    }
+
+    fn for_rule(&self, rule: &str) -> Option<u8> {
+        self.hostnames
+            .iter()
+            .find(|(hostname, _)| hostname == rule)
+            .map(|(_, node)| *node)
+    }
+}
+
+/// Lays `ranges` over each other so that a narrower range wins over a wider
+/// one it sits in: a website's address carried by its own node even when an
+/// IP rule for its whole network names another. The result is disjoint and
+/// sorted, with neighbours on the same node merged.
+fn layer_destinations(mut ranges: Vec<(u32, u32, u8)>) -> Vec<(u32, u32, u8)> {
+    ranges.sort_by_key(|(first, last, _)| std::cmp::Reverse(last - first));
+    let mut layered: std::collections::BTreeMap<u32, (u32, u8)> = Default::default();
+    for (first, last, node) in ranges {
+        // Disjoint and sorted, so the ranges it overlaps are the last ones
+        // starting at or before its end.
+        let covered = layered
+            .range(..=last)
+            .rev()
+            .take_while(|(_, (end, _))| *end >= first)
+            .map(|(start, value)| (*start, *value))
+            .collect::<Vec<_>>();
+        for (start, (end, held)) in covered {
+            layered.remove(&start);
+            if start < first {
+                layered.insert(start, (first - 1, held));
+            }
+            if end > last {
+                layered.insert(last + 1, (end, held));
+            }
+        }
+        layered.insert(first, (last, node));
+    }
+    let mut merged: Vec<(u32, u32, u8)> = Vec::with_capacity(layered.len());
+    for (first, (last, node)) in layered {
+        match merged.last_mut() {
+            Some(previous) if previous.2 == node && first <= previous.1.saturating_add(1) => {
+                previous.1 = previous.1.max(last);
+            }
+            _ => merged.push((first, last, node)),
+        }
+    }
+    merged
 }
 
 #[derive(Clone, Debug)]
@@ -451,70 +563,80 @@ struct FlowOwner {
 struct SelectorState {
     selectors: HashMap<TrafficSelector, Option<String>>,
     flow_owners: HashMap<TrafficSelector, Vec<FlowOwner>>,
+    /// The node of each destination selector; absent means the default.
+    destination_nodes: HashMap<TrafficSelector, u8>,
 }
 
 impl SelectorTable {
     #[cfg(test)]
     fn build(selectors: &HashMap<TrafficSelector, Option<String>>) -> Self {
-        Self::build_with_owners(selectors, &HashMap::new())
+        Self::build_with_owners(
+            selectors,
+            &HashMap::new(),
+            &HashMap::new(),
+            &TargetNodes::default(),
+        )
     }
 
-    fn build_state(state: &SelectorState) -> Self {
-        Self::build_with_owners(&state.selectors, &state.flow_owners)
+    fn build_state(state: &SelectorState, targets: &TargetNodes) -> Self {
+        Self::build_with_owners(
+            &state.selectors,
+            &state.flow_owners,
+            &state.destination_nodes,
+            targets,
+        )
     }
 
     fn build_with_owners(
         selectors: &HashMap<TrafficSelector, Option<String>>,
         flow_owners: &HashMap<TrafficSelector, Vec<FlowOwner>>,
+        destination_nodes: &HashMap<TrafficSelector, u8>,
+        targets: &TargetNodes,
     ) -> Self {
         let mut destinations = Vec::new();
         let mut flows = HashMap::new();
         for (selector, application) in selectors {
             match *selector {
-                TrafficSelector::Destination { first, last } => destinations.push((first, last)),
+                TrafficSelector::Destination { first, last } => destinations.push((
+                    first,
+                    last,
+                    destination_nodes.get(selector).copied().unwrap_or(0),
+                )),
                 TrafficSelector::Flow {
                     protocol,
                     local_port,
                     remote_port,
                 } => {
+                    let owner = flow_owners.get(selector).and_then(|owners| owners.last());
                     flows.insert(
                         (protocol, local_port, remote_port),
                         Selection {
                             application: application.clone(),
-                            process_id: flow_owners
-                                .get(selector)
-                                .and_then(|owners| owners.last())
-                                .map(|owner| owner.process_id),
+                            process_id: owner.map(|owner| owner.process_id),
+                            node: owner.map_or(0, |owner| targets.for_path(&owner.path)),
                         },
                     );
                 }
             }
         }
-        destinations.sort_unstable();
-        // Overlapping rules are ordinary - a /24 and a host inside it - and
-        // merging them is what lets the search stop at the first candidate.
-        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(destinations.len());
-        for (first, last) in destinations {
-            match merged.last_mut() {
-                Some(previous) if first <= previous.1.saturating_add(1) => {
-                    previous.1 = previous.1.max(last);
-                }
-                _ => merged.push((first, last)),
-            }
-        }
         Self {
-            destinations: merged,
+            // Overlapping rules are ordinary - a /24 and a host inside it -
+            // and layering them is what lets the search stop at the first
+            // candidate.
+            destinations: layer_destinations(destinations),
             flows,
             len: selectors.len(),
         }
     }
 
-    /// The application a packet is selected for, or `None` when nothing
-    /// matches. A destination match has no application attached to it.
-    fn lookup(&self, fields: Ipv4Fields) -> Option<(Option<&str>, Option<u32>)> {
-        // Flows are checked first: they name the process that owns the
-        // connection, which is the more specific of the two answers.
-        if let Some(application) = self
+    /// What a packet is selected for, or `None` when nothing matches. A
+    /// destination match has no application attached to it.
+    fn lookup(&self, fields: Ipv4Fields) -> Option<Match<'_>> {
+        let destination = self.destination_node(fields.destination);
+        // Flows are checked first for the application: they name the process
+        // that owns the connection. A website or IP rule still decides the
+        // node, because it applies in whichever app opens that site.
+        if let Some(flow) = self
             .flows
             .get(&(
                 fields.protocol,
@@ -523,14 +645,26 @@ impl SelectorTable {
             ))
             .or_else(|| self.flows.get(&(fields.protocol, fields.source_port, None)))
         {
-            return Some((application.application.as_deref(), application.process_id));
+            return Some(Match {
+                application: flow.application.as_deref(),
+                process_id: flow.process_id,
+                node: destination.unwrap_or(flow.node),
+            });
         }
-        let destination = u32::from(fields.destination);
+        destination.map(|node| Match {
+            application: None,
+            process_id: None,
+            node,
+        })
+    }
+
+    fn destination_node(&self, address: Ipv4Addr) -> Option<u8> {
+        let destination = u32::from(address);
         let index = self
             .destinations
-            .partition_point(|(first, _)| *first <= destination);
-        let (_, last) = self.destinations.get(index.checked_sub(1)?)?;
-        (destination <= *last).then_some((None, None))
+            .partition_point(|(first, _, _)| *first <= destination);
+        let (_, last, node) = self.destinations.get(index.checked_sub(1)?)?;
+        (destination <= *last).then_some(*node)
     }
 }
 
@@ -558,10 +692,17 @@ struct Registry {
     udp_classifier: Mutex<crate::udp_classifier::UdpClassifier>,
     fragments: Mutex<FragmentRouter<Address>>,
     redirected_dns: AtomicU64,
-    /// The session is a proxy that may hand out fake-IP addresses.
-    proxy_fake_ips: bool,
-    /// The proxy's own process, when it runs on this machine.
-    proxy: Option<crate::proxy_identity::ProxyIdentity>,
+    /// The nodes flows are pinned to, and what each can carry unfragmented.
+    nodes: Arc<SessionNodes>,
+    limits: Vec<NodeLimits>,
+    targets: TargetNodes,
+    /// Nodes that are SOCKS5 proxies, by bit.
+    proxy_nodes: u64,
+    /// The proxy that fake-IP addresses belong to when no rule names one:
+    /// such an address reaches nothing but a proxy.
+    fake_ip_node: Option<u8>,
+    /// The proxies' own processes, when they run on this machine.
+    proxies: Vec<crate::proxy_identity::ProxyIdentity>,
     /// See `PacketCaptureRequest::own_hostnames`.
     own_hostnames: HashSet<String>,
     /// The hostname rule each address was learned for, so a connection it
@@ -608,11 +749,6 @@ struct Registry {
     /// size and not only by packet count.
     bypass_queued_bytes: AtomicUsize,
     capture_threads: AtomicU64,
-    /// MSS advertised on captured TCP handshakes, derived from what the chosen
-    /// transports add to a packet rather than fixed at a guess.
-    tcp_mss: u16,
-    /// The largest packet that crosses the session unfragmented.
-    tunnel_mtu: u16,
     /// Oversized Don't Fragment packets answered with "fragmentation needed".
     fragmentation_needed_sent: AtomicU64,
     /// Answers that could not be injected; those packets were carried instead.
@@ -691,6 +827,40 @@ impl TrafficSelector {
                     && remote_port.is_none_or(|port| fields.destination_port == port)
             }
         }
+    }
+}
+
+/// What one node can carry, fixed when capture starts.
+#[derive(Clone, Copy)]
+struct NodeLimits {
+    /// MSS advertised on captured TCP handshakes, derived from what the
+    /// node's transport adds to a packet rather than fixed at a guess.
+    tcp_mss: u16,
+    /// The largest packet that crosses the node unfragmented.
+    tunnel_mtu: u16,
+}
+
+impl NodeLimits {
+    fn of(mtu: EffectiveMtu) -> Self {
+        // Clamped to what crosses unfragmented, which on a narrow link is
+        // under the floored tunnel MTU.
+        Self {
+            tcp_mss: mtu.unfragmented() - 40,
+            tunnel_mtu: mtu.unfragmented(),
+        }
+    }
+}
+
+impl Registry {
+    fn limits(&self, node: u8) -> NodeLimits {
+        self.limits
+            .get(usize::from(node))
+            .copied()
+            .unwrap_or(self.limits[0])
+    }
+
+    fn is_proxy_node(&self, node: u8) -> bool {
+        self.proxy_nodes & 1_u64.checked_shl(u32::from(node)).unwrap_or(0) != 0
     }
 }
 
@@ -848,13 +1018,15 @@ fn capture_scope(plan: &InterceptionPlan, destinations: &[(u32, u32)]) -> Captur
 }
 
 impl SplitPacketCapture {
+    /// `mtus` holds each node's MTU, in the order of `nodes`.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         rules: &[RuleSpec],
-        virtual_ipv4: Ipv4Addr,
+        nodes: Arc<SessionNodes>,
+        mtus: &[EffectiveMtu],
         bypass_ips: &[Ipv4Addr],
         sessions: Arc<Mutex<WireGuardSessionManager>>,
         data_receiver: Arc<DataReceiver>,
-        effective_mtu: EffectiveMtu,
         options: SplitOptions,
     ) -> Result<Self, String> {
         let SplitOptions {
@@ -903,8 +1075,26 @@ impl SplitPacketCapture {
             .into_iter()
             .filter(|(address, name)| direct.matches_name(name) && !direct.contains(*address))
             .collect();
-        let socks_proxy = sessions.lock().unwrap().socks_proxy();
-        let proxy_fake_ips = socks_proxy.is_some();
+        let proxies = nodes.socks_proxies().collect::<Vec<_>>();
+        let proxy_nodes = proxies
+            .iter()
+            .fold(0_u64, |mask, (node, _)| mask | 1_u64 << node);
+        // The default node when it is a proxy, else the first proxy: the one
+        // most of the machine's lookups are answered through.
+        let fake_ip_node = proxies.first().map(|(node, _)| *node);
+        if proxies.len() > 1 {
+            gamepath_engine::log_warn!(
+                "{} SOCKS5 proxies share this session; fake-IP addresses no rule claims go \
+                 through node {}",
+                proxies.len(),
+                fake_ip_node.unwrap_or(0) + 1
+            );
+        }
+        let proxy_fake_ips = fake_ip_node.is_some();
+        let limits = mtus.iter().copied().map(NodeLimits::of).collect::<Vec<_>>();
+        if limits.is_empty() {
+            return Err("the session has no node to capture into".into());
+        }
         let registry = Arc::new(Registry {
             capture_id,
             dll: dll_path()?,
@@ -918,8 +1108,15 @@ impl SplitPacketCapture {
             udp_classifier: Mutex::new(crate::udp_classifier::UdpClassifier::default()),
             fragments: Mutex::new(fragments),
             redirected_dns: AtomicU64::new(0),
-            proxy_fake_ips,
-            proxy: socks_proxy.and_then(crate::proxy_identity::ProxyIdentity::for_endpoint),
+            nodes,
+            limits,
+            targets: TargetNodes::of(&plan),
+            proxy_nodes,
+            fake_ip_node,
+            proxies: proxies
+                .iter()
+                .filter_map(|(_, proxy)| crate::proxy_identity::ProxyIdentity::for_endpoint(*proxy))
+                .collect(),
             own_hostnames: own_hostnames
                 .iter()
                 .map(|name| name.trim_end_matches('.').to_ascii_lowercase())
@@ -966,10 +1163,6 @@ impl SplitPacketCapture {
             packet_diagnostics: Default::default(),
             unmatched_return_packets: AtomicU64::new(0),
             return_injection_errors: AtomicU64::new(0),
-            // Clamped to what crosses unfragmented, which on a narrow link is
-            // under the floored tunnel MTU.
-            tcp_mss: effective_mtu.unfragmented() - 40,
-            tunnel_mtu: effective_mtu.unfragmented(),
             fragmentation_needed_sent: AtomicU64::new(0),
             fragmentation_needed_failed: AtomicU64::new(0),
             fragments_discarded: AtomicU64::new(0),
@@ -986,8 +1179,8 @@ impl SplitPacketCapture {
             0x0008,
         )?);
 
-        for selector in destination_selectors(&plan)? {
-            add_selector(&registry, selector);
+        for (selector, node) in destination_selectors(&plan)? {
+            add_selector(&registry, selector, node);
         }
         for (ip, hostname) in retained_hostname_addresses(labels, &plan.hostnames) {
             add_hostname_address(&registry, ip, &hostname);
@@ -1019,7 +1212,11 @@ impl SplitPacketCapture {
         // fixed when the handle opens, while those two learn new addresses and
         // ports while the session runs, so they need the broad filter and the
         // in-memory classifier behind it.
-        let mut destinations = selector_table(&registry).destinations.clone();
+        let mut destinations = selector_table(&registry)
+            .destinations
+            .iter()
+            .map(|(first, last, _)| (*first, *last))
+            .collect::<Vec<_>>();
         if proxy_fake_ips {
             destinations.push(FAKE_IP_RANGE);
         }
@@ -1058,7 +1255,6 @@ impl SplitPacketCapture {
                     pending_stop,
                     pending_sessions,
                     pending_returns,
-                    virtual_ipv4,
                     pending_registry,
                     pending_rx,
                 )
@@ -1099,7 +1295,6 @@ impl SplitPacketCapture {
                         capture_stop,
                         capture_sessions,
                         capture_returns,
-                        virtual_ipv4,
                         capture_registry,
                         capture_pending,
                         capture_bypass,
@@ -1121,7 +1316,6 @@ impl SplitPacketCapture {
                     inject_stop,
                     data_receiver,
                     inject_returns,
-                    virtual_ipv4,
                     inject_registry,
                 )
             })
@@ -1279,7 +1473,7 @@ impl SplitPacketCapture {
             "bypassQueuedBytes": self.registry.bypass_queued_bytes.load(Ordering::Relaxed),
             "captureScopeReason": self.scope.reason,
             "captureFilter": self.scope.clause,
-            "tcpMss": self.registry.tcp_mss,
+            "tcpMss": self.registry.limits.iter().map(|limits| limits.tcp_mss).collect::<Vec<_>>(),
             "capturedPackets": self.registry.captured_packets.load(Ordering::Relaxed),
             "capturedBytes": self.registry.captured_bytes.load(Ordering::Relaxed),
             "relayedPackets": self.registry.relayed_packets.load(Ordering::Relaxed),
@@ -1400,9 +1594,12 @@ fn close_preexisting_connections(
     closed
 }
 
-fn add_selector(registry: &Registry, selector: TrafficSelector) {
+fn add_selector(registry: &Registry, selector: TrafficSelector, node: u8) {
     let mut state = registry.selector_state.lock().unwrap();
-    if state.selectors.insert(selector, None).is_none() {
+    let added = state.selectors.insert(selector, None).is_none();
+    // A shared CDN address learned for two websites goes with the latest.
+    let moved = state.destination_nodes.insert(selector, node) != Some(node);
+    if added || moved {
         publish_selectors(registry, &state);
     }
 }
@@ -1453,7 +1650,8 @@ fn add_process_selector(
 /// Swaps in a fresh classification table. Called with the selector lock held so
 /// the table is never built from a half-applied change.
 fn publish_selectors(registry: &Registry, state: &SelectorState) {
-    *registry.table.write().unwrap() = Arc::new(SelectorTable::build_state(state));
+    *registry.table.write().unwrap() =
+        Arc::new(SelectorTable::build_state(state, &registry.targets));
     registry.table_version.fetch_add(1, Ordering::Release);
 }
 
@@ -1493,7 +1691,6 @@ fn run_selected_capture(
     stop: Arc<AtomicBool>,
     sessions: Arc<Mutex<WireGuardSessionManager>>,
     return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
-    virtual_ipv4: Ipv4Addr,
     registry: Arc<Registry>,
     pending_syns: mpsc::SyncSender<PendingSyn>,
     bypass: mpsc::SyncSender<Bypass>,
@@ -1548,7 +1745,6 @@ fn run_selected_capture(
                     &handle,
                     &bypass,
                     &mut sender,
-                    virtual_ipv4,
                     &registry,
                     packet,
                     address,
@@ -1572,7 +1768,6 @@ fn run_selected_capture(
                     &handle,
                     &bypass,
                     &mut sender,
-                    virtual_ipv4,
                     &registry,
                     ticket,
                     FragmentRoute::Drop,
@@ -1583,9 +1778,14 @@ fn run_selected_capture(
             }
             continue;
         };
-        let (mut selected, application, mut process_id) = match table.lookup(fields) {
-            Some((application, process_id)) => (true, application.map(Cow::Borrowed), process_id),
-            None => (false, None, None),
+        let (mut selected, application, mut process_id, mut node) = match table.lookup(fields) {
+            Some(found) => (
+                true,
+                found.application.map(Cow::Borrowed),
+                found.process_id,
+                found.node,
+            ),
+            None => (false, None, None, 0),
         };
         // Name resolution is never direct: remote DNS fails closed, and the
         // list only learns its names from answers that come back.
@@ -1600,6 +1800,7 @@ fn run_selected_capture(
                 {
                     application = Some(Cow::Owned(process_name(&path)));
                     process_id = Some(pid);
+                    node = registry.targets.for_path(&path);
                     add_process_selector(
                         &registry,
                         process_socket_selector(
@@ -1639,6 +1840,7 @@ fn run_selected_capture(
             if let Some((pid, path)) = owner {
                 application = Some(Cow::Owned(process_name(&path)));
                 process_id = Some(pid);
+                node = registry.targets.for_path(&path);
                 add_process_selector(
                     &registry,
                     process_socket_selector(17, fields.source_port, fields.destination_port),
@@ -1672,7 +1874,7 @@ fn run_selected_capture(
         let question = lookup_name(packet, fields);
         // GamePath resolving its own nodes: left exactly as it would go with
         // this session off, whichever session's capture sees it first.
-        let own_lookup = registry.proxy.as_ref().is_some_and(|proxy| {
+        let own_lookup = registry.proxies.iter().any(|proxy| {
             matches!(fields.protocol, 6 | 17)
                 && fields.destination_port == 53
                 && proxy.owns_port(fields.protocol, fields.source_port)
@@ -1702,7 +1904,6 @@ fn run_selected_capture(
                     &handle,
                     &bypass,
                     &mut sender,
-                    virtual_ipv4,
                     &registry,
                     ticket,
                     FragmentRoute::Drop,
@@ -1728,6 +1929,14 @@ fn run_selected_capture(
             selected = remote_dns;
             if remote_dns {
                 registry.tunnelled_dns.fetch_add(1, Ordering::Relaxed);
+                // A website's names resolve through the website's node, from
+                // whichever app; an app's own lookups through the app's node;
+                // everything else, Windows' resolver included, through the
+                // default node.
+                node = question
+                    .as_deref()
+                    .and_then(|name| registry.targets.for_name(name))
+                    .unwrap_or(if rule_selected { node } else { 0 });
             }
         }
         // Remote DNS without touching Windows' resolver settings: a lookup to
@@ -1754,8 +1963,14 @@ fn run_selected_capture(
         }
         // An address the proxy invented reaches nothing but the proxy, whoever
         // looked it up.
-        let fake_ip = registry.proxy_fake_ips && crate::netutil::is_fake_ip(fields.destination);
+        let fake_ip =
+            registry.fake_ip_node.is_some() && crate::netutil::is_fake_ip(fields.destination);
         if fake_ip {
+            // An app pinned to a proxy resolved through that proxy, so the
+            // address is that proxy's to answer.
+            if !(selected && registry.is_proxy_node(node)) {
+                node = registry.fake_ip_node.unwrap_or(0);
+            }
             if registry.fake_ip_packets.fetch_add(1, Ordering::Relaxed) == 0 {
                 gamepath_engine::log_info!(
                     "the proxy answers name lookups with fake-IP addresses; connections to {} \
@@ -1773,6 +1988,7 @@ fn run_selected_capture(
             {
                 application = Some(Cow::Owned(process_name(&path)));
                 process_id = Some(matched_process_id);
+                node = registry.targets.for_path(&path);
                 add_process_selector(
                     &registry,
                     TrafficSelector::Flow {
@@ -1857,7 +2073,6 @@ fn run_selected_capture(
                     &handle,
                     &bypass,
                     &mut sender,
-                    virtual_ipv4,
                     &registry,
                     ticket,
                     FragmentRoute::Bypass,
@@ -1871,13 +2086,13 @@ fn run_selected_capture(
             &handle,
             &mut sender,
             &return_paths,
-            virtual_ipv4,
             &registry,
             packet,
             address,
             fields,
             application.as_deref(),
             process_id,
+            node,
             &mut tunnel_buffer,
             hold_on_failure,
             redirect,
@@ -1885,8 +2100,8 @@ fn run_selected_capture(
         // A held first fragment counts as tunnelled: its later fragments are
         // then dropped with it rather than leaving on their own.
         if let Some(ticket) = first_fragment {
-            let route = if carried {
-                FragmentRoute::Tunnel(redirect)
+            let route = if let Some(node) = carried {
+                FragmentRoute::Tunnel(redirect, node)
             } else if hold_on_failure {
                 FragmentRoute::Drop
             } else {
@@ -1896,7 +2111,6 @@ fn run_selected_capture(
                 &handle,
                 &bypass,
                 &mut sender,
-                virtual_ipv4,
                 &registry,
                 ticket,
                 route,
@@ -1911,7 +2125,6 @@ fn dispatch_fragment(
     handle: &Handle,
     bypass: &mpsc::SyncSender<Bypass>,
     sender: &mut SenderCache,
-    virtual_ipv4: Ipv4Addr,
     registry: &Registry,
     packet: &[u8],
     address: Address,
@@ -1919,15 +2132,15 @@ fn dispatch_fragment(
     route: FragmentRoute,
 ) {
     match route {
-        FragmentRoute::Tunnel(redirect) => route_later_fragment(
+        FragmentRoute::Tunnel(redirect, node) => route_later_fragment(
             handle,
             sender,
-            virtual_ipv4,
             registry,
             packet,
             address,
             tunnel_buffer,
             redirect,
+            node,
         ),
         FragmentRoute::Bypass => reinject(handle, bypass, registry, packet, address),
         FragmentRoute::Drop => {
@@ -1941,7 +2154,6 @@ fn finish_fragments(
     handle: &Handle,
     bypass: &mpsc::SyncSender<Bypass>,
     sender: &mut SenderCache,
-    virtual_ipv4: Ipv4Addr,
     registry: &Registry,
     ticket: FragmentTicket,
     route: FragmentRoute,
@@ -1960,7 +2172,6 @@ fn finish_fragments(
             handle,
             bypass,
             sender,
-            virtual_ipv4,
             registry,
             &packet,
             address,
@@ -1974,16 +2185,16 @@ fn finish_fragments(
 fn route_later_fragment(
     handle: &Handle,
     sender: &mut SenderCache,
-    virtual_ipv4: Ipv4Addr,
     registry: &Registry,
     packet: &[u8],
     address: Address,
     tunnel_buffer: &mut Vec<u8>,
     redirect: Option<Ipv4Addr>,
+    node: u8,
 ) {
     tunnel_buffer.clear();
     tunnel_buffer.extend_from_slice(packet);
-    tunnel_buffer[12..16].copy_from_slice(&virtual_ipv4.octets());
+    tunnel_buffer[12..16].copy_from_slice(&registry.nodes.address(node).octets());
     if redirect.is_some() {
         tunnel_buffer[16..20].copy_from_slice(&TUNNEL_RESOLVER.octets());
     }
@@ -1991,7 +2202,7 @@ fn route_later_fragment(
     let forwarded = handle
         .ip_checksum(tunnel_buffer, &mut checksum_address)
         .is_ok()
-        && sender.send(tunnel_buffer).is_ok();
+        && sender.send(tunnel_buffer, node).is_ok();
     // Never fails open: the first fragment is already in the tunnel, and half
     // a datagram on each path reassembles nowhere.
     if forwarded {
@@ -2250,18 +2461,18 @@ fn route_selected_packet(
     handle: &Handle,
     sender: &mut SenderCache,
     return_paths: &Mutex<HashMap<ReturnKey, ReturnPath>>,
-    virtual_ipv4: Ipv4Addr,
     registry: &Registry,
     packet: &[u8],
     address: Address,
     fields: Ipv4Fields,
     application: Option<&str>,
     process_id: Option<u32>,
+    node: u8,
     tunnel_buffer: &mut Vec<u8>,
     hold_on_failure: bool,
     // The LAN resolver a redirected lookup was sent to.
     redirect: Option<Ipv4Addr>,
-) -> bool {
+) -> Option<u8> {
     let fields = match redirect {
         Some(_) => Ipv4Fields {
             destination: TUNNEL_RESOLVER,
@@ -2286,9 +2497,12 @@ fn route_selected_packet(
             registry.handled_connections.lock().unwrap().remove(&oldest);
         }
     }
-    let usage = paths
+    let carried = paths
         .get(&connection_key)
-        .filter(|path| path.process_id == process_id)
+        .filter(|path| path.process_id == process_id);
+    // A flow stays on the node it started on.
+    let node = carried.map_or(node, |path| path.node);
+    let usage = carried
         .map(|path| Arc::clone(&path.usage))
         .unwrap_or_else(|| {
             let label = destination_label(registry, fields.destination);
@@ -2309,26 +2523,35 @@ fn route_selected_packet(
             usage: Arc::clone(&usage),
             last_seen: now,
             resolver: redirect,
+            node,
         },
     );
     drop(paths);
     let is_new_connection = previous.is_none_or(|path| path.process_id != process_id);
     if is_new_connection {
-        record_handled_connection(registry, connection_key, fields, application, process_id);
+        record_handled_connection(
+            registry,
+            connection_key,
+            fields,
+            application,
+            process_id,
+            node,
+        );
     }
     registry.captured_packets.fetch_add(1, Ordering::Relaxed);
     registry
         .captured_bytes
         .fetch_add(packet.len() as u64, Ordering::Relaxed);
-    if let Some(reply) = crate::icmp::fragmentation_needed(packet, registry.tunnel_mtu) {
+    let limits = registry.limits(node);
+    if let Some(reply) = crate::icmp::fragmentation_needed(packet, limits.tunnel_mtu) {
         if signal_fragmentation_needed(handle, registry, reply, address) {
-            return true;
+            return Some(node);
         }
     }
     tunnel_buffer.clear();
     tunnel_buffer.extend_from_slice(packet);
     let tunneled = &mut tunnel_buffer[..];
-    tunneled[12..16].copy_from_slice(&virtual_ipv4.octets());
+    tunneled[12..16].copy_from_slice(&registry.nodes.address(node).octets());
     if redirect.is_some() {
         tunneled[16..20].copy_from_slice(&TUNNEL_RESOLVER.octets());
     }
@@ -2341,7 +2564,7 @@ fn route_selected_packet(
             Err("the first fragment is too short to hold its checksum".to_owned())
         }
     } else {
-        clamp_tcp_mss(tunneled, registry.tcp_mss);
+        clamp_tcp_mss(tunneled, limits.tcp_mss);
         handle.checksums(tunneled, &mut checksum_address)
     };
     if let Err(error) = &checksummed {
@@ -2354,7 +2577,7 @@ fn route_selected_packet(
     let forwarded = if checksummed.is_err() {
         Err("could not update packet checksums".to_owned())
     } else {
-        sender.send(tunneled)
+        sender.send(tunneled, node)
     };
     if forwarded.is_err() && hold_on_failure {
         registry.held_packets.fetch_add(1, Ordering::Relaxed);
@@ -2368,7 +2591,7 @@ fn route_selected_packet(
             usage.sent.fetch_add(packet.len() as u64, Ordering::Relaxed);
         }
     }
-    forwarded.is_ok()
+    forwarded.is_ok().then_some(node)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2377,7 +2600,6 @@ fn run_pending_syns(
     stop: Arc<AtomicBool>,
     sessions: Arc<Mutex<WireGuardSessionManager>>,
     return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
-    virtual_ipv4: Ipv4Addr,
     registry: Arc<Registry>,
     pending: mpsc::Receiver<PendingSyn>,
 ) {
@@ -2400,18 +2622,18 @@ fn run_pending_syns(
             thread::sleep(wait);
         }
         let table = selector_table(&registry);
-        if let Some((application, process_id)) = table.lookup(item.fields) {
+        if let Some(found) = table.lookup(item.fields) {
             route_selected_packet(
                 &handle,
                 &mut sender,
                 &return_paths,
-                virtual_ipv4,
                 &registry,
                 &item.packet,
                 item.address,
                 item.fields,
-                application,
-                process_id,
+                found.application,
+                found.process_id,
+                found.node,
                 &mut tunnel_buffer,
                 registry.kill_switch,
                 None,
@@ -2907,7 +3129,6 @@ fn run_reply_injector(
     stop: Arc<AtomicBool>,
     data_receiver: Arc<DataReceiver>,
     return_paths: Arc<Mutex<HashMap<ReturnKey, ReturnPath>>>,
-    virtual_ipv4: Ipv4Addr,
     registry: Arc<Registry>,
 ) {
     let mut fragments = gamepath_engine::ipv4_fragments::Reassembler::default();
@@ -2949,7 +3170,7 @@ fn run_reply_injector(
                 .fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        if fields.destination != virtual_ipv4 {
+        if !registry.nodes.owns(fields.destination) {
             registry
                 .return_wrong_destination
                 .fetch_add(1, Ordering::Relaxed);
@@ -2958,7 +3179,7 @@ fn run_reply_injector(
                 .fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if deliver_icmp_error(&handle, &return_paths, &registry, &mut packet, virtual_ipv4) {
+        if deliver_icmp_error(&handle, &return_paths, &registry, &mut packet) {
             continue;
         }
         let path = {
@@ -2982,7 +3203,7 @@ fn run_reply_injector(
         if let Some(resolver) = path.resolver {
             packet[12..16].copy_from_slice(&resolver.octets());
         }
-        clamp_tcp_mss(&mut packet, registry.tcp_mss);
+        clamp_tcp_mss(&mut packet, registry.limits(path.node).tcp_mss);
         let mut address = Address::inbound(path.interface_index, path.subinterface_index);
         let injected = handle
             .checksums(&mut packet, &mut address)
@@ -3021,12 +3242,11 @@ fn deliver_icmp_error(
     return_paths: &Mutex<HashMap<ReturnKey, ReturnPath>>,
     registry: &Registry,
     packet: &mut [u8],
-    virtual_ipv4: Ipv4Addr,
 ) -> bool {
     let Some(quoted) = icmp_error_quote(packet) else {
         return false;
     };
-    let Some(flow) = quoted.filter(|flow| flow.source == virtual_ipv4) else {
+    let Some(flow) = quoted.filter(|flow| registry.nodes.owns(flow.source)) else {
         return true;
     };
     let Some(path) = return_paths
@@ -3330,7 +3550,7 @@ fn ipv4_fields(packet: &[u8]) -> Option<Ipv4Fields> {
     })
 }
 
-fn destination_selectors(plan: &InterceptionPlan) -> Result<Vec<TrafficSelector>, String> {
+fn destination_selectors(plan: &InterceptionPlan) -> Result<Vec<(TrafficSelector, u8)>, String> {
     let mut selectors = Vec::new();
     for network in &plan.ip_networks {
         let (address, prefix) = network.split_once('/').unwrap();
@@ -3350,10 +3570,13 @@ fn destination_selectors(plan: &InterceptionPlan) -> Result<Vec<TrafficSelector>
         };
         let first = Ipv4Addr::from(u32::from(address) & mask);
         let last = Ipv4Addr::from(u32::from(first) | !mask);
-        selectors.push(TrafficSelector::Destination {
-            first: u32::from(first),
-            last: u32::from(last),
-        });
+        selectors.push((
+            TrafficSelector::Destination {
+                first: u32::from(first),
+                last: u32::from(last),
+            },
+            plan.node_of(network),
+        ));
     }
     Ok(selectors)
 }
@@ -3459,6 +3682,7 @@ fn add_hostname_address(registry: &Registry, address: Ipv4Addr, hostname: &str) 
             first: u32::from(address),
             last: u32::from(address),
         },
+        registry.targets.for_rule(hostname).unwrap_or(0),
     );
 }
 
@@ -3506,12 +3730,14 @@ pub(crate) fn dll_path() -> Result<PathBuf, String> {
 
 fn path_matches(path: &str, applications: &[String], folders: &[String]) -> bool {
     applications.iter().any(|target| target == path)
-        || folders.iter().any(|folder| {
-            path == folder
-                || path
-                    .strip_prefix(folder)
-                    .is_some_and(|suffix| suffix.starts_with('\\'))
-        })
+        || folders.iter().any(|folder| folder_contains(folder, path))
+}
+
+fn folder_contains(folder: &str, path: &str) -> bool {
+    path == folder
+        || path
+            .strip_prefix(folder)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
 }
 
 fn process_name(path: &str) -> String {
@@ -3528,6 +3754,7 @@ fn record_handled_connection(
     fields: Ipv4Fields,
     application: Option<&str>,
     process_id: Option<u32>,
+    node: u8,
 ) {
     let protocol = match fields.protocol {
         6 => "TCP",
@@ -3575,6 +3802,7 @@ fn record_handled_connection(
                 .as_secs(),
             path: None,
             process_id,
+            node,
         },
     );
 }
@@ -3625,12 +3853,7 @@ fn dns_addresses<'a>(packet: &[u8], hostnames: &'a [String]) -> Vec<(Ipv4Addr, &
         let Some((name, next)) = dns_name(dns, offset) else {
             return Vec::new();
         };
-        matched = matched.or_else(|| {
-            hostnames
-                .iter()
-                .find(|target| hostname_matches(&name, target))
-                .map(String::as_str)
-        });
+        matched = matched.or_else(|| most_specific_rule(&name, hostnames.iter()));
         offset = next + 4;
         if offset > dns.len() {
             return Vec::new();
@@ -3697,6 +3920,15 @@ fn dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
     Some((labels.join(".").to_lowercase(), next.unwrap_or(offset)))
 }
 
+/// The hostname rule `name` falls under: an exact rule before a wildcard, and
+/// a longer wildcard before a shorter one.
+fn most_specific_rule<'a>(name: &str, rules: impl Iterator<Item = &'a String>) -> Option<&'a str> {
+    rules
+        .filter(|rule| hostname_matches(name, rule))
+        .max_by_key(|rule| (!rule.starts_with("*."), rule.len()))
+        .map(String::as_str)
+}
+
 fn hostname_matches(name: &str, target: &str) -> bool {
     target.strip_prefix("*.").map_or(name == target, |suffix| {
         name == suffix || name.ends_with(&format!(".{suffix}"))
@@ -3724,6 +3956,7 @@ mod tests {
             usage: Arc::new(AppUsage::default()),
             last_seen: Instant::now(),
             resolver: None,
+            node: 0,
         };
         let mut paths = HashMap::from([(key, path.clone())]);
         paths.insert(
@@ -3857,6 +4090,7 @@ mod tests {
             .map(|(kind, value)| RuleSpec {
                 kind: (*kind).into(),
                 value: (*value).into(),
+                node: 0,
             })
             .collect::<Vec<_>>();
         compile("split", &rules).unwrap()
@@ -4063,11 +4297,19 @@ mod tests {
         ]);
         assert_eq!(
             table.lookup(fields(Ipv4Addr::new(8, 8, 8, 8), 6, 51_000, 443)),
-            Some((Some("game.exe"), None))
+            Some(Match {
+                application: Some("game.exe"),
+                process_id: None,
+                node: 0,
+            })
         );
         assert_eq!(
             table.lookup(fields(Ipv4Addr::new(203, 0, 113, 5), 17, 1, 1)),
-            Some((None, None))
+            Some(Match {
+                application: None,
+                process_id: None,
+                node: 0,
+            })
         );
     }
 
@@ -4091,10 +4333,129 @@ mod tests {
                 stale_observations: 0,
             }],
         );
-        let table = SelectorTable::build_state(&state);
+        let table = SelectorTable::build_state(&state, &TargetNodes::default());
         assert_eq!(
             table.lookup(fields(Ipv4Addr::new(8, 8, 8, 8), 17, 51_001, 9999)),
-            Some((Some("game.exe"), Some(1234)))
+            Some(Match {
+                application: Some("game.exe"),
+                process_id: Some(1234),
+                node: 0,
+            })
+        );
+    }
+
+    fn chat_and_browser_on_their_own_nodes() -> TargetNodes {
+        TargetNodes::of(
+            &compile(
+                "split",
+                &[
+                    RuleSpec {
+                        kind: "application".into(),
+                        value: r"C:\Apps\chat.exe".into(),
+                        node: 1,
+                    },
+                    RuleSpec {
+                        kind: "folder".into(),
+                        value: r"C:\Apps".into(),
+                        node: 2,
+                    },
+                    RuleSpec {
+                        kind: "hostname".into(),
+                        value: "*.example.com".into(),
+                        node: 3,
+                    },
+                    RuleSpec {
+                        kind: "hostname".into(),
+                        value: "api.example.com".into(),
+                        node: 0,
+                    },
+                ],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn an_application_rule_outranks_the_folder_it_sits_in() {
+        let targets = chat_and_browser_on_their_own_nodes();
+        assert_eq!(targets.for_path(r"c:\apps\chat.exe"), 1);
+        assert_eq!(targets.for_path(r"c:\apps\browser\browser.exe"), 2);
+        assert_eq!(targets.for_path(r"c:\games\game.exe"), 0);
+    }
+
+    #[test]
+    fn a_lookup_resolves_through_the_most_specific_website_rule() {
+        let targets = chat_and_browser_on_their_own_nodes();
+        assert_eq!(targets.for_name("cdn.example.com"), Some(3));
+        // An exact rule on the default node still claims its own name.
+        assert_eq!(targets.for_name("api.example.com"), Some(0));
+        assert_eq!(targets.for_name("example.org"), None);
+    }
+
+    #[test]
+    fn a_flow_takes_its_application_node_unless_a_website_rule_names_another() {
+        let selector = TrafficSelector::Flow {
+            protocol: 6,
+            local_port: 52_000,
+            remote_port: Some(443),
+        };
+        let site = TrafficSelector::Destination {
+            first: u32::from(Ipv4Addr::new(203, 0, 113, 9)),
+            last: u32::from(Ipv4Addr::new(203, 0, 113, 9)),
+        };
+        let mut state = SelectorState::default();
+        state
+            .selectors
+            .insert(selector, Some("chat.exe".to_owned()));
+        state.selectors.insert(site, None);
+        state.destination_nodes.insert(site, 3);
+        state.flow_owners.insert(
+            selector,
+            vec![FlowOwner {
+                endpoint_id: Some(1),
+                process_id: 77,
+                path: r"c:\apps\chat.exe".to_owned(),
+                stale_observations: 0,
+            }],
+        );
+        let table = SelectorTable::build_state(&state, &chat_and_browser_on_their_own_nodes());
+        let node_for = |destination| {
+            table
+                .lookup(fields(destination, 6, 52_000, 443))
+                .map(|found| found.node)
+        };
+        assert_eq!(node_for(Ipv4Addr::new(198, 51, 100, 1)), Some(1));
+        assert_eq!(node_for(Ipv4Addr::new(203, 0, 113, 9)), Some(3));
+    }
+
+    #[test]
+    fn a_narrower_range_keeps_its_own_node_inside_a_wider_one() {
+        let address = |last| u32::from(Ipv4Addr::new(203, 0, 113, last));
+        let layered = layer_destinations(vec![
+            (address(0), address(255), 1),
+            (address(40), address(40), 2),
+            (address(100), address(199), 1),
+        ]);
+        assert_eq!(
+            layered,
+            [
+                (address(0), address(39), 1),
+                (address(40), address(40), 2),
+                (address(41), address(255), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn ranges_on_one_node_merge_as_they_always_did() {
+        let address = |last| u32::from(Ipv4Addr::new(203, 0, 113, last));
+        assert_eq!(
+            layer_destinations(vec![
+                (address(10), address(20), 0),
+                (address(0), address(15), 0),
+                (address(21), address(30), 0),
+            ]),
+            [(address(0), address(30), 0)]
         );
     }
 
@@ -4136,10 +4497,15 @@ mod tests {
             &destination_selectors(&plan)
                 .unwrap()
                 .into_iter()
-                .map(|selector| (selector, None))
+                .map(|(selector, _)| (selector, None))
                 .collect(),
         );
-        let scope = capture_scope(&plan, &table.destinations);
+        let destinations = table
+            .destinations
+            .iter()
+            .map(|(first, last, _)| (*first, *last))
+            .collect::<Vec<_>>();
+        let scope = capture_scope(&plan, &destinations);
         assert!(!scope.broad);
         assert!(scope.clause.contains("ip.DstAddr >= 203.0.113.0"));
         assert!(scope.clause.contains("ip.DstAddr <= 203.0.113.255"));
@@ -4180,15 +4546,19 @@ mod tests {
             &[RuleSpec {
                 kind: "ip".into(),
                 value: "203.0.113.0/24".into(),
+                node: 0,
             }],
         )
         .unwrap();
         assert_eq!(
             destination_selectors(&plan).unwrap(),
-            [TrafficSelector::Destination {
-                first: u32::from(Ipv4Addr::new(203, 0, 113, 0)),
-                last: u32::from(Ipv4Addr::new(203, 0, 113, 255)),
-            }]
+            [(
+                TrafficSelector::Destination {
+                    first: u32::from(Ipv4Addr::new(203, 0, 113, 0)),
+                    last: u32::from(Ipv4Addr::new(203, 0, 113, 255)),
+                },
+                0
+            )]
         );
     }
 

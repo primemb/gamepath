@@ -35,7 +35,7 @@ export function VpnCommandCard({ vpn, onToggle, busy }: { vpn: VpnState; onToggl
           </span>
         </span>
         <div>
-          <span className="eyebrow">VPN · one node, direct</span>
+          <span className="eyebrow">VPN · direct</span>
           <h2 id="vpn-headline">{text.headline}</h2>
           {/* Announced, so a status change is heard as well as seen. */}
           <p aria-live="polite">

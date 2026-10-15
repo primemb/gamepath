@@ -5,6 +5,11 @@ const {
   normalizeVpn,
   selectedVpnNode,
   migrateVpnState,
+  MAX_VPN_NODES,
+  ruleNode,
+  sessionNodes,
+  nodeSetLimitation,
+  assignedLimitation,
   vpnRuleSpecs,
   ruleLimitation,
   unroutableRules,
@@ -49,7 +54,7 @@ test('a saved VPN keeps what is valid and drops what is not', () => {
       ['d', 'news.example', true],
     ],
   )
-  assert.deepEqual(vpnRuleSpecs(vpn), [{ kind: 'hostname', value: 'news.example' }])
+  assert.deepEqual(vpnRuleSpecs(vpn), [{ kind: 'hostname', value: 'news.example', node: 0 }])
 })
 
 test('a VPN without a node never wants to be connected', () => {
@@ -142,4 +147,55 @@ test('a VPN rule the game also selects is reported, because the game takes it fi
   // A rule in a switched-off group is not live, so it takes nothing.
   groups[0].enabled = false
   assert.deepEqual(ruleConflicts(vpnRules, activeGameRules(gameRules, groups)), ['inside-folder'])
+})
+
+const proxy = { id: 'proxy', kind: 'socks5', name: 'Proxy', endpoint: 'proxy.example:1080' }
+const office = { id: 'office', kind: 'l2tp', name: 'Office', endpoint: 'office.example' }
+
+function threeNodes(rules, trafficMode = 'split') {
+  return normalizeVpn({ nodes: [wireguard, proxy, office], selectedNodeId: wireguard.id, trafficMode, rules })
+}
+
+test('a session connects the default node first, then only the nodes enabled targets name', () => {
+  const vpn = threeNodes([
+    { id: 'chat', kind: 'application', value: 'C:\\Apps\\chat.exe', nodeId: 'proxy' },
+    { id: 'news', kind: 'hostname', value: 'news.example' },
+    { id: 'off', kind: 'hostname', value: 'intranet.example', nodeId: 'office', enabled: false },
+  ])
+  assert.deepEqual(
+    sessionNodes(vpn).map((node) => node.id),
+    ['vpn-node', 'proxy'],
+  )
+  assert.deepEqual(
+    vpnRuleSpecs(vpn).map((rule) => [rule.value, rule.node]),
+    [
+      ['C:\\Apps\\chat.exe', 1],
+      ['news.example', 0],
+    ],
+  )
+  // All traffic goes through the default node alone.
+  assert.deepEqual(
+    sessionNodes({ ...vpn, trafficMode: 'all' }).map((node) => node.id),
+    ['vpn-node'],
+  )
+})
+
+test('a target whose node is gone falls back to the default node', () => {
+  const vpn = threeNodes([{ id: 'chat', kind: 'application', value: 'C:\\Apps\\chat.exe', nodeId: 'gone' }])
+  assert.equal(vpn.rules[0].nodeId, null)
+  assert.equal(ruleNode(vpn, vpn.rules[0]).id, 'vpn-node')
+})
+
+test('L2TP cannot share the VPN, and a session has a node limit', () => {
+  assert.equal(nodeSetLimitation([wireguard, proxy]), null)
+  assert.equal(nodeSetLimitation([office]), null)
+  assert.match(nodeSetLimitation([wireguard, office]), /Office is an L2TP\/IPsec node/)
+  const many = Array.from({ length: MAX_VPN_NODES + 1 }, (_, index) => ({ ...proxy, id: `p${index}` }))
+  assert.match(nodeSetLimitation(many), /up to 8 nodes/)
+})
+
+test('a rule is judged by the node it is assigned, not the default node', () => {
+  const vpn = threeNodes([{ id: 'chat', kind: 'application', value: 'C:\\Apps\\chat.exe', nodeId: 'office' }])
+  assert.match(assignedLimitation(vpn, vpn.rules[0]), /cannot select applications/)
+  assert.equal(assignedLimitation(vpn, { ...vpn.rules[0], nodeId: 'proxy' }), null)
 })

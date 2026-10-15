@@ -10,7 +10,7 @@ use crate::l2tp::{
 use crate::l2tp_join::{L2tpDials, next_generation};
 use crate::registry::{Registry, STOPPED_FOR_GAME_ALL_TRAFFIC, SlotSummary};
 use crate::slot::{SessionSlot, SlotId};
-use crate::validate::{ValidateRequest, carries_direct};
+use crate::validate::{ValidateRequest, check_vpn_nodes};
 use gamepath_engine::relay_path::{NodeSpec, SessionMode};
 use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -169,12 +169,10 @@ fn start_slot(
             .map_err(|error| format!("route {}: {error}", index + 1))?;
     }
     if id == SlotId::Vpn {
-        if request.mode != SessionMode::Direct || nodes.len() != 1 {
-            return Err("the VPN connects straight to exactly one node".into());
+        if request.mode != SessionMode::Direct {
+            return Err("the VPN connects straight to its nodes and cannot use a relay".into());
         }
-        if !carries_direct(id, &nodes[0]) {
-            return Err(format!("{} cannot carry the VPN", nodes[0].describe()));
-        }
+        check_vpn_nodes(payload["trafficMode"].as_str().unwrap_or("all"), &nodes)?;
         if registry.summary(SlotId::Game).owns_all_traffic() {
             return Err(format!(
                 "{STOPPED_FOR_GAME_ALL_TRAFFIC}: the game session is carrying all traffic, \
@@ -1043,7 +1041,7 @@ mod tests {
             &registry,
         )
         .unwrap_err();
-        assert!(error.contains("exactly one node"), "{error}");
+        assert!(error.contains("cannot use a relay"), "{error}");
     }
 
     #[test]

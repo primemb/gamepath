@@ -64,7 +64,7 @@ export const vpnTabs: TabDefinition<VpnTab>[] = [
     id: 'node',
     label: 'Nodes',
     icon: ShieldCheck,
-    description: 'Save your VPN nodes and choose one to connect through.',
+    description: 'Save your VPN nodes, choose the default one, and see which nodes are carrying traffic.',
   },
   {
     id: 'split',

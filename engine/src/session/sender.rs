@@ -56,7 +56,9 @@ impl DataSender {
     /// Ok(true) when at least one path accepted the packet. An error means no
     /// path was even chosen, which split mode reads as the relay being
     /// unavailable and answers by letting the packet take the normal route.
-    pub(crate) fn send(&self, packet: &[u8]) -> Result<bool, String> {
+    ///
+    /// `node` picks the node of a direct session; a relay session ignores it.
+    pub(crate) fn send(&self, packet: &[u8], node: u8) -> Result<bool, String> {
         if !self.is_live() {
             return Err("the session has stopped".into());
         }
@@ -75,12 +77,20 @@ impl DataSender {
             // wrap it in and no sequence for anyone to compare copies by.
             SessionOverlay::Direct => (packet.to_vec(), None),
         };
-        // The scheduler's pick, narrowed to the paths that are actually
-        // carrying traffic. A path that never came up would otherwise take a
-        // copy of every packet and throw it away.
-        let decision = self.decision_mask.load(Ordering::Acquire);
-        let healthy = self.healthy_mask.load(Ordering::Acquire);
-        let dispatched = self.dispatch.send(frame, selected_paths(decision, healthy));
+        let mask = match self.overlay {
+            // The scheduler's pick, narrowed to the paths that are actually
+            // carrying traffic. A path that never came up would otherwise take
+            // a copy of every packet and throw it away.
+            SessionOverlay::Relay { .. } => selected_paths(
+                self.decision_mask.load(Ordering::Acquire),
+                self.healthy_mask.load(Ordering::Acquire),
+            ),
+            // A direct flow stays on the node its rule chose, healthy or not.
+            // Another node would carry the app somewhere the user did not
+            // pick, from an address its server has never seen.
+            SessionOverlay::Direct => 1_u64.checked_shl(u32::from(node)).unwrap_or(0),
+        };
+        let dispatched = self.dispatch.send(frame, mask);
         // Nothing to send down: only then is failing open correct. A packet
         // dropped because every chosen path is saturated must not bypass:
         // half a flow arriving from a different source address breaks it at
@@ -128,14 +138,14 @@ impl SenderCache {
         }
     }
 
-    pub(crate) fn send(&mut self, packet: &[u8]) -> Result<bool, String> {
+    pub(crate) fn send(&mut self, packet: &[u8], node: u8) -> Result<bool, String> {
         if !self.sender.as_ref().is_some_and(DataSender::is_live) {
             self.sender = self.sessions.lock().unwrap().data_sender();
         }
         self.sender
             .as_ref()
             .ok_or("start the WireGuard session before sending packets")?
-            .send(packet)
+            .send(packet, node)
     }
 }
 
@@ -143,9 +153,23 @@ impl SenderCache {
 mod tests {
     use super::super::worker::PathTelemetry;
     use super::*;
+    use gamepath_engine::auth::SessionCrypto;
     use std::sync::mpsc;
 
+    /// Two routes of a relay session, so every packet takes both.
     fn sender() -> (
+        DataSender,
+        Vec<mpsc::Receiver<super::super::worker::PathCommand>>,
+    ) {
+        sender_with(SessionOverlay::Relay {
+            client_id: [1; 16],
+            crypto: Arc::new(SessionCrypto::new(&[3; 32], 1).unwrap()),
+        })
+    }
+
+    fn sender_with(
+        overlay: SessionOverlay,
+    ) -> (
         DataSender,
         Vec<mpsc::Receiver<super::super::worker::PathCommand>>,
     ) {
@@ -155,7 +179,7 @@ mod tests {
         let diagnostics = Arc::clone(&telemetry.packet_diagnostics);
         (
             DataSender {
-                overlay: SessionOverlay::Direct,
+                overlay,
                 session_id: 1,
                 sequences: Arc::new(AtomicU64::new(0)),
                 decision_mask: Arc::new(AtomicU64::new(3)),
@@ -183,12 +207,12 @@ mod tests {
     #[test]
     fn a_saturated_copy_is_not_reported_as_rejected_by_every_path() {
         let (sender, receivers) = sender();
-        assert_eq!(sender.send(&udp()), Ok(true));
+        assert_eq!(sender.send(&udp(), 0), Ok(true));
         receivers[1].try_recv().unwrap();
         sender.dispatch.telemetry.queue_depth[1].fetch_sub(1, Ordering::Relaxed);
-        assert_eq!(sender.send(&udp()), Ok(true));
+        assert_eq!(sender.send(&udp(), 0), Ok(true));
         assert_eq!(sender.diagnostics.status()["outbound-no-queue"]["udp"], 0);
-        assert_eq!(sender.send(&udp()), Ok(false));
+        assert_eq!(sender.send(&udp(), 0), Ok(false));
         assert_eq!(sender.diagnostics.status()["outbound-no-queue"]["udp"], 1);
         assert_eq!(sender.user_bytes_sent.load(Ordering::Relaxed), 40);
         assert_eq!(
@@ -202,10 +226,22 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_flow_goes_only_to_its_own_node_even_while_it_is_down() {
+        let (sender, receivers) = sender_with(SessionOverlay::Direct);
+        sender.healthy_mask.store(0b01, Ordering::Relaxed);
+        assert_eq!(sender.send(&udp(), 1), Ok(true));
+        assert!(receivers[0].try_recv().is_err());
+        assert!(receivers[1].try_recv().is_ok());
+        assert_eq!(sender.send(&udp(), 0), Ok(true));
+        assert!(receivers[0].try_recv().is_ok());
+        assert!(receivers[1].try_recv().is_err());
+    }
+
+    #[test]
     fn stopped_workers_are_reported_separately_from_full_queues() {
         let (sender, receivers) = sender();
         drop(receivers);
-        assert_eq!(sender.send(&udp()), Ok(false));
+        assert_eq!(sender.send(&udp(), 0), Ok(false));
         assert_eq!(sender.diagnostics.status()["outbound-no-worker"]["udp"], 1);
         assert_eq!(sender.diagnostics.status()["outbound-no-queue"]["udp"], 0);
         assert_eq!(
@@ -226,7 +262,7 @@ mod tests {
             }
         });
         for _ in 0..10_000 {
-            sender.send(&udp()).unwrap();
+            sender.send(&udp(), 0).unwrap();
         }
         let telemetry = sender.dispatch.telemetry.clone();
         drop(sender);

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -7,6 +8,10 @@ use std::path::Path;
 pub struct RuleSpec {
     pub kind: String,
     pub value: String,
+    /// Which of a direct session's nodes carries the target. 0, the default
+    /// node, for every caller that sends one node or none.
+    #[serde(default)]
+    pub node: u8,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -19,6 +24,17 @@ pub struct InterceptionPlan {
     pub hostnames: Vec<String>,
     pub ip_networks: Vec<String>,
     pub protocols: Vec<String>,
+    /// The node of every target not carried by the default one, keyed by its
+    /// normalised value.
+    #[serde(skip)]
+    pub nodes: HashMap<String, u8>,
+}
+
+impl InterceptionPlan {
+    /// The node that carries `target`, a normalised value from this plan.
+    pub fn node_of(&self, target: &str) -> u8 {
+        self.nodes.get(target).copied().unwrap_or(0)
+    }
 }
 
 pub fn compile(mode: &str, rules: &[RuleSpec]) -> Result<InterceptionPlan, String> {
@@ -31,6 +47,7 @@ pub fn compile(mode: &str, rules: &[RuleSpec]) -> Result<InterceptionPlan, Strin
             hostnames: Vec::new(),
             ip_networks: Vec::new(),
             protocols: vec!["udp".into(), "tcp".into()],
+            nodes: HashMap::new(),
         });
     }
     if mode != "split" {
@@ -48,13 +65,14 @@ pub fn compile(mode: &str, rules: &[RuleSpec]) -> Result<InterceptionPlan, Strin
         hostnames: Vec::new(),
         ip_networks: Vec::new(),
         protocols: vec!["udp".into(), "tcp".into()],
+        nodes: HashMap::new(),
     };
     for rule in rules {
         let value = rule.value.trim();
         if value.is_empty() {
             return Err(format!("{} target cannot be empty", rule.kind));
         }
-        match rule.kind.as_str() {
+        let target = match rule.kind.as_str() {
             "application" => {
                 let path = Path::new(value);
                 if !path.is_absolute()
@@ -66,21 +84,36 @@ pub fn compile(mode: &str, rules: &[RuleSpec]) -> Result<InterceptionPlan, Strin
                         "application target must be an absolute .exe path: {value}"
                     ));
                 }
-                plan.application_paths.push(normalize_windows_path(value));
+                let path = normalize_windows_path(value);
+                plan.application_paths.push(path.clone());
+                path
             }
             "folder" => {
                 if !Path::new(value).is_absolute() {
                     return Err(format!("folder target must be an absolute path: {value}"));
                 }
-                plan.folder_prefixes.push(
-                    normalize_windows_path(value)
-                        .trim_end_matches('\\')
-                        .to_owned(),
-                );
+                let folder = normalize_windows_path(value)
+                    .trim_end_matches('\\')
+                    .to_owned();
+                plan.folder_prefixes.push(folder.clone());
+                folder
             }
-            "hostname" => plan.hostnames.push(normalize_hostname(value)?),
-            "ip" => plan.ip_networks.push(normalize_ip_network(value)?),
+            "hostname" => {
+                let hostname = normalize_hostname(value)?;
+                plan.hostnames.push(hostname.clone());
+                hostname
+            }
+            "ip" => {
+                let network = normalize_ip_network(value)?;
+                plan.ip_networks.push(network.clone());
+                network
+            }
             other => return Err(format!("unsupported target type: {other}")),
+        };
+        if rule.node == 0 {
+            plan.nodes.remove(&target);
+        } else {
+            plan.nodes.insert(target, rule.node);
         }
     }
     Ok(plan)
@@ -150,18 +183,22 @@ mod tests {
             RuleSpec {
                 kind: "application".into(),
                 value: r"C:\Games\Demo\game.exe".into(),
+                node: 0,
             },
             RuleSpec {
                 kind: "folder".into(),
                 value: r"C:\Games\Demo".into(),
+                node: 0,
             },
             RuleSpec {
                 kind: "hostname".into(),
                 value: "*.Game.Example.COM".into(),
+                node: 0,
             },
             RuleSpec {
                 kind: "ip".into(),
                 value: "203.0.113.0/24".into(),
+                node: 0,
             },
         ];
         let plan = compile("split", &rules).unwrap();
@@ -171,10 +208,38 @@ mod tests {
     }
 
     #[test]
+    fn each_target_keeps_the_node_its_rule_names() {
+        let rules = [
+            RuleSpec {
+                kind: "application".into(),
+                value: r"C:\Apps\Chat.exe".into(),
+                node: 2,
+            },
+            RuleSpec {
+                kind: "hostname".into(),
+                value: "*.Example.com".into(),
+                node: 1,
+            },
+            RuleSpec {
+                kind: "ip".into(),
+                value: "198.51.100.7".into(),
+                node: 0,
+            },
+        ];
+        let plan = compile("split", &rules).unwrap();
+        assert_eq!(plan.node_of(r"c:\apps\chat.exe"), 2);
+        assert_eq!(plan.node_of("*.example.com"), 1);
+        assert_eq!(plan.node_of("198.51.100.7/32"), 0);
+        // Only targets off the default node are stored.
+        assert_eq!(plan.nodes.len(), 2);
+    }
+
+    #[test]
     fn bad_cidr_is_rejected() {
         let rules = [RuleSpec {
             kind: "ip".into(),
             value: "10.0.0.0/44".into(),
+            node: 0,
         }];
         assert!(compile("split", &rules).is_err());
     }

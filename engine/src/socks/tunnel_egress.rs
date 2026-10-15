@@ -106,7 +106,7 @@ impl PacketOutlet for Arc<Mutex<WireGuardSessionManager>> {
         };
         for packet in packets {
             // A packet no path took is lost like any other; TCP retransmits.
-            let _ = sender.send(&packet);
+            let _ = sender.send(&packet, 0);
         }
     }
 }

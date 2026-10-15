@@ -36,7 +36,7 @@ export const persian: Record<string, string> = {
   'Import an .ovpn file': 'وارد کردن فایل .ovpn',
   'Proxy address and login': 'نشانی پراکسی و ورود',
   'Server, key and login': 'سرور، کلید و ورود',
-  'VPN · one node, direct': 'VPN · یک گره، مستقیم',
+  'VPN · direct': 'VPN · مستقیم',
   Traffic: 'ترافیک',
   'Connected for': 'مدت اتصال',
   'Turn off VPN': 'خاموش کردن VPN',
@@ -79,8 +79,47 @@ export const persian: Record<string, string> = {
   'Turn off the VPN kill switch': 'خاموش کردن قطع‌کننده اضطراری VPN',
   'Turn on the VPN kill switch': 'روشن کردن قطع‌کننده اضطراری VPN',
   'Apps and websites': 'برنامه‌ها و وب‌سایت‌ها',
-  'All traffic uses the VPN, so this list is not needed right now.':
-    'همه ترافیک از VPN عبور می‌کند، پس فعلاً به این فهرست نیازی نیست.',
+  'All traffic uses the default node, so this list is not needed right now.':
+    'همه ترافیک از گره پیش‌فرض عبور می‌کند، پس فعلاً به این فهرست نیازی نیست.',
+  'Pick a node for any target, or leave it on the default node. A website rule applies in every app, and its names are looked up through its own node.':
+    'برای هر مقصد یک گره انتخاب کنید یا آن را روی گره پیش‌فرض بگذارید. قانون وب‌سایت در همه برنامه‌ها اعمال می‌شود و نام‌های آن از طریق گره خودش پیدا می‌شوند.',
+  'not answering': 'پاسخ نمی‌دهد',
+  'Not answering': 'پاسخ نمی‌دهد',
+  'Default node': 'گره پیش‌فرض',
+  Default: 'پیش‌فرض',
+  'Which node carries what': 'کدام گره چه چیزی را منتقل می‌کند',
+  'Save your VPN nodes, choose the default one, and see which nodes are carrying traffic.':
+    'گره‌های VPN را ذخیره کنید، گره پیش‌فرض را انتخاب کنید و ببینید کدام گره‌ها ترافیک را منتقل می‌کنند.',
+  'Apps and websites that are not listed here keep your normal connection.':
+    'برنامه‌ها و وب‌سایت‌هایی که اینجا نیستند از اتصال عادی شما استفاده می‌کنند.',
+  'All traffic mode sends everything through the default node.': 'حالت همه ترافیک همه چیز را از گره پیش‌فرض می‌فرستد.',
+  'Carries all traffic except your game.': 'همه ترافیک به‌جز بازی شما را منتقل می‌کند.',
+  'Also looks up names for apps that use Windows’ resolver.':
+    'نام‌ها را برای برنامه‌هایی که از جست‌وجوگر نام ویندوز استفاده می‌کنند هم پیدا می‌کند.',
+  'No targets of its own. It looks up names for apps that use Windows’ resolver.':
+    'مقصد اختصاصی ندارد. نام‌ها را برای برنامه‌هایی که از جست‌وجوگر نام ویندوز استفاده می‌کنند پیدا می‌کند.',
+  'Not connected': 'متصل نیست',
+  Change: 'تغییر',
+  Saved: 'ذخیره‌شده',
+  'Switching…': 'در حال تغییر…',
+  'Connect through': 'اتصال از طریق',
+  'This website, and its name lookups, use this node in every app.':
+    'این وب‌سایت و جست‌وجوی نام‌های آن در همه برنامه‌ها از این گره استفاده می‌کنند.',
+  'Traffic to this address uses this node in every app.':
+    'ترافیک این نشانی در همه برنامه‌ها از این گره استفاده می‌کند.',
+  'Its traffic uses this node. Apps that look names up themselves, such as Chrome and Discord, resolve through it too; other apps resolve through the default node.':
+    'ترافیک آن از این گره عبور می‌کند. برنامه‌هایی که خودشان نام‌ها را پیدا می‌کنند، مانند Chrome و Discord، نام‌ها را هم از این گره پیدا می‌کنند؛ برنامه‌های دیگر از گره پیش‌فرض.',
+  'The default node carries everything you have not assigned to another node.':
+    'گره پیش‌فرض هر چیزی را که به گره دیگری نسپرده‌اید منتقل می‌کند.',
+  'Changing the default node reconnects a running VPN. To send an app or website through another node, pick it beside that target in Split tunnel.':
+    'تغییر گره پیش‌فرض، VPN در حال اجرا را دوباره متصل می‌کند. برای فرستادن یک برنامه یا وب‌سایت از گره دیگر، آن گره را کنار همان مقصد در بخش تونل جداگانه انتخاب کنید.',
+  'Default VPN node': 'گره پیش‌فرض VPN',
+  'Removing the default node turns the VPN off.': 'حذف گره پیش‌فرض، VPN را خاموش می‌کند.',
+  'Its targets move to the default node.': 'مقصدهای آن به گره پیش‌فرض منتقل می‌شوند.',
+  'The VPN reconnected to change which nodes it uses.': 'VPN برای تغییر گره‌هایی که استفاده می‌کند دوباره متصل شد.',
+  'That target no longer exists.': 'این مقصد دیگر وجود ندارد.',
+  'The VPN can use up to 8 nodes at once. Move some targets to a node that is already in use.':
+    'VPN هم‌زمان حداکثر از ۸ گره استفاده می‌کند. برخی مقصدها را به گرهی که در حال استفاده است منتقل کنید.',
   'Add app': 'افزودن برنامه',
   'Add folder': 'افزودن پوشه',
   'Add website or IP': 'افزودن وب‌سایت یا IP',
@@ -716,6 +755,30 @@ const dynamic: [RegExp, (...parts: string[]) => string][] = [
   [/^Reconnecting to (.+)…$/, (node) => `در حال اتصال دوباره به ${node}…`],
   [/^Connected through (.+)\.$/, (node) => `از طریق ${node} متصل است.`],
   [/^Through (.+)$/, (detail) => `از طریق ${detail}`],
+  [/^Default · (.+)$/, (node) => `پیش‌فرض · ${node}`],
+  [
+    /^Connected(?: · (\d+) ms)? · (\d+) connections?$/,
+    (latency, count) => `متصل${latency ? ` · ${latency} میلی‌ثانیه` : ''} · ${count} اتصال`,
+  ],
+  [/^Targets through (.+)$/, (node) => `مقصدهای ${node}`],
+  [/^(.+) \(default only\)$/, (node) => `${node} (فقط پیش‌فرض)`],
+  [/^Node for (.+)$/, (target) => `گره ${target}`],
+  [/^Make (.+) the default node$/, (node) => `${node} گره پیش‌فرض شود`],
+  [/^Carries (\d+) targets?$/, (count) => `${count} مقصد را منتقل می‌کند`],
+  [/^(\d+) nodes in use(.*)$/, (count, rest) => `${count} گره در حال استفاده${rest}`],
+  [
+    /^(.+) (?:is|are) not answering\. Apps assigned to (?:it|them) reconnect when (?:it is|they are) back\.$/,
+    (nodes) => `${nodes} پاسخ نمی‌دهد. برنامه‌هایی که به آن سپرده شده‌اند پس از بازگشت آن دوباره وصل می‌شوند.`,
+  ],
+  [
+    /^(.+) is already in the list\. Choose its node there instead\.$/,
+    (target) => `${target} از قبل در فهرست است. گره آن را همان‌جا انتخاب کنید.`,
+  ],
+  [
+    /^(.+) is an L2TP\/IPsec node, which Windows routes for the whole VPN, so it cannot share the VPN with other nodes\. Send every target through one node, or use a WireGuard, OpenVPN or SOCKS5 node\.$/,
+    (node) =>
+      `${node} یک گره L2TP/IPsec است که ویندوز آن را برای کل VPN مسیریابی می‌کند، پس نمی‌تواند VPN را با گره‌های دیگر شریک شود. همه مقصدها را از یک گره بفرستید یا از گره WireGuard، OpenVPN یا SOCKS5 استفاده کنید.`,
+  ],
   [/^(.+) is ready to connect\.?$/, (node) => `${node} آماده اتصال است`],
   [/^(.+) node saved for the VPN\.$/, (kind) => `گره ${kind} برای VPN ذخیره شد.`],
   [/^(.+) Retrying in (\d+) s\.$/, (reason, seconds) => `${reason} تلاش دوباره تا ${seconds} ثانیه دیگر.`],

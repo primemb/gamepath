@@ -12,7 +12,7 @@ import { VpnTargetList } from '../components/vpn/VpnTargetList'
 import { VpnTargetModal } from '../components/vpn/VpnTargetModal'
 import { VpnTrafficCard } from '../components/vpn/VpnTrafficCard'
 import { vpnTabs, type VpnTab } from '../lib/views'
-import { vpnLive, vpnOn } from '../lib/vpn'
+import { assignedTargets, nodeLive, vpnLive, vpnOn } from '../lib/vpn'
 import { L2tpModal } from '../modals/L2tpModal'
 import { OpenVpnLoginModal } from '../modals/OpenVpnLoginModal'
 import { Socks5Modal } from '../modals/Socks5Modal'
@@ -29,8 +29,8 @@ type Modal =
   | null
 
 /**
- * The VPN section: one node connected directly, beside the game session and
- * never in its way.
+ * The VPN section: a default node, and others for the targets assigned to
+ * them, connected directly beside the game session and never in its way.
  */
 export function VpnView({
   state,
@@ -144,7 +144,8 @@ export function VpnView({
           <VpnNodePanel
             nodes={vpn.nodes}
             selectedNodeId={vpn.selectedNodeId}
-            session={vpn.session}
+            live={nodeLive(vpn)}
+            assigned={assignedTargets(vpn)}
             busy={toggling}
             onChoose={chooseNode}
             onSelect={(id) =>
@@ -171,6 +172,17 @@ export function VpnView({
               vpn={vpn}
               onAdd={(initial) => setModal({ kind: 'target', initial })}
               onToggle={(id, enabled) => void guard(() => api.vpn.setRuleEnabled(id, enabled))}
+              onNode={(id, nodeId) =>
+                void guard(async () => {
+                  const running = vpnLive(vpn.session.status) ? vpn.session.sessionId : null
+                  const next = await api.vpn.setRuleNode(id, nodeId)
+                  // A node joining or leaving opens or closes a tunnel.
+                  if (running && next.vpn.session.sessionId !== running) {
+                    notify('The VPN reconnected to change which nodes it uses.')
+                  }
+                  return next
+                })
+              }
               onRemove={(id) => void guard(() => api.vpn.removeRule(id))}
             />
           </div>
@@ -215,6 +227,7 @@ export function VpnView({
       )}
       {modal?.kind === 'target' && (
         <VpnTargetModal
+          vpn={vpn}
           canSelectApps={vpn.canSelectApps}
           initialKind={modal.initial}
           onClose={() => setModal(null)}

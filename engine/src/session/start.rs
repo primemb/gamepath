@@ -8,11 +8,12 @@
 //! nothing to seal frames for.
 
 use super::dialer::PathDialer;
-use super::direct_worker::run_direct_path;
+use super::direct_worker::{DirectRoute, run_direct_path};
 use super::dispatch::Dispatch;
 use super::join::{JoinGate, RouteStart, RouteTransport, START_RETRY_WINDOW, dial_routes};
 use super::local_tap::{InboundSink, LocalTap};
 use super::monitors::{spawn_session_summary, spawn_uplink_monitor};
+use super::nodes::{MAX_DIRECT_NODES, SessionNode, SessionNodes};
 use super::path_mtu::SessionMtu;
 use super::relay_worker::run_path;
 use super::repair::{LossRepair, spawn_flusher};
@@ -27,13 +28,14 @@ use crate::netutil::{link_mtu_for_endpoints, resolve_ipv4, warn_if_below_link_bu
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::l2tp::L2tpRuntime;
 use gamepath_engine::mtu::EffectiveMtu;
-use gamepath_engine::relay_path::{NodeSpec, RelayPath, SessionMode};
+use gamepath_engine::relay_path::{DirectPath, KIND_SOCKS5, NodeSpec, RelayPath, SessionMode};
+use gamepath_engine::role::Role;
 use gamepath_engine::scheduler::{PathMetrics, Strategy};
 use gamepath_engine::thread_priority;
 use gamepath_engine::timer::HighResolutionTimer;
 use gamepath_engine::{log_info, log_warn};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -233,7 +235,7 @@ impl WireGuardSessionManager {
         let effective_mtu =
             EffectiveMtu::for_session(SessionMode::Relay, kinds.iter().copied(), link_mtu)
                 .with_tunnel_limit(provider_mtu);
-        let session_mtu = SessionMtu::measure(
+        let session_mtu = Arc::new(SessionMtu::measure(
             effective_mtu,
             link_mtu,
             paths.iter().flat_map(SessionRoute::measured_endpoints),
@@ -241,7 +243,7 @@ impl WireGuardSessionManager {
                 EffectiveMtu::for_session(SessionMode::Relay, kinds, link_mtu)
                     .with_tunnel_limit(provider_mtu)
             },
-        );
+        ));
         let route_summary = paths
             .iter()
             .map(|route| {
@@ -426,101 +428,198 @@ impl WireGuardSessionManager {
             decision_mask,
             telemetry,
             scheduler_metrics,
+            // The relay is the one node: the scheduler picks its routes.
+            nodes: Arc::new(SessionNodes::new(vec![SessionNode {
+                address: enrollment.virtual_ipv4,
+                mtu: Arc::clone(&session_mtu),
+                socks_proxy: None,
+            }])),
             mtu: session_mtu,
             bypass_ips,
-            socks_proxy: None,
             local_tap,
             timer,
         });
         Ok(())
     }
 
-    /// Brings up a direct session: no relay, and one tunnelling node doing the
-    /// routing that a relay would otherwise do.
+    /// Brings up a direct session: no relay, and each node doing the routing
+    /// that a relay would otherwise do for the flows pinned to it.
     pub(super) fn start_direct(&mut self, nodes: &[NodeSpec]) -> Result<(), String> {
-        // Duplication is the only reason to run several paths, and duplication
-        // needs a relay to recognise the copies. Say so rather than silently
-        // using the first node and leaving the rest looking active.
-        let [node] = nodes else {
+        // Duplication needs a relay to recognise the copies, so several nodes
+        // only make sense when each flow is pinned to one of them, which is
+        // the VPN's per-app routing. Say so rather than silently using the
+        // first node and leaving the rest looking active.
+        if nodes.len() > 1 && Role::current() != Role::Vpn {
             return Err(format!(
                 "direct mode sends traffic through exactly one node, but {} are enabled. \
                  Enable a single WireGuard, OpenVPN or L2TP/IPsec node, or switch to relay mode to combine them.",
                 nodes.len()
             ));
-        };
-        let path = node
-            .open_direct()
-            .map_err(|error| format!("{}: {error}", node.describe()))?;
-        let virtual_ipv4 = path.address();
-        let bypass_ips = path.bypass_ipv4().into_iter().collect::<Vec<_>>();
-        let label = node.label().unwrap_or_else(|| node.default_label(1));
-        let endpoint = path.endpoint().to_string();
+        }
+        if nodes.is_empty() || nodes.len() > MAX_DIRECT_NODES {
+            return Err(format!(
+                "a direct session uses between 1 and {MAX_DIRECT_NODES} nodes, but {} were given",
+                nodes.len()
+            ));
+        }
+        // Together: each OpenVPN node is a handshake of its own, and one slow
+        // provider must not hold the others.
+        let opened = thread::scope(|scope| {
+            nodes
+                .iter()
+                .map(|node| scope.spawn(move || node.open_direct()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|opening| {
+                    opening
+                        .join()
+                        .unwrap_or_else(|_| Err("opening the node panicked".to_owned()))
+                })
+                .collect::<Vec<_>>()
+        });
+        // A node that did not open keeps being dialled by its worker, so the
+        // session starts on the others; only a session with none fails.
+        if opened.iter().all(Result::is_err) {
+            return Err(nodes
+                .iter()
+                .zip(&opened)
+                .filter_map(|(node, path)| {
+                    Some(format!("{}: {}", node.describe(), path.as_ref().err()?))
+                })
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
 
         self.stop();
         let timer = HighResolutionTimer::raise();
         let stop = Arc::new(AtomicBool::new(false));
-        let kind = path.kind();
-        let socks_proxy =
-            (kind == gamepath_engine::relay_path::KIND_SOCKS5).then(|| path.endpoint());
-        let label_for_log = label.clone();
-        let link_mtu = link_mtu_for_endpoints(path.bypass_ipv4());
-        let provider_mtu = node.configured_tunnel_mtu();
-        let effective_mtu = EffectiveMtu::for_session(SessionMode::Direct, [kind], link_mtu)
-            .with_tunnel_limit(provider_mtu);
-        let session_mtu = SessionMtu::measure(
-            effective_mtu,
-            link_mtu,
-            path.bypass_ipv4().filter(|_| !path.carried_by_stream()),
-            move |link_mtu| {
-                EffectiveMtu::for_session(SessionMode::Direct, [kind], link_mtu)
-                    .with_tunnel_limit(provider_mtu)
-            },
-        );
-        let statuses = Arc::new(Mutex::new(vec![initial_status(1, kind, label, endpoint)]));
-        let scheduler_metrics = Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())]));
-        let (command_tx, command_rx) = mpsc::sync_channel(PATH_QUEUE_DEPTH);
+        let session_id = rand::random::<u64>();
+        let count = nodes.len();
+        let mut bypass_ips = Vec::new();
+        let mut session_nodes = Vec::with_capacity(count);
+        let mut initial_statuses = Vec::with_capacity(count);
+        let mut summary = Vec::with_capacity(count);
+        for (index, (node, path)) in nodes.iter().zip(&opened).enumerate() {
+            let route = index + 1;
+            let path = path.as_ref();
+            let kind = path.map_or_else(|_| node.kind(), DirectPath::kind);
+            // Every address the node may dial, so a redial to another one
+            // still leaves outside the capture.
+            let mut endpoints = node.endpoint_ipv4s();
+            endpoints.extend(path.ok().and_then(DirectPath::bypass_ipv4));
+            endpoints.sort_unstable();
+            endpoints.dedup();
+            let link_mtu = link_mtu_for_endpoints(endpoints.iter().copied());
+            let provider_mtu = node.configured_tunnel_mtu();
+            let effective_mtu = EffectiveMtu::for_session(SessionMode::Direct, [kind], link_mtu)
+                .with_tunnel_limit(provider_mtu);
+            warn_if_below_link_budget(effective_mtu, link_mtu);
+            let measured = path
+                .ok()
+                .filter(|path| !path.carried_by_stream())
+                .and_then(DirectPath::bypass_ipv4);
+            let mtu = Arc::new(SessionMtu::measure(
+                effective_mtu,
+                link_mtu,
+                measured,
+                move |link_mtu| {
+                    EffectiveMtu::for_session(SessionMode::Direct, [kind], link_mtu)
+                        .with_tunnel_limit(provider_mtu)
+                },
+            ));
+            let label = node.label().unwrap_or_else(|| node.default_label(route));
+            let mut status = initial_status(
+                route,
+                kind,
+                label.clone(),
+                path.map_or_else(|_| node.describe(), |path| path.endpoint().to_string()),
+            );
+            if let Err(error) = path {
+                log_warn!("route {route} ({label}) did not open, retrying: {error}");
+                status.joining = true;
+                status.last_error = Some(error.clone());
+            }
+            summary.push(format!(
+                "{route}:{label}/{kind} mtu {}{}",
+                effective_mtu.mtu,
+                if path.is_ok() { "" } else { " (dialling)" }
+            ));
+            session_nodes.push(SessionNode {
+                address: path.map_or(Ipv4Addr::UNSPECIFIED, DirectPath::address),
+                mtu,
+                socks_proxy: match path {
+                    Ok(path) if kind == KIND_SOCKS5 => Some(path.endpoint()),
+                    _ => proxy_address(node),
+                },
+            });
+            initial_statuses.push(status);
+            bypass_ips.extend(endpoints);
+        }
+        bypass_ips.sort_unstable();
+        bypass_ips.dedup();
+        let session_mtu = Arc::clone(&session_nodes[0].mtu);
+        let session_nodes = Arc::new(SessionNodes::new(session_nodes));
+        let statuses = Arc::new(Mutex::new(initial_statuses));
+        let scheduler_metrics = Arc::new(Mutex::new(
+            (0..count)
+                .map(|index| PathMetrics::new(index.to_string()))
+                .collect::<Vec<_>>(),
+        ));
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let local_tap = Arc::new(LocalTap::default());
         let inbound = InboundSink::new(inbound_tx, Arc::clone(&local_tap));
-        let telemetry = PathTelemetry::new(1);
-        let worker_telemetry = telemetry.clone();
-        let dispatch_telemetry = telemetry.clone();
-        let worker_stop = Arc::clone(&stop);
-        let worker_statuses = Arc::clone(&statuses);
-        let worker_metrics = Arc::clone(&scheduler_metrics);
-        let session_id = rand::random::<u64>();
-        let worker = thread::Builder::new()
-            .name("gamepath-direct-1".into())
-            .spawn(move || {
-                thread_priority::raise_current_for_data_plane();
-                run_direct_path(
-                    path,
-                    virtual_ipv4,
-                    worker_stop,
-                    worker_statuses,
-                    command_rx,
-                    inbound,
-                    worker_metrics,
-                    worker_telemetry,
-                    session_id,
-                )
-            })
-            .map_err(|error| format!("could not start path worker: {error}"))?;
-        let mut workers = vec![worker];
-        warn_if_below_link_budget(effective_mtu, link_mtu);
+        let telemetry = PathTelemetry::new(count);
+        let (commands, receivers): (Vec<_>, Vec<_>) = (0..count)
+            .map(|_| mpsc::sync_channel(PATH_QUEUE_DEPTH))
+            .unzip();
+        let mut workers = Vec::with_capacity(count + 2);
+        for (index, ((node, path), command_rx)) in
+            nodes.iter().zip(opened).zip(receivers).enumerate()
+        {
+            let route = DirectRoute {
+                index,
+                node: node.clone(),
+                nodes: Arc::clone(&session_nodes),
+            };
+            let worker_stop = Arc::clone(&stop);
+            let worker_statuses = Arc::clone(&statuses);
+            let worker_inbound = inbound.clone();
+            let worker_metrics = Arc::clone(&scheduler_metrics);
+            let worker_telemetry = telemetry.clone();
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("gamepath-direct-{}", index + 1))
+                    .spawn(move || {
+                        thread_priority::raise_current_for_data_plane();
+                        run_direct_path(
+                            path.ok(),
+                            route,
+                            worker_stop,
+                            worker_statuses,
+                            command_rx,
+                            worker_inbound,
+                            worker_metrics,
+                            worker_telemetry,
+                            session_id,
+                        )
+                    })
+                    .map_err(|error| format!("could not start path worker: {error}"))?,
+            );
+        }
+        // Every node is in the pick; capture says which one each flow takes.
+        let decision_mask = Arc::new(AtomicU64::new(u64::MAX >> (64 - count)));
         workers.extend(spawn_uplink_monitor(&stop, &telemetry));
         workers.extend(spawn_session_summary(
             session_id,
             &stop,
             &statuses,
             &telemetry,
-            &Arc::new(AtomicU64::new(1)),
+            &decision_mask,
             &scheduler_metrics,
         ));
         log_info!(
-            "direct session up: {label_for_log} ({kind}), uplink mtu {link_mtu}, tunnel mtu {} overhead {}",
-            effective_mtu.mtu,
-            effective_mtu.overhead
+            "direct session up: {count} node(s) [{}]",
+            summary.join(", ")
         );
         self.active = Some(ActiveWireGuardSession {
             mode: SessionMode::Direct,
@@ -535,8 +634,8 @@ impl WireGuardSessionManager {
             skipped_routes: Arc::default(),
             service_dials: HashMap::new(),
             dispatch: Arc::new(Dispatch {
-                commands: vec![command_tx],
-                telemetry: dispatch_telemetry,
+                commands,
+                telemetry: telemetry.clone(),
             }),
             loss_repair: None,
             ingress: None,
@@ -544,18 +643,26 @@ impl WireGuardSessionManager {
                 inbound: Mutex::new(inbound_rx),
                 user_bytes_received: AtomicU64::new(0),
             }),
-            virtual_ipv4,
+            virtual_ipv4: session_nodes.address(0),
             sequences: Arc::new(AtomicU64::new(1)),
-            // One path, always selected: there is nothing to schedule between.
-            decision_mask: Arc::new(AtomicU64::new(1)),
+            decision_mask,
             telemetry,
             scheduler_metrics,
             mtu: session_mtu,
+            nodes: session_nodes,
             bypass_ips,
-            socks_proxy,
             local_tap,
             timer,
         });
         Ok(())
     }
+}
+
+/// Where a SOCKS5 node's proxy listens, before it has been opened.
+fn proxy_address(node: &NodeSpec) -> Option<SocketAddr> {
+    let NodeSpec::Socks5 { port, .. } = node else {
+        return None;
+    };
+    let address = *node.endpoint_ipv4s().first()?;
+    Some(SocketAddr::from((address, *port)))
 }

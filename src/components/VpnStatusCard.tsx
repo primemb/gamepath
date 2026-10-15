@@ -1,6 +1,6 @@
 import { ArrowDownLeft, ArrowUpRight, ChevronRight, ShieldCheck } from 'lucide-react'
 import { formatRate } from '../lib/format'
-import { useVpnRates, vpnLive, vpnStatusText } from '../lib/vpn'
+import { nodeNames, useVpnRates, vpnLive, vpnStatusText } from '../lib/vpn'
 import type { AppState } from '../types'
 
 /** The VPN at a glance on the overview, and the way into its screen. */
@@ -11,7 +11,7 @@ export function VpnStatusCard({ state, onOpen }: { state: AppState; onOpen: () =
   const detail = !node
     ? 'Add a node to use it beside your game'
     : live
-      ? `Through ${node.name}${session.metrics?.latencyMs != null ? ` · ${Math.round(session.metrics.latencyMs)} ms` : ''}`
+      ? `Through ${nodeNames(session.nodes?.length ? session.nodes : [node])}${session.metrics?.latencyMs != null ? ` · ${Math.round(session.metrics.latencyMs)} ms` : ''}`
       : (session.message ?? `${node.name} is ready to connect`)
 
   return (

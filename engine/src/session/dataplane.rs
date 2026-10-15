@@ -185,7 +185,7 @@ impl WireGuardSessionManager {
     pub(crate) fn enqueue_data_packet(&mut self, packet: &[u8]) -> Result<bool, String> {
         self.data_sender()
             .ok_or("start the WireGuard session before sending packets")?
-            .send(packet)
+            .send(packet, 0)
     }
 
     fn receive_data_packet(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {

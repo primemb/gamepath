@@ -352,11 +352,23 @@ The **VPN** section is a second connection for everyday apps, running beside the
 way: a browser, a chat client or a launcher's store can use a VPN while the game uses its own tunnel, and
 everything else keeps the normal connection.
 
-- **One node, connected directly.** WireGuard, OpenVPN, L2TP/IPsec or SOCKS5. Nothing is duplicated and no
-  relay is involved. Save multiple nodes and select one at a time. Adding a node keeps the current selection;
-  selecting another reconnects a running VPN through it. Removing an unused node leaves the connection alone.
+- **A default node, connected directly.** WireGuard, OpenVPN, L2TP/IPsec or SOCKS5. Nothing is duplicated and
+  no relay is involved. Save multiple nodes and choose which is the default; choosing another reconnects a
+  running VPN through it. Removing an unused node leaves the connection alone.
 - **Its own targets.** Applications, folders, websites and IP ranges, exactly like the game's split rules, or
   all traffic except the game. Edits apply live, without reconnecting.
+- **Each target can use its own node.** In split mode, pick a node beside any target: Chrome through a SOCKS5
+  proxy, Discord through WireGuard, everything else through the default node. Up to eight nodes run at once,
+  each with its own tunnel, and a connection stays on the node it started on. Moving a target between nodes
+  already in use applies live; bringing a node in or leaving one unused reconnects the VPN. A website or IP
+  rule applies in every app, so it wins over an app rule for that site. A node that stops answering is shown
+  on its own targets and dialled again in the background; the other nodes keep running. L2TP/IPsec is
+  routed by Windows for the whole VPN, so it can only be used alone.
+- **Names resolve through the target's node.** A website's lookups go through its node from any app. Apps that
+  look names up themselves (Chrome, Edge, Discord and other Chromium apps) resolve through their own node.
+  Windows' resolver answers for most other apps and does not say which app asked, so those lookups go through
+  the default node, or through the game's route while a game session runs. Remote DNS stays fail closed on
+  every node.
 - **The game always comes first.** Whatever the game session selects goes through the game, even if the VPN
   lists it too; such a target is marked **Game rule wins**. A game session in all-traffic mode pauses the VPN,
   which resumes by itself when that session stops or switches to split mode. Starting the game is never

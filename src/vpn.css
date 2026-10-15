@@ -379,6 +379,126 @@
 .vpn-node.is-selected .vpn-node-selection {
   color: var(--vpn-accent);
 }
+/* Carrying assigned targets beside the default node. */
+.vpn-node.is-in-use {
+  border-color: rgba(78, 225, 155, 0.24);
+}
+.vpn-node .vpn-route-live {
+  margin-top: 5px;
+}
+
+/* ---- Which node carries what ---- */
+.vpn-route-list {
+  margin: 14px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  list-style: none;
+}
+.vpn-route {
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  display: grid;
+  gap: 8px;
+  background: var(--panel);
+}
+.vpn-route.is-down {
+  border-color: rgba(255, 179, 92, 0.32);
+}
+.vpn-route-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.vpn-route-name {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.vpn-route-name strong {
+  font-size: 12.5px;
+}
+.vpn-default-pill {
+  color: #0d0a24;
+  background: var(--vpn-accent);
+  font-size: 9px;
+}
+/* Text beside the dot, so the state never rests on colour alone. */
+.vpn-route-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.vpn-route-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+.vpn-route-live.is-connected {
+  color: var(--green);
+}
+.vpn-route-live.is-connecting {
+  color: var(--vpn-accent);
+}
+.vpn-route-live.is-down {
+  color: var(--vpn-warn);
+}
+.vpn-route-live.is-idle {
+  color: #6f7b8d;
+}
+.vpn-route-chips {
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  list-style: none;
+}
+.vpn-route-chip {
+  max-width: 220px;
+  padding: 4px 9px;
+  border: 1px solid var(--vpn-accent-line);
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #cfd5e2;
+  background: var(--vpn-accent-soft);
+  font-size: 11px;
+}
+.vpn-route-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vpn-route-chip svg {
+  flex: none;
+  color: var(--vpn-accent);
+}
+.vpn-route-note {
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+.connection-node {
+  padding: 2px 7px;
+  border-radius: 999px;
+  overflow: hidden;
+  color: var(--vpn-accent);
+  background: var(--vpn-accent-soft);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .vpn-node-hint,
 .vpn-node-remove-hint {
   color: var(--muted);
@@ -533,6 +653,39 @@
   flex: none;
   color: #6f7b8d;
   font-size: 10.5px;
+}
+/* The node a target goes through, chosen in its row. */
+.vpn-node-picker.is-compact {
+  flex: 0 1 190px;
+  min-width: 112px;
+}
+.vpn-node-picker.is-compact select {
+  width: 100%;
+  height: 30px;
+  padding: 0 24px 0 9px;
+  border: 1px solid var(--vpn-accent-line);
+  border-radius: 8px;
+  outline: none;
+  overflow: hidden;
+  color: #cfd5e2;
+  background: #0b1018;
+  cursor: pointer;
+  font-size: 11px;
+  text-overflow: ellipsis;
+}
+.vpn-node-picker select:focus-visible {
+  outline: 2px solid var(--vpn-accent);
+  outline-offset: 1px;
+}
+.vpn-node-picker select option:disabled {
+  color: #6f7b8d;
+}
+.vpn-node-picker > small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.5;
 }
 .vpn-empty-targets {
   margin-top: 14px;

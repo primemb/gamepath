@@ -97,7 +97,7 @@ test('connecting sends the node, rules and settings to the vpn slot', async () =
   assert.equal(start.slot, 'vpn')
   assert.equal(start.mode, 'direct')
   assert.equal(start.killSwitch, true)
-  assert.deepEqual(start.rules, [{ kind: 'application', value: 'C:\\Apps\\chat.exe' }])
+  assert.deepEqual(start.rules, [{ kind: 'application', value: 'C:\\Apps\\chat.exe', node: 0 }])
   assert.equal(start.nodes[0].kind, 'socks5')
   // Its own proxy's name is never answered through the tunnel it carries.
   assert.ok(start.ownHostnames.includes('proxy.example'))
@@ -398,4 +398,98 @@ test('an L2TP VPN is told it cannot leave sites out, and sends no direct list', 
   assert.match(result.vpn.direct.limitation, /routed by Windows/)
   await invoke('vpn:connect')
   assert.equal(calls.find((call) => call.command === 'start-session').payload.direct, null)
+})
+
+/** A default SOCKS5 node, a second one, and the second's id. */
+async function twoProxies(invoke) {
+  const first = (await invoke('vpn:add-socks5', socks5)).vpn.node
+  const saved = await invoke('vpn:add-socks5', { address: 'second.example:1081', label: 'Second' })
+  return { first, second: saved.vpn.nodes.find((node) => node.id !== first.id) }
+}
+
+test('each target goes through its own node, and the default node carries the rest', async () => {
+  const { invoke, calls } = harness()
+  const { first, second } = await twoProxies(invoke)
+  await invoke('vpn:add-rule', { kind: 'application', value: 'C:\\Apps\\chat.exe', nodeId: second.id })
+  await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example' })
+  const result = await invoke('vpn:connect')
+  const start = calls.find((call) => call.command === 'start-session').payload
+  assert.deepEqual(
+    start.nodes.map((node) => node.host),
+    ['proxy.example', 'second.example'],
+  )
+  assert.deepEqual(
+    start.rules.map((rule) => [rule.value, rule.node]),
+    [
+      ['C:\\Apps\\chat.exe', 1],
+      ['news.example', 0],
+    ],
+  )
+  assert.deepEqual(result.vpn.session.nodeIds, [first.id, second.id])
+  assert.match(result.vpn.session.message, /Proxy, Second/)
+})
+
+test('moving a target between running nodes is live; bringing in another node reconnects', async () => {
+  const { invoke, calls } = harness({ service: { 'update-session-rules': { targetCount: 2 } } })
+  const { second } = await twoProxies(invoke)
+  const chat = (await invoke('vpn:add-rule', { kind: 'application', value: 'C:\\Apps\\chat.exe' })).vpn.rules[0]
+  await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example', nodeId: second.id })
+  await invoke('vpn:connect')
+
+  let before = calls.length
+  await invoke('vpn:set-rule-node', chat.id, second.id)
+  assert.deepEqual(
+    calls.slice(before).map((call) => call.command),
+    ['update-session-rules'],
+  )
+  assert.equal(calls.at(-1).payload.rules[0].node, 1)
+
+  // The second node keeps carrying chat, so the first move is live; moving
+  // chat off it too takes the node out of the session, which reconnects.
+  before = calls.length
+  const news = (await invoke('vpn:status')).vpn.rules[1]
+  await invoke('vpn:set-rule-node', news.id, null)
+  await invoke('vpn:set-rule-node', chat.id, null)
+  assert.deepEqual(
+    calls.slice(before).map((call) => call.command),
+    ['update-session-rules', 'stop-session', 'validate-runtime', 'start-session'],
+  )
+  assert.equal(calls.at(-1).payload.nodes.length, 1)
+})
+
+test('an L2TP node cannot share the VPN with another node', async () => {
+  const { invoke, state } = harness()
+  await invoke('vpn:add-socks5', socks5)
+  const office = (await invoke('vpn:add-l2tp', l2tp)).vpn.nodes.find((node) => node.kind === 'l2tp')
+  await assert.rejects(
+    invoke('vpn:add-rule', { kind: 'hostname', value: 'intranet.example', nodeId: office.id }),
+    /cannot share the VPN/,
+  )
+  assert.deepEqual(state.vpn.rules, [])
+  const rule = (await invoke('vpn:add-rule', { kind: 'hostname', value: 'intranet.example' })).vpn.rules[0]
+  await assert.rejects(invoke('vpn:set-rule-node', rule.id, office.id), /cannot share the VPN/)
+  assert.equal(state.vpn.rules[0].nodeId, null)
+})
+
+test('removing a node in use moves its targets to the default node and reconnects', async () => {
+  const { invoke, calls, state } = harness()
+  const { second } = await twoProxies(invoke)
+  await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example', nodeId: second.id })
+  await invoke('vpn:connect')
+  const before = calls.length
+  const result = await invoke('vpn:remove-node', second.id)
+  assert.deepEqual(
+    calls.slice(before).map((call) => call.command),
+    ['stop-session', 'validate-runtime', 'start-session'],
+  )
+  assert.equal(state.vpn.rules[0].nodeId, null)
+  assert.equal(calls.at(-1).payload.nodes.length, 1)
+  assert.equal(result.vpn.session.status, 'connected')
+})
+
+test('a target already in the list is not added twice', async () => {
+  const { invoke } = harness()
+  await invoke('vpn:add-socks5', socks5)
+  await invoke('vpn:add-rule', { kind: 'hostname', value: 'news.example' })
+  await assert.rejects(invoke('vpn:add-rule', { kind: 'hostname', value: 'NEWS.example' }), /already in the list/)
 })

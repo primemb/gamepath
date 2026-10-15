@@ -3,8 +3,9 @@ import type { ReactNode } from 'react'
 import { HandledConnections } from '../HandledConnections'
 import { nodeKindLabels } from '../../lib/nodes'
 import type { VpnTab } from '../../lib/views'
-import { vpnLive } from '../../lib/vpn'
+import { nodeNames, vpnLive } from '../../lib/vpn'
 import type { VpnState } from '../../types'
+import { VpnRoutingMap } from './VpnRoutingMap'
 
 function SummaryTile({
   icon,
@@ -40,6 +41,8 @@ export function VpnOverview({ vpn, onOpenTab }: { vpn: VpnState; onOpenTab: (tab
   const split = vpn.trafficMode === 'split'
   const targets = vpn.rules.filter((rule) => rule.enabled).length
   const latency = live ? vpn.session.metrics?.latencyMs : null
+  const inUse = live && vpn.session.nodes?.length ? vpn.session.nodes : vpn.node ? [vpn.node] : []
+  const latencyText = latency != null ? ` · ${Math.round(latency)} ms` : ''
 
   // All-traffic mode captures nothing per app, so there is no list to show.
   const emptyText = !live
@@ -53,12 +56,14 @@ export function VpnOverview({ vpn, onOpenTab }: { vpn: VpnState; onOpenTab: (tab
       <div className="vpn-summary-grid">
         <SummaryTile
           icon={<ShieldCheck size={18} />}
-          eyebrow="Node"
-          title={vpn.node?.name ?? 'No node yet'}
+          eyebrow={inUse.length > 1 ? 'Nodes' : 'Node'}
+          title={inUse.length ? nodeNames(inUse) : 'No node yet'}
           detail={
-            vpn.node
-              ? `${nodeKindLabels[vpn.node.kind]}${latency != null ? ` · ${Math.round(latency)} ms` : ''}`
-              : 'Add a node in the Nodes tab to get started.'
+            !vpn.node
+              ? 'Add a node in the Nodes tab to get started.'
+              : inUse.length > 1
+                ? `${inUse.length} nodes in use${latencyText}`
+                : `${nodeKindLabels[vpn.node.kind]}${latencyText}`
           }
           onOpen={() => onOpenTab('node')}
         />
@@ -77,9 +82,15 @@ export function VpnOverview({ vpn, onOpenTab }: { vpn: VpnState; onOpenTab: (tab
           onOpen={() => onOpenTab('split')}
         />
       </div>
+      <VpnRoutingMap vpn={vpn} onEdit={() => onOpenTab('split')} />
       <HandledConnections
         capture={live && split ? vpn.session.capture?.diagnostics : undefined}
         emptyText={emptyText}
+        nodeOf={
+          (vpn.session.nodes?.length ?? 0) > 1
+            ? (connection) => vpn.session.nodes?.[connection.node ?? 0]?.name
+            : undefined
+        }
       />
     </div>
   )

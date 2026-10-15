@@ -13,10 +13,13 @@ const { vpnPauseReason } = require('./session-coordinator.cjs')
 const { VpnSessionController, VpnConfigError } = require('./vpn-session.cjs')
 const { createVpnDirect } = require('./vpn-direct-ipc.cjs')
 const {
+  sessionNodes,
   vpnRuleSpecs,
-  ruleLimitation,
+  nodeSetLimitation,
+  assignedLimitation,
   unroutableRules,
   createRule,
+  sameTarget,
   ruleConflicts,
   activeGameRules,
   selectedVpnNode,
@@ -72,16 +75,7 @@ function createVpnFeature({
     return vpnPauseReason(game, mode) ?? (gameStartingAllTraffic ? 'game-all-traffic' : null)
   }
 
-  function buildRequest() {
-    const settings = vpn()
-    const node = selectedVpnNode(settings)
-    if (!node) throw new VpnConfigError('Add a VPN node first.')
-    const [blocked] = unroutableRules(settings)
-    if (blocked) throw new VpnConfigError(ruleLimitation(node, settings.trafficMode, blocked.kind, blocked.value))
-    const rules = vpnRuleSpecs(settings)
-    if (settings.trafficMode === 'split' && !rules.length) {
-      throw new VpnConfigError('Add at least one app or website for the VPN, or switch it to all traffic.')
-    }
+  function storedSecret(node) {
     const stored = state().encryptedVpnConfigs[node.id]
     let secret
     try {
@@ -92,8 +86,25 @@ function createVpnFeature({
     if (!secret) {
       throw new VpnConfigError(`${node.name} is missing its stored secret. Remove it and add it again.`)
     }
+    return secret
+  }
+
+  function buildRequest() {
+    const settings = vpn()
+    const node = selectedVpnNode(settings)
+    if (!node) throw new VpnConfigError('Add a VPN node first.')
+    const [blocked] = unroutableRules(settings)
+    if (blocked) throw new VpnConfigError(assignedLimitation(settings, blocked))
+    const nodes = sessionNodes(settings)
+    const combined = nodeSetLimitation(nodes)
+    if (combined) throw new VpnConfigError(combined)
+    const rules = vpnRuleSpecs(settings, nodes)
+    if (settings.trafficMode === 'split' && !rules.length) {
+      throw new VpnConfigError('Add at least one app or website for the VPN, or switch it to all traffic.')
+    }
     return {
       node,
+      nodes,
       request: {
         mode: 'direct',
         trafficMode: settings.trafficMode,
@@ -102,7 +113,7 @@ function createVpnFeature({
         ownHostnames: ownHostnames(state()),
         killSwitch: settings.killSwitch,
         direct: direct.spec(),
-        nodes: [nodeSpec(node, secret)],
+        nodes: nodes.map((item) => nodeSpec(item, storedSecret(item))),
       },
     }
   }
@@ -131,7 +142,7 @@ function createVpnFeature({
     const node = selectedVpnNode(settings)
     const limitations = Object.fromEntries(
       settings.rules
-        .map((rule) => [rule.id, ruleLimitation(node, settings.trafficMode, rule.kind, rule.value)])
+        .map((rule) => [rule.id, assignedLimitation(settings, rule)])
         .filter(([, limitation]) => limitation),
     )
     return {
@@ -140,6 +151,7 @@ function createVpnFeature({
       session: controller.snapshot(),
       conflicts: ruleConflicts(settings.rules, activeGameRules(state().rules, state().ruleGroups)),
       limitations,
+      nodeLimitation: nodeSetLimitation(sessionNodes(settings)),
       canSelectApps: !(node?.kind === 'l2tp' && settings.trafficMode === 'split'),
       direct: direct.publicDirect(node),
     }
@@ -170,29 +182,45 @@ function createVpnFeature({
       const node = vpn().nodes.find((item) => item.id === id)
       if (!node) throw new Error('That VPN node no longer exists.')
       if (id === vpn().selectedNodeId) return publicState()
-      const blocked = vpn().rules.find(
-        (rule) => rule.enabled && ruleLimitation(node, vpn().trafficMode, rule.kind, rule.value),
-      )
-      if (blocked) throw new Error(ruleLimitation(node, vpn().trafficMode, blocked.kind, blocked.value))
+      const proposed = { ...vpn(), selectedNodeId: id }
+      const [blocked] = unroutableRules(proposed)
+      if (blocked) throw new Error(assignedLimitation(proposed, blocked))
+      const combined = nodeSetLimitation(sessionNodes(proposed))
+      if (combined) throw new Error(combined)
       if (!state().encryptedVpnConfigs[id])
         throw new Error('That VPN node is missing its stored secret. Remove it and add it again.')
       vpn().selectedNodeId = id
       vpn().nodes = vpn().nodes.map((item) => ({ ...item, enabled: item.id === id }))
       saveState()
-      await controller.restart('the selected VPN node changed')
+      await controller.restart('the default VPN node changed')
       vpn().wantConnected = controller.wanted
       saveState()
       return publicState()
     })
   }
 
-  /** Same contract as the game's rule edits: live, or not at all. */
+  /**
+   * Same contract as the game's rule edits: live, or not at all. The one
+   * exception is a change to which nodes are in use, since a node joining or
+   * leaving is a tunnel opening or closing: that reconnects the VPN.
+   */
   function commitRuleChange(change) {
     const operation = ruleQueue.then(async () => {
       const previous = structuredClone(vpn().rules)
       change(vpn())
+      const nodes = sessionNodes(vpn())
+      const combined = nodeSetLimitation(nodes)
+      if (combined) {
+        vpn().rules = previous
+        throw new Error(combined)
+      }
+      if (!controller.carriesNodes(nodes.map((node) => node.id))) {
+        saveState()
+        await controller.restart('the VPN nodes in use changed')
+        return publicState()
+      }
       try {
-        await controller.applyRules(vpnRuleSpecs(vpn()), vpn().trafficMode)
+        await controller.applyRules(vpnRuleSpecs(vpn(), nodes), vpn().trafficMode)
         saveState()
         return publicState()
       } catch (error) {
@@ -337,6 +365,7 @@ function createVpnFeature({
         const id = nodeId ?? vpn().selectedNodeId
         if (!vpn().nodes.some((node) => node.id === id)) throw new Error('That VPN node no longer exists.')
         const selected = id === vpn().selectedNodeId
+        const inUse = !selected && sessionNodes(vpn()).some((node) => node.id === id)
         if (selected) {
           vpn().wantConnected = false
           await controller.disconnect()
@@ -346,9 +375,12 @@ function createVpnFeature({
           vpn().selectedNodeId = vpn().nodes[0]?.id ?? null
           vpn().nodes = vpn().nodes.map((node) => ({ ...node, enabled: node.id === vpn().selectedNodeId }))
         }
+        // Its targets stay, on the default node.
+        vpn().rules = vpn().rules.map((rule) => (rule.nodeId === id ? { ...rule, nodeId: null } : rule))
         delete state().encryptedVpnConfigs[id]
-        logger.scope('vpn').info(`node removed: selected=${selected}`)
+        logger.scope('vpn').info(`node removed: selected=${selected} inUse=${inUse}`)
         saveState()
+        if (inUse) await controller.restart('a VPN node in use was removed')
         return publicState()
       }),
     )
@@ -384,9 +416,29 @@ function createVpnFeature({
 
     ipcMain.handle('vpn:add-rule', (_event, input) => {
       const rule = createRule(input, crypto.randomUUID())
-      const limitation = ruleLimitation(selectedVpnNode(vpn()), vpn().trafficMode, rule.kind, rule.value)
+      if (rule.nodeId && !vpn().nodes.some((node) => node.id === rule.nodeId)) {
+        throw new Error('That VPN node no longer exists.')
+      }
+      if (vpn().rules.some((existing) => sameTarget(existing, rule))) {
+        throw new Error(`${rule.label} is already in the list. Choose its node there instead.`)
+      }
+      const limitation = assignedLimitation(vpn(), rule)
       if (limitation) throw new Error(limitation)
       return commitRuleChange((settings) => settings.rules.push(rule))
+    })
+
+    // Null puts the target back on the default node.
+    ipcMain.handle('vpn:set-rule-node', (_event, id, nodeId) => {
+      const target = nodeId ? vpn().nodes.find((node) => node.id === nodeId) : null
+      if (nodeId && !target) throw new Error('That VPN node no longer exists.')
+      const rule = vpn().rules.find((item) => item.id === id)
+      if (!rule) throw new Error('That target no longer exists.')
+      const limitation = assignedLimitation(vpn(), { ...rule, nodeId: target?.id ?? null })
+      if (limitation) throw new Error(limitation)
+      return commitRuleChange((settings) => {
+        const current = settings.rules.find((item) => item.id === id)
+        if (current) current.nodeId = target?.id ?? null
+      })
     })
 
     ipcMain.handle('vpn:set-rule-enabled', (_event, id, enabled) =>

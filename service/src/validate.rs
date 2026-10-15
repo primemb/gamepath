@@ -51,6 +51,46 @@ pub(crate) fn carries_direct(slot: SlotId, node: &NodeSpec) -> bool {
     node.supports_direct() || (slot == SlotId::Vpn && matches!(node, NodeSpec::Socks5 { .. }))
 }
 
+/// Most nodes the VPN pins its apps across at once. The engine's
+/// `MAX_DIRECT_NODES` is the same number; a test keeps the two together.
+pub(crate) const MAX_VPN_NODES: usize = 8;
+
+/// Whether `nodes` can carry the VPN together.
+///
+/// Several nodes are the VPN's per-app routing: its capture pins each flow to
+/// the node its rule names, which only exists in split mode. L2TP/IPsec is
+/// routed by Windows, by address, so it cannot be one node among others.
+pub(crate) fn check_vpn_nodes(traffic_mode: &str, nodes: &[NodeSpec]) -> Result<(), String> {
+    if nodes.len() > 1 {
+        if traffic_mode != "split" {
+            return Err(
+                "the VPN sends all traffic through its default node; other nodes carry \
+                 selected apps only in split mode"
+                    .into(),
+            );
+        }
+        if nodes.len() > MAX_VPN_NODES {
+            return Err(format!(
+                "the VPN uses at most {MAX_VPN_NODES} nodes at once, but {} are assigned",
+                nodes.len()
+            ));
+        }
+        if let Some(node) = nodes
+            .iter()
+            .find(|node| matches!(node, NodeSpec::L2tp { .. }))
+        {
+            return Err(format!(
+                "{} is routed by Windows and cannot share the VPN with other nodes",
+                node.describe()
+            ));
+        }
+    }
+    match nodes.iter().find(|node| !carries_direct(SlotId::Vpn, node)) {
+        Some(node) => Err(format!("{} cannot carry the VPN", node.describe())),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn validate_runtime(payload: Value, slot: SlotId) -> Result<Value, String> {
     let input: ValidateRequest = serde_json::from_value(payload)
         .map_err(|error| format!("invalid runtime request: {error}"))?;
@@ -68,7 +108,9 @@ pub(crate) fn validate_runtime(payload: Value, slot: SlotId) -> Result<Value, St
     }
     // A direct session has no relay behind the node, so the node itself has
     // to be able to route. Catch that here, before anything is opened.
-    if input.mode == SessionMode::Direct {
+    if input.mode == SessionMode::Direct && slot == SlotId::Vpn {
+        check_vpn_nodes(&input.traffic_mode, &nodes)?;
+    } else if input.mode == SessionMode::Direct {
         if nodes.len() != 1 {
             return Err(format!(
                 "direct mode sends traffic through exactly one node, but {} are enabled. \
@@ -296,13 +338,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("cannot use a relay"), "{error}");
+    }
+
+    #[test]
+    fn the_vpn_pins_apps_across_several_nodes_in_split_mode_only() {
+        let pair = json!([
+            { "kind": "wireguard", "config": WIREGUARD_CONFIG },
+            { "kind": "socks5", "host": "proxy.example", "port": 1080 },
+        ]);
+        let result = validate_vpn(pair.clone()).unwrap();
+        assert_eq!(result["nodeKinds"], json!(["wireguard", "socks5"]));
+
+        let error = validate_runtime(
+            json!({ "mode": "direct", "trafficMode": "all", "nodes": pair }),
+            SlotId::Vpn,
+        )
+        .unwrap_err();
+        assert!(error.contains("default node"), "{error}");
 
         let error = validate_vpn(json!([
             { "kind": "wireguard", "config": WIREGUARD_CONFIG },
-            { "kind": "socks5", "host": "proxy.example", "port": 1080 },
+            { "kind": "l2tp", "server": "vpn.example", "username": "user", "password": "secret", "preSharedKey": "key" },
         ]))
         .unwrap_err();
-        assert!(error.contains("exactly one node"), "{error}");
+        assert!(error.contains("routed by Windows"), "{error}");
+
+        let many = (0..=MAX_VPN_NODES)
+            .map(|_| json!({ "kind": "wireguard", "config": WIREGUARD_CONFIG }))
+            .collect::<Vec<_>>();
+        let error = validate_vpn(json!(many)).unwrap_err();
+        assert!(error.contains("at most"), "{error}");
     }
 
     #[test]

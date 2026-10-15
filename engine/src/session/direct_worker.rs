@@ -1,21 +1,27 @@
-//! The direct session's worker: setup proves initial availability, while
-//! tunnelled ICMP echoes and authenticated replies provide live health.
+//! A direct session's worker, one per node: setup proves initial
+//! availability, while tunnelled ICMP echoes and authenticated replies provide
+//! live health.
 
+use super::dialer::{RECONNECT_BACKOFF_MIN, next_backoff};
 use super::health::{PROBE_INTERVAL, publish_path_health, record_path_receive, record_path_send};
 use super::latency::{LatencyEvent, LatencyWatch};
 use super::local_tap::{InboundQueue, InboundSink};
+use super::nodes::SessionNodes;
 use super::state::PathSessionStatus;
 use super::worker::{
     PassProfile, PathCommand, PathTelemetry, WORKER_GAP_LOG_INTERVAL, WORKER_GAP_WARN,
     WORKER_RECEIVE_TIMEOUT, drain_send_queue,
 };
 use crate::icmp::{icmp_echo_packet, icmp_reply_sequence};
-use gamepath_engine::relay_path::{DirectPath, KIND_WIREGUARD};
+use gamepath_engine::relay_path::{DirectPath, KIND_SOCKS5, KIND_WIREGUARD, NodeSpec};
 use gamepath_engine::rtt::RttEstimator;
 use gamepath_engine::scheduler::PathMetrics;
+use gamepath_engine::uplink::UplinkState;
 use gamepath_engine::{log_info, log_warn};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// How many unanswered probes it takes to conclude the node filters ICMP.
@@ -58,7 +64,101 @@ fn probe_outage(requires_probe: bool, answered: bool, losses: u64, carrying: boo
     (requires_probe || answered) && losses >= DIRECT_LOSS_LIMIT && (requires_probe || !carrying)
 }
 
-/// Carries a direct session's traffic through its single node.
+/// Which node of the session a worker carries, and what it needs to dial that
+/// node again.
+pub(crate) struct DirectRoute {
+    pub(crate) index: usize,
+    pub(crate) node: NodeSpec,
+    pub(crate) nodes: Arc<SessionNodes>,
+}
+
+/// The health of one open transport. A redial starts it again from nothing,
+/// because nothing the old transport proved says anything about the new one.
+struct PathWatch {
+    address: Ipv4Addr,
+    endpoint: SocketAddr,
+    max_age: Option<Duration>,
+    requires_probe: bool,
+    probe_interval: Duration,
+    probe_sequence: u16,
+    next_probe: Instant,
+    pending_probe: Option<(u16, Instant)>,
+    rtt: RttEstimator,
+    latency_watch: LatencyWatch,
+    probes_attempted: u64,
+    consecutive_losses: u64,
+    icmp_answered: bool,
+    published_health: (Option<f64>, bool),
+    published_error: bool,
+    /// Set once this worker has a specific answer for why the node is not
+    /// usable. Transport errors are noisier and less useful than that answer,
+    /// so they stop overwriting it.
+    verdict: bool,
+    started: Instant,
+    reported_silence: bool,
+    /// Any packet the node sends back has already passed WireGuard's or
+    /// OpenVPN's authentication, so it proves the tunnel is alive whether or
+    /// not ICMP is carried. Handshake age alone does not: a node can complete
+    /// one and then stop forwarding.
+    last_authenticated_receive: Option<Instant>,
+    published_healthy: bool,
+}
+
+impl PathWatch {
+    fn new(path: &DirectPath) -> Self {
+        // A SOCKS5 node is a TCP stack in this process, not a network; see
+        // `drain_send_queue`.
+        let requires_probe = path.kind() == KIND_SOCKS5;
+        Self {
+            address: path.address(),
+            endpoint: path.endpoint(),
+            max_age: (!requires_probe).then_some(super::worker::PATH_QUEUE_MAX_AGE),
+            requires_probe,
+            probe_interval: if requires_probe {
+                SOCKS5_PROBE_INTERVAL
+            } else {
+                PROBE_INTERVAL
+            },
+            probe_sequence: 0,
+            next_probe: Instant::now(),
+            pending_probe: None,
+            // The probe deadline follows this node's own round trip, so a
+            // provider that is simply distant is not mistaken for one that is
+            // losing packets.
+            rtt: RttEstimator::with_floor(path.probe_deadline_floor()),
+            latency_watch: LatencyWatch::default(),
+            probes_attempted: 0,
+            consecutive_losses: 0,
+            icmp_answered: false,
+            published_health: (None, false),
+            published_error: false,
+            verdict: false,
+            started: Instant::now(),
+            reported_silence: false,
+            last_authenticated_receive: None,
+            published_healthy: false,
+        }
+    }
+}
+
+/// Opens `node` on a thread of its own, so the worker keeps draining and
+/// probing while an OpenVPN handshake takes its seconds.
+fn begin_dial(node: &NodeSpec, route: usize) -> Option<mpsc::Receiver<Result<DirectPath, String>>> {
+    let (result, receiver) = mpsc::channel();
+    let node = node.clone();
+    thread::Builder::new()
+        .name(format!("gamepath-direct-dial-{route}"))
+        .spawn(move || {
+            // Nobody is listening once the session has stopped; the path is
+            // then simply closed again.
+            let _ = result.send(node.open_direct());
+        })
+        .map_err(|error| log_warn!("could not start dialling route {route}: {error}"))
+        .ok()?;
+    Some(receiver)
+}
+
+/// Carries a direct session's traffic through one of its nodes.
 ///
 /// There is no relay here to exchange control frames with, so health and
 /// latency come from two different places. The handshake proves the node
@@ -67,10 +167,16 @@ fn probe_outage(requires_probe: bool, answered: bool, losses: u64, carrying: boo
 /// Plenty of providers filter ICMP while routing everything else perfectly, so
 /// after a few unanswered probes this backs off and stops counting them as
 /// loss, rather than reporting a healthy node as totally lossy.
+///
+/// `path` is `None` when the node did not open with the session. The worker
+/// then keeps dialling it, and the flows pinned to it start moving the moment
+/// it opens, without the session or the other nodes noticing. An OpenVPN node
+/// that stops answering is dialled again the same way: unlike WireGuard it has
+/// no handshake timer of its own to bring a dead link back.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_direct_path(
-    mut path: DirectPath,
-    address: std::net::Ipv4Addr,
+    mut path: Option<DirectPath>,
+    route: DirectRoute,
     stop: Arc<AtomicBool>,
     statuses: Arc<Mutex<Vec<PathSessionStatus>>>,
     commands: mpsc::Receiver<PathCommand>,
@@ -79,107 +185,177 @@ pub(crate) fn run_direct_path(
     telemetry: PathTelemetry,
     session_id: u64,
 ) {
+    let index = route.index;
+    let number = index + 1;
     let identifier = rand::random::<u16>();
-    // A SOCKS5 node is a TCP stack in this process, not a network; see
-    // `drain_send_queue`.
-    let max_age = (path.kind() != gamepath_engine::relay_path::KIND_SOCKS5)
-        .then_some(super::worker::PATH_QUEUE_MAX_AGE);
-    let requires_probe = path.kind() == gamepath_engine::relay_path::KIND_SOCKS5;
-    let probe_interval = if requires_probe {
-        SOCKS5_PROBE_INTERVAL
+    let mut watch = path.as_ref().map(PathWatch::new);
+    let mut dial: Option<mpsc::Receiver<Result<DirectPath, String>>> = None;
+    // A node that failed to open has just been tried, so its first retry
+    // waits; a node that fails later is redialled at once.
+    let mut backoff = if path.is_some() {
+        RECONNECT_BACKOFF_MIN
     } else {
-        PROBE_INTERVAL
+        next_backoff(RECONNECT_BACKOFF_MIN)
     };
-    let mut probe_sequence = 0_u16;
-    let mut next_probe = Instant::now();
-    let mut pending_probe: Option<(u16, Instant)> = None;
-    // The probe deadline follows this node's own round trip, so a provider that
-    // is simply distant is not mistaken for one that is losing packets.
-    let mut rtt = RttEstimator::with_floor(path.probe_deadline_floor());
-    let mut latency_watch = LatencyWatch::default();
+    let mut next_redial = path.is_none().then(|| Instant::now() + backoff);
     let mut last_iteration = Instant::now();
     let mut last_worker_gap_log: Option<Instant> = None;
-    let mut probes_attempted = 0_u64;
-    let mut consecutive_losses = 0_u64;
-    let mut icmp_answered = false;
-    let mut published_health = (None, false);
-    let mut published_error = false;
-    // Set once this worker has a specific answer for why the node is not
-    // usable. Transport errors are noisier and less useful than that answer,
-    // so they stop overwriting it.
-    let mut verdict = false;
-    let started = Instant::now();
-    let mut reported_silence = false;
-    // Any packet the node sends back has already passed WireGuard's or
-    // OpenVPN's authentication, so it proves the tunnel is alive whether or not
-    // ICMP is carried. Handshake age alone does not: a node can complete one
-    // and then stop forwarding.
-    let mut last_authenticated_receive: Option<Instant> = None;
-    let mut published_healthy = false;
-    let endpoint = path.endpoint();
     let mut pass = PassProfile::default();
 
     while !stop.load(Ordering::Acquire) {
+        if let Some(receiver) = &dial {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("the dial stopped without a result".to_owned()))
+                }
+            };
+            match result {
+                Some(Ok(opened)) => {
+                    dial = None;
+                    let fresh = PathWatch::new(&opened);
+                    route.nodes.set_address(index, fresh.address);
+                    publish_path_health(&telemetry.healthy_mask, index, false);
+                    {
+                        let mut current = statuses.lock().unwrap();
+                        current[index].endpoint = fresh.endpoint.to_string();
+                        current[index].joining = false;
+                        current[index].reachable = false;
+                        current[index].last_error = None;
+                    }
+                    log_info!(
+                        "session {session_id} route {number} ({}) {} at {}",
+                        opened.kind(),
+                        if path.is_some() {
+                            "redialled"
+                        } else {
+                            "opened"
+                        },
+                        fresh.address
+                    );
+                    watch = Some(fresh);
+                    path = Some(opened);
+                    backoff = RECONNECT_BACKOFF_MIN;
+                }
+                Some(Err(error)) => {
+                    dial = None;
+                    backoff = next_backoff(backoff);
+                    next_redial = Some(Instant::now() + backoff);
+                    log_warn!(
+                        "session {session_id} route {number} could not be dialled: {error}; \
+                         retrying in {} s",
+                        backoff.as_secs()
+                    );
+                    statuses.lock().unwrap()[index].last_error = Some(error);
+                    if let Some(watch) = watch.as_mut() {
+                        watch.published_error = true;
+                    }
+                }
+                None => {}
+            }
+        }
+        // A dial has nowhere to go while the uplink itself is down, and a
+        // node that is still carrying is not thrown away for it.
+        if dial.is_none()
+            && next_redial.is_some_and(|due| Instant::now() >= due)
+            && telemetry.uplink.state() != UplinkState::Down
+        {
+            next_redial = None;
+            dial = begin_dial(&route.node, number);
+            if dial.is_none() {
+                next_redial = Some(Instant::now() + next_backoff(backoff));
+            }
+        }
+        let (Some(path), Some(watch)) = (path.as_mut(), watch.as_mut()) else {
+            // Nothing can carry these yet. Holding them would only hand the
+            // node stale packets when it opens.
+            drain_send_queue(
+                &commands,
+                None,
+                index,
+                &telemetry.queue_depth,
+                &telemetry.dropped,
+                &telemetry.stale_dropped,
+                |frame| (frame.len(), Err("the node is not open".to_owned())),
+                |_, _| {
+                    telemetry.dropped[index].fetch_add(1, Ordering::Relaxed);
+                },
+            );
+            thread::sleep(WORKER_RECEIVE_TIMEOUT);
+            continue;
+        };
+        let address = watch.address;
+        let endpoint = watch.endpoint;
         let iteration_started = Instant::now();
         let worker_gap = iteration_started.saturating_duration_since(last_iteration);
         last_iteration = iteration_started;
         let worker_gap_ms = worker_gap.as_millis().min(u128::from(u64::MAX)) as u64;
-        telemetry.worker_gap_peak_ms[0].fetch_max(worker_gap_ms, Ordering::Relaxed);
+        telemetry.worker_gap_peak_ms[index].fetch_max(worker_gap_ms, Ordering::Relaxed);
         if worker_gap >= WORKER_GAP_WARN
             && last_worker_gap_log.is_none_or(|logged| logged.elapsed() >= WORKER_GAP_LOG_INTERVAL)
         {
             last_worker_gap_log = Some(iteration_started);
             log_warn!(
-                "session {session_id} route 1 worker gap {worker_gap_ms} ms; q={} drop={} uplink={:?}; {pass}",
-                telemetry.queue_depth[0].load(Ordering::Relaxed),
-                telemetry.dropped[0].load(Ordering::Relaxed),
+                "session {session_id} route {number} worker gap {worker_gap_ms} ms; q={} drop={} uplink={:?}; {pass}",
+                telemetry.queue_depth[index].load(Ordering::Relaxed),
+                telemetry.dropped[index].load(Ordering::Relaxed),
                 telemetry.uplink.state()
             );
         }
         pass = PassProfile::default();
-        telemetry.iterations[0].fetch_add(1, Ordering::Relaxed);
+        telemetry.iterations[index].fetch_add(1, Ordering::Relaxed);
         // Health is decided first so the rest of the iteration can see it, and
         // published only when it moves: this lock is on the hot path.
         let handshake = path.handshake_latency_ms();
         // Authenticated return traffic outranks the probe verdict: a node that
         // is demonstrably carrying packets is not down because ICMP to
         // the benchmark target is being filtered somewhere past it.
-        let carrying =
-            last_authenticated_receive.is_some_and(|seen| seen.elapsed() <= DIRECT_LIVENESS_WINDOW);
+        let carrying = watch
+            .last_authenticated_receive
+            .is_some_and(|seen| seen.elapsed() <= DIRECT_LIVENESS_WINDOW);
         // SOCKS5 generates SYN/ACK, resets and SERVFAIL locally; those packets
         // cannot disprove an outage beyond the proxy's listener.
-        let losing = probe_outage(requires_probe, icmp_answered, consecutive_losses, carrying);
-        let reachable = handshake.is_some() && !losing;
-        if reachable != published_healthy {
-            publish_path_health(&telemetry.healthy_mask, 0, reachable);
-            published_healthy = reachable;
+        let losing = probe_outage(
+            watch.requires_probe,
+            watch.icmp_answered,
+            watch.consecutive_losses,
+            carrying,
+        );
+        if losing && path.needs_redial_when_lost() && dial.is_none() && next_redial.is_none() {
+            next_redial = Some(Instant::now() + backoff);
         }
-        if (handshake, reachable) != published_health {
+        let reachable = handshake.is_some() && !losing;
+        if reachable != watch.published_healthy {
+            publish_path_health(&telemetry.healthy_mask, index, reachable);
+            watch.published_healthy = reachable;
+        }
+        if (handshake, reachable) != watch.published_health {
             let mut current = statuses.lock().unwrap();
-            current[0].reachable = reachable;
-            current[0].handshake_ms = handshake;
+            current[index].reachable = reachable;
+            current[index].handshake_ms = handshake;
             // WireGuard's handshake is one round trip, so it doubles as a hop
             // estimate. OpenVPN's spans a TLS negotiation whose round-trip
             // count depends on the server, so none is offered.
-            current[0].handshake_round_trips = (path.kind() == KIND_WIREGUARD).then_some(1);
+            current[index].handshake_round_trips = (path.kind() == KIND_WIREGUARD).then_some(1);
             if let Some(latency) = handshake {
                 // Stand in for the end-to-end number until a probe answers, so
                 // a node that filters ICMP still reports a real measurement.
-                current[0].latency_ms.get_or_insert(latency);
+                current[index].latency_ms.get_or_insert(latency);
             }
-            current[0].last_error = losing
+            current[index].last_error = losing
                 .then(|| format!("{endpoint} stopped answering probes sent through the tunnel"));
-            published_error = losing;
-            verdict = losing;
-            published_health = (handshake, reachable);
+            watch.published_error = losing;
+            watch.verdict = losing;
+            watch.published_health = (handshake, reachable);
         }
         pass.bookkeeping = iteration_started.elapsed();
         let (mut socket_send, mut status_lock, mut frames_sent) =
             (Duration::ZERO, Duration::ZERO, 0);
         drain_send_queue(
             &commands,
-            max_age,
-            0,
+            watch.max_age,
+            index,
             &telemetry.queue_depth,
             &telemetry.dropped,
             &telemetry.stale_dropped,
@@ -187,8 +363,8 @@ pub(crate) fn run_direct_path(
                 let started = Instant::now();
                 let result = path.send_packet(frame);
                 if let Err(error) = &result {
-                    telemetry.dropped[0].fetch_add(1, Ordering::Relaxed);
-                    telemetry.send_failed[0].fetch_add(1, Ordering::Relaxed);
+                    telemetry.dropped[index].fetch_add(1, Ordering::Relaxed);
+                    telemetry.send_failed[index].fetch_add(1, Ordering::Relaxed);
                     telemetry.packet_diagnostics.record_error(
                         gamepath_engine::packet_diagnostics::Reason::TransportSend,
                         frame,
@@ -201,43 +377,43 @@ pub(crate) fn run_direct_path(
             },
             |length, result| {
                 let started = Instant::now();
-                record_path_send(&statuses, 0, length, result);
+                record_path_send(&statuses, index, length, result);
                 status_lock += started.elapsed();
             },
         );
         (pass.socket_send, pass.status_lock, pass.frames_sent) =
             (socket_send, status_lock, frames_sent);
         let probe_started = Instant::now();
-        if pending_probe.is_none() && Instant::now() >= next_probe {
-            probe_sequence = probe_sequence.wrapping_add(1);
+        if watch.pending_probe.is_none() && Instant::now() >= watch.next_probe {
+            watch.probe_sequence = watch.probe_sequence.wrapping_add(1);
             let probe = icmp_echo_packet(
                 address,
                 DIRECT_PROBE_TARGET,
                 identifier,
-                probe_sequence,
+                watch.probe_sequence,
                 false,
             );
             match path.send_probe(&probe) {
                 Ok(()) => {
-                    probes_attempted += 1;
+                    watch.probes_attempted += 1;
                     // Until one probe is answered nothing is published, so a
                     // node that filters ICMP never reports probes it did send
                     // and never looks totally lossy because of it.
-                    if icmp_answered || requires_probe {
-                        statuses.lock().unwrap()[0].probes_sent += 1;
+                    if watch.icmp_answered || watch.requires_probe {
+                        statuses.lock().unwrap()[index].probes_sent += 1;
                     }
-                    pending_probe = Some((probe_sequence, Instant::now()));
+                    watch.pending_probe = Some((watch.probe_sequence, Instant::now()));
                 }
                 // The handshake, not this probe, decides whether the node is
                 // up, so a failed send is recorded and the loop carries on.
                 Err(error) => {
-                    if !verdict {
-                        statuses.lock().unwrap()[0].last_error = Some(error);
-                        published_error = true;
+                    if !watch.verdict {
+                        statuses.lock().unwrap()[index].last_error = Some(error);
+                        watch.published_error = true;
                     }
                 }
             }
-            next_probe = Instant::now() + probe_interval;
+            watch.next_probe = Instant::now() + watch.probe_interval;
         }
         pass.probe = probe_started.elapsed();
         let receive_started = Instant::now();
@@ -248,35 +424,35 @@ pub(crate) fn run_direct_path(
                         icmp_reply_sequence(&packet, DIRECT_PROBE_TARGET, address, identifier)
                     {
                         // A late reply must not consume the next probe's timer.
-                        let Some(started) = take_matching_probe(&mut pending_probe, sequence)
+                        let Some(started) = take_matching_probe(&mut watch.pending_probe, sequence)
                         else {
                             continue;
                         };
                         let elapsed = started.elapsed();
-                        rtt.record(elapsed);
+                        watch.rtt.record(elapsed);
                         let latency = elapsed.as_secs_f64() * 1000.0;
-                        let first = !icmp_answered;
-                        icmp_answered = true;
-                        consecutive_losses = 0;
+                        let first = !watch.icmp_answered;
+                        watch.icmp_answered = true;
+                        watch.consecutive_losses = 0;
                         {
                             let mut current = statuses.lock().unwrap();
                             // The probe this answers was sent before ICMP was
                             // known to work, so it was not counted then.
-                            current[0].probes_sent += u64::from(first && !requires_probe);
-                            current[0].probes_received += 1;
-                            current[0].latency_ms = Some(latency);
+                            current[index].probes_sent += u64::from(first && !watch.requires_probe);
+                            current[index].probes_received += 1;
+                            current[index].latency_ms = Some(latency);
                         }
-                        scheduler_metrics.lock().unwrap()[0].record_probe(latency);
-                        match latency_watch.observe(latency, Instant::now()) {
+                        scheduler_metrics.lock().unwrap()[index].record_probe(latency);
+                        match watch.latency_watch.observe(latency, Instant::now()) {
                             Some(LatencyEvent::Degraded {
                                 baseline_ms,
                                 observed_ms,
                             }) => log_warn!(
-                                "session {session_id} route 1 data-plane RTT degraded: \
+                                "session {session_id} route {number} data-plane RTT degraded: \
                                  {observed_ms:.0} ms vs {baseline_ms:.0} ms baseline; \
                                  q={} drop={} uplink={:?}",
-                                telemetry.queue_depth[0].load(Ordering::Relaxed),
-                                telemetry.dropped[0].load(Ordering::Relaxed),
+                                telemetry.queue_depth[index].load(Ordering::Relaxed),
+                                telemetry.dropped[index].load(Ordering::Relaxed),
                                 telemetry.uplink.state()
                             ),
                             Some(LatencyEvent::Recovered {
@@ -284,74 +460,77 @@ pub(crate) fn run_direct_path(
                                 peak_ms,
                                 duration,
                             }) => log_info!(
-                                "session {session_id} route 1 data-plane RTT recovered after \
+                                "session {session_id} route {number} data-plane RTT recovered after \
                                  {:.1} s (baseline {baseline_ms:.0} ms, peak {peak_ms:.0} ms)",
                                 duration.as_secs_f64()
                             ),
                             None => {}
                         }
-                        last_authenticated_receive = Some(Instant::now());
+                        watch.last_authenticated_receive = Some(Instant::now());
                         continue;
                     }
-                    record_path_receive(&statuses, 0, packet.len());
-                    last_authenticated_receive = Some(Instant::now());
+                    record_path_receive(&statuses, index, packet.len());
+                    watch.last_authenticated_receive = Some(Instant::now());
                     // Blocking here would stall the probe and timer work that
                     // decides whether this path is still usable.
                     if let Err(mpsc::TrySendError::Full(_)) = inbound.try_send(packet) {
-                        telemetry.dropped[0].fetch_add(1, Ordering::Relaxed);
-                        telemetry.inbound_dropped[0].fetch_add(1, Ordering::Relaxed);
+                        telemetry.dropped[index].fetch_add(1, Ordering::Relaxed);
+                        telemetry.inbound_dropped[index].fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 // Windows reports an unreachable endpoint on the next read of a
                 // connected UDP socket, so a restarting node leaves an error
                 // behind that its next reply disproves. Clearing it costs a
                 // lock, so it is taken only when the state actually changes.
-                if published_error && reachable {
-                    statuses.lock().unwrap()[0].last_error = None;
-                    published_error = false;
+                if watch.published_error && reachable {
+                    statuses.lock().unwrap()[index].last_error = None;
+                    watch.published_error = false;
                 }
             }
             Err(error) => {
-                if !verdict {
-                    statuses.lock().unwrap()[0].last_error = Some(error);
-                    published_error = true;
+                if !watch.verdict {
+                    statuses.lock().unwrap()[index].last_error = Some(error);
+                    watch.published_error = true;
                 }
             }
         }
-        telemetry.record_transport_drops(0, path.take_transport_drops());
+        telemetry.record_transport_drops(index, path.take_transport_drops());
         pass.receive = receive_started.elapsed();
         // A silent peer is the usual way a direct session fails to start, and
         // the timeout alone would not say which part of the file to look at.
-        if !reported_silence
+        if !watch.reported_silence
             && path.kind() == KIND_WIREGUARD
             && path.handshake_latency_ms().is_none()
-            && started.elapsed() > Duration::from_secs(3)
+            && watch.started.elapsed() > Duration::from_secs(3)
         {
-            reported_silence = true;
-            published_error = true;
-            verdict = true;
-            statuses.lock().unwrap()[0].last_error = Some(format!(
+            watch.reported_silence = true;
+            watch.published_error = true;
+            watch.verdict = true;
+            statuses.lock().unwrap()[index].last_error = Some(format!(
                 "no WireGuard handshake reply from {endpoint}; check the configuration's Endpoint, \
                  PrivateKey and Peer PublicKey"
             ));
         }
-        let probe_timeout = if requires_probe {
+        let probe_timeout = if watch.requires_probe {
             SOCKS5_PROBE_TIMEOUT
         } else {
-            rtt.timeout()
+            watch.rtt.timeout()
         };
-        if pending_probe.is_some_and(|(_, started)| started.elapsed() > probe_timeout) {
-            pending_probe = None;
-            if icmp_answered || requires_probe {
-                consecutive_losses += 1;
-                statuses.lock().unwrap()[0].probes_lost += 1;
-                scheduler_metrics.lock().unwrap()[0].record_loss();
-            } else if probes_attempted >= DIRECT_PROBE_ATTEMPTS {
+        if watch
+            .pending_probe
+            .is_some_and(|(_, started)| started.elapsed() > probe_timeout)
+        {
+            watch.pending_probe = None;
+            if watch.icmp_answered || watch.requires_probe {
+                watch.consecutive_losses += 1;
+                statuses.lock().unwrap()[index].probes_lost += 1;
+                scheduler_metrics.lock().unwrap()[index].record_loss();
+            } else if watch.probes_attempted >= DIRECT_PROBE_ATTEMPTS {
                 // Never answered once: this node does not carry ICMP, which
                 // says nothing about the traffic it does carry. Back off to a
                 // slow retry rather than stopping for the session, so a node
                 // that starts answering later is measured again.
-                next_probe = Instant::now() + DIRECT_QUIET_PROBE_INTERVAL;
+                watch.next_probe = Instant::now() + DIRECT_QUIET_PROBE_INTERVAL;
             }
         }
         pass.total = iteration_started.elapsed();
@@ -364,7 +543,6 @@ mod tests {
     use super::super::worker::{INBOUND_QUEUE_DEPTH, PATH_QUEUE_DEPTH};
     use super::*;
     use base64::Engine as _;
-    use gamepath_engine::relay_path::NodeSpec;
     use std::net::UdpSocket;
     use std::thread;
 
@@ -492,12 +670,25 @@ mod tests {
             STANDARD.encode(client_secret),
             STANDARD.encode(server_public),
         );
-        let path = NodeSpec::WireGuard {
+        let node = NodeSpec::WireGuard {
             config,
             label: None,
-        }
-        .open_direct()
-        .unwrap();
+        };
+        let path = node.open_direct().unwrap();
+        let nodes = Arc::new(SessionNodes::new(vec![super::super::nodes::SessionNode {
+            address,
+            mtu: Arc::new(super::super::path_mtu::SessionMtu::measure(
+                gamepath_engine::mtu::EffectiveMtu::for_session(
+                    gamepath_engine::relay_path::SessionMode::Direct,
+                    [KIND_WIREGUARD],
+                    1500,
+                ),
+                1500,
+                [],
+                |_| unreachable!(),
+            )),
+            socks_proxy: None,
+        }]));
 
         let statuses = Arc::new(Mutex::new(vec![initial_status(
             1,
@@ -513,8 +704,12 @@ mod tests {
             let (stop, statuses) = (Arc::clone(&stop), Arc::clone(&statuses));
             move || {
                 run_direct_path(
-                    path,
-                    address,
+                    Some(path),
+                    DirectRoute {
+                        index: 0,
+                        node,
+                        nodes,
+                    },
                     stop,
                     statuses,
                     command_rx,

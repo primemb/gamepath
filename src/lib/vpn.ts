@@ -1,5 +1,77 @@
 import { useEffect, useRef, useState } from 'react'
-import type { NodeKind, VpnSession, VpnSessionStatus } from '../types'
+import type { NodeKind, VpnNode, VpnRule, VpnSession, VpnSessionStatus, VpnState } from '../types'
+
+/** "Home", "Home, Proxy", "Home +2": names, with nothing to translate between them. */
+export function nodeNames(nodes: { name: string }[]) {
+  const [first, ...rest] = nodes
+  if (!first) return ''
+  if (!rest.length) return first.name
+  return rest.length === 1 ? `${first.name}, ${rest[0].name}` : `${first.name} +${rest.length}`
+}
+
+/** The node a target goes through: the one it names, or the default node. */
+export const targetNode = (vpn: VpnState, rule: VpnRule): VpnNode | null =>
+  vpn.nodes.find((node) => node.id === rule.nodeId) ?? vpn.node
+
+/** Enabled targets assigned to each node other than the default, by node id. */
+export function assignedTargets(vpn: VpnState) {
+  const counts = new Map<string, number>()
+  for (const rule of vpn.rules) {
+    if (!rule.enabled || !rule.nodeId || rule.nodeId === vpn.selectedNodeId) continue
+    counts.set(rule.nodeId, (counts.get(rule.nodeId) ?? 0) + 1)
+  }
+  return counts
+}
+
+/** How a node of the session is doing right now. */
+export type NodeLive = {
+  state: 'connecting' | 'connected' | 'down'
+  latencyMs: number | null
+  /** Connections it is carrying, from the capture's live list. */
+  connections: number
+}
+
+/** Every node the VPN is connecting or connected through, by id. Absent: not in use. */
+export function nodeLive(vpn: VpnState) {
+  const { session } = vpn
+  const result = new Map<string, NodeLive>()
+  const ids = session.nodeIds ?? (session.node ? [session.node.id] : [])
+  if (session.status === 'connecting' || session.status === 'reconnecting') {
+    for (const id of ids) result.set(id, { state: 'connecting', latencyMs: null, connections: 0 })
+    return result
+  }
+  if (!vpnLive(session.status)) return result
+  const health = new Map((session.nodeHealth ?? []).map((node) => [node.id, node]))
+  const carried = new Map<string, number>()
+  for (const connection of session.capture?.diagnostics?.handledConnections ?? []) {
+    const id = ids[connection.node ?? 0]
+    if (id) carried.set(id, (carried.get(id) ?? 0) + 1)
+  }
+  ids.forEach((id, index) => {
+    const node = health.get(id)
+    result.set(id, {
+      state: node?.reachable === false ? 'down' : 'connected',
+      latencyMs: node?.latencyMs ?? (index === 0 ? (session.metrics?.latencyMs ?? null) : null),
+      connections: carried.get(id) ?? 0,
+    })
+  })
+  return result
+}
+
+/** "Connected · 58 ms · 3 connections", for a node in use. */
+export function describeNodeLive(live: NodeLive) {
+  if (live.state === 'connecting') return 'Connecting…'
+  if (live.state === 'down') return 'Not answering'
+  const parts = ['Connected']
+  if (live.latencyMs != null) parts.push(`${Math.round(live.latencyMs)} ms`)
+  parts.push(`${live.connections} connection${live.connections === 1 ? '' : 's'}`)
+  return parts.join(' · ')
+}
+
+/** A node of the running session that is not answering, by id. */
+export function downNodes(session: VpnSession) {
+  return new Map((session.nodeHealth ?? []).filter((node) => !node.reachable).map((node) => [node.id, node]))
+}
 
 /** Statuses in which the VPN holds a session in the service. */
 export const vpnLive = (status: VpnSessionStatus) => status === 'connected' || status === 'degraded'

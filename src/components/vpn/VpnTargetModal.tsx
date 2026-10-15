@@ -2,7 +2,8 @@ import { useState } from 'react'
 import { AlertTriangle, AppWindow, FolderOpen, Globe2, Network, Plus, X } from 'lucide-react'
 import { api } from '../../api'
 import { errorMessage } from '../Toast'
-import type { RuleKind, VpnRule } from '../../types'
+import type { RuleKind, VpnRule, VpnState } from '../../types'
+import { VpnNodePicker } from './VpnNodePicker'
 
 const kinds: { id: RuleKind; label: string; icon: typeof AppWindow; needsApps: boolean }[] = [
   { id: 'application', label: 'Application', icon: AppWindow, needsApps: true },
@@ -13,19 +14,22 @@ const kinds: { id: RuleKind; label: string; icon: typeof AppWindow; needsApps: b
 
 /** Adds one app, folder, website or address to the VPN. */
 export function VpnTargetModal({
+  vpn,
   canSelectApps,
   initialKind,
   onClose,
   onSave,
 }: {
+  vpn: VpnState
   canSelectApps: boolean
   initialKind: RuleKind
   onClose: () => void
-  onSave: (input: Pick<VpnRule, 'kind' | 'value' | 'label'>) => Promise<void>
+  onSave: (input: Pick<VpnRule, 'kind' | 'value' | 'label' | 'nodeId'>) => Promise<void>
 }) {
   const [kind, setKind] = useState<RuleKind>(canSelectApps ? initialKind : 'hostname')
   const [value, setValue] = useState('')
   const [label, setLabel] = useState('')
+  const [nodeId, setNodeId] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
 
@@ -41,7 +45,7 @@ export function VpnTargetModal({
     setSaving(true)
     setFailure(null)
     try {
-      await onSave({ kind, value: value.trim(), label: label || value.trim() })
+      await onSave({ kind, value: value.trim(), label: label || value.trim(), nodeId })
     } catch (error) {
       setFailure(errorMessage(error))
       setSaving(false)
@@ -121,6 +125,24 @@ export function VpnTargetModal({
               aria-describedby={failure ? 'vpn-target-error' : undefined}
             />
           </label>
+        )}
+        {vpn.nodes.length > 1 && vpn.trafficMode === 'split' && (
+          <VpnNodePicker
+            vpn={vpn}
+            value={nodeId}
+            label="Connect through"
+            hint={
+              kind === 'hostname'
+                ? 'This website, and its name lookups, use this node in every app.'
+                : kind === 'ip'
+                  ? 'Traffic to this address uses this node in every app.'
+                  : 'Its traffic uses this node. Apps that look names up themselves, such as Chrome and Discord, resolve through it too; other apps resolve through the default node.'
+            }
+            onChange={(next) => {
+              setNodeId(next)
+              setFailure(null)
+            }}
+          />
         )}
         {failure && (
           <p className="field-error vpn-field-error" id="vpn-target-error" role="alert">

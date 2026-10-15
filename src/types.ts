@@ -182,6 +182,8 @@ export type HandledConnection = {
   destinationPort: number
   protocol: string
   startedAt: number
+  /** The VPN node carrying it, by its place in the session's nodes. */
+  node?: number
 }
 
 /** How the LAN proxy is configured. The password itself never leaves the main process. */
@@ -252,6 +254,17 @@ export type VpnRule = {
   value: string
   label: string
   enabled: boolean
+  /** The node that carries this target; null follows the default node. */
+  nodeId: string | null
+}
+
+/** How one node of a running VPN is doing. */
+export type VpnNodeHealth = {
+  id: string
+  name: string
+  reachable: boolean
+  latencyMs: number | null
+  error: string | null
 }
 
 /** A downloadable list of sites or addresses that keep the normal connection. */
@@ -293,7 +306,12 @@ export type VpnSession = {
   pauseReason?: 'game-all-traffic'
   /** Tags this session's lines in every log file. */
   sessionId?: string
+  /** The default node. */
   node?: { id: string; name: string; kind: NodeKind }
+  /** Every node the session connects, the default node first. */
+  nodes?: { id: string; name: string; kind: NodeKind }[]
+  nodeIds?: string[]
+  nodeHealth?: VpnNodeHealth[]
   startedAt?: number
   /** When the next reconnect attempt runs. */
   retryAt?: number
@@ -312,13 +330,15 @@ export type VpnSession = {
 }
 
 /**
- * The VPN beside the game session: one node connected directly, its own
- * split rules, and a session of its own. The game always takes priority.
+ * The VPN beside the game session: a default node, other nodes for the
+ * targets assigned to them, its own split rules, and a session of its own.
+ * The game always takes priority.
  */
 export type VpnState = {
   nodes: VpnNode[]
+  /** The default node: all traffic, or every target not assigned another. */
   selectedNodeId: string | null
-  /** The selected node, ready to connect or reconnect. */
+  /** The default node, ready to connect or reconnect. */
   node: VpnNode | null
   trafficMode: 'all' | 'split'
   remoteDns: boolean
@@ -329,9 +349,11 @@ export type VpnState = {
   session: VpnSession
   /** VPN rules the game also selects, which the game therefore takes. */
   conflicts: string[]
-  /** Rules this node cannot route, by rule id, with the reason. */
+  /** Rules their node cannot route, by rule id, with the reason. */
   limitations: Record<string, string>
-  /** False for an L2TP node in split mode, which routes by address only. */
+  /** Why the nodes in use cannot run together, or null. */
+  nodeLimitation: string | null
+  /** False for an L2TP default node in split mode, which routes by address only. */
   canSelectApps: boolean
   direct: VpnDirect
 }
@@ -354,8 +376,10 @@ export type VpnApi = {
   setRemoteDns: (enabled: boolean) => Promise<AppState>
   setKillSwitch: (enabled: boolean) => Promise<AppState>
   browseTarget: (kind: RuleKind) => Promise<{ canceled: boolean; value?: string; label?: string }>
-  addRule: (input: Pick<VpnRule, 'kind' | 'value' | 'label'>) => Promise<AppState>
+  addRule: (input: Pick<VpnRule, 'kind' | 'value' | 'label'> & { nodeId?: string | null }) => Promise<AppState>
   setRuleEnabled: (id: string, enabled: boolean) => Promise<AppState>
+  /** Null puts the target back on the default node. */
+  setRuleNode: (id: string, nodeId: string | null) => Promise<AppState>
   removeRule: (id: string) => Promise<AppState>
   /** Turning it on the first time downloads the lists it starts with. */
   setDirectEnabled: (enabled: boolean) => Promise<AppState>

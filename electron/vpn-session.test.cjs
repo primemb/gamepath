@@ -354,6 +354,44 @@ test('remote DNS setup failure stops the session before reporting connected or r
   assert.equal(localDns.controller.snapshot().status, 'connected')
 })
 
+test('one node down is reported by name and never restarts the nodes that work', async () => {
+  const nodes = [node, { id: 'proxy', name: 'Proxy', kind: 'socks5' }]
+  let proxyUp = false
+  const paths = () => ({
+    ...connectedPaths,
+    state: 'connected',
+    paths: [
+      { route: 1, reachable: true, latencyMs: 30 },
+      { route: 2, reachable: proxyUp, lastError: 'proxy refused' },
+    ],
+  })
+  const { controller, advance, service } = harness({
+    buildRequest: () => ({ request, node, nodes }),
+    script: { 'session-status': paths },
+  })
+  await controller.connect()
+  await controller.poll()
+  let session = controller.snapshot()
+  assert.equal(session.status, 'degraded')
+  assert.match(session.message, /Proxy is not answering/)
+  assert.deepEqual(
+    session.nodeHealth.map((health) => [health.id, health.reachable, health.error]),
+    [
+      ['vpn-node', true, null],
+      ['proxy', false, 'proxy refused'],
+    ],
+  )
+  advance(DEGRADED_RESTART_MS * 2)
+  await controller.poll()
+  await controller.queue
+  assert.equal(service.calls.filter((call) => call.command === 'stop-session').length, 0)
+  proxyUp = true
+  await controller.poll()
+  session = controller.snapshot()
+  assert.equal(session.status, 'connected')
+  assert.match(session.message, /Home, Proxy/)
+})
+
 test('a poll answered after the VPN was turned off does not bring it back', async () => {
   let answer
   const { controller } = harness({

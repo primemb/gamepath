@@ -4,6 +4,7 @@
 
 use super::dispatch::Dispatch;
 use super::local_tap::{InboundQueue, LocalTap};
+use super::nodes::SessionNodes;
 use super::path_mtu::SessionMtu;
 use super::repair::LossRepair;
 use super::worker::PathTelemetry;
@@ -141,11 +142,10 @@ pub(crate) struct ActiveWireGuardSession {
     pub(crate) decision_mask: Arc<AtomicU64>,
     pub(crate) telemetry: PathTelemetry,
     pub(crate) scheduler_metrics: Arc<Mutex<Vec<PathMetrics>>>,
-    pub(crate) mtu: SessionMtu,
+    /// The default node's, or the relay session's.
+    pub(crate) mtu: Arc<SessionMtu>,
+    pub(crate) nodes: Arc<SessionNodes>,
     pub(crate) bypass_ips: Vec<std::net::Ipv4Addr>,
-    /// The SOCKS5 proxy a direct VPN session runs through. Such a proxy may
-    /// answer name lookups with fake-IP addresses only it can reach.
-    pub(crate) socks_proxy: Option<std::net::SocketAddr>,
     /// Diverts replies for the LAN proxy's own flows away from capture.
     pub(crate) local_tap: Arc<LocalTap>,
     // Held for the session so the path workers wake on a millisecond timer

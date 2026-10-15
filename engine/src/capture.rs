@@ -279,7 +279,7 @@ impl PacketCaptureManager {
                 .map(crate::split_capture::SplitPacketCapture::into_carried)
         };
         self.last_request = Some(payload);
-        let (virtual_ipv4, bypass_ips, data_receiver, effective_mtu) = {
+        let (virtual_ipv4, bypass_ips, data_receiver, nodes) = {
             let manager = sessions.lock().unwrap();
             (
                 manager
@@ -290,10 +290,14 @@ impl PacketCaptureManager {
                     .data_receiver()
                     .ok_or("start the multipath session before packet capture")?,
                 manager
-                    .effective_mtu()
+                    .nodes()
                     .ok_or("start the multipath session before packet capture")?,
             )
         };
+        // Waits for each node's path measurement, without the session lock:
+        // a status request must not queue behind it.
+        let node_mtus = nodes.mtus_for_capture();
+        let effective_mtu = node_mtus[0];
         if input.traffic_mode == "split" {
             self.dns_guard = if input.remote_dns {
                 Some(crate::dns_guard::DnsGuard::start(&input, None)?)
@@ -307,11 +311,11 @@ impl PacketCaptureManager {
             excluded.extend(&input.foreign_bypass);
             let split = crate::split_capture::SplitPacketCapture::start(
                 &input.rules,
-                virtual_ipv4,
+                nodes,
+                &node_mtus,
                 &excluded,
                 sessions,
                 data_receiver,
-                effective_mtu,
                 crate::split_capture::SplitOptions {
                     kill_switch: input.kill_switch,
                     remote_dns: input.remote_dns,
@@ -823,7 +827,7 @@ fn run_wintun_uplink(
         let bytes = packet.bytes().to_vec();
         drop(packet);
         if ipv4_source_address(&bytes) == Some(virtual_ipv4) {
-            let _ = sender.send(&bytes);
+            let _ = sender.send(&bytes, 0);
         } else {
             diagnostics.record(
                 gamepath_engine::packet_diagnostics::Reason::WintunInvalidSource,
