@@ -18,7 +18,7 @@ const serviceSource = () =>
 /** The live rule-update handler, from its signature to the function after it. */
 const updateHandlerSource = () => {
   const session = serviceFile('session.rs')
-  return session.slice(session.indexOf('fn update_session_rules'), session.indexOf('fn set_foreign_bypass'))
+  return session.slice(session.indexOf('fn update_session_rules'), session.indexOf('fn update_session_direct'))
 }
 
 test('authenticates and parses a network service response', async (context) => {

@@ -187,7 +187,7 @@ impl WireGuardSessionManager {
         self.active.as_ref().map(|session| LocalStackBinding {
             tap: Arc::clone(&session.local_tap),
             address: session.virtual_ipv4,
-            mtu: session.mtu.current().mtu,
+            mtu: session.mtu.current().own_stack(),
             mode: session.mode,
             data_receiver: Arc::clone(&session.data_receiver),
         })

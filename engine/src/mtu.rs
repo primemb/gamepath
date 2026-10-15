@@ -33,6 +33,9 @@ pub const MIN_TUNNEL_MTU: u16 = 1280;
 /// RakNet's 1200-byte MTU probe counts its headers, so it fits as well.
 pub const MIN_SIGNALLED_MTU: u16 = 1228;
 
+/// The datagram every IPv4 host must accept (RFC 791).
+const MIN_IPV4_MTU: u16 = 576;
+
 /// Makes an OS-reported link MTU safe to use as an Internet packet budget.
 /// Jumbo frames do not help the Internet path, and a missing or implausibly
 /// small report must never make connection startup fail.
@@ -231,6 +234,14 @@ impl EffectiveMtu {
         self.budget.clamp(MIN_SIGNALLED_MTU, self.mtu)
     }
 
+    /// MTU for a TCP/IP stack the engine runs itself, such as the LAN proxy's.
+    /// Neither floor applies there: no application is told this MTU, and
+    /// every segment it sends or invites is sized from it, so the whole link
+    /// budget keeps full-size downloads from fragmenting on a narrow uplink.
+    pub fn own_stack(self) -> u16 {
+        self.budget.clamp(MIN_IPV4_MTU, self.mtu)
+    }
+
     /// MSS for a clamped TCP handshake: the tunnel MTU less the IPv4 and TCP
     /// headers the peer will add back.
     pub fn tcp_mss(self) -> u16 {
@@ -258,6 +269,17 @@ mod tests {
         let wide = EffectiveMtu::for_session(SessionMode::Relay, ["wireguard"], LINK_MTU);
         assert_eq!(wide.unfragmented(), wide.mtu);
         assert_eq!(wide.with_tunnel_limit(Some(1300)).unfragmented(), 1300);
+    }
+
+    #[test]
+    fn the_engines_own_stack_fits_the_link_below_both_floors() {
+        // Measured live: a 1424-byte path carrying L2TP routes (215 bytes).
+        let mtu = EffectiveMtu::for_session(SessionMode::Relay, ["l2tp"], 1424);
+        assert_eq!(mtu.own_stack(), 1209);
+        assert_eq!(mtu.own_stack() + mtu.overhead, 1424);
+        let wide = EffectiveMtu::for_session(SessionMode::Relay, ["wireguard"], LINK_MTU);
+        assert_eq!(wide.own_stack(), wide.mtu);
+        assert_eq!(wide.with_tunnel_limit(Some(1300)).own_stack(), 1300);
     }
 
     #[test]
