@@ -461,8 +461,14 @@ first host of its own `/24`.
 
 The privileged service creates a temporary Windows VPN profile, passes the
 pre-shared key to PowerShell over anonymous stdin, and dials with `RasDialW`.
-The dial uses an asynchronous notifier and polls `RasGetConnectStatusW`, with a
-45-second negotiation deadline. A slot teardown signals cancellation immediately,
+The dial is asynchronous with a `RasDialFunc2` notifier, which reports each
+state and the error that ends a failed dial, keyed by `dwCallbackId`; the wait
+has a 45-second negotiation deadline. Polling `RasGetConnectStatusW` alone does
+not work: measured, the first poll 7 ms after `RasDialW` returned
+ERROR_INVALID_HANDLE (6) before RAS had registered the dial, and 0.7.1 hung up
+every L2TP route that way (RasClient logged each as failed with error 0). The
+poll remains only as a second way to see `RASCS_Connected`; its errors are
+ignored while the notifier reports none. A slot teardown signals cancellation immediately,
 so a stopped session does not keep negotiating beside its replacement. Failed
 background attempts report their Windows error and retry count through
 `attach-l2tp-route` without consuming the route's pending runtime channel.
