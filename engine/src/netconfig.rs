@@ -715,6 +715,27 @@ pub fn add_route(
     )
 }
 
+/// A relay socket is pinned to its RAS interface. Its host route must lose
+/// to the uplink's matching /32 for unbound sockets, including SSH to the VPS.
+pub fn add_l2tp_relay_route(destination: Ipv4Addr, interface_index: u32) -> Result<(), String> {
+    let (_, uplink) = default_ipv4_route()?;
+    let metric = l2tp_relay_metric(ip_interface_entry(uplink)?.Metric)?;
+    add_route_via(
+        destination,
+        32,
+        Ipv4Addr::UNSPECIFIED,
+        interface_index,
+        metric,
+    )
+}
+
+fn l2tp_relay_metric(uplink_interface_metric: u32) -> Result<u32, String> {
+    uplink_interface_metric
+        .checked_add(2)
+        .filter(|metric| *metric != u32::MAX)
+        .ok_or_else(|| "the uplink metric is too large to isolate the L2TP relay route".into())
+}
+
 /// Routes `destination/prefix_length` through `next_hop` on
 /// `interface_index`.
 ///
@@ -1206,6 +1227,49 @@ mod tests {
         assert_eq!(ipv4_from(&row.NextHop), Some(gateway));
         assert_eq!(row.DestinationPrefix.PrefixLength, 1);
         assert_eq!(row.Metric, 5);
+    }
+
+    #[test]
+    fn relay_host_routes_keep_unbound_ssh_on_the_uplink() {
+        let relay = Ipv4Addr::new(203, 0, 113, 9);
+        for uplink_metric in [1, 25, 5000] {
+            let tunnel_metric = l2tp_relay_metric(uplink_metric).unwrap();
+            let candidates = vec![
+                (Ipv4Addr::UNSPECIFIED, 83, tunnel_metric),
+                (Ipv4Addr::UNSPECIFIED, 92, tunnel_metric),
+                (relay, 6, 1),
+            ];
+            let metrics = |index| match index {
+                6 => Some(uplink_metric),
+                83 => Some(1),
+                92 => Some(5),
+                _ => None,
+            };
+            assert_eq!(
+                rank_default_routes(candidates.clone(), metrics),
+                Some((relay, 6))
+            );
+            // A source/interface-pinned relay socket considers only its RAS
+            // interface, so the preferred uplink cannot steal its packets.
+            for index in [83, 92] {
+                let pinned = candidates
+                    .iter()
+                    .copied()
+                    .filter(|(_, interface, _)| *interface == index)
+                    .collect();
+                assert_eq!(
+                    rank_default_routes(pinned, metrics),
+                    Some((Ipv4Addr::UNSPECIFIED, index))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relay_route_priority_never_wraps_or_uses_the_unused_metric() {
+        assert!(l2tp_relay_metric(u32::MAX).is_err());
+        assert!(l2tp_relay_metric(u32::MAX - 2).is_err());
+        assert_eq!(l2tp_relay_metric(25).unwrap(), 27);
     }
 
     /// Removing a route that is not there is the intended end state, not an

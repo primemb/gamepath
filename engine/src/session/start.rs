@@ -311,7 +311,7 @@ impl WireGuardSessionManager {
             Arc::clone(&sequences),
             Arc::clone(&dispatch),
             Arc::clone(&decision_mask),
-            effective_mtu.mtu,
+            Arc::clone(&session_mtu),
         ));
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let local_tap = Arc::new(LocalTap::default());

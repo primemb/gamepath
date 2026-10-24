@@ -370,7 +370,7 @@ impl PacketCaptureManager {
                 "trafficMode": "split",
                 "targetCount": target_count,
                 "effectiveMtu": effective_mtu.mtu,
-                "tcpMss": effective_mtu.tcp_mss(),
+                "tcpMss": effective_mtu.unfragmented() - 40,
                 "dnsServers": dns_servers,
                 // Selected targets are matched as IPv4. A game reaching the
                 // same server over IPv6 is not captured at all, so the
@@ -415,6 +415,7 @@ impl PacketCaptureManager {
                     uplink_session,
                     uplink_sessions,
                     virtual_ipv4,
+                    effective_mtu,
                     uplink_stop,
                     uplink_diagnostics,
                 )
@@ -448,6 +449,7 @@ impl PacketCaptureManager {
                     downlink_stop,
                     diagnostics,
                     direct_router,
+                    effective_mtu.unfragmented() - 40,
                 )
             })
             .map_err(|error| format!("could not start Wintun downlink: {error}"))?;
@@ -808,10 +810,16 @@ fn run_wintun_uplink(
     session: Arc<wintun::Session>,
     sessions: Arc<Mutex<WireGuardSessionManager>>,
     virtual_ipv4: std::net::Ipv4Addr,
+    mtu: gamepath_engine::mtu::EffectiveMtu,
     stop: Arc<AtomicBool>,
     diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
 ) {
     let mut sender = SenderCache::new(sessions);
+    // The adapter keeps the 1280-byte floor, so Windows hands over packets
+    // the link may not carry whole once wrapped. Measured live on an Iranian
+    // uplink: anything over ~1430 bytes vanished with no ICMP answer, which a
+    // 1280-byte packet plus 159-215 bytes of encapsulation is.
+    let limit = mtu.unfragmented();
     while !stop.load(Ordering::Acquire) {
         let packet = match session.receive_blocking() {
             Ok(packet) => packet,
@@ -824,16 +832,51 @@ fn run_wintun_uplink(
                 return;
             }
         };
-        let bytes = packet.bytes().to_vec();
+        let mut bytes = packet.bytes().to_vec();
         drop(packet);
-        if ipv4_source_address(&bytes) == Some(virtual_ipv4) {
-            let _ = sender.send(&bytes, 0);
-        } else {
+        if ipv4_source_address(&bytes) != Some(virtual_ipv4) {
             diagnostics.record(
                 gamepath_engine::packet_diagnostics::Reason::WintunInvalidSource,
                 &bytes,
             );
+            continue;
         }
+        gamepath_engine::tcp_mss::clamp_with_checksum(&mut bytes, limit - 40);
+        // Answered as a router on the link would, so Windows lowers its path
+        // MTU for that destination and the sender's next packet fits.
+        if let Some(answer) = gamepath_engine::icmp::fragmentation_needed(&bytes, limit) {
+            deliver(&session, &answer, &diagnostics);
+            continue;
+        }
+        match gamepath_engine::ipv4_fragments::fragment(&bytes, usize::from(limit)) {
+            Some(pieces) => {
+                for piece in &pieces {
+                    let _ = sender.send(piece, 0);
+                }
+            }
+            None => {
+                let _ = sender.send(&bytes, 0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn deliver(
+    session: &Arc<wintun::Session>,
+    packet: &[u8],
+    diagnostics: &gamepath_engine::packet_diagnostics::PacketDiagnostics,
+) {
+    match session.allocate_send_packet(packet.len() as u16) {
+        Ok(mut allocated) => {
+            allocated.bytes_mut().copy_from_slice(packet);
+            session.send_packet(allocated);
+        }
+        Err(error) => diagnostics.record_error(
+            gamepath_engine::packet_diagnostics::Reason::WintunInject,
+            packet,
+            &error.to_string(),
+        ),
     }
 }
 
@@ -844,9 +887,10 @@ fn run_wintun_downlink(
     stop: Arc<AtomicBool>,
     diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
     direct: Option<Arc<crate::direct_routes::DirectRouter>>,
+    tcp_mss: u16,
 ) {
     while !stop.load(Ordering::Acquire) {
-        let reply = match data_receiver.receive(Duration::from_millis(250)) {
+        let mut reply = match data_receiver.receive(Duration::from_millis(250)) {
             Ok(Some(packet)) => packet,
             Ok(None) => continue,
             Err(error) => {
@@ -870,17 +914,9 @@ fn run_wintun_downlink(
         if let Some(direct) = &direct {
             direct.learn(&reply);
         }
-        match session.allocate_send_packet(reply.len() as u16) {
-            Ok(mut packet) => {
-                packet.bytes_mut().copy_from_slice(&reply);
-                session.send_packet(packet);
-            }
-            Err(error) => diagnostics.record_error(
-                gamepath_engine::packet_diagnostics::Reason::WintunInject,
-                &reply,
-                &error.to_string(),
-            ),
-        }
+        // The server sizes its segments from this, not from the adapter.
+        gamepath_engine::tcp_mss::clamp_with_checksum(&mut reply, tcp_mss);
+        deliver(&session, &reply, &diagnostics);
     }
 }
 

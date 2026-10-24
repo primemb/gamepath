@@ -66,6 +66,7 @@ impl Socks5Stack {
             waker,
             stop: AtomicBool::new(false),
             counters: Default::default(),
+            upstream_activity: AtomicBool::new(false),
         });
         let (outbound_tx, outbound) = mpsc::sync_channel(QUEUE_LIMIT);
         let credentials = config
@@ -119,6 +120,12 @@ impl Socks5Stack {
 
     pub fn handshake_latency_ms(&self) -> Option<f64> {
         Some(self.setup_latency_ms)
+    }
+
+    /// Only forwarded TCP payload and UDP replies count, never local stack
+    /// packets, SOCKS handshakes or DNS that a proxy may synthesize itself.
+    pub fn take_upstream_activity(&self) -> bool {
+        self.shared.upstream_activity.swap(false, Ordering::Relaxed)
     }
 
     pub fn send_packet(&mut self, packet: &[u8]) -> Result<(), String> {

@@ -75,6 +75,11 @@ struct Dialled {
     session: Option<L2tpSession>,
 }
 
+enum DialUpdate {
+    Retrying { index: usize, reason: String },
+    Done(Dialled),
+}
+
 /// Dials `node` until it connects, its attempts run out or the dials are
 /// cancelled. `None` when cancelled: there is no session left to tell.
 fn dial_with_retries(
@@ -83,6 +88,7 @@ fn dial_with_retries(
     relay: Ipv4Addr,
     tag: &str,
     cancelled: &AtomicBool,
+    updates: &mpsc::Sender<DialUpdate>,
 ) -> Option<Dialled> {
     let route = index + 1;
     for attempt in 1..=DIAL_ATTEMPTS {
@@ -91,11 +97,14 @@ fn dial_with_retries(
         }
         // A fresh copy every time: a failed dial clears the key it used.
         let mut dialled = node.clone();
-        let session = connect_l2tp_node(&mut dialled, index, Some(relay), true, tag)
+        let session = connect_l2tp_node(&mut dialled, index, Some(relay), true, tag, cancelled)
             .unwrap_or_else(|error| {
                 mark_failed(&mut dialled, error);
                 None
             });
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
         if session.is_some() {
             return Some(Dialled {
                 index,
@@ -127,6 +136,10 @@ fn dial_with_retries(
             });
         }
         let delay = retry_delay(attempt);
+        let _ = updates.send(DialUpdate::Retrying {
+            index,
+            reason: format!("L2TP/IPsec attempt {attempt} of {DIAL_ATTEMPTS} failed: {error}; retrying (next attempt after {} s)", delay.as_secs()),
+        });
         gamepath_engine::log_info!(
             "{tag} route {route}: L2TP/IPsec attempt {attempt} of {DIAL_ATTEMPTS} failed; retrying in {} s",
             delay.as_secs()
@@ -143,7 +156,7 @@ fn dial_with_retries(
 /// Dropping it cancels whatever is still retrying: the session it was for has
 /// failed to start, stopped or been replaced.
 pub(crate) struct L2tpDials {
-    results: mpsc::Receiver<Dialled>,
+    results: mpsc::Receiver<DialUpdate>,
     outstanding: usize,
     cancelled: Arc<AtomicBool>,
     started: Instant,
@@ -175,10 +188,10 @@ impl L2tpDials {
                 .name(format!("gamepath-l2tp-dial-{}", index + 1))
                 .spawn(move || {
                     if let Some(dialled) =
-                        dial_with_retries(&pristine, index, relay, &tag, &cancelled)
+                        dial_with_retries(&pristine, index, relay, &tag, &cancelled, &sender)
                     {
                         // Dropped with its connection when the session is gone.
-                        let _ = sender.send(dialled);
+                        let _ = sender.send(DialUpdate::Done(dialled));
                     }
                 });
             let NodeSpec::L2tp {
@@ -210,6 +223,10 @@ impl L2tpDials {
         self.outstanding > 0
     }
 
+    pub(crate) fn cancellation(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
     /// Applies every dial that has already finished. Returns whether one of
     /// them connected.
     pub(crate) fn collect(
@@ -222,7 +239,9 @@ impl L2tpDials {
             let Ok(dialled) = self.results.try_recv() else {
                 break;
             };
-            connected |= self.apply(dialled, nodes, sessions);
+            if let DialUpdate::Done(dialled) = dialled {
+                connected |= self.apply(dialled, nodes, sessions);
+            }
         }
         connected
     }
@@ -246,8 +265,10 @@ impl L2tpDials {
                     break;
                 }
             };
-            if self.apply(dialled, nodes, sessions) {
-                return true;
+            if let DialUpdate::Done(dialled) = dialled {
+                if self.apply(dialled, nodes, sessions) {
+                    return true;
+                }
             }
         }
         false
@@ -285,9 +306,26 @@ impl L2tpDials {
             .spawn(move || {
                 while self.outstanding() {
                     match self.results.recv_timeout(Duration::from_secs(1)) {
-                        Ok(dialled) => {
+                        Ok(DialUpdate::Done(dialled)) => {
                             self.outstanding -= 1;
                             attach(dialled, id, generation, &registry);
+                        }
+                        Ok(DialUpdate::Retrying { index, reason }) => {
+                            let mut slot = registry.slot(id).lock().unwrap();
+                            if slot.generation != generation {
+                                return;
+                            }
+                            if let Some(engine) = slot.engine.as_mut() {
+                                if let Err(error) = engine.request(
+                                    "attach-l2tp-route",
+                                    json!({
+                                        "route": index + 1,
+                                        "retrying": reason,
+                                    }),
+                                ) {
+                                    slot.warn(&format!("could not report L2TP retry: {error}"));
+                                }
+                            }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             // Busy means a start or stop holds it; asked again

@@ -18,13 +18,13 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::NetworkManagement::Rras::{
     HRASCONN, RAS_STATS, RASCONNSTATUSW, RASCS_Disconnected, RASDIALPARAMSW, RASP_PppIp, RASPPPIPW,
-    RasDeleteEntryW, RasDialW, RasGetConnectStatusW, RasGetConnectionStatistics,
-    RasGetErrorStringW, RasGetProjectionInfoW, RasHangUpW,
+    RasDeleteEntryW, RasGetConnectStatusW, RasGetConnectionStatistics, RasGetErrorStringW,
+    RasGetProjectionInfoW, RasHangUpW,
 };
 
 static L2TP_PROFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
@@ -117,7 +117,7 @@ fn take_wide(value: &[u16]) -> String {
     )
 }
 
-fn ras_error(code: u32) -> String {
+pub(crate) fn ras_error(code: u32) -> String {
     let mut message = [0_u16; 512];
     let result = unsafe { RasGetErrorStringW(code, message.as_mut_ptr(), message.len() as u32) };
     if result == 0 {
@@ -306,6 +306,7 @@ impl L2tpSession {
         pre_shared_key: &str,
         split_tunneling: bool,
         allow_user_fallback: bool,
+        cancelled: &AtomicBool,
     ) -> Result<Self, String> {
         if server.trim().is_empty()
             || username.trim().is_empty()
@@ -347,24 +348,12 @@ impl L2tpSession {
         }
         let started = Instant::now();
         let mut connection: HRASCONN = 0;
-        let status = unsafe {
-            RasDialW(
-                std::ptr::null(),
-                phonebook.as_ptr(),
-                &params,
-                0,
-                std::ptr::null(),
-                &mut connection,
-            )
-        };
+        let status = crate::ras_dial::dial(&phonebook, &params, &mut connection, cancelled);
         params.szUserName.fill(0);
         params.szPassword.fill(0);
-        if status != 0 {
+        if let Err(error) = status {
             close_l2tp(connection, &phonebook, &profile_name);
-            return Err(format!(
-                "L2TP/IPsec connection failed: {}",
-                ras_error(status)
-            ));
+            return Err(format!("L2TP/IPsec connection failed: {}", error));
         }
         let mut projection: RASPPPIPW = unsafe { std::mem::zeroed() };
         projection.dwSize = std::mem::size_of::<RASPPPIPW>() as u32;
@@ -444,6 +433,12 @@ impl L2tpSession {
         if !self.routes.iter().any(|route| route == prefix) {
             self.routes.push(prefix.to_owned());
         }
+        Ok(())
+    }
+
+    fn add_relay_route(&mut self, relay: Ipv4Addr) -> Result<(), String> {
+        netconfig::add_l2tp_relay_route(relay, self.interface_index)?;
+        self.routes.push(format!("{relay}/32"));
         Ok(())
     }
 
@@ -530,7 +525,16 @@ pub(crate) fn connect_l2tp_nodes(
             .enumerate()
             .filter(|(_, node)| matches!(node, NodeSpec::L2tp { .. }))
             .map(|(index, node)| {
-                scope.spawn(move || connect_l2tp_node(node, index, relay, split_tunneling, tag))
+                scope.spawn(move || {
+                    connect_l2tp_node(
+                        node,
+                        index,
+                        relay,
+                        split_tunneling,
+                        tag,
+                        &AtomicBool::new(false),
+                    )
+                })
             })
             .collect();
         dials
@@ -556,6 +560,7 @@ pub(crate) fn connect_l2tp_node(
     relay: Option<Ipv4Addr>,
     split_tunneling: bool,
     tag: &str,
+    cancelled: &AtomicBool,
 ) -> Result<Option<L2tpSession>, String> {
     let NodeSpec::L2tp {
         server,
@@ -583,10 +588,11 @@ pub(crate) fn connect_l2tp_node(
         pre_shared_key,
         split_tunneling,
         false,
+        cancelled,
     )
     .and_then(|mut session| {
         if let Some(relay) = relay {
-            session.add_route(&format!("{relay}/32"))?;
+            session.add_relay_route(relay)?;
         }
         Ok(session)
     });
@@ -925,6 +931,7 @@ pub(crate) fn probe_l2tp_node(payload: Value) -> Result<Value, String> {
         &input.pre_shared_key,
         true,
         true,
+        &AtomicBool::new(false),
     )?;
     let (reachable, data_latency_ms) = probe_direct_l2tp(&session, Duration::from_secs(2));
     if !reachable {

@@ -53,6 +53,8 @@ struct L2tpAttachRequest {
     runtime: Option<gamepath_engine::l2tp::L2tpRuntime>,
     #[serde(default)]
     dial_error: Option<String>,
+    #[serde(default)]
+    retrying: Option<String>,
 }
 
 pub(crate) struct LocalStackBinding {
@@ -239,6 +241,21 @@ impl WireGuardSessionManager {
         let request: L2tpAttachRequest = serde_json::from_value(payload)
             .map_err(|error| format!("invalid L2TP attach request: {error}"))?;
         let session = self.active.as_mut().ok_or("no active network session")?;
+        if let Some(reason) = request.retrying {
+            if !session.service_dials.contains_key(&request.route) {
+                return Err(format!(
+                    "route {} is not waiting for an L2TP dial",
+                    request.route
+                ));
+            }
+            let mut paths = session.paths.lock().unwrap();
+            let path = paths
+                .iter_mut()
+                .find(|path| path.route == request.route)
+                .ok_or_else(|| format!("unknown L2TP route {}", request.route))?;
+            path.last_error = Some(reason);
+            return Ok(json!({ "route": request.route, "joining": true }));
+        }
         let dial = session
             .service_dials
             .remove(&request.route)
@@ -287,6 +304,79 @@ impl Drop for WireGuardSessionManager {
 mod tests {
     use super::*;
     use gamepath_engine::relay_path::NodeSpec;
+
+    #[test]
+    fn l2tp_retry_progress_keeps_the_dial_open_for_its_final_result() {
+        use base64::Engine as _;
+        let peer = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let key = base64::engine::general_purpose::STANDARD.encode([7_u8; 32]);
+        let config = format!(
+            "[Interface]\nPrivateKey = {key}\nAddress = 10.66.66.2/32\n[Peer]\nPublicKey = {key}\nEndpoint = 127.0.0.1:{}\nAllowedIPs = 0.0.0.0/0",
+            peer.local_addr().unwrap().port()
+        );
+        let enrollment =
+            gamepath_engine::auth::EnrollmentToken::generate("10.203.0.2".parse().unwrap());
+        let input: SessionRequest = serde_json::from_value(json!({
+            "relayHost": "127.0.0.1",
+            "relayPort": peer.local_addr().unwrap().port(),
+            "enrollmentToken": enrollment.encode().unwrap(),
+            "nodes": [
+                {"kind": "wireguard", "config": config},
+                {"kind": "l2tp", "server": "127.0.0.1", "username": "player", "password": "secret", "preSharedKey": "", "pending": true}
+            ]
+        })).unwrap();
+        let mut manager = WireGuardSessionManager::default();
+        manager.start_relay(&input, &input.nodes).unwrap();
+        let note = "L2TP/IPsec attempt 1 of 5 failed: RAS error 809; retrying";
+        for _ in 0..2 {
+            manager
+                .attach_l2tp_route(json!({"route": 2, "retrying": note}))
+                .unwrap();
+            let session = manager.active.as_ref().unwrap();
+            assert!(session.service_dials.contains_key(&2));
+            let paths = session.paths.lock().unwrap();
+            let path = paths.iter().find(|path| path.route == 2).unwrap();
+            assert!(path.joining);
+            assert_eq!(path.last_error.as_deref(), Some(note));
+        }
+        assert!(
+            manager
+                .attach_l2tp_route(json!({"route": 1, "retrying": note}))
+                .is_err()
+        );
+        manager
+            .attach_l2tp_route(
+                json!({"route": 2, "dialError": "RAS error 809 (gave up after 5 attempts)"}),
+            )
+            .unwrap();
+        assert!(
+            !manager
+                .active
+                .as_ref()
+                .unwrap()
+                .service_dials
+                .contains_key(&2)
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let session = manager.active.as_ref().unwrap();
+            let paths = session.paths.lock().unwrap();
+            let path = paths.iter().find(|path| path.route == 2).unwrap();
+            if !path.joining {
+                assert_eq!(
+                    path.last_error.as_deref(),
+                    Some("RAS error 809 (gave up after 5 attempts)")
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "final L2TP failure stayed pending"
+            );
+            drop(paths);
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn a_direct_session_refuses_to_pick_one_node_out_of_several() {

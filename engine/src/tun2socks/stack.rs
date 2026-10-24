@@ -89,6 +89,7 @@ pub(crate) struct Shared {
     pub(crate) waker: Waker,
     pub(crate) stop: AtomicBool,
     pub(crate) counters: Counters,
+    pub(crate) upstream_activity: AtomicBool,
 }
 
 pub(crate) struct StackConfig {
@@ -639,6 +640,9 @@ impl Stack {
     /// The proxy opened the far end: hand the held SYN to smoltcp, listening
     /// on exactly that destination.
     fn accept_tcp(&mut self, key: FlowKey, leftover: Vec<u8>) {
+        if !leftover.is_empty() && key.remote.port() != DNS_PORT {
+            self.shared.upstream_activity.store(true, Ordering::Relaxed);
+        }
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; TCP_RECEIVE_BUFFER]),
             tcp::SocketBuffer::new(vec![0; TCP_SEND_BUFFER]),
@@ -996,6 +1000,7 @@ impl Stack {
                     Ok(length) => {
                         *last_used = Instant::now();
                         if let Some((from, payload)) = udp_reply(&self.buffer[..length]) {
+                            self.shared.upstream_activity.store(true, Ordering::Relaxed);
                             replies.push(build_udp(from, client, payload));
                         }
                     }
@@ -1226,6 +1231,9 @@ impl Stack {
             {
                 let room = PENDING_LIMIT - flow.to_app.len();
                 let (data, done) = flow.upstream.read(room, &mut self.buffer);
+                if !data.is_empty() && key.remote.port() != DNS_PORT {
+                    self.shared.upstream_activity.store(true, Ordering::Relaxed);
+                }
                 flow.to_app.extend_from_slice(&data);
                 flow.proxy_finished |= done;
             }

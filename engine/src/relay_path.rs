@@ -778,6 +778,14 @@ pub enum DirectPath {
 }
 
 impl DirectPath {
+    pub fn take_upstream_activity(&self) -> bool {
+        #[cfg(all(windows, feature = "socks-server"))]
+        if let Self::Socks5(path) = self {
+            return path.take_upstream_activity();
+        }
+        false
+    }
+
     pub fn take_transport_drops(&mut self) -> [u64; 2] {
         #[cfg(feature = "openvpn")]
         if let Self::OpenVpn(path) = self {

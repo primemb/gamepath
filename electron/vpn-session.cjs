@@ -397,6 +397,13 @@ class VpnSessionController {
     this.session.message = this.session.killSwitch
       ? 'The node has stopped answering. Selected apps are blocked until it is back.'
       : 'The node has stopped answering. Selected apps use your normal connection until it is back.'
+    // SOCKS5 dials per connection. Rebuilding its stack cannot repair an
+    // upstream DNS outage, but does reset every existing application stream.
+    const nodes = this.session.nodes ?? [this.session.node]
+    if (nodes.length && nodes.every((node) => node?.kind === 'socks5')) {
+      this.degradedSince = null
+      return
+    }
     this.degradedSince ??= this.now()
     if (this.now() - this.degradedSince >= DEGRADED_RESTART_MS) {
       this.log.warn(`degraded for ${Math.round((this.now() - this.degradedSince) / 1000)} s; reconnecting`)

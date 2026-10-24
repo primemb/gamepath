@@ -1,10 +1,23 @@
 const { app, safeStorage } = require('electron')
 const fs = require('node:fs')
 const path = require('node:path')
+const dns = require('node:dns').promises
 const { execFileSync } = require('node:child_process')
 const { ServiceBridge } = require('../electron/service.cjs')
 
 app.setName('gamepath-client')
+
+function routeTo(address) {
+  const script =
+    `Find-NetRoute -RemoteIPAddress '${address}' | Where-Object { $_.DestinationPrefix } | ` +
+    'Select-Object InterfaceIndex,DestinationPrefix,NextHop | ConvertTo-Json -Compress'
+  return JSON.parse(
+    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8',
+      windowsHide: true,
+    }),
+  )
+}
 
 function routeExists(prefix, interfaceIndex) {
   const script =
@@ -47,11 +60,15 @@ app
     })
     const node = { kind: 'l2tp', server, preSharedKey, username, password, label: 'L2TP live test' }
     let relayFields = {}
+    let relayIp = null
+    let relayUplink = null
     if (mode === 'relay') {
       const state = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'gamepath-state.json'), 'utf8'))
       const relay = state.relays.find((item) => item.id === state.activeRelayId)
       const encryptedToken = relay && state.encryptedRelayTokens?.[relay.id]
       if (!relay?.address || !encryptedToken) throw new Error('The selected GamePath relay is not configured')
+      relayIp = (await dns.lookup(relay.address, { family: 4 })).address
+      relayUplink = routeTo(relayIp)
       relayFields = {
         relayHost: relay.address,
         relayPort: relay.port,
@@ -100,6 +117,13 @@ app
         if (!routeExists('1.0.0.1/32', directAdapterIndex) || routeExists('1.1.1.1/32', directAdapterIndex)) {
           throw new Error('Windows did not replace the live L2TP split route')
         }
+      } else {
+        const during = routeTo(relayIp)
+        if (during.InterfaceIndex !== relayUplink.InterfaceIndex || during.NextHop !== relayUplink.NextHop) {
+          throw new Error('The game L2TP relay route moved unrelated connections to the VPS off the normal uplink')
+        }
+        if (!result.dataPlane.reachable) throw new Error('The interface-pinned L2TP relay did not return data')
+        console.log('Ordinary connections to the relay keep the normal uplink while L2TP returns relay data.')
       }
     } finally {
       await service.request('stop-session').catch(() => undefined)

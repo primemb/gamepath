@@ -389,6 +389,35 @@ const STALE_FLOW_CONFIRMATIONS: u8 = 15;
 /// visible briefly between packets so ordinary game traffic does not flicker.
 const ACTIVE_CONNECTION_WINDOW: Duration = Duration::from_secs(30);
 
+/// Each selected remote endpoint is logged once per window, at most
+/// `DESTINATION_LOG_LIMIT` of them. A per-session cap was spent within two
+/// seconds of a Steam game starting - its SDR ping-location probes reach ~60
+/// Valve relays - so the match server joined minutes later was never logged.
+const DESTINATION_LOG_LIMIT: usize = 64;
+const DESTINATION_LOG_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+struct DestinationLog {
+    window_started: Instant,
+    logged: HashSet<(u8, Ipv4Addr, u16)>,
+}
+
+impl DestinationLog {
+    fn new() -> Self {
+        Self {
+            window_started: Instant::now(),
+            logged: HashSet::new(),
+        }
+    }
+
+    fn first_seen(&mut self, destination: (u8, Ipv4Addr, u16), now: Instant) -> bool {
+        if now.saturating_duration_since(self.window_started) >= DESTINATION_LOG_WINDOW {
+            self.window_started = now;
+            self.logged.clear();
+        }
+        self.logged.len() < DESTINATION_LOG_LIMIT && self.logged.insert(destination)
+    }
+}
+
 /// Capture threads reading the shared WinDivert handle.
 ///
 /// WinDivert supports concurrent receives on one handle, which is what stops a
@@ -728,10 +757,7 @@ struct Registry {
     table_version: AtomicU64,
     handled_connections: Mutex<HashMap<ReturnKey, HandledConnection>>,
     app_usage: Mutex<HashMap<String, Arc<AppUsage>>>,
-    /// Each selected remote endpoint is logged once per capture session. The
-    /// fixed cap preserves enough game-server context without turning a busy
-    /// application's connection churn into log spam.
-    logged_destinations: Mutex<HashSet<(u8, Ipv4Addr, u16)>>,
+    logged_destinations: Mutex<DestinationLog>,
     capture_loop_buckets: [AtomicU64; 8],
     capture_loop_peak_us: AtomicU64,
     slow_capture_loops: AtomicU64,
@@ -1133,7 +1159,7 @@ impl SplitPacketCapture {
             table_version: AtomicU64::new(0),
             handled_connections: Mutex::new(carried_handled),
             app_usage: Mutex::new(carried_usage),
-            logged_destinations: Mutex::new(HashSet::new()),
+            logged_destinations: Mutex::new(DestinationLog::new()),
             capture_loop_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             capture_loop_peak_us: AtomicU64::new(0),
             slow_capture_loops: AtomicU64::new(0),
@@ -2202,7 +2228,13 @@ fn route_later_fragment(
     let forwarded = handle
         .ip_checksum(tunnel_buffer, &mut checksum_address)
         .is_ok()
-        && sender.send(tunnel_buffer, node).is_ok();
+        && send_within(
+            sender,
+            tunnel_buffer,
+            node,
+            registry.limits(node).tunnel_mtu,
+        )
+        .is_ok();
     // Never fails open: the first fragment is already in the tunnel, and half
     // a datagram on each path reassembles nowhere.
     if forwarded {
@@ -2213,6 +2245,28 @@ fn route_later_fragment(
     } else {
         registry.fragments_discarded.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Sends `packet` into the tunnel, split first, as an adapter of `mtu` bytes
+/// would split it, when it is too large to cross the link whole and its sender
+/// allows fragmenting. Split mode takes packets before any adapter sees them,
+/// so nothing else does this. Observed live on an Iranian uplink: anything over
+/// ~1430 bytes vanished, Don't Fragment or not, with no ICMP answer, so a
+/// 1300-byte game datagram plus encapsulation never arrived.
+fn send_within(
+    sender: &mut SenderCache,
+    packet: &[u8],
+    node: u8,
+    mtu: u16,
+) -> Result<bool, String> {
+    let Some(pieces) = gamepath_engine::ipv4_fragments::fragment(packet, usize::from(mtu)) else {
+        return sender.send(packet, node);
+    };
+    let mut sent = false;
+    for piece in &pieces {
+        sent |= sender.send(piece, node)?;
+    }
+    Ok(sent)
 }
 
 /// Answers a packet the tunnel cannot carry whole as a router on the path
@@ -2564,7 +2618,7 @@ fn route_selected_packet(
             Err("the first fragment is too short to hold its checksum".to_owned())
         }
     } else {
-        clamp_tcp_mss(tunneled, limits.tcp_mss);
+        gamepath_engine::tcp_mss::clamp(tunneled, limits.tcp_mss);
         handle.checksums(tunneled, &mut checksum_address)
     };
     if let Err(error) = &checksummed {
@@ -2577,7 +2631,7 @@ fn route_selected_packet(
     let forwarded = if checksummed.is_err() {
         Err("could not update packet checksums".to_owned())
     } else {
-        sender.send(tunneled, node)
+        send_within(sender, tunneled, node, limits.tunnel_mtu)
     };
     if forwarded.is_err() && hold_on_failure {
         registry.held_packets.fetch_add(1, Ordering::Relaxed);
@@ -3203,7 +3257,7 @@ fn run_reply_injector(
         if let Some(resolver) = path.resolver {
             packet[12..16].copy_from_slice(&resolver.octets());
         }
-        clamp_tcp_mss(&mut packet, registry.limits(path.node).tcp_mss);
+        gamepath_engine::tcp_mss::clamp(&mut packet, registry.limits(path.node).tcp_mss);
         let mut address = Address::inbound(path.interface_index, path.subinterface_index);
         let injected = handle
             .checksums(&mut packet, &mut address)
@@ -3425,45 +3479,6 @@ fn describe_reply(packet: &[u8], fields: Ipv4Fields) -> String {
         description.push_str(&format!(" [{names}]"));
     }
     description
-}
-
-fn clamp_tcp_mss(packet: &mut [u8], maximum: u16) {
-    if packet.len() < 20 || packet[0] >> 4 != 4 || packet[9] != 6 {
-        return;
-    }
-    let ip_header = usize::from(packet[0] & 0x0f) * 4;
-    if packet.len() < ip_header + 20 || packet[ip_header + 13] & 0x02 == 0 {
-        return;
-    }
-    let tcp_header = usize::from(packet[ip_header + 12] >> 4) * 4;
-    if tcp_header < 20 || packet.len() < ip_header + tcp_header {
-        return;
-    }
-    let mut offset = ip_header + 20;
-    let end = ip_header + tcp_header;
-    while offset < end {
-        match packet[offset] {
-            0 => break,
-            1 => offset += 1,
-            kind => {
-                let Some(&length) = packet.get(offset + 1) else {
-                    break;
-                };
-                let length = usize::from(length);
-                if length < 2 || offset + length > end {
-                    break;
-                }
-                if kind == 2 && length == 4 {
-                    let current = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
-                    if current > maximum {
-                        packet[offset + 2..offset + 4].copy_from_slice(&maximum.to_be_bytes());
-                    }
-                    break;
-                }
-                offset += length;
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3766,11 +3781,10 @@ fn record_handled_connection(
     let application = application
         .or(label.as_deref())
         .unwrap_or("Matched destination");
-    let first_seen = {
-        let mut logged = registry.logged_destinations.lock().unwrap();
-        logged.len() < 64
-            && logged.insert((fields.protocol, fields.destination, fields.destination_port))
-    };
+    let first_seen = registry.logged_destinations.lock().unwrap().first_seen(
+        (fields.protocol, fields.destination, fields.destination_port),
+        Instant::now(),
+    );
     if first_seen {
         gamepath_engine::log_info!(
             "split capture selected {application}: {protocol} {}:{}",
@@ -3779,16 +3793,8 @@ fn record_handled_connection(
         );
     }
     let mut connections = registry.handled_connections.lock().unwrap();
-    if connections.len() >= 64 && !connections.contains_key(&key) {
-        let oldest = connections
-            .iter()
-            .min_by_key(|(_, connection)| connection.started_at)
-            .map(|(key, _)| *key);
-        // `None` only when the map is empty, which the length check rules out.
-        if let Some(oldest) = oldest {
-            connections.remove(&oldest);
-        }
-    }
+    // Keep metadata for the reply path's lifetime. A separate size cap can
+    // evict an active game flow that never opens again to restore its row.
     connections.insert(
         key,
         HandledConnection {
@@ -3937,6 +3943,23 @@ fn hostname_matches(name: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_ping_burst_does_not_spend_the_destination_log_for_the_whole_session() {
+        let mut log = DestinationLog::new();
+        let started = log.window_started;
+        let relay = |last: u8| (17, Ipv4Addr::new(155, 133, 230, last), 27015);
+        for last in 0..DESTINATION_LOG_LIMIT as u8 {
+            assert!(log.first_seen(relay(last), started));
+        }
+        assert!(!log.first_seen(relay(0), started), "already logged");
+        let server = (17, Ipv4Addr::new(54, 115, 107, 161), 4192);
+        assert!(!log.first_seen(server, started), "over the limit");
+        assert!(
+            log.first_seen(server, started + DESTINATION_LOG_WINDOW),
+            "the next window logs the match server"
+        );
+    }
 
     #[test]
     fn disconnect_matches_only_tracked_tcp_endpoints_and_keeps_the_owner() {
@@ -4628,34 +4651,6 @@ mod tests {
         );
         assert_eq!(queries, ["unanswered.example", "game.example"]);
         assert_eq!(published, [(address, "*.game.example".into())]);
-    }
-
-    /// A TCP SYN advertising `mss`.
-    fn syn_with_mss(mss: u16) -> Vec<u8> {
-        let mut packet = vec![0_u8; 44];
-        packet[0] = 0x45;
-        packet[9] = 6;
-        packet[20 + 12] = 0x60;
-        packet[20 + 13] = 0x02;
-        packet[40..42].copy_from_slice(&[2, 4]);
-        packet[42..44].copy_from_slice(&mss.to_be_bytes());
-        packet
-    }
-
-    #[test]
-    fn nested_tunnel_clamps_tcp_mss() {
-        let mut packet = syn_with_mss(1460);
-        clamp_tcp_mss(&mut packet, 1000);
-        assert_eq!(&packet[42..44], &1000_u16.to_be_bytes());
-    }
-
-    #[test]
-    fn the_clamp_only_ever_lowers_the_advertised_mss() {
-        // The derived clamp is far above the old fixed 1000, so it matters that
-        // a peer offering less is left alone rather than talked upwards.
-        let mut packet = syn_with_mss(536);
-        clamp_tcp_mss(&mut packet, 1316);
-        assert_eq!(&packet[42..44], &536_u16.to_be_bytes());
     }
 
     #[test]

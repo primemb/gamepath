@@ -235,10 +235,13 @@ impl ProbeHistory {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Offer {
     pub group_size: u8,
-    /// The client session's tunnel MTU. It is derived per session from the
-    /// client's own link and transports, which the relay cannot see, and a
-    /// reply larger than it is left out of its group, like a client packet
-    /// larger than the MTU is: its repair would not fit the client's link.
+    /// The largest packet that crosses the client's link whole, measured per
+    /// session from its own path and transports, which the relay cannot see.
+    /// The relay splits a larger reply to this size (or, for Don't Fragment,
+    /// answers its sender "fragmentation needed"), and leaves anything larger
+    /// out of its groups: its repair would not fit the client's link. Older
+    /// clients sent their tunnel MTU here, which the floor holds at 1280 or
+    /// more, so their replies stay whole up to that size.
     pub mtu: u16,
 }
 

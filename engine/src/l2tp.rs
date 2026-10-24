@@ -527,7 +527,7 @@ fn configure_mtu(interface_index: u32, mtu: u16) -> Result<(), String> {
 
 #[cfg(windows)]
 fn add_route(relay: Ipv4Addr, interface_index: u32) -> Result<(), String> {
-    crate::netconfig::add_route(relay, 32, interface_index)
+    crate::netconfig::add_l2tp_relay_route(relay, interface_index)
         .map_err(|error| format!("could not route the relay through reconnected L2TP: {error}"))
 }
 

@@ -218,10 +218,15 @@ Switching modes needs no provider-side reconfiguration beyond choosing the node.
 
 ## L2TP/IPsec nodes
 
+In relay mode, other nodes carry the session while Windows connects L2TP.
+Failed dials retry up to five times, showing the latest Windows error and
+attempt count. Stopping the session cancels pending dials and their retries.
+
 L2TP/IPsec uses the Windows RAS client. GamePath creates a temporary VPN profile,
 dials it from the privileged network service, and removes the connection,
 profile and routes on disconnect or lease expiry. In relay mode only the relay
-host is routed through that adapter. If RAS drops, the privileged engine redials
+socket uses that adapter; ordinary connections to the same VPS, including SSH,
+keep their normal uplink. If RAS drops, the privileged engine redials
 that profile without restarting the other relay paths. In direct all-traffic
 mode Windows owns the VPN default route. Direct split mode installs IPv4 routes
 for CIDRs and the current A records of exact hostnames; application, folder,

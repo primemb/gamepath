@@ -296,6 +296,39 @@ test('a node degraded for too long is restarted; a brief drop is not', async () 
   assert.equal(service.calls.filter((call) => call.command === 'stop-session').length, 1)
 })
 
+test('failed SOCKS5 probes preserve the stack and its streams until the proxy recovers', async () => {
+  for (const killSwitch of [false, true]) {
+    let healthy = false
+    const proxy = { id: 'proxy', name: 'Proxy', kind: 'socks5' }
+    const { controller, advance, service } = harness({
+      buildRequest: () => ({
+        request: { ...request, killSwitch, nodes: [{ kind: 'socks5', label: 'Proxy' }] },
+        node: proxy,
+      }),
+      script: {
+        'session-status': () => ({
+          ...connectedPaths,
+          state: healthy ? 'connected' : 'connecting',
+          paths: [{ route: 1, reachable: healthy }],
+        }),
+      },
+    })
+    await controller.connect()
+    const sessionId = controller.snapshot().sessionId
+    await controller.poll()
+    advance(DEGRADED_RESTART_MS * 4)
+    await controller.poll()
+    await controller.queue
+    assert.equal(controller.snapshot().status, 'degraded')
+    assert.equal(controller.snapshot().sessionId, sessionId)
+    assert.equal(service.calls.filter((call) => call.command === 'stop-session').length, 0)
+    healthy = true
+    await controller.poll()
+    assert.equal(controller.snapshot().status, 'connected')
+    assert.equal(controller.snapshot().sessionId, sessionId)
+  }
+})
+
 test('live rules go to the running vpn slot only in split mode', async () => {
   const { controller, service } = harness({ script: { 'update-session-rules': { targetCount: 2 } } })
   assert.equal(await controller.applyRules([], 'split'), null)

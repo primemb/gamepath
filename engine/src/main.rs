@@ -13,7 +13,7 @@ mod direct_routes;
 mod dns_guard;
 #[cfg(windows)]
 mod file_icon;
-mod icmp;
+use gamepath_engine::icmp;
 mod ipc;
 mod netutil;
 mod session;

@@ -11,19 +11,21 @@
 //! down with it, so they bought nothing and added to the congestion.
 //!
 //! Downlink: the relay encodes its replies the same way once this client has
-//! offered, with the same group size this side uses and this session's tunnel
-//! MTU. Path workers send the offer and read the relay's acceptance. A
+//! offered, with the same group size this side uses, and splits replies to the
+//! size that crosses this client's link whole. Path workers send the offer and
+//! read the relay's acceptance. A
 //! relay that never accepts predates loss repair; the session then runs
 //! exactly as it did before, and nothing is spent on repairs it would discard.
 
 use super::dispatch::Dispatch;
+use super::path_mtu::SessionMtu;
 use super::worker::PATH_QUEUE_DEPTH;
 use gamepath_engine::auth::SessionCrypto;
 use gamepath_engine::fec::{self, Encoder, MultipathPolicy, Offer, ProbeHistory};
 use gamepath_engine::protocol::{FLAG_REPAIR, FrameHeader};
 use gamepath_engine::thread_priority;
 use gamepath_engine::{log_info, log_warn};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -70,7 +72,12 @@ pub(crate) struct LossRepair {
     decision_mask: Arc<AtomicU64>,
     encoder: Mutex<Encoder>,
     wake: Condvar,
-    tunnel_mtu: u16,
+    /// Measured after the session starts; replies and repairs are sized from
+    /// what crosses the link whole, not from the tunnel MTU the floor keeps.
+    mtu: Arc<SessionMtu>,
+    /// The MTU the last offer named, so a measurement that lands after the
+    /// relay accepted reaches it within OFFER_RETRY rather than the refresh.
+    offered_mtu: AtomicU16,
     policy: Mutex<MultipathPolicy>,
     histories: Mutex<Vec<ProbeHistory>>,
     /// What `policy` last decided, read per packet without its lock.
@@ -109,7 +116,7 @@ impl LossRepair {
         sequences: Arc<AtomicU64>,
         dispatch: Arc<Dispatch>,
         decision_mask: Arc<AtomicU64>,
-        tunnel_mtu: u16,
+        mtu: Arc<SessionMtu>,
     ) -> Self {
         let routes = dispatch.commands.len();
         Self {
@@ -121,10 +128,11 @@ impl LossRepair {
             decision_mask,
             encoder: Mutex::new(Encoder::new(
                 fec::SINGLE_PATH_GROUP,
-                usize::from(tunnel_mtu),
+                usize::from(mtu.current().unfragmented()),
             )),
             wake: Condvar::new(),
-            tunnel_mtu,
+            mtu,
+            offered_mtu: AtomicU16::new(0),
             policy: Mutex::new(MultipathPolicy::default()),
             histories: Mutex::new(vec![ProbeHistory::default(); routes]),
             multipath_group: AtomicU8::new(fec::MULTIPATH_GROUP),
@@ -219,6 +227,7 @@ impl LossRepair {
         let group = self.desired_group();
         let (resized, closed, opened) = {
             let mut encoder = self.encoder.lock().unwrap();
+            encoder.set_max_packet(usize::from(self.mtu.current().unfragmented()));
             let resized = encoder.set_group_size(group);
             let idle = encoder.deadline().is_none();
             let closed = encoder.push(sequence, packet, Instant::now());
@@ -285,8 +294,10 @@ impl LossRepair {
         }
         let support = self.support.load(Ordering::Acquire);
         let desired = self.desired_group();
-        let in_step =
-            support == SUPPORTED && self.downlink_group.load(Ordering::Acquire) == desired;
+        let mtu = self.mtu.current().unfragmented();
+        let in_step = support == SUPPORTED
+            && self.downlink_group.load(Ordering::Acquire) == desired
+            && self.offered_mtu.load(Ordering::Acquire) == mtu;
         let retry = match support {
             _ if in_step => OFFER_REFRESH,
             LEGACY => LEGACY_OFFER_RETRY,
@@ -314,9 +325,12 @@ impl LossRepair {
                 self.session_id
             );
         }
+        self.offered_mtu.store(mtu, Ordering::Release);
+        // What crosses the client's link whole: the relay splits a larger
+        // reply to it, and leaves it out of its repair groups.
         Some(Offer {
             group_size: desired,
-            mtu: self.tunnel_mtu,
+            mtu,
         })
     }
 
@@ -427,7 +441,16 @@ mod tests {
             Arc::new(AtomicU64::new(1)),
             Arc::clone(&dispatch),
             Arc::clone(&decision),
-            1341,
+            Arc::new(SessionMtu::measure(
+                gamepath_engine::mtu::EffectiveMtu::for_session(
+                    gamepath_engine::relay_path::SessionMode::Relay,
+                    ["wireguard"],
+                    1500,
+                ),
+                1500,
+                [],
+                |_| unreachable!(),
+            )),
         );
         assert_eq!(repair.desired_group(), fec::MULTIPATH_GROUP);
         decision.store(0b0001, Ordering::Release);

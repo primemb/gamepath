@@ -114,6 +114,49 @@ pub fn readdress_transport_checksum(rewritten: &mut [u8], original: &[u8]) -> bo
     true
 }
 
+/// Splits a datagram into fragments of at most `mtu` bytes, as a router in
+/// front of a link that size does. A fragment is split further, keeping its
+/// offset and its More Fragments flag on the last piece.
+///
+/// `None` when the datagram fits, sets Don't Fragment (its sender asked to be
+/// told the size instead), carries IPv4 options, or is malformed.
+pub fn fragment(packet: &[u8], mtu: usize) -> Option<Vec<Vec<u8>>> {
+    if packet.len() < 20 || packet[0] != 0x45 || mtu < 28 {
+        return None;
+    }
+    let total_length = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    let flags = flags(packet);
+    if total_length > packet.len() || total_length <= mtu || flags & DONT_FRAGMENT != 0 {
+        return None;
+    }
+    let base = usize::from(flags & OFFSET_MASK) * 8;
+    let more = flags & MORE_FRAGMENTS != 0;
+    // Every piece but the last carries a multiple of eight bytes.
+    let size = (mtu - 20) & !7;
+    let payload = &packet[20..total_length];
+    let count = payload.len().div_ceil(size);
+    let pieces = payload
+        .chunks(size)
+        .enumerate()
+        .map(|(index, piece)| {
+            let mut fragment = Vec::with_capacity(20 + piece.len());
+            fragment.extend_from_slice(&packet[..20]);
+            fragment.extend_from_slice(piece);
+            let length = fragment.len() as u16;
+            fragment[2..4].copy_from_slice(&length.to_be_bytes());
+            let last = index + 1 == count;
+            let flags =
+                ((base + index * size) / 8) as u16 | if more || !last { MORE_FRAGMENTS } else { 0 };
+            fragment[6..8].copy_from_slice(&flags.to_be_bytes());
+            fragment[10..12].fill(0);
+            let checksum = crate::icmp::internet_checksum(&fragment[..20]);
+            fragment[10..12].copy_from_slice(&checksum.to_be_bytes());
+            fragment
+        })
+        .collect();
+    Some(pieces)
+}
+
 /// How long the later fragments of a datagram keep following its first.
 const TRAIL_TTL: Duration = Duration::from_secs(5);
 const TRAIL_LIMIT: usize = 64;
@@ -249,6 +292,10 @@ impl Reassembler {
         let dont_fragment = flags_of_header(header) & DONT_FRAGMENT;
         datagram[2..4].copy_from_slice(&length.to_be_bytes());
         datagram[6..8].copy_from_slice(&dont_fragment.to_be_bytes());
+        // The first fragment's checksum covered its own length and flags.
+        datagram[10..12].fill(0);
+        let checksum = crate::icmp::internet_checksum(&datagram[..header.len()]);
+        datagram[10..12].copy_from_slice(&checksum.to_be_bytes());
         self.partials.remove(&key);
         Some(datagram)
     }
@@ -286,6 +333,13 @@ mod tests {
         for (index, byte) in packet[20..].iter_mut().enumerate() {
             *byte = index as u8;
         }
+        with_header_checksum(packet)
+    }
+
+    fn with_header_checksum(mut packet: Vec<u8>) -> Vec<u8> {
+        packet[10..12].fill(0);
+        let checksum = crate::icmp::internet_checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
         packet
     }
 
@@ -470,6 +524,7 @@ mod tests {
     fn the_rebuilt_datagram_keeps_the_first_fragments_flags() {
         let mut original = datagram(2000);
         original[6..8].copy_from_slice(&DONT_FRAGMENT.to_be_bytes());
+        let original = with_header_checksum(original);
         let mut pieces = fragment(&datagram(2000), 1000);
         pieces[0][6..8].copy_from_slice(&(DONT_FRAGMENT | MORE_FRAGMENTS).to_be_bytes());
         let mut reassembler = Reassembler::default();
@@ -477,6 +532,51 @@ mod tests {
         reassembler.push(&pieces[1], now);
         let rebuilt = reassembler.push(&pieces[0], now).unwrap();
         assert_eq!(rebuilt, original);
+    }
+
+    #[test]
+    fn a_datagram_split_to_fit_a_narrow_link_is_rebuilt_whole() {
+        let original = datagram(1300);
+        let pieces = super::fragment(&original, 1228).unwrap();
+        assert_eq!(pieces.len(), 2);
+        assert!(pieces.iter().all(|piece| piece.len() <= 1228));
+        assert_eq!((pieces[0].len() - 20) % 8, 0);
+        for piece in &pieces {
+            assert_eq!(crate::icmp::internet_checksum(&piece[..20]), 0);
+        }
+        let mut reassembler = Reassembler::default();
+        let now = Instant::now();
+        assert_eq!(reassembler.push(&pieces[1], now), None);
+        assert_eq!(reassembler.push(&pieces[0], now), Some(original));
+    }
+
+    #[test]
+    fn a_fragment_split_again_keeps_its_place_in_the_datagram() {
+        let original = datagram(3000);
+        let mut pieces = fragment(&original, 1480);
+        let middle = pieces.remove(1);
+        let mut split = super::fragment(&middle, 1000).unwrap();
+        assert!(split.iter().all(|piece| flags(piece) & MORE_FRAGMENTS != 0));
+        split.extend(pieces);
+        let mut reassembler = Reassembler::default();
+        let now = Instant::now();
+        let rebuilt = split
+            .iter()
+            .filter_map(|piece| reassembler.push(piece, now))
+            .collect::<Vec<_>>();
+        assert_eq!(rebuilt, vec![original]);
+    }
+
+    #[test]
+    fn only_an_oversized_fragmentable_datagram_is_split() {
+        let original = datagram(1300);
+        assert!(super::fragment(&original, 1320).is_none(), "it fits");
+        let mut dont_fragment = original.clone();
+        dont_fragment[6..8].copy_from_slice(&DONT_FRAGMENT.to_be_bytes());
+        assert!(super::fragment(&dont_fragment, 1228).is_none());
+        let mut with_options = original;
+        with_options[0] = 0x46;
+        assert!(super::fragment(&with_options, 1228).is_none());
     }
 
     #[test]

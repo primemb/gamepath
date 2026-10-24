@@ -224,6 +224,16 @@ fn start_slot(
             lan_proxy,
         );
     }
+    if let Some(relay) = relay_address {
+        if nodes
+            .iter()
+            .any(|node| matches!(node, NodeSpec::L2tp { .. }))
+        {
+            let mut routes = BypassRoutes::on_physical_uplink()?;
+            routes.apply(&[relay])?;
+            runtime.bypass_routes = Some(routes);
+        }
+    }
     runtime.generation = next_generation();
     // The engine child and the L2TP dials do not depend on each other, so the
     // two run together. A relay session no longer waits for the dials at all:
@@ -233,6 +243,7 @@ fn start_slot(
     let mut l2tp_dials = None;
     if let Some(relay) = relay_address {
         l2tp_dials = Some(L2tpDials::begin(&mut nodes, relay, &runtime.tag));
+        runtime.l2tp_cancelled = l2tp_dials.as_ref().map(L2tpDials::cancellation);
     } else {
         match connect_l2tp_nodes(&mut nodes, None, true, &runtime.tag) {
             Ok(sessions) => runtime.l2tp_sessions = sessions,

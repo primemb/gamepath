@@ -271,14 +271,19 @@ fn tcp_socket() -> tcp::Socket<'static> {
 }
 
 #[test]
-fn an_applications_connection_is_carried_through_the_proxy() {
-    let mut app = App::new(spawn_proxy(true));
+fn forwarded_payload_proves_activity_even_when_dns_probes_fail() {
+    let mut app = App::new(spawn_proxy_with_probe_answer(true, false, Some(2)));
+    app.stack.send_packet(&health_probe_packet()).unwrap();
     let mut socket = tcp_socket();
     socket
         .connect(app.iface.context(), (IpAddress::Ipv4(TARGET), 80), 40_000)
         .unwrap();
     let handle = app.sockets.add(socket);
     assert!(app.until(|app| app.sockets.get::<tcp::Socket>(handle).may_send()));
+    assert!(
+        !app.stack.take_upstream_activity(),
+        "a local SYN/ACK is not payload"
+    );
     app.sockets
         .get_mut::<tcp::Socket>(handle)
         .send_slice(b"hello through the proxy")
@@ -295,6 +300,15 @@ fn an_applications_connection_is_carried_through_the_proxy() {
         }
         echoed == b"hello through the proxy"
     }));
+    assert!(app.stack.take_upstream_activity());
+    assert!(
+        !app.stack.take_upstream_activity(),
+        "old payload cannot renew health"
+    );
+    assert!(
+        app.other.is_empty(),
+        "the failed DNS probe must stay failed"
+    );
 }
 
 #[test]
@@ -319,6 +333,7 @@ fn a_connection_the_proxy_refuses_is_refused_to_the_application() {
         !ever_open,
         "the connection looked open before the proxy refused it"
     );
+    assert!(!app.stack.take_upstream_activity());
 }
 
 #[test]
@@ -431,6 +446,7 @@ fn a_datagram_goes_through_a_udp_association_and_back() {
                 && udp.payload == b"ping"
         })
     }));
+    assert!(app.stack.take_upstream_activity());
 }
 
 #[test]
@@ -596,6 +612,10 @@ fn the_session_health_probe_is_answered_only_through_the_proxy() {
             ip.protocol == 1 && ip.source == RESOLVER && ip.payload[0] == 0
         })
     }));
+    assert!(
+        !app.stack.take_upstream_activity(),
+        "DNS can be synthesized by the proxy"
+    );
 }
 
 #[test]
@@ -611,6 +631,7 @@ fn accepting_socks_connect_without_answering_dns_does_not_answer_a_health_probe(
             app.other.is_empty(),
             "SOCKS acceptance or failed DNS was credited as a healthy path: {rcode:?}"
         );
+        assert!(!app.stack.take_upstream_activity());
     }
 }
 

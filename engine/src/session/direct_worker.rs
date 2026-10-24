@@ -61,7 +61,7 @@ fn take_matching_probe(pending: &mut Option<(u16, Instant)>, sequence: u16) -> O
 }
 
 fn probe_outage(requires_probe: bool, answered: bool, losses: u64, carrying: bool) -> bool {
-    (requires_probe || answered) && losses >= DIRECT_LOSS_LIMIT && (requires_probe || !carrying)
+    (requires_probe || answered) && losses >= DIRECT_LOSS_LIMIT && !carrying
 }
 
 /// Which node of the session a worker carries, and what it needs to dial that
@@ -308,14 +308,17 @@ pub(crate) fn run_direct_path(
         // Health is decided first so the rest of the iteration can see it, and
         // published only when it moves: this lock is on the hot path.
         let handshake = path.handshake_latency_ms();
+        if path.take_upstream_activity() {
+            watch.last_authenticated_receive = Some(Instant::now());
+        }
         // Authenticated return traffic outranks the probe verdict: a node that
         // is demonstrably carrying packets is not down because ICMP to
         // the benchmark target is being filtered somewhere past it.
         let carrying = watch
             .last_authenticated_receive
             .is_some_and(|seen| seen.elapsed() <= DIRECT_LIVENESS_WINDOW);
-        // SOCKS5 generates SYN/ACK, resets and SERVFAIL locally; those packets
-        // cannot disprove an outage beyond the proxy's listener.
+        // SOCKS5 activity comes from forwarded payload, not its locally
+        // generated SYN/ACK, resets or SERVFAIL packets.
         let losing = probe_outage(
             watch.requires_probe,
             watch.icmp_answered,
@@ -470,7 +473,9 @@ pub(crate) fn run_direct_path(
                         continue;
                     }
                     record_path_receive(&statuses, index, packet.len());
-                    watch.last_authenticated_receive = Some(Instant::now());
+                    if !watch.requires_probe {
+                        watch.last_authenticated_receive = Some(Instant::now());
+                    }
                     // Blocking here would stall the probe and timer work that
                     // decides whether this path is still usable.
                     if let Err(mpsc::TrySendError::Full(_)) = inbound.try_send(packet) {
@@ -558,9 +563,11 @@ mod tests {
     }
 
     #[test]
-    fn local_proxy_replies_cannot_hide_failed_dns_probes() {
-        assert!(probe_outage(true, true, DIRECT_LOSS_LIMIT, true));
-        assert!(probe_outage(true, false, DIRECT_LOSS_LIMIT, true));
+    fn forwarded_payload_outweighs_failed_probes_but_local_stack_replies_do_not() {
+        assert!(!probe_outage(true, true, DIRECT_LOSS_LIMIT, true));
+        assert!(!probe_outage(true, false, DIRECT_LOSS_LIMIT, true));
+        assert!(probe_outage(true, true, DIRECT_LOSS_LIMIT, false));
+        assert!(probe_outage(true, false, DIRECT_LOSS_LIMIT, false));
         assert!(!probe_outage(true, true, DIRECT_LOSS_LIMIT - 1, true));
         assert!(!probe_outage(true, true, 0, false));
         assert!(!probe_outage(false, true, DIRECT_LOSS_LIMIT, true));

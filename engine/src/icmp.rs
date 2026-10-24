@@ -4,7 +4,7 @@
 //! request *through* the tunnel, which means building the IPv4 and ICMP
 //! headers here rather than opening a raw socket the OS would route itself.
 
-pub(crate) fn icmp_echo_packet(
+pub fn icmp_echo_packet(
     source: std::net::Ipv4Addr,
     destination: std::net::Ipv4Addr,
     identifier: u16,
@@ -32,7 +32,7 @@ pub(crate) fn icmp_echo_packet(
     packet
 }
 
-pub(crate) fn icmp_reply_sequence(
+pub fn icmp_reply_sequence(
     packet: &[u8],
     source: std::net::Ipv4Addr,
     destination: std::net::Ipv4Addr,
@@ -71,7 +71,7 @@ pub(crate) fn icmp_reply_sequence(
 /// issue #278). With it, Windows lowers its path MTU for that destination and
 /// the next oversized send fails with `WSAEMSGSIZE`, which is how RakNet's
 /// MTU discovery moves straight to its next size.
-pub(crate) fn fragmentation_needed(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
+pub fn fragmentation_needed(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
     let header_length = usize::from(*packet.first()? & 0x0f) * 4;
     let total_length = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
     let flags = u16::from_be_bytes([*packet.get(6)?, *packet.get(7)?]);
@@ -107,7 +107,7 @@ pub(crate) fn fragmentation_needed(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
     Some(reply)
 }
 
-pub(crate) fn internet_checksum(bytes: &[u8]) -> u16 {
+pub fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0_u32;
     let mut chunks = bytes.chunks_exact(2);
     for chunk in &mut chunks {

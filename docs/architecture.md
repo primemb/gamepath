@@ -37,8 +37,10 @@ is hard-limited to 4096 entries and evicts the least-recently-used entry at the
 ceiling, so a long-running session cannot grow without bound. Application labels
 are borrowed from the immutable read snapshot rather than allocated again for
 every packet. The UI connection list contains only flows active within the last
-30 seconds without adding cleanup bookkeeping to the normal interface. The
-4096-entry reply-path target evicts only inactive destination-only state;
+30 seconds without adding cleanup bookkeeping to the normal interface. Its metadata
+stays with each reply path until that path is removed; a separate 64-row limit
+hid ongoing game connections while their traffic continued. The 4096-entry
+reply-path target evicts only inactive destination-only state;
 process-owned game routes are left exclusively to exact or confirmed-stale
 cleanup.
 
@@ -228,6 +230,7 @@ The interface MTU only describes the first hop, so each session also measures th
 UDP has no MSS to clamp, so split mode does for UDP what a tunnel adapter with this MTU would make Windows do. Observed live with Rust, whose RakNet transport probes 1492, 1200 and 576-byte packets with Don't Fragment set: the 1492 probe was carried, the server agreed to 1492, and the relay's tunnel interface fragmented every snapshot that followed. Every fragmented reply was lost, half counted as injection errors and half as replies with no flow, and joining a server never completed. Four things now handle it, in `ipv4_fragments`, `icmp` and the split capture:
 
 - **The size split mode enforces is what crosses unfragmented** (`EffectiveMtu::unfragmented`): the link's budget after encapsulation, which on a narrow link is under the 1280 floor the tunnel MTU keeps. Measured live: a 1445-byte path carrying L2TP routes (215 bytes) leaves 1230, and a 1280-byte packet would leave as 1495. It never goes under 1228, QUIC's mandatory 1200 bytes of UDP payload with its headers (RFC 9000 §14). The TCP MSS clamp, in both directions, uses the same figure.
+- **A selected packet larger than that, without Don't Fragment, is split before it enters the tunnel** (`ipv4_fragments::fragment`), as an adapter with that MTU would make Windows split it; the far end reassembles. Split mode takes packets before any adapter sees them, so without this nothing does. Measured live on an Iranian uplink: anything over ~1430 bytes vanished whether Don't Fragment was set or not, and no "fragmentation needed" came back, so the 1209-1280-byte datagrams the floor let through plus 159-215 bytes of encapsulation simply never arrived. Steam/Unreal games such as Wardogs send their state as non-DF UDP of that size and turned the loss into lag that probes, being small, never saw. All-traffic mode does the same in its Wintun uplink: the adapter keeps the 1280 floor, so Windows hands over packets up to that size, and the engine answers, splits or clamps them to `unfragmented` exactly as split mode does (`tcp_mss::clamp_with_checksum` recomputes the TCP checksum there, since no WinDivert pass follows).
 - **A selected Don't Fragment packet larger than that is answered, not sent**: ICMP "fragmentation needed" carrying the size, quoting the packet as the application sent it, built as WinDivert's driver builds its own (`windivert_inject_packet_too_big`). Windows records the smaller path MTU for that destination, so a later oversized send can fail with `WSAEMSGSIZE` (measured: a 1500-byte Don't Fragment send refused with 10040 once the path MTU was known), and RakNet treats exactly that error as "use the next size". The send that triggered it has already succeeded from the application's view, so the first probe to a new destination is lost and RakNet's own retry moves on. Without the answer the packet would simply vanish, the failure WinDivert issue #278 describes; if the answer cannot be injected, the packet is carried after all.
 - **ICMP errors that come back through the tunnel are matched by the packet they quote**, rewritten to the local address and delivered. A router's "fragmentation needed" or "unreachable" for a tunnelled packet is addressed to the virtual address, and matched by its own header, as an echo reply is, it fit no flow: the log's `ICMP ... -> :0` replies with no flow were these. Path MTU discovery now works beyond the relay too.
 - **Fragments are handled in both directions.** Inbound, a datagram is reassembled before flow matching and injection; duplicate copies are accepted only when identical. Outbound, the first fragment's transport checksum is corrected incrementally (RFC 1624). One capture-wide `fragment_router` coordinates all readers using source, destination, protocol and IP ID. It reserves the first fragment's verdict before classification or sending, and buffers later fragments whose verdict is unknown for at most 100 ms. Once known, every piece follows the same tunnel/redirect, bypass or discard decision. Unknown, expired or failed selected fragments never fail open. Storage is bounded to 64 datagrams, 64 waiting pieces per datagram and 1 MiB total; known verdicts last 5 s. A generation ticket prevents an older worker from overwriting a reused ID's new verdict. Capture replacement transfers this state with the reply table. Narrow kernel filters also admit fragments so DNS fragments lacking ports cannot escape the classifier. Ordinary unfragmented packets do not acquire the fragment lock.
@@ -458,7 +461,12 @@ first host of its own `/24`.
 
 The privileged service creates a temporary Windows VPN profile, passes the
 pre-shared key to PowerShell over anonymous stdin, and dials with `RasDialW`.
-The password is cleared from the RAS parameter buffer after the call. The
+The dial uses an asynchronous notifier and polls `RasGetConnectStatusW`, with a
+45-second negotiation deadline. A slot teardown signals cancellation immediately,
+so a stopped session does not keep negotiating beside its replacement. Failed
+background attempts report their Windows error and retry count through
+`attach-l2tp-route` without consuming the route's pending runtime channel.
+The password is cleared from the RAS parameter buffer after negotiation. The
 profile, connection and any explicit routes are removed when the user stops,
 the client disappears and its lease expires, or setup fails.
 
@@ -623,9 +631,13 @@ late by a slower path is discarded as a duplicate.
   tunnel MTU is sized for the repair and not only the packet. A packet above the
   tunnel MTU would fragment anyway and is left out of its group. The tunnel MTU
   is derived per session from the client's own link and transports, which the
-  relay cannot see, so the offer carries it and the relay leaves replies larger
-  than it out of its groups too, instead of sizing them for the 1500-byte link
-  it assumes for its TUN.
+  relay cannot see, so the offer carries what crosses the client's link whole
+  (`EffectiveMtu::unfragmented`, from the measured path once known; the offer
+  is resent when the measurement lands). The relay splits a larger reply to
+  that size, or answers a Don't Fragment one with "fragmentation needed"
+  written back into its TUN, which conntrack translates to the sender, instead
+  of sending what it sized for the 1500-byte link it assumes for its TUN. The
+  pieces are small enough to join repair groups; the client reassembles them.
 - **History.** The receiver keeps recent delivered packets to rebuild from, but
   only once the peer has sent a group of more than one: a group of one carries
   its packet whole. A repair that arrives while two members are still missing
@@ -1356,7 +1368,9 @@ worker, with the usual backoff, while the others carry on; the session fails onl
 that stops answering is redialled the same way (`DirectPath::needs_redial_when_lost`); WireGuard renegotiates
 from its own timers and SOCKS5 dials per connection, so neither needs it. The client reports one node down on
 its own targets and restarts the session only when every node has been down for `DEGRADED_RESTART_MS`, since a
-restart for one node would cut every app on the nodes that work. Rule edits that keep the same nodes in use are
+restart for one node would cut every app on the nodes that work. SOCKS5-only sessions keep their stack even
+when probes fail: each connection dials independently, so rebuilding cannot fix the proxy's upstream and
+would reset working streams. Rule edits that keep the same nodes in use are
 applied live; a node joining or leaving opens or closes a tunnel, so that reconnects the VPN.
 
 L2TP/IPsec cannot be one of several nodes: Windows routes it for the whole VPN by address, with no GamePath
@@ -1387,8 +1401,12 @@ held cancels the outstanding proxy stream immediately, rather than letting an ab
 return a SYN/ACK for an application socket that no longer exists. ICMP cannot cross a proxy, so
 the worker's echo to the benchmark target opens a real `CONNECT` to it on port 53 and sends a fresh DNS
 question immediately. Only a complete matching success or NXDOMAIN response answers the echo; acceptance,
-silence, SERVFAIL and refusal do not. Three missed probes report the SOCKS5 path down even while its local
-stack produces packets. Probes continue every five seconds, including when none has ever answered, so a
+silence, SERVFAIL and refusal do not. Three missed probes report the SOCKS5 path down unless forwarded
+application payload has arrived within `DIRECT_LIVENESS_WINDOW`. Only TCP payload after CONNECT (excluding
+DNS streams) and decoded UDP replies count as activity; local SYN/ACK, reset and DNS packets do not renew it.
+Observed through Throne: DNS probes failed while application traffic still returned, and whole-session
+restarts reset 24–30 TCP connections each time. Probe losses remain recorded when payload proves liveness.
+Probes continue every five seconds, including when none has ever answered, so a
 recovered DNS path is detected without treating SOCKS5 as an ICMP-filtering VPN. This measures the proxy's
 DNS response path, not game-server ping: a proxy that synthesizes DNS locally can still answer while its
 remote transport is unavailable. Remote DNS remains fail closed during an outage.
@@ -1447,6 +1465,17 @@ Addresses are what routes and classifiers see, so a non-domestic site sharing an
 domestic one (a shared CDN edge) also goes direct. Per-connection sniffing would avoid that, but needs a
 proxy stack in every path. L2TP/IPsec is routed by Windows RAS with no GamePath capture, so it has no direct
 list.
+
+## L2TP relay routes
+
+L2TP relay paths keep a relay `/32` on both the normal uplink and each RAS
+interface. The uplink route has metric offset 1; each RAS route's offset exceeds
+the uplink interface metric plus 1. Windows adds interface and route metrics, so
+ordinary sockets to that VPS keep the uplink, while relay UDP sockets bound to
+the RAS source and `IP_UNICAST_IF` use their own interface's route. The service
+owns the uplink route until the session stops, including background L2TP joins;
+redials restore the same route preference. Without the matching uplink `/32`,
+the RAS host route also redirected unrelated SSH connections to the relay.
 
 ## Remote DNS and the router's resolver
 

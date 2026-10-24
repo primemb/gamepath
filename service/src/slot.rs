@@ -10,6 +10,10 @@ use crate::bypass_routes::BypassRoutes;
 use crate::engine_process::EngineProcess;
 use crate::l2tp::{L2tpSession, NativeL2tpUsage};
 use serde_json::Value;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 /// How long the service keeps a session alive without hearing from the
@@ -64,6 +68,7 @@ pub(crate) struct SessionSlot {
     /// Which session this is, from `l2tp_join::next_generation`; zero while
     /// idle. A late L2TP dial joins only the session it was dialled for.
     pub(crate) generation: u64,
+    pub(crate) l2tp_cancelled: Option<Arc<AtomicBool>>,
     pub(crate) session_status: String,
     pub(crate) route_count: usize,
     pub(crate) traffic_mode: String,
@@ -86,8 +91,8 @@ pub(crate) struct SessionSlot {
     pub(crate) native_l2tp_probe_supported: bool,
     pub(crate) native_l2tp_probe_failures: u32,
     pub(crate) native_l2tp_usage: NativeL2tpUsage,
-    /// Routes that keep the other slot's tunnel off a native L2TP default
-    /// route. Only a VPN slot in L2TP all-traffic mode has any.
+    /// Uplink routes for the relay beside L2TP paths, or for the other slot's
+    /// tunnel endpoints beside a native L2TP all-traffic VPN.
     pub(crate) bypass_routes: Option<BypassRoutes>,
     /// The LAN proxy's last status, for when there is no engine to ask:
     /// it failed to start, or it was never asked for.
@@ -104,6 +109,7 @@ impl SessionSlot {
             id,
             tag: format!("[{}]", id.as_str()),
             generation: 0,
+            l2tp_cancelled: None,
             session_status: "idle".into(),
             route_count: 0,
             traffic_mode: String::new(),
@@ -150,6 +156,9 @@ impl SessionSlot {
     /// Resets the slot to idle and hands back what still has to be torn
     /// down. The caller does the slow part after releasing the slot's lock.
     pub(crate) fn take_for_teardown(&mut self, reason: Option<&str>) -> Teardown {
+        if let Some(cancelled) = self.l2tp_cancelled.take() {
+            cancelled.store(true, Ordering::Release);
+        }
         let teardown = Teardown {
             sweep_direct_routes: self.id == SlotId::Vpn && self.engine.is_some(),
             engine: self.engine.take(),
@@ -213,11 +222,14 @@ mod tests {
     #[test]
     fn teardown_leaves_an_idle_slot_that_says_why_it_stopped() {
         let mut slot = SessionSlot::new(SlotId::Vpn);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        slot.l2tp_cancelled = Some(Arc::clone(&cancelled));
         slot.session_status = "connected".into();
         slot.traffic_mode = "split".into();
         slot.route_count = 1;
         slot.renew_lease();
         slot.take_for_teardown(Some("game-all-traffic")).run();
+        assert!(cancelled.load(Ordering::Acquire));
         assert_eq!(slot.session_status, "idle");
         assert_eq!(slot.route_count, 0);
         assert!(slot.lease_deadline.is_none());
