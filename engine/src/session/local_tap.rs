@@ -205,22 +205,64 @@ impl InboundQueue for mpsc::SyncSender<Vec<u8>> {
     }
 }
 
+/// Replies waiting between the path workers and capture's delivery thread.
+/// The queue holds 2048, half a minute of a game's replies, so a delivery
+/// thread that falls behind adds latency nothing else reports: the path
+/// queues and relay RTT stay clean while the game's ping climbs.
+#[derive(Default)]
+pub(crate) struct InboundGauge {
+    depth: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl InboundGauge {
+    fn queued(&self) {
+        let depth = self.depth.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(depth, Ordering::Relaxed);
+    }
+
+    pub(crate) fn taken(&self) {
+        let _ = self
+            .depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                depth.checked_sub(1)
+            });
+    }
+
+    pub(crate) fn depth(&self) -> u64 {
+        self.depth.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct InboundSink {
     queue: mpsc::SyncSender<Vec<u8>>,
     tap: Arc<LocalTap>,
+    gauge: Arc<InboundGauge>,
 }
 
 impl InboundSink {
-    pub(crate) fn new(queue: mpsc::SyncSender<Vec<u8>>, tap: Arc<LocalTap>) -> Self {
-        Self { queue, tap }
+    pub(crate) fn new(
+        queue: mpsc::SyncSender<Vec<u8>>,
+        tap: Arc<LocalTap>,
+        gauge: Arc<InboundGauge>,
+    ) -> Self {
+        Self { queue, tap, gauge }
     }
 }
 
 impl InboundQueue for InboundSink {
     fn try_send(&self, packet: Vec<u8>) -> Result<(), mpsc::TrySendError<Vec<u8>>> {
         match self.tap.divert(packet) {
-            Diversion::NotLocal(packet) => self.queue.try_send(packet),
+            Diversion::NotLocal(packet) => {
+                self.queue.try_send(packet)?;
+                self.gauge.queued();
+                Ok(())
+            }
             Diversion::Taken => Ok(()),
             Diversion::Full => Err(mpsc::TrySendError::Full(Vec::new())),
         }
@@ -230,6 +272,27 @@ impl InboundQueue for InboundSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gauge_follows_replies_into_and_out_of_the_queue() {
+        let (queue, receiver) = mpsc::sync_channel(2);
+        let gauge = Arc::new(InboundGauge::default());
+        let sink = InboundSink::new(queue, Arc::default(), Arc::clone(&gauge));
+        sink.try_send(vec![0x45; 20]).unwrap();
+        sink.try_send(vec![0x45; 20]).unwrap();
+        assert!(sink.try_send(vec![0x45; 20]).is_err(), "full");
+        assert_eq!(
+            (gauge.depth(), gauge.peak()),
+            (2, 2),
+            "a refusal is not queued"
+        );
+        receiver.recv().unwrap();
+        gauge.taken();
+        assert_eq!((gauge.depth(), gauge.peak()), (1, 2));
+        gauge.taken();
+        gauge.taken();
+        assert_eq!(gauge.depth(), 0, "never below empty");
+    }
 
     struct Collect(Mutex<Vec<Vec<u8>>>);
 

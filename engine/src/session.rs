@@ -198,6 +198,10 @@ impl WireGuardSessionManager {
     }
 
     /// The nodes capture can pin a flow to; see [`SessionNodes`].
+    pub(crate) fn mode(&self) -> Option<SessionMode> {
+        self.active.as_ref().map(|session| session.mode)
+    }
+
     pub(crate) fn nodes(&self) -> Option<Arc<SessionNodes>> {
         self.active
             .as_ref()

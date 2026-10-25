@@ -704,6 +704,8 @@ struct Registry {
     bypass: String,
     /// Drop rule-selected traffic on failure. Remote DNS always fails closed independently.
     kill_switch: bool,
+    /// See `SplitOptions::relay_reassembles`.
+    relay_reassembles: bool,
     /// Packets dropped by the kill switch.
     held_packets: AtomicU64,
     /// Remote DNS: lookups to a LAN resolver are answered by
@@ -905,6 +907,9 @@ pub struct SplitOptions {
     pub reset_existing: bool,
     /// See `PacketCaptureRequest::direct`.
     pub direct: DirectSpec,
+    /// A relay rebuilds what this capture splits, so a Don't Fragment packet
+    /// too large for the link is split rather than refused.
+    pub relay_reassembles: bool,
 }
 
 /// What a replaced capture hands its successor. A rule edit, or the other
@@ -1064,6 +1069,7 @@ impl SplitPacketCapture {
             carried,
             reset_existing,
             direct,
+            relay_reassembles,
         } = options;
         let plan = compile("split", rules)?;
         let direct = DirectList::compile(&direct);
@@ -1126,6 +1132,7 @@ impl SplitPacketCapture {
             dll: dll_path()?,
             bypass: bypass_clause(bypass_ips),
             kill_switch,
+            relay_reassembles,
             held_packets: AtomicU64::new(0),
             redirect_dns: AtomicBool::new(remote_dns),
             dns_own_apps_only: AtomicBool::new(own_apps_only),
@@ -2233,6 +2240,7 @@ fn route_later_fragment(
             tunnel_buffer,
             node,
             registry.limits(node).tunnel_mtu,
+            registry.relay_reassembles,
         )
         .is_ok();
     // Never fails open: the first fragment is already in the tunnel, and half
@@ -2248,18 +2256,29 @@ fn route_later_fragment(
 }
 
 /// Sends `packet` into the tunnel, split first, as an adapter of `mtu` bytes
-/// would split it, when it is too large to cross the link whole and its sender
-/// allows fragmenting. Split mode takes packets before any adapter sees them,
-/// so nothing else does this. Observed live on an Iranian uplink: anything over
-/// ~1430 bytes vanished, Don't Fragment or not, with no ICMP answer, so a
-/// 1300-byte game datagram plus encapsulation never arrived.
+/// would split it, when it is too large to cross the link whole. Split mode
+/// takes packets before any adapter sees them, so nothing else does this.
+/// Observed live on an Iranian uplink: anything over ~1430 bytes vanished,
+/// Don't Fragment or not, with no ICMP answer, so a 1300-byte game datagram
+/// plus encapsulation never arrived.
+///
+/// With a relay rebuilding the pieces, a Don't Fragment packet is split too:
+/// the game server receives it whole, DF intact. Refused instead, Windows
+/// lowered its path MTU for the server to 1228 and Overwatch's larger sends
+/// failed, while a plain WireGuard tunnel with a 1300-byte MTU carried them.
 fn send_within(
     sender: &mut SenderCache,
     packet: &[u8],
     node: u8,
     mtu: u16,
+    relay_reassembles: bool,
 ) -> Result<bool, String> {
-    let Some(pieces) = gamepath_engine::ipv4_fragments::fragment(packet, usize::from(mtu)) else {
+    let split = if relay_reassembles {
+        gamepath_engine::ipv4_fragments::split_for_tunnel(packet, usize::from(mtu))
+    } else {
+        gamepath_engine::ipv4_fragments::fragment(packet, usize::from(mtu))
+    };
+    let Some(pieces) = split else {
         return sender.send(packet, node);
     };
     let mut sent = false;
@@ -2597,9 +2616,13 @@ fn route_selected_packet(
         .captured_bytes
         .fetch_add(packet.len() as u64, Ordering::Relaxed);
     let limits = registry.limits(node);
-    if let Some(reply) = crate::icmp::fragmentation_needed(packet, limits.tunnel_mtu) {
-        if signal_fragmentation_needed(handle, registry, reply, address) {
-            return Some(node);
+    // Without a relay, nothing rebuilds a split Don't Fragment packet before
+    // it reaches the far end, so its sender is told the size instead.
+    if !registry.relay_reassembles {
+        if let Some(reply) = crate::icmp::fragmentation_needed(packet, limits.tunnel_mtu) {
+            if signal_fragmentation_needed(handle, registry, reply, address) {
+                return Some(node);
+            }
         }
     }
     tunnel_buffer.clear();
@@ -2631,7 +2654,13 @@ fn route_selected_packet(
     let forwarded = if checksummed.is_err() {
         Err("could not update packet checksums".to_owned())
     } else {
-        send_within(sender, tunneled, node, limits.tunnel_mtu)
+        send_within(
+            sender,
+            tunneled,
+            node,
+            limits.tunnel_mtu,
+            registry.relay_reassembles,
+        )
     };
     if forwarded.is_err() && hold_on_failure {
         registry.held_packets.fetch_add(1, Ordering::Relaxed);

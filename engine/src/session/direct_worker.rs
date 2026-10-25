@@ -720,7 +720,7 @@ mod tests {
                     stop,
                     statuses,
                     command_rx,
-                    InboundSink::new(inbound_tx, Arc::default()),
+                    InboundSink::new(inbound_tx, Arc::default(), Arc::default()),
                     Arc::new(Mutex::new(vec![PathMetrics::new("0".to_owned())])),
                     telemetry,
                     1,

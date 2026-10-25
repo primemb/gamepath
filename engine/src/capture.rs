@@ -279,7 +279,7 @@ impl PacketCaptureManager {
                 .map(crate::split_capture::SplitPacketCapture::into_carried)
         };
         self.last_request = Some(payload);
-        let (virtual_ipv4, bypass_ips, data_receiver, nodes) = {
+        let (virtual_ipv4, bypass_ips, data_receiver, nodes, relay_reassembles) = {
             let manager = sessions.lock().unwrap();
             (
                 manager
@@ -292,6 +292,7 @@ impl PacketCaptureManager {
                 manager
                     .nodes()
                     .ok_or("start the multipath session before packet capture")?,
+                manager.mode() == Some(gamepath_engine::relay_path::SessionMode::Relay),
             )
         };
         // Waits for each node's path measurement, without the session lock:
@@ -332,6 +333,7 @@ impl PacketCaptureManager {
                         == gamepath_engine::role::Role::Vpn
                         && !input.other_session_active,
                     direct: input.direct.clone(),
+                    relay_reassembles,
                 },
             )?;
             let target_count = split.target_count();
@@ -416,6 +418,7 @@ impl PacketCaptureManager {
                     uplink_sessions,
                     virtual_ipv4,
                     effective_mtu,
+                    relay_reassembles,
                     uplink_stop,
                     uplink_diagnostics,
                 )
@@ -811,6 +814,7 @@ fn run_wintun_uplink(
     sessions: Arc<Mutex<WireGuardSessionManager>>,
     virtual_ipv4: std::net::Ipv4Addr,
     mtu: gamepath_engine::mtu::EffectiveMtu,
+    relay_reassembles: bool,
     stop: Arc<AtomicBool>,
     diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
 ) {
@@ -842,13 +846,20 @@ fn run_wintun_uplink(
             continue;
         }
         gamepath_engine::tcp_mss::clamp_with_checksum(&mut bytes, limit - 40);
-        // Answered as a router on the link would, so Windows lowers its path
-        // MTU for that destination and the sender's next packet fits.
-        if let Some(answer) = gamepath_engine::icmp::fragmentation_needed(&bytes, limit) {
-            deliver(&session, &answer, &diagnostics);
-            continue;
-        }
-        match gamepath_engine::ipv4_fragments::fragment(&bytes, usize::from(limit)) {
+        // A relay rebuilds what is split, Don't Fragment included, as split
+        // mode relies on too. Without one the sender is answered as a router
+        // on the link would, so Windows lowers its path MTU for that
+        // destination and the next packet fits.
+        let split = if relay_reassembles {
+            gamepath_engine::ipv4_fragments::split_for_tunnel(&bytes, usize::from(limit))
+        } else {
+            if let Some(answer) = gamepath_engine::icmp::fragmentation_needed(&bytes, limit) {
+                deliver(&session, &answer, &diagnostics);
+                continue;
+            }
+            gamepath_engine::ipv4_fragments::fragment(&bytes, usize::from(limit))
+        };
+        match split {
             Some(pieces) => {
                 for piece in &pieces {
                     let _ = sender.send(piece, 0);

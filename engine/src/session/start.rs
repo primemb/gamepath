@@ -11,7 +11,7 @@ use super::dialer::PathDialer;
 use super::direct_worker::{DirectRoute, run_direct_path};
 use super::dispatch::Dispatch;
 use super::join::{JoinGate, RouteStart, RouteTransport, START_RETRY_WINDOW, dial_routes};
-use super::local_tap::{InboundSink, LocalTap};
+use super::local_tap::{InboundGauge, InboundSink, LocalTap};
 use super::monitors::{spawn_session_summary, spawn_uplink_monitor};
 use super::nodes::{MAX_DIRECT_NODES, SessionNode, SessionNodes};
 use super::path_mtu::SessionMtu;
@@ -315,7 +315,12 @@ impl WireGuardSessionManager {
         ));
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let local_tap = Arc::new(LocalTap::default());
-        let inbound = InboundSink::new(inbound_tx, Arc::clone(&local_tap));
+        let inbound_gauge = Arc::new(InboundGauge::default());
+        let inbound = InboundSink::new(
+            inbound_tx,
+            Arc::clone(&local_tap),
+            Arc::clone(&inbound_gauge),
+        );
         let ingress = Arc::new(RelayIngress::new(
             client_id,
             session_id,
@@ -389,6 +394,7 @@ impl WireGuardSessionManager {
         let data_receiver = Arc::new(DataReceiver {
             inbound: Mutex::new(inbound_rx),
             user_bytes_received: AtomicU64::new(0),
+            gauge: Arc::clone(&inbound_gauge),
         });
         workers.extend(spawn_uplink_monitor(&stop, &telemetry));
         let summary = spawn_session_summary(
@@ -567,7 +573,12 @@ impl WireGuardSessionManager {
         ));
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let local_tap = Arc::new(LocalTap::default());
-        let inbound = InboundSink::new(inbound_tx, Arc::clone(&local_tap));
+        let inbound_gauge = Arc::new(InboundGauge::default());
+        let inbound = InboundSink::new(
+            inbound_tx,
+            Arc::clone(&local_tap),
+            Arc::clone(&inbound_gauge),
+        );
         let telemetry = PathTelemetry::new(count);
         let (commands, receivers): (Vec<_>, Vec<_>) = (0..count)
             .map(|_| mpsc::sync_channel(PATH_QUEUE_DEPTH))
@@ -642,6 +653,7 @@ impl WireGuardSessionManager {
             data_receiver: Arc::new(DataReceiver {
                 inbound: Mutex::new(inbound_rx),
                 user_bytes_received: AtomicU64::new(0),
+                gauge: Arc::clone(&inbound_gauge),
             }),
             virtual_ipv4: session_nodes.address(0),
             sequences: Arc::new(AtomicU64::new(1)),

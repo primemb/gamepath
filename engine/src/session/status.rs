@@ -91,6 +91,10 @@ impl WireGuardSessionManager {
             "startedAt": session.started_at,
             "userBytesSent": session.user_bytes_sent.load(Ordering::Relaxed),
             "userBytesReceived": session.data_receiver.user_bytes_received.load(Ordering::Relaxed),
+            "inboundQueue": {
+                "depth": session.data_receiver.gauge.depth(),
+                "peak": session.data_receiver.gauge.peak(),
+            },
             "paths": paths,
             "skippedRoutes": skipped_routes,
             "strategy": match session.mode {

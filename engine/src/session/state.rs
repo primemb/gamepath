@@ -333,6 +333,7 @@ pub(crate) struct DataReceiver {
     /// direct workers likewise provide validated inner packets.
     pub(crate) inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
     pub(crate) user_bytes_received: AtomicU64,
+    pub(crate) gauge: Arc<super::local_tap::InboundGauge>,
 }
 
 impl DataReceiver {
@@ -344,6 +345,7 @@ impl DataReceiver {
                 return Err("all path receivers stopped".into());
             }
         };
+        self.gauge.taken();
         self.user_bytes_received
             .fetch_add(response.len() as u64, Ordering::Relaxed);
         Ok(Some(response))

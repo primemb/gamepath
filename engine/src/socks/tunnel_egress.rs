@@ -642,6 +642,7 @@ mod tests {
             let received = Arc::new(DataReceiver {
                 inbound: Mutex::new(mpsc::sync_channel(1).1),
                 user_bytes_received: AtomicU64::new(0),
+                gauge: Arc::default(),
             });
             let wire = Wire::default();
             let binding = LocalStackBinding {
