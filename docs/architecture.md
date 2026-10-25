@@ -1534,6 +1534,14 @@ applications with their own DNS client (Chrome, Discord). Everything else follow
 through the game's tunnel with remote DNS on, or the local resolver with it off. Otherwise a game resolved
 through a fake-IP proxy got an address only that proxy can reach, and its traffic ended up in the VPN.
 
+**Certificate revocation checks are carried like shared DNS.** Windows validates a server certificate for an
+application's TLS connection itself, in `lsass.exe`, fetching OCSP responses, CRLs and issuer certificates
+over plain HTTP. Split capture selects `lsass.exe`'s TCP connections to port 80 (`carries_certificate_check`)
+in either slot, the game's first by WinDivert priority. Measured live: BattlEye's updater, its download in the
+tunnel, failed with `CRYPT_E_REVOCATION_OFFLINE` (0x80092013) because `ocsp.sectigo.com` never answered lsass
+over an Iranian uplink; `certutil -urlfetch -verify` on the same certificate failed its OCSP check after 45 s.
+Port 80 only: lsass's other traffic (Kerberos, LDAP) belongs to the local network.
+
 **The proxy's own lookups are never redirected.** A local proxy client resolves its upstream server with the
 machine's DNS servers, from its own process (sing-box does, `dns/transport/local`). Redirected, that lookup went
 into the proxy itself; with fake IP on, Throne answered its own WARP server with `198.18.0.3` after a restart and

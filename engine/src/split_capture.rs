@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -2763,9 +2763,10 @@ fn spawn_process_tracker(
                 }
                 // WinDivert SOCKET-layer ports are already in host byte order.
                 let port = event.local_port;
-                let Some(path) = process_path(event.process_id)
-                    .filter(|path| path_matches(path, &applications, &folders))
-                else {
+                let Some(path) = process_path(event.process_id).filter(|path| {
+                    path_matches(path, &applications, &folders)
+                        || carries_certificate_check(path, event.protocol, event.remote_port)
+                }) else {
                     continue;
                 };
                 if port == 0 {
@@ -3048,7 +3049,10 @@ fn tcp_socket_process(
                 return None;
             }
             process_path(row.dwOwningPid)
-                .filter(|path| path_matches(path, applications, folders))
+                .filter(|path| {
+                    path_matches(path, applications, folders)
+                        || carries_certificate_check(path, 6, fields.destination_port)
+                })
                 .map(|path| (row.dwOwningPid, path))
         })
 }
@@ -3748,6 +3752,23 @@ fn path_matches(path: &str, applications: &[String], folders: &[String]) -> bool
         || folders.iter().any(|folder| folder_contains(folder, path))
 }
 
+/// Windows checks a server certificate's revocation for an application's TLS
+/// connection itself, in lsass.exe, over plain HTTP (OCSP, CRLs and issuer
+/// certificates, RFC 5280 and RFC 6960). Left on the open network that check
+/// fails wherever the CA's responder is filtered. Measured live: BattlEye's
+/// updater, its download carried by the tunnel, failed with
+/// CRYPT_E_REVOCATION_OFFLINE because ocsp.sectigo.com never answered lsass
+/// from an Iranian uplink. Like shared DNS, the check is carried for the
+/// session, whichever application it is for.
+fn carries_certificate_check(path: &str, protocol: u8, remote_port: u16) -> bool {
+    static LSASS: OnceLock<String> = OnceLock::new();
+    let lsass = LSASS.get_or_init(|| {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        format!(r"{}\System32\lsass.exe", root.trim_end_matches('\\'))
+    });
+    protocol == 6 && remote_port == 80 && path.eq_ignore_ascii_case(lsass)
+}
+
 fn folder_contains(folder: &str, path: &str) -> bool {
     path == folder
         || path
@@ -3943,6 +3964,23 @@ fn hostname_matches(name: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_lsass_certificate_checks_over_http_are_carried() {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let lsass = format!(r"{root}\System32\lsass.exe");
+        assert!(carries_certificate_check(&lsass, 6, 80));
+        assert!(carries_certificate_check(&lsass.to_uppercase(), 6, 80));
+        assert!(
+            !carries_certificate_check(&lsass, 6, 443),
+            "only revocation HTTP"
+        );
+        assert!(!carries_certificate_check(&lsass, 6, 88), "never Kerberos");
+        assert!(!carries_certificate_check(&lsass, 17, 80));
+        let svchost = format!(r"{root}\System32\svchost.exe");
+        assert!(!carries_certificate_check(&svchost, 6, 80));
+        assert!(!carries_certificate_check(r"D:\fake\lsass.exe", 6, 80));
+    }
 
     #[test]
     fn a_ping_burst_does_not_spend_the_destination_log_for_the_whole_session() {
