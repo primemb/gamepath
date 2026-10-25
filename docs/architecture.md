@@ -640,10 +640,17 @@ late by a slower path is discarded as a duplicate.
   relay cannot see, so the offer carries what crosses the client's link whole
   (`EffectiveMtu::unfragmented`, from the measured path once known; the offer
   is resent when the measurement lands). The relay splits a larger reply to
-  that size, or answers a Don't Fragment one with "fragmentation needed"
-  written back into its TUN, which conntrack translates to the sender, instead
-  of sending what it sized for the 1500-byte link it assumes for its TUN. The
-  pieces are small enough to join repair groups; the client reassembles them.
+  that size (`ipv4_fragments::split_for_tunnel`), Don't Fragment included, and
+  the client reassembles it before delivery, so the application only ever sees
+  the datagram whole with its DF bit intact: link fragmentation, which DF does
+  not forbid. 0.7.1 instead answered a DF reply with "fragmentation needed"
+  written back into the TUN and dropped it; servers that never acted on that
+  answer lost those replies for good (measured: BattlEye's service sent 44 KB
+  to `57.129.90.115:17005-17006` and received nothing). The pieces are small
+  enough to join repair groups. In the other direction the relay rebuilds a
+  datagram the client split before writing it to its TUN (`write_to_tun`), so
+  nothing depends on conntrack reassembling it and no fragment ever reaches a
+  game server's DDoS filter.
 - **History.** The receiver keeps recent delivered packets to rebuild from, but
   only once the peer has sent a group of more than one: a group of one carries
   its packet whole. A repair that arrives while two members are still missing

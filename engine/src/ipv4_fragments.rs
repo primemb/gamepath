@@ -121,16 +121,32 @@ pub fn readdress_transport_checksum(rewritten: &mut [u8], original: &[u8]) -> bo
 /// `None` when the datagram fits, sets Don't Fragment (its sender asked to be
 /// told the size instead), carries IPv4 options, or is malformed.
 pub fn fragment(packet: &[u8], mtu: usize) -> Option<Vec<Vec<u8>>> {
+    if packet.len() < 20 || flags(packet) & DONT_FRAGMENT != 0 {
+        return None;
+    }
+    split_for_tunnel(packet, mtu)
+}
+
+/// Splits a datagram to cross GamePath's own tunnel, Don't Fragment or not.
+/// The far end reassembles before anything else sees the datagram, so its
+/// sender and receiver only ever handle it whole, DF bit included: this is
+/// link fragmentation, which DF does not forbid. Refusing a DF reply here
+/// instead, with "fragmentation needed" back through the relay's NAT, lost
+/// it for good wherever that answer was ignored: BattlEye's service then
+/// heard nothing back at all.
+pub fn split_for_tunnel(packet: &[u8], mtu: usize) -> Option<Vec<Vec<u8>>> {
     if packet.len() < 20 || packet[0] != 0x45 || mtu < 28 {
         return None;
     }
     let total_length = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
     let flags = flags(packet);
-    if total_length > packet.len() || total_length <= mtu || flags & DONT_FRAGMENT != 0 {
+    if total_length > packet.len() || total_length <= mtu {
         return None;
     }
     let base = usize::from(flags & OFFSET_MASK) * 8;
     let more = flags & MORE_FRAGMENTS != 0;
+    // Kept on every piece, so the rebuilt datagram is the one that was sent.
+    let dont_fragment = flags & DONT_FRAGMENT;
     // Every piece but the last carries a multiple of eight bytes.
     let size = (mtu - 20) & !7;
     let payload = &packet[20..total_length];
@@ -145,8 +161,9 @@ pub fn fragment(packet: &[u8], mtu: usize) -> Option<Vec<Vec<u8>>> {
             let length = fragment.len() as u16;
             fragment[2..4].copy_from_slice(&length.to_be_bytes());
             let last = index + 1 == count;
-            let flags =
-                ((base + index * size) / 8) as u16 | if more || !last { MORE_FRAGMENTS } else { 0 };
+            let flags = dont_fragment
+                | ((base + index * size) / 8) as u16
+                | if more || !last { MORE_FRAGMENTS } else { 0 };
             fragment[6..8].copy_from_slice(&flags.to_be_bytes());
             fragment[10..12].fill(0);
             let checksum = crate::icmp::internet_checksum(&fragment[..20]);
@@ -565,6 +582,23 @@ mod tests {
             .filter_map(|piece| reassembler.push(piece, now))
             .collect::<Vec<_>>();
         assert_eq!(rebuilt, vec![original]);
+    }
+
+    #[test]
+    fn a_dont_fragment_datagram_crosses_the_tunnel_split_and_comes_out_whole() {
+        let mut original = datagram(1300);
+        original[6..8].copy_from_slice(&DONT_FRAGMENT.to_be_bytes());
+        let original = with_header_checksum(original);
+        assert!(
+            super::fragment(&original, 1228).is_none(),
+            "a router refuses"
+        );
+        let pieces = split_for_tunnel(&original, 1228).unwrap();
+        assert_eq!(pieces.len(), 2);
+        let mut reassembler = Reassembler::default();
+        let now = Instant::now();
+        assert_eq!(reassembler.push(&pieces[0], now), None);
+        assert_eq!(reassembler.push(&pieces[1], now), Some(original));
     }
 
     #[test]

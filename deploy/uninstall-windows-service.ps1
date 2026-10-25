@@ -1,5 +1,9 @@
 [CmdletBinding()]
-param()
+param(
+    # An update runs the uninstaller first. The logs are what explains a
+    # problem that appears after it, so an update keeps them.
+    [switch]$KeepLogs
+)
 
 $ErrorActionPreference = 'Continue'
 $serviceName = 'GamePathService'
@@ -57,6 +61,13 @@ Remove-Item -LiteralPath $programRuntime -Recurse -Force -ErrorAction SilentlyCo
 if ($legacyProgramRuntime -and $legacyProgramRuntime -ne $programRuntime) {
     Remove-Item -LiteralPath $legacyProgramRuntime -Recurse -Force -ErrorAction SilentlyContinue
 }
-Remove-Item -LiteralPath (Join-Path $env:ProgramData 'GamePath') -Recurse -Force -ErrorAction SilentlyContinue
+$dataDirectory = Join-Path $env:ProgramData 'GamePath'
+if ($KeepLogs) {
+    Get-ChildItem -LiteralPath $dataDirectory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne 'logs' } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+} else {
+    Remove-Item -LiteralPath $dataDirectory -Recurse -Force -ErrorAction SilentlyContinue
+}
 Remove-Item -LiteralPath $temporaryRuntime -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $env:APPDATA 'GamePath') -Recurse -Force -ErrorAction SilentlyContinue

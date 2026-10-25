@@ -9,9 +9,6 @@
 !macroend
 
 !macro customUnInstall
-  DetailPrint "Stopping and removing the GamePath network service..."
-  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\deploy\uninstall-windows-service.ps1"'
-  Pop $0
   ; "Start with Windows" (electron/startup.cjs). An update runs this uninstaller
   ; too, and must keep the user's choice.
   ${ifNot} ${isUpdated}
@@ -21,4 +18,12 @@
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "GamePath"
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "GamePath"
   ${endIf}
+  DetailPrint "Stopping and removing the GamePath network service..."
+  ; An update keeps the logs, which explain whatever appears after it.
+  ${if} ${isUpdated}
+    nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\deploy\uninstall-windows-service.ps1" -KeepLogs'
+  ${else}
+    nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\deploy\uninstall-windows-service.ps1"'
+  ${endIf}
+  Pop $0
 !macroend

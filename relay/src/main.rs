@@ -1,13 +1,14 @@
 use clap::{Parser, Subcommand};
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::fec::{self, Decoder, Encoder, Offer};
-use gamepath_engine::ipv4_fragments::fragment;
+use gamepath_engine::ipv4_fragments::{Reassembler, is_fragment, split_for_tunnel};
 use gamepath_engine::mtu::{LINK_MTU, relay_tun_mtu};
 use gamepath_engine::protocol::{
     FLAG_CONTROL, FLAG_PATH_UNHEALTHY, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader, HEADER_LEN,
 };
 use gamepath_engine::replay::ReplayWindow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -144,6 +145,8 @@ struct SessionState {
     /// Largest reply that crosses the client's link whole, from its latest
     /// offer. Unknown until the first one, and replies then go out as they are.
     reply_mtu: Option<u16>,
+    /// Datagrams the client split to cross its link, rebuilt before the TUN.
+    fragments: Reassembler,
 }
 
 struct RepairState {
@@ -205,6 +208,7 @@ impl SessionState {
             rejected_frames: 0,
             repair: None,
             reply_mtu: None,
+            fragments: Reassembler::default(),
         }
     }
 
@@ -519,16 +523,12 @@ fn serve(
             let mut packet = [0_u8; MAX_PACKET];
             loop {
                 match tun.recv(&mut packet) {
-                    Ok(length) => {
-                        if let Some(answer) = forward_reply(
-                            &reply_socket,
-                            &reply_clients,
-                            &reply_wake,
-                            &packet[..length],
-                        ) {
-                            let _ = tun.send(&answer);
-                        }
-                    }
+                    Ok(length) => forward_reply(
+                        &reply_socket,
+                        &reply_clients,
+                        &reply_wake,
+                        &packet[..length],
+                    ),
                     Err(error) => {
                         gamepath_engine::log_error!("TUN receive failed: {error}");
                         thread::sleep(Duration::from_millis(100));
@@ -638,9 +638,7 @@ fn serve(
         if ipv4_source(&plaintext) != Some(virtual_ipv4) {
             continue;
         }
-        if let Err(error) = tun_writer.send(&plaintext) {
-            gamepath_engine::log_error!("TUN send failed: {error}");
-        }
+        write_to_tun(&tun_writer, &mut session.fragments, &plaintext);
         if let Some(repair) = session.repair.as_mut() {
             repair
                 .decoder
@@ -754,12 +752,33 @@ fn admit_rebuilt(
     if ipv4_source(&packet) != Some(virtual_ipv4) || !session.replay.accept(sequence) {
         return;
     }
-    if let Err(error) = tun.send(&packet) {
-        gamepath_engine::log_error!("TUN send failed: {error}");
-    }
+    write_to_tun(tun, &mut session.fragments, &packet);
     if let Some(repair) = session.repair.as_mut() {
         repair.decoder.remember(sequence, &packet);
         repair.recovered += 1;
+    }
+}
+
+/// Writes a client packet to the TUN, rebuilding a datagram the client split
+/// to cross its link first. Left to the kernel, the pieces depend on
+/// conntrack reassembling them, and any that leave the VPS as fragments meet
+/// game servers' DDoS filters, which commonly drop fragments outright.
+fn write_to_tun(tun: &SyncDevice, fragments: &mut Reassembler, packet: &[u8]) {
+    let Some(whole) = rebuilt(fragments, packet) else {
+        return;
+    };
+    if let Err(error) = tun.send(&whole) {
+        gamepath_engine::log_error!("TUN send failed: {error}");
+    }
+}
+
+/// The datagram to write for `packet`: itself, or once its last piece has
+/// arrived, the datagram it was split from.
+fn rebuilt<'a>(fragments: &mut Reassembler, packet: &'a [u8]) -> Option<Cow<'a, [u8]>> {
+    if is_fragment(packet) {
+        fragments.push(packet, Instant::now()).map(Cow::Owned)
+    } else {
+        Some(Cow::Borrowed(packet))
     }
 }
 
@@ -828,34 +847,41 @@ fn flush_repairs(
     }
 }
 
-/// Sends a packet from the TUN to the client it is addressed to. Returns the
-/// ICMP "fragmentation needed" to write back to the TUN when the packet is too
-/// large for the client's link and its sender forbade fragmenting it.
 fn forward_reply(
     socket: &UdpSocket,
     clients: &Mutex<HashMap<[u8; 16], RelayClient>>,
     repair_wake: &Condvar,
     packet: &[u8],
-) -> Option<Vec<u8>> {
-    let destination = ipv4_destination(packet)?;
+) {
+    let Some(destination) = ipv4_destination(packet) else {
+        return;
+    };
     let mut clients = clients.lock().unwrap();
-    let client = clients
+    let Some(client) = clients
         .values_mut()
-        .find(|client| client.record.virtual_ipv4 == destination)?;
-    let (&session_id, session) = client
+        .find(|client| client.record.virtual_ipv4 == destination)
+    else {
+        return;
+    };
+    let Some((&session_id, session)) = client
         .sessions
         .iter_mut()
-        .max_by_key(|(_, session)| session.last_seen)?;
-    let crypto = SessionCrypto::new(&client.key, session_id).ok()?;
-    // Split to what crosses the client's link whole, as a router in front of
-    // it would. Observed live on an Iranian uplink: anything over ~1430 bytes
-    // vanished, Don't Fragment or not, with no ICMP answer, so a reply that
-    // fit this TUN plus the client's encapsulation never arrived.
-    if let Some(mtu) = session.reply_mtu {
-        if let Some(answer) = gamepath_engine::icmp::fragmentation_needed(packet, mtu) {
-            return Some(answer);
-        }
-        if let Some(pieces) = fragment(packet, usize::from(mtu)) {
+        .max_by_key(|(_, session)| session.last_seen)
+    else {
+        return;
+    };
+    let Ok(crypto) = SessionCrypto::new(&client.key, session_id) else {
+        return;
+    };
+    // Split to what crosses the client's link whole. Observed live on an
+    // Iranian uplink: anything over ~1430 bytes vanished, Don't Fragment or
+    // not, with no ICMP answer. The client reassembles before delivery, so
+    // the application receives the reply whole either way.
+    let pieces = session
+        .reply_mtu
+        .and_then(|mtu| split_for_tunnel(packet, usize::from(mtu)));
+    match pieces {
+        Some(pieces) => {
             for piece in &pieces {
                 send_reply(
                     socket,
@@ -867,19 +893,17 @@ fn forward_reply(
                     piece,
                 );
             }
-            return None;
         }
+        None => send_reply(
+            socket,
+            repair_wake,
+            &crypto,
+            client.client_id,
+            session_id,
+            session,
+            packet,
+        ),
     }
-    send_reply(
-        socket,
-        repair_wake,
-        &crypto,
-        client.client_id,
-        session_id,
-        session,
-        packet,
-    );
-    None
 }
 
 fn send_reply(
@@ -969,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_too_large_for_the_clients_link_is_split_or_refused() {
+    fn a_reply_too_large_for_the_clients_link_arrives_split_and_rebuilds_whole() {
         let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
         let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         client_socket
@@ -981,42 +1005,57 @@ mod tests {
         session.reply_mtu = Some(1228);
         let clients = Mutex::new(HashMap::from([([0; 16], client)]));
         let crypto = SessionCrypto::new(&[0; 32], 7).unwrap();
-        let mut reply = vec![0_u8; 1280];
-        reply[0] = 0x45;
-        reply[2..4].copy_from_slice(&1280_u16.to_be_bytes());
-        reply[4..6].copy_from_slice(&0x0101_u16.to_be_bytes());
-        reply[8] = 57;
-        reply[9] = 17;
-        reply[12..16].copy_from_slice(&[54, 115, 107, 161]);
-        reply[16..20].copy_from_slice(&[10, 203, 0, 2]);
-        let checksum = gamepath_engine::icmp::internet_checksum(&reply[..20]);
-        reply[10..12].copy_from_slice(&checksum.to_be_bytes());
-
-        assert_eq!(
-            forward_reply(&relay, &clients, &Condvar::new(), &reply),
-            None
-        );
-        let mut reassembler = gamepath_engine::ipv4_fragments::Reassembler::default();
-        let mut rebuilt = None;
-        for _ in 0..2 {
-            let mut frame = [0_u8; 2048];
-            let length = client_socket.recv(&mut frame).unwrap();
-            let (_, piece) = crypto.open_server(&frame[..length]).unwrap();
-            assert!(piece.len() <= 1228);
-            rebuilt = reassembler.push(&piece, Instant::now());
+        // Plain, then Don't Fragment: Linux game servers set DF on UDP, and a
+        // refused DF reply was lost for good.
+        for (identification, flags) in [(0x0101_u16, 0_u16), (0x0102, 0x4000)] {
+            let mut reply = vec![0_u8; 1280];
+            reply[0] = 0x45;
+            reply[2..4].copy_from_slice(&1280_u16.to_be_bytes());
+            reply[4..6].copy_from_slice(&identification.to_be_bytes());
+            reply[6..8].copy_from_slice(&flags.to_be_bytes());
+            reply[8] = 57;
+            reply[9] = 17;
+            reply[12..16].copy_from_slice(&[57, 129, 90, 115]);
+            reply[16..20].copy_from_slice(&[10, 203, 0, 2]);
+            let checksum = gamepath_engine::icmp::internet_checksum(&reply[..20]);
+            reply[10..12].copy_from_slice(&checksum.to_be_bytes());
+            forward_reply(&relay, &clients, &Condvar::new(), &reply);
+            let mut reassembler = Reassembler::default();
+            let mut rebuilt = None;
+            for _ in 0..2 {
+                let mut frame = [0_u8; 2048];
+                let length = client_socket.recv(&mut frame).unwrap();
+                let (_, piece) = crypto.open_server(&frame[..length]).unwrap();
+                assert!(piece.len() <= 1228);
+                rebuilt = reassembler.push(&piece, Instant::now());
+            }
+            assert_eq!(rebuilt, Some(reply));
         }
-        assert_eq!(rebuilt, Some(reply.clone()));
+    }
 
-        reply[6..8].copy_from_slice(&0x4000_u16.to_be_bytes());
-        let answer = forward_reply(&relay, &clients, &Condvar::new(), &reply).unwrap();
-        assert_eq!((answer[20], answer[21]), (3, 4), "fragmentation needed");
-        assert_eq!(u16::from_be_bytes([answer[26], answer[27]]), 1228);
-        assert_eq!(&answer[16..20], &[54, 115, 107, 161], "back to the sender");
-        client_socket.set_nonblocking(true).unwrap();
-        assert!(
-            client_socket.recv(&mut [0_u8; 2048]).is_err(),
-            "nothing sent"
+    #[test]
+    fn a_client_datagram_split_for_its_link_reaches_the_tun_whole() {
+        let mut datagram = vec![0_u8; 1300];
+        datagram[0] = 0x45;
+        datagram[2..4].copy_from_slice(&1300_u16.to_be_bytes());
+        datagram[4..6].copy_from_slice(&7_u16.to_be_bytes());
+        datagram[8] = 128;
+        datagram[9] = 17;
+        datagram[12..16].copy_from_slice(&[10, 203, 0, 2]);
+        datagram[16..20].copy_from_slice(&[57, 129, 90, 115]);
+        let checksum = gamepath_engine::icmp::internet_checksum(&datagram[..20]);
+        datagram[10..12].copy_from_slice(&checksum.to_be_bytes());
+        let pieces = split_for_tunnel(&datagram, 1228).unwrap();
+        let mut fragments = Reassembler::default();
+        assert!(rebuilt(&mut fragments, &pieces[0]).is_none(), "held");
+        assert_eq!(
+            rebuilt(&mut fragments, &pieces[1]).as_deref(),
+            Some(datagram.as_slice())
         );
+        assert!(matches!(
+            rebuilt(&mut fragments, &datagram),
+            Some(Cow::Borrowed(_))
+        ));
     }
 
     #[test]
