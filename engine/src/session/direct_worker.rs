@@ -13,7 +13,7 @@ use super::worker::{
     WORKER_RECEIVE_TIMEOUT, drain_send_queue,
 };
 use crate::icmp::{icmp_echo_packet, icmp_reply_sequence};
-use gamepath_engine::relay_path::{DirectPath, KIND_SOCKS5, KIND_WIREGUARD, NodeSpec};
+use gamepath_engine::relay_path::{DirectPath, KIND_WIREGUARD, NodeSpec};
 use gamepath_engine::rtt::RttEstimator;
 use gamepath_engine::scheduler::PathMetrics;
 use gamepath_engine::uplink::UplinkState;
@@ -106,9 +106,9 @@ struct PathWatch {
 
 impl PathWatch {
     fn new(path: &DirectPath) -> Self {
-        // A SOCKS5 node is a TCP stack in this process, not a network; see
+        // A SOCKS5 or adapter node is a TCP stack in this process, not a network; see
         // `drain_send_queue`.
-        let requires_probe = path.kind() == KIND_SOCKS5;
+        let requires_probe = path.terminates_locally();
         Self {
             address: path.address(),
             endpoint: path.endpoint(),

@@ -1,13 +1,14 @@
 import { useState } from 'react'
 import type { ReactNode } from 'react'
-import { Check, Info, Radio, Share2, ShieldCheck, Trash2 } from 'lucide-react'
+import { AppWindow, Check, Info, Radio, Share2, ShieldCheck, Trash2 } from 'lucide-react'
 import { AddressWithCountry } from '../IpLocation'
 import { errorMessage } from './Toast'
 import { Toggle } from './Toggle'
-import { nodeKindLabels } from '../lib/nodes'
-import type { L2tpProbeResult, NodeGroup, Socks5ProbeResult, Tunnel } from '../types'
+import { needsRelay, nodeKindLabels } from '../lib/nodes'
+import { describeAdapterProbe } from '../modals/AdapterModal'
+import type { AdapterProbeResult, L2tpProbeResult, NodeGroup, Socks5ProbeResult, Tunnel } from '../types'
 
-type Probe = Socks5ProbeResult | L2tpProbeResult
+type Probe = Socks5ProbeResult | L2tpProbeResult | AdapterProbeResult
 type Outcome = { ok: boolean; message: ReactNode }
 
 /** One labelled detail under a node's name; `hint` becomes its tooltip. */
@@ -24,6 +25,17 @@ function nodeFacts(tunnel: Tunnel): NodeFact[] {
           label: 'Encryption',
           value: 'Frames only',
           hint: 'Frames are encrypted by GamePath, but the proxy hop itself is not',
+          icon: <Info size={12} aria-hidden="true" />,
+        },
+      ]
+    case 'adapter':
+      return [
+        { label: 'Transport', value: 'The app’s own' },
+        { label: 'Auth', value: 'Held by the app' },
+        {
+          label: 'Adapter',
+          value: 'Found by name',
+          hint: 'Looked up again whenever the app reconnects or switches protocol',
           icon: <Info size={12} aria-hidden="true" />,
         },
       ]
@@ -89,10 +101,11 @@ export function NodeCard({
   const [outcome, setOutcome] = useState<Outcome | null>(null)
   const isProxy = tunnel.kind === 'socks5'
   const isL2tp = tunnel.kind === 'l2tp'
+  const isAdapter = tunnel.kind === 'adapter'
   // A proxy has no way to route on its own, so in direct mode it stays in the
   // list with the reason attached rather than quietly refusing to switch on.
   // Every tunnelling kind routes, so all three are usable in either mode.
-  const unusable = direct && isProxy
+  const unusable = direct && needsRelay(tunnel.kind)
   const carrying = tunnel.enabled && groupEnabled && !unusable
   const state = unusable
     ? { label: 'Needs a relay', tone: '' }
@@ -107,7 +120,10 @@ export function NodeCard({
     setOutcome(null)
     try {
       const probe = await onTest()
-      if (isL2tp) {
+      if (isAdapter) {
+        const adapter = probe as AdapterProbeResult
+        setOutcome({ ok: adapter.udp, message: describeAdapterProbe(adapter) })
+      } else if (isL2tp) {
         const l2tp = probe as L2tpProbeResult
         setOutcome({
           ok: true,
@@ -136,7 +152,7 @@ export function NodeCard({
     <article className={`node-item ${carrying ? 'is-carrying' : ''} ${unusable ? 'is-unusable' : ''}`}>
       <span className="node-item-rail" aria-hidden="true" />
       <span className="node-item-avatar" aria-hidden="true">
-        {isProxy ? <Share2 size={17} /> : <Radio size={17} />}
+        {isProxy ? <Share2 size={17} /> : isAdapter ? <AppWindow size={17} /> : <Radio size={17} />}
       </span>
 
       <div className="node-item-body">
@@ -183,8 +199,10 @@ export function NodeCard({
         )}
         {unusable && (
           <p className="node-item-note">
-            <Info size={13} /> A SOCKS5 proxy forwards connections, it does not route packets, so it needs a relay on
-            the other side. Switch to relay mode to use this node.
+            <Info size={13} />{' '}
+            {isAdapter
+              ? 'Another VPN app’s adapter only takes connections, so game traffic needs a relay on the other side. Switch to relay mode to use this node, or add it to the VPN section.'
+              : 'A SOCKS5 proxy forwards connections, it does not route packets, so it needs a relay on the other side. Switch to relay mode to use this node.'}
           </p>
         )}
       </div>
@@ -203,7 +221,7 @@ export function NodeCard({
         </label>
         {/* A proxy is the one node whose reachability the app cannot infer, so
             it gets a check of its own. Direct mode has no relay to answer it. */}
-        {((isProxy && !direct) || isL2tp) && (
+        {((isProxy && !direct) || isL2tp || isAdapter) && (
           <button className="button secondary" disabled={testing} onClick={runTest}>
             {testing ? 'Testing…' : 'Test'}
           </button>

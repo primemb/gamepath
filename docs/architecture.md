@@ -1442,6 +1442,37 @@ them, so with a SOCKS5 node the VPN carries every packet to that range whichever
 engines treat it as not globally routable. With remote DNS on, this means every app that resolves a name
 uses the proxy for it; turn fake DNS off in the proxy for a strict split tunnel.
 
+### Another VPN app's adapter as a node
+
+An adapter node (`engine/src/vpn_adapter.rs`) sends traffic out through an adapter another VPN app owns. GamePath
+cannot put packets into that adapter, only sockets bound to it, so the VPN reuses the SOCKS5 node's stack with a
+different exit (`tun2socks/exit.rs`). Each connection is a TCP socket bound to the adapter's address and pinned
+with `IP_UNICAST_IF`. Each local UDP socket gets a pinned UDP socket of its own, and DNS is plain UDP through it.
+The held SYN is answered only once that connection opens, as with a proxy. In relay mode the node is one UDP
+socket pinned the same way (`AdapterRelayPath`), like the L2TP relay socket, and fails fast on the same
+"adapter gone" send errors (`transport::is_interface_gone`).
+
+The node stores a name, not an index or an address: Windscribe hands out a new address on every reconnect and
+another adapter per protocol. A bind that fails looks the name up again before giving up, so the node follows the
+app's reconnects without a redial. The adapter reports 1500 bytes however much its own transport costs
+(Windscribe's OpenVPN adapter does), so a path is budgeted the L2TP/IPsec allowance. That is the dearest wrapper
+relays are already sized for, so no relay update is needed.
+
+**Capture leaves the exit's own sockets alone.** Their packets reach the VPN's capture like any application's,
+and a website, IP or fake-IP rule naming the destination, or remote DNS, would select them straight back into the
+stack. Each socket the exit opens is registered by protocol and exact local address and port
+(`is_exit_socket`) while it exists and for 240 s after it closes, because its FIN, reset or TIME_WAIT
+acknowledgement reaches capture after the socket is gone. Capture leaves those packets alone, never holds
+their SYNs, and never resets them when rules change. A process that never opened one, the game engine
+always, answers from an atomic flag without touching the table. Neither of the cheaper keys is safe. With Windscribe in full-tunnel
+mode, every application's packets leave by its interface index and carry its address, so either key would
+exempt the whole machine. Process ownership would also exempt the engine's own resolver queries, which must
+stay remote. The game's capture does not know these sockets, so a VPN lookup sent through an adapter while a
+game session runs may resolve through the game's route instead. That stays remote and fail closed.
+
+All-traffic mode is refused for adapter nodes, as for a proxy on this PC: the tunnel would capture the app's
+own connection to its server.
+
 ### The VPN's direct list
 
 The VPN can leave a list of destinations on the normal connection: a country's registered ranges and its
@@ -1555,12 +1586,21 @@ machine's DNS servers, from its own process (sing-box does, `dns/transport/local
 into the proxy itself; with fake IP on, Throne answered its own WARP server with `198.18.0.3` after a restart and
 nothing went through it again. `proxy_identity` finds the process listening on the proxy's port and leaves its
 UDP lookups alone, so it resolves exactly as it would without GamePath.
+When a destination rule matches the local proxy's own upstream TCP, split capture also leaves that
+socket outside its own proxy node. Otherwise the proxy can be asked to proxy its own outgoing connection.
+The exception is limited to that proxy's process and node, so other applications and other proxy nodes retain
+their configured routing. The listener can be bound to loopback or to an IPv4 address assigned to this machine,
+as with Windscribe's proxy gateway; a remote LAN proxy is not treated as local just because it uses a private
+address. The proxy's own DNS sockets are left alone in both cases: Windscribe's gateway carries GamePath's
+DNS-over-TCP upstream as `windscribe.exe -> 8.8.8.8:53`, and remote DNS sent that stream back into the gateway,
+so every lookup and the node's health probe timed out. TCP is matched by the exact four-tuple, UDP by the socket's
+owner; every other application's DNS stays under the remote DNS policy.
 
 **Connections already open are ended, not left to hang.** A TCP connection an application opened before the
 VPN started (or before a rule selected it) is carried from its next packet on, but from the session's address,
 so the server stops answering it and the application only notices when its own timeout fires. When the VPN's
 capture opens, `tcp_reset` ends those connections with `SetTcpEntry(MIB_TCP_STATE_DELETE_TCB)`, as Windscribe
-does, and the applications reconnect through the VPN at once. Connections the session already carries are
+does, including outbound connections still waiting for a SYN reply, and the applications reconnect through the VPN at once. Connections the session already carries are
 kept, and nothing is ended while a game session runs, because the VPN cannot see the game's rules and must never
 end a connection the game carries.
 

@@ -4,6 +4,7 @@ import { VpnStatusCard } from '../components/VpnStatusCard'
 import { SetupDrawer, type SetupItem } from '../components/SetupDrawer'
 import { TelemetryPanel } from '../components/TelemetryPanel'
 import type { PathHistory, PathRate } from '../lib/format'
+import { needsRelay } from '../lib/nodes'
 import { deriveReadiness } from '../lib/readiness'
 import type { AppState } from '../types'
 import type { GameTab } from '../lib/views'
@@ -28,7 +29,7 @@ export function GameOverview({
   const { carrying, directNode, enabledRules, readyCount, stepCount, direct, routesReady, rulesReady, relayReady } =
     deriveReadiness(state)
   const relay = state.relays.find((item) => item.id === state.activeRelayId)
-  const routingNodes = state.tunnels.filter((item) => item.kind !== 'socks5').length
+  const routingNodes = state.tunnels.filter((item) => !needsRelay(item.kind)).length
   const connected = state.session.status === 'connected'
   const sessionRelay = (connected && state.relays.find((item) => item.id === state.session.relayId)) || relay
   const complete = readyCount === stepCount

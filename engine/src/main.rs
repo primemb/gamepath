@@ -170,6 +170,10 @@ fn handle_request(
         "inspect-system" => Ok(inspect_system()),
         "lan-addresses" => Ok(lan_addresses()),
         #[cfg(windows)]
+        "network-adapters" => Ok(json!(gamepath_engine::vpn_adapter::candidates())),
+        #[cfg(windows)]
+        "probe-adapter" => commands::probe_adapter(request.payload),
+        #[cfg(windows)]
         "file-icon" => file_icon::file_icon(request.payload),
         "prepare-session" => prepare_session(request.payload),
         "probe-relay" => probe_relay(request.payload),

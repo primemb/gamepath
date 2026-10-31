@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { FileKey2, KeyRound, Network, Plus, Server, ShieldCheck, Trash2, Zap } from 'lucide-react'
+import { AppWindow, FileKey2, KeyRound, Network, Plus, Server, ShieldCheck, Trash2, Zap } from 'lucide-react'
 import { AddressWithCountry } from '../../IpLocation'
 import { nodeKindLabels } from '../../lib/nodes'
 import { describeNodeLive, vpnNodeKinds, type NodeLive } from '../../lib/vpn'
@@ -11,6 +11,7 @@ const kindIcons: Record<NodeKind, typeof Server> = {
   openvpn: ShieldCheck,
   socks5: Network,
   l2tp: KeyRound,
+  adapter: AppWindow,
 }
 
 function KindChooser({ onChoose, disabled }: { onChoose: (kind: NodeKind) => void; disabled: boolean }) {
@@ -146,7 +147,7 @@ export function VpnNodePanel({
                           : 'Saved'}
                   </span>
                   <div className="vpn-node-actions">
-                    {(node.kind === 'socks5' || node.kind === 'l2tp') && (
+                    {(node.kind === 'socks5' || node.kind === 'l2tp' || node.kind === 'adapter') && (
                       <button
                         className="button secondary"
                         aria-label={`Test ${node.name}`}

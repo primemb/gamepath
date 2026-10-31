@@ -7,6 +7,7 @@ const { parseWireGuardConfig } = require('./wireguard.cjs')
 const { parseOpenVpnConfig } = require('./openvpn.cjs')
 const { parseSocks5Node } = require('./socks5.cjs')
 const { parseL2tpNode } = require('./l2tp.cjs')
+const { parseAdapterNode } = require('./adapter.cjs')
 const { nodeSpec } = require('./node-spec.cjs')
 const { ownHostnames } = require('./own-hostnames.cjs')
 const { vpnPauseReason } = require('./session-coordinator.cjs')
@@ -24,6 +25,7 @@ const {
   activeGameRules,
   selectedVpnNode,
   migrateVpnState,
+  trafficModeLimitation,
 } = require('./vpn-state.cjs')
 
 /**
@@ -187,6 +189,8 @@ function createVpnFeature({
       if (blocked) throw new Error(assignedLimitation(proposed, blocked))
       const combined = nodeSetLimitation(sessionNodes(proposed))
       if (combined) throw new Error(combined)
+      const mode = trafficModeLimitation(node, proposed.trafficMode)
+      if (mode) throw new Error(mode)
       if (!state().encryptedVpnConfigs[id])
         throw new Error('That VPN node is missing its stored secret. Remove it and add it again.')
       vpn().selectedNodeId = id
@@ -328,6 +332,19 @@ function createVpnFeature({
       return setNode(node, JSON.stringify(credentials))
     })
 
+    ipcMain.handle('vpn:add-adapter', (_event, input) => {
+      const { node, secret } = parseAdapterNode(input ?? {}, crypto.randomUUID())
+      return setNode(node, secret)
+    })
+
+    ipcMain.handle('vpn:test-adapter', (_event, input, nodeId) => {
+      if (!engine.ready()) throw new Error('The native routing engine is unavailable')
+      const saved = nodeId === undefined ? selectedVpnNode(vpn()) : vpn().nodes.find((item) => item.id === nodeId)
+      const node = input ? parseAdapterNode(input, 'probe').node : saved
+      if (node?.kind !== 'adapter') throw new Error('The VPN node is not a network adapter')
+      return engine.request('probe-adapter', { adapter: node.adapter }, 20000)
+    })
+
     ipcMain.handle('vpn:test-l2tp', (_event, input, nodeId) => {
       if (!service.ready()) throw new Error('Install and start the GamePath Network Service first')
       const node = nodeId === undefined ? selectedVpnNode(vpn()) : vpn().nodes.find((item) => item.id === nodeId)
@@ -387,6 +404,8 @@ function createVpnFeature({
 
     ipcMain.handle('vpn:set-traffic-mode', (_event, mode) => {
       if (mode !== 'split' && mode !== 'all') throw new Error('Unknown traffic mode')
+      const limitation = trafficModeLimitation(selectedVpnNode(vpn()), mode)
+      if (limitation) throw new Error(limitation)
       vpn().trafficMode = mode
       return saveAndReconnect(`traffic mode changed to ${mode}`)
     })

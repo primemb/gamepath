@@ -6,8 +6,10 @@
  * starts and never reach the renderer: a WireGuard node yields its
  * configuration body, a SOCKS5 node its stored credentials, an OpenVPN node
  * its file and credentials, and an L2TP node its login and pre-shared key.
+ * An adapter node has no secret; it is named by the adapter it leaves through.
  */
 function nodeSpec(node, secret) {
+  if (node.kind === 'adapter') return { kind: 'adapter', adapter: node.adapter, label: node.name }
   if (node.kind === 'socks5') {
     const { username, password } = JSON.parse(secret)
     return {

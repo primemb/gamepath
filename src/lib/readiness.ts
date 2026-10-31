@@ -1,4 +1,4 @@
-import { activeNodes } from './nodes'
+import { activeNodes, needsRelay } from './nodes'
 import type { AppState, Tunnel } from '../types'
 
 export type Readiness = {
@@ -28,7 +28,7 @@ export function deriveReadiness(state: AppState): Readiness {
   const carrying = activeNodes(state.tunnels, state.nodeGroups)
   // Direct mode is ready when exactly one node is carrying and that node can
   // actually route, which is the same rule the engine enforces.
-  const directNode = carrying.length === 1 && carrying[0].kind !== 'socks5' ? carrying[0] : null
+  const directNode = carrying.length === 1 && !needsRelay(carrying[0].kind) ? carrying[0] : null
 
   const enabledRuleGroupIds = new Set(state.ruleGroups.filter((group) => group.enabled).map((group) => group.id))
   const enabledRules = state.rules.filter(

@@ -44,11 +44,14 @@ impl ValidateRequest {
 
 /// Whether `node` can carry a direct session in `slot`.
 ///
-/// The VPN slot also takes a SOCKS5 proxy: its engine terminates the captured
-/// connections itself and replays them through the proxy. The game slot does
-/// not, because game traffic is UDP that must not be re-originated.
+/// The VPN slot also takes a SOCKS5 proxy or another VPN's adapter: its
+/// engine terminates the captured connections itself and replays them through
+/// the exit. The game slot does not, because game traffic is UDP that must not
+/// be re-originated.
 pub(crate) fn carries_direct(slot: SlotId, node: &NodeSpec) -> bool {
-    node.supports_direct() || (slot == SlotId::Vpn && matches!(node, NodeSpec::Socks5 { .. }))
+    node.supports_direct()
+        || (slot == SlotId::Vpn
+            && matches!(node, NodeSpec::Socks5 { .. } | NodeSpec::Adapter { .. }))
 }
 
 /// Most nodes the VPN pins its apps across at once. The engine's
@@ -131,14 +134,15 @@ pub(crate) fn validate_runtime(payload: Value, slot: SlotId) -> Result<Value, St
         let route = index + 1;
         node.validate()
             .map_err(|error| format!("route {route}: {error}"))?;
-        // A proxy on this machine reaches its own upstream over the default
-        // route. In all-traffic mode the tunnel owns that route, so the
-        // proxy's forwarded traffic would be captured and fed back into it.
-        if input.traffic_mode == "all" && node.is_loopback_proxy() {
+        // A proxy on this machine, or the VPN app behind an adapter, reaches
+        // its own server over the default route. In all-traffic mode the
+        // tunnel owns that route, so that traffic would be captured and fed
+        // back into the node it carries.
+        if input.traffic_mode == "all" && node.exits_through_this_pc() {
             return Err(format!(
                 "route {route} ({}) runs on this PC and cannot be used in all-traffic mode, \
                  because its own upstream traffic would be captured and looped back. \
-                 Use split-tunnel mode for a local proxy, or add a remote SOCKS5 proxy.",
+                 Use split-tunnel mode for it, or a remote node.",
                 node.describe()
             ));
         }
@@ -324,6 +328,24 @@ mod tests {
         let result = validate_vpn(proxy).unwrap();
         assert_eq!(result["slot"], "vpn");
         assert_eq!(result["nodeKinds"][0], "socks5");
+    }
+
+    #[test]
+    fn an_adapter_carries_relay_paths_and_the_vpn_but_not_a_direct_game() {
+        let adapter = json!([{ "kind": "adapter", "adapter": "Windscribe" }]);
+        assert_eq!(
+            validate("split", adapter.clone()).unwrap()["nodeKinds"][0],
+            "adapter"
+        );
+        assert_eq!(
+            validate_vpn(adapter.clone()).unwrap()["nodeKinds"][0],
+            "adapter"
+        );
+        assert!(validate_direct(adapter.clone()).is_err());
+        // The other VPN app's own connection would be captured in all-traffic mode.
+        let error = validate("all", adapter).err().unwrap();
+        assert!(error.contains("looped back"), "{error}");
+        assert!(validate_vpn(json!([{ "kind": "adapter", "adapter": " " }])).is_err());
     }
 
     #[test]

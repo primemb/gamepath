@@ -1,4 +1,4 @@
-//! Ends established TCP connections so their applications reconnect at once.
+//! Ends active and connecting TCP connections so their applications reconnect at once.
 //!
 //! A connection opened before a session started is carried by it from the
 //! next packet on, but from the session's address: the server no longer
@@ -11,8 +11,8 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use windows_sys::Win32::Foundation::NO_ERROR;
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB, MIB_TCPROW_LH, MIB_TCPROW_LH_0, SetTcpEntry,
-    TCP_TABLE_OWNER_PID_CONNECTIONS,
+    MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB, MIB_TCP_STATE_SYN_SENT, MIB_TCPROW_LH,
+    MIB_TCPROW_LH_0, SetTcpEntry, TCP_TABLE_OWNER_PID_CONNECTIONS,
 };
 
 pub(crate) struct Connection {
@@ -24,13 +24,17 @@ pub(crate) struct Connection {
     raw: [u32; 4],
 }
 
-/// Every established IPv4 TCP connection, with the process that owns it.
-pub(crate) fn established() -> Vec<Connection> {
+fn can_restart(state: u32) -> bool {
+    state == MIB_TCP_STATE_ESTAB as u32 || state == MIB_TCP_STATE_SYN_SENT as u32
+}
+
+/// IPv4 TCP connections that are established or still connecting, with their owners.
+pub(crate) fn connections() -> Vec<Connection> {
     let Some(rows) = crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_CONNECTIONS) else {
         return Vec::new();
     };
     rows.into_iter()
-        .filter(|row| row.dwState == MIB_TCP_STATE_ESTAB as u32 && row.dwOwningPid != 0)
+        .filter(|row| can_restart(row.dwState) && row.dwOwningPid != 0)
         .map(|row| Connection {
             local: SocketAddrV4::new(
                 Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()),
@@ -67,7 +71,7 @@ pub(crate) fn close(connection: &Connection) -> bool {
 }
 
 pub(crate) fn close_matching(matches: impl Fn(&Connection) -> bool) -> usize {
-    established()
+    connections()
         .iter()
         .filter(|connection| matches(connection) && close(connection))
         .count()
@@ -102,7 +106,7 @@ mod tests {
                 && connection.process_id == std::process::id()
         };
         assert_eq!(close_matching(selected_only), 1);
-        assert!(!established().iter().any(selected_only));
+        assert!(!connections().iter().any(selected_only));
         let mut buffer = [0];
         match selected.read(&mut buffer) {
             Ok(0) => {}
@@ -131,10 +135,21 @@ mod tests {
         let std::net::SocketAddr::V4(remote) = client.peer_addr().unwrap() else {
             unreachable!()
         };
-        let found = established()
+        let found = connections()
             .into_iter()
             .find(|connection| connection.local == local && connection.remote == remote)
             .expect("the connection is listed");
         assert_eq!(found.process_id, std::process::id());
+    }
+
+    #[test]
+    fn connecting_and_established_sockets_can_be_restarted() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            MIB_TCP_STATE_LISTEN, MIB_TCP_STATE_TIME_WAIT,
+        };
+        assert!(can_restart(MIB_TCP_STATE_SYN_SENT as u32));
+        assert!(can_restart(MIB_TCP_STATE_ESTAB as u32));
+        assert!(!can_restart(MIB_TCP_STATE_LISTEN as u32));
+        assert!(!can_restart(MIB_TCP_STATE_TIME_WAIT as u32));
     }
 }

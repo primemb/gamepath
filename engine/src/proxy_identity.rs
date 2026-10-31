@@ -9,9 +9,15 @@
 //! through it stopped. Observed: Throne restarted while the VPN was on, looked
 //! up `engage.cloudflareclient.com` (its WARP upstream), got `198.18.0.3`, and
 //! no connection through it opened again.
+//!
+//! The same holds for the DNS streams a proxy carries upstream for its
+//! clients. Windscribe's proxy gateway listens on the LAN address and opens
+//! `10.141.184.93 -> 8.8.8.8:53` from `windscribe.exe` for GamePath's own
+//! lookups; redirected, that stream went back into the proxy and every lookup
+//! through it timed out.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -26,19 +32,34 @@ const OWNER_TTL: Duration = Duration::from_secs(2);
 const PROCESS_TTL: Duration = Duration::from_secs(5);
 pub(crate) struct ProxyIdentity {
     port: u16,
+    address: Ipv4Addr,
     /// The process listening on the proxy port, and when that was checked.
     /// Compared by id, so a lookup never has to open a process.
     process: Mutex<(Option<u32>, Option<Instant>)>,
-    owners: Mutex<HashMap<(u8, u16), (bool, Instant)>>,
+    udp_owners: Mutex<HashMap<u16, (bool, Instant)>>,
+    tcp_flows: Mutex<HashMap<TcpFlow, (bool, Instant)>>,
 }
+
+/// Local address and port, then remote address and port.
+type TcpFlow = (Ipv4Addr, u16, Ipv4Addr, u16);
 
 impl ProxyIdentity {
     /// Only a proxy on this machine has a process to recognise.
     pub(crate) fn for_endpoint(endpoint: SocketAddr) -> Option<Self> {
-        endpoint.ip().is_loopback().then(|| Self {
+        let IpAddr::V4(address) = endpoint.ip() else {
+            return None;
+        };
+        let local = address.is_loopback()
+            || gamepath_engine::netconfig::interface_index_for_address(address)
+                .ok()
+                .flatten()
+                .is_some();
+        local.then(|| Self {
             port: endpoint.port(),
+            address,
             process: Mutex::new((None, None)),
-            owners: Mutex::new(HashMap::new()),
+            udp_owners: Mutex::new(HashMap::new()),
+            tcp_flows: Mutex::new(HashMap::new()),
         })
     }
 
@@ -46,7 +67,7 @@ impl ProxyIdentity {
     fn process_id(&self) -> Option<u32> {
         let mut process = self.process.lock().unwrap();
         if process.1.is_none_or(|at| at.elapsed() >= PROCESS_TTL) {
-            let found = listener_owner(self.port);
+            let found = listener_owner(self.address, self.port);
             if let Some(id) = found.filter(|id| Some(*id) != process.0) {
                 gamepath_engine::log_info!(
                     "the SOCKS5 proxy on port {} is {} (pid {id}); its own name lookups are never redirected",
@@ -60,39 +81,65 @@ impl ProxyIdentity {
     }
 
     /// Whether the UDP socket on `local_port` belongs to the proxy's process.
-    #[cfg(test)]
     pub(crate) fn owns_udp_port(&self, local_port: u16) -> bool {
-        self.owns_port(17, local_port)
-    }
-
-    pub(crate) fn owns_port(&self, protocol: u8, local_port: u16) -> bool {
-        if let Some((owned, at)) = self.owners.lock().unwrap().get(&(protocol, local_port)) {
+        if let Some((owned, at)) = self.udp_owners.lock().unwrap().get(&local_port) {
             if at.elapsed() < OWNER_TTL {
                 return *owned;
             }
         }
-        let owner = if protocol == 17 {
-            udp_owner(local_port)
-        } else {
-            crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_ALL).and_then(|rows| {
-                rows.into_iter()
-                    .find(|row| u16::from_be(row.dwLocalPort as u16) == local_port)
-                    .map(|row| row.dwOwningPid)
-            })
-        };
+        let owner = udp_owner(local_port);
         let owned = self.process_id().is_some_and(|proxy| owner == Some(proxy));
-        let mut owners = self.owners.lock().unwrap();
+        let mut owners = self.udp_owners.lock().unwrap();
         owners.retain(|_, (_, at)| at.elapsed() < OWNER_TTL);
-        owners.insert((protocol, local_port), (owned, Instant::now()));
+        owners.insert(local_port, (owned, Instant::now()));
+        owned
+    }
+
+    pub(crate) fn owns_tcp_flow(
+        &self,
+        source: Ipv4Addr,
+        source_port: u16,
+        destination: Ipv4Addr,
+        destination_port: u16,
+    ) -> bool {
+        let key = (source, source_port, destination, destination_port);
+        if let Some((owned, at)) = self.tcp_flows.lock().unwrap().get(&key) {
+            if at.elapsed() < OWNER_TTL {
+                return *owned;
+            }
+        }
+        let owner = crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_ALL).and_then(|rows| {
+            rows.into_iter()
+                .find(|row| {
+                    Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()) == source
+                        && crate::split_capture::port_from_dword(row.dwLocalPort) == source_port
+                        && Ipv4Addr::from(row.dwRemoteAddr.to_ne_bytes()) == destination
+                        && crate::split_capture::port_from_dword(row.dwRemotePort)
+                            == destination_port
+                })
+                .map(|row| row.dwOwningPid)
+        });
+        let owned = self.process_id().is_some_and(|proxy| owner == Some(proxy));
+        let mut flows = self.tcp_flows.lock().unwrap();
+        if flows.len() >= 4096 {
+            flows.retain(|_, (_, at)| at.elapsed() < OWNER_TTL);
+        }
+        if flows.len() < 4096 {
+            flows.insert(key, (owned, Instant::now()));
+        }
         owned
     }
 }
 
-/// The process listening for TCP on `port`, on loopback or every address.
-fn listener_owner(port: u16) -> Option<u32> {
+/// The process listening on the selected local address or on every address.
+fn listener_owner(address: Ipv4Addr, port: u16) -> Option<u32> {
     crate::socket_table::tcp_rows(TCP_TABLE_OWNER_PID_LISTENER)?
         .into_iter()
-        .find(|row| crate::split_capture::port_from_dword(row.dwLocalPort) == port)
+        .find(|row| {
+            let bound = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+            (bound.is_unspecified() || bound == address)
+                && crate::split_capture::port_from_dword(row.dwLocalPort) == port
+        })
         .map(|row| row.dwOwningPid)
 }
 
@@ -127,5 +174,22 @@ mod tests {
     #[test]
     fn only_a_proxy_on_this_machine_has_a_process() {
         assert!(ProxyIdentity::for_endpoint("203.0.113.5:1080".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn an_all_interfaces_listener_matches_a_local_endpoint() {
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(
+            listener_owner(Ipv4Addr::LOCALHOST, port),
+            Some(std::process::id())
+        );
+    }
+
+    #[test]
+    fn a_listener_bound_to_another_local_address_is_not_the_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(listener_owner(Ipv4Addr::new(127, 0, 0, 2), port), None);
     }
 }

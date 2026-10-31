@@ -49,5 +49,6 @@ pub mod transport;
 pub mod tun2socks;
 pub mod uplink;
 pub mod userspace_wireguard;
+pub mod vpn_adapter;
 pub mod wfp;
 pub mod wireguard_runtime;

@@ -26,6 +26,11 @@ impl DnsProbe {
         frame
     }
 
+    /// The question as one datagram, for a probe sent over UDP.
+    pub(super) fn message(&self) -> &[u8] {
+        &self.message
+    }
+
     pub(super) fn receive(&mut self, bytes: &[u8]) -> Option<bool> {
         if self.received.len() + bytes.len() > usize::from(u16::MAX) + 2 {
             return Some(false);
@@ -37,14 +42,19 @@ impl DnsProbe {
             return Some(false);
         }
         let response = self.received.get(2..2 + length)?;
-        Some(
-            matches!(
+        Some(self.answers(response))
+    }
+
+    /// Whether `response` is a complete success or NXDOMAIN for this question.
+    pub(super) fn answers(&self, response: &[u8]) -> bool {
+        response.len() >= 12
+            && matches!(
                 dns::verdict(response, self.id),
                 ResolverVerdict::Answered | ResolverVerdict::Refused { rcode: 3 }
-            ) && response[2] & 0x7a == 0
-                && response.get(4..6) == Some(&[0, 1])
-                && response.get(12..self.message.len()) == self.message.get(12..),
-        )
+            )
+            && response[2] & 0x7a == 0
+            && response.get(4..6) == Some(&[0, 1])
+            && response.get(12..self.message.len()) == self.message.get(12..)
     }
 }
 

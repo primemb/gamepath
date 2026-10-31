@@ -387,6 +387,20 @@ pub(crate) fn probe_socks5_proxy(payload: Value) -> Result<Value, String> {
     }))
 }
 
+/// Tests another VPN app's adapter the way a node uses it: a connection out
+/// through it, then a STUN exchange that only real UDP forwarding answers.
+#[cfg(windows)]
+pub(crate) fn probe_adapter(payload: Value) -> Result<Value, String> {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        adapter: String,
+    }
+    let input: Request = serde_json::from_value(payload)
+        .map_err(|error| format!("invalid adapter test: {error}"))?;
+    let check = gamepath_engine::vpn_adapter::check(&input.adapter)?;
+    Ok(json!({ "reachable": true, "udp": check.udp_latency_ms.is_some(), "check": check }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -102,6 +102,11 @@ pub fn path_overhead_bytes(mode: SessionMode, kind: &str) -> u16 {
         "socks5" => (SOCKS5_UDP_REQUEST, OUTER_IPV4_UDP),
         "openvpn" => (OPENVPN_DATA, OUTER_IPV4_TCP),
         "l2tp" => (L2TP_IPSEC_DATA, 0),
+        // Another VPN app wraps the datagram in its own transport, which
+        // GamePath cannot see. Its adapter reports 1500 whatever that costs
+        // (Windscribe's OpenVPN adapter does), so it is budgeted as the
+        // dearest wrapper the relay is already sized for.
+        "adapter" => (L2TP_IPSEC_DATA - OUTER_IPV4_UDP, OUTER_IPV4_UDP),
         // An unrecognised transport is assumed to cost as much as the most
         // expensive one this build knows about.
         _ => (L2TP_IPSEC_DATA, 0),
@@ -372,7 +377,9 @@ mod tests {
     #[test]
     fn the_relay_tun_fits_inside_every_client_transport() {
         let relay = relay_tun_mtu(LINK_MTU);
-        for kind in ["wireguard", "socks5", "openvpn", "l2tp"] {
+        // An adapter path is sized to fit the relay as it is, so relays that
+        // predate it need no update to carry it.
+        for kind in ["wireguard", "socks5", "openvpn", "l2tp", "adapter"] {
             let client = EffectiveMtu::for_session(SessionMode::Relay, [kind], LINK_MTU);
             assert!(
                 relay <= client.mtu,
@@ -415,7 +422,14 @@ mod tests {
     fn no_session_is_ever_configured_below_the_floor() {
         for link in [0_u16, 576, 1000, 1280, 1400, 1492, 1500, 9000, u16::MAX] {
             for mode in [SessionMode::Relay, SessionMode::Direct] {
-                for kind in ["wireguard", "openvpn", "socks5", "l2tp", "something-new"] {
+                for kind in [
+                    "wireguard",
+                    "openvpn",
+                    "socks5",
+                    "l2tp",
+                    "adapter",
+                    "something-new",
+                ] {
                     let mtu = EffectiveMtu::for_session(mode, [kind], link);
                     assert!(
                         mtu.mtu >= MIN_TUNNEL_MTU,
@@ -447,6 +461,7 @@ mod tests {
         assert_eq!(crate::relay_path::KIND_WIREGUARD, "wireguard");
         assert_eq!(crate::relay_path::KIND_SOCKS5, "socks5");
         assert_eq!(crate::relay_path::KIND_L2TP, "l2tp");
+        assert_eq!(crate::relay_path::KIND_ADAPTER, "adapter");
         #[cfg(feature = "openvpn")]
         assert_eq!(crate::relay_path::KIND_OPENVPN, "openvpn");
     }

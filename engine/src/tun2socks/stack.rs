@@ -1,17 +1,21 @@
-//! The event loop behind [`super::Socks5Stack`].
+//! The event loop behind [`super::ForwardingStack`].
 //!
 //! Captured packets come in as raw IPv4. TCP goes into a smoltcp interface
 //! that accepts any destination, so every connection an application opens is
-//! answered here and replayed through the proxy with `CONNECT`. UDP is
-//! forwarded datagram by datagram over one `UDP ASSOCIATE` per local socket.
-//! Name lookups go over TCP through the proxy, which works whether or not the
-//! proxy carries UDP. One thread and one `mio` poll drive all of it.
+//! answered here and replayed through the exit: with `CONNECT` through a
+//! proxy, or as an ordinary connection pinned to another VPN's adapter. Through
+//! a proxy, UDP is forwarded datagram by datagram over one `UDP ASSOCIATE` per
+//! local socket and name lookups go over TCP, which works whether or not the
+//! proxy carries UDP. Through an adapter, each local UDP socket gets a pinned
+//! socket of its own, lookups included. One thread and one `mio` poll drive
+//! all of it.
 //!
-//! A connection is only answered once the proxy has opened its far end: the
+//! A connection is only answered once the exit has opened its far end: the
 //! held SYN is fed to smoltcp then, or refused with a reset. Answering first
-//! would make every connection look open while the proxy is down, and would
-//! hand the session's health check packets the proxy never carried.
+//! would make every connection look open while the exit is down, and would
+//! hand the session's health check packets the exit never carried.
 
+use super::exit::{Claim, Exit};
 use super::handshake::{Command, Handshake, Step};
 use super::packet::{
     PROTOCOL_TCP, PROTOCOL_UDP, build_echo_reply, build_tcp_reset, build_udp, is_echo_request,
@@ -54,8 +58,14 @@ const MAX_UDP_ASSOCIATIONS: usize = 512;
 const UDP_QUEUE_LIMIT: usize = 64;
 /// QUIC and voice keep their sockets busy; one quiet for this long is done.
 const UDP_IDLE: Duration = Duration::from_secs(60);
+/// Through an adapter each lookup brings a socket of its own, since Windows
+/// sends every query from a fresh port. One quiet past its retries is done.
+const DNS_SOCKET_IDLE: Duration = Duration::from_secs(15);
 /// A refused association is not asked for again on that port this soon.
 const UDP_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// An adapter with no socket to give is usually its app reconnecting, which
+/// takes seconds, so the port is tried again much sooner than a refusal.
+const ADAPTER_RETRY_AFTER: Duration = Duration::from_secs(2);
 /// Windows resends a lookup after one second and gives up after about ten,
 /// so a lookup still unanswered by now is not coming back.
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -97,8 +107,7 @@ pub(crate) struct StackConfig {
     pub(crate) client: Ipv4Addr,
     /// The stack's own address on the same /24; it answers for every other.
     pub(crate) gateway: Ipv4Addr,
-    pub(crate) proxy: SocketAddr,
-    pub(crate) credentials: Option<(String, String)>,
+    pub(crate) exit: Exit,
     /// Where health probes and their echo replies are expected.
     pub(crate) probe_target: Ipv4Addr,
     pub(crate) mtu: usize,
@@ -149,11 +158,16 @@ impl Device for QueueDevice {
     }
 }
 
-/// One stream to the proxy: its handshake, then the bytes it carries.
+/// One stream to the exit: a proxy handshake, or the adapter connection
+/// still opening, then the bytes it carries.
 struct Upstream {
     stream: TcpStream,
     token: Token,
     handshake: Option<Handshake>,
+    /// An adapter connection whose far end has not answered yet.
+    connecting: bool,
+    /// Keeps capture from selecting an adapter connection's own packets.
+    _claim: Option<Claim>,
     outgoing: Vec<u8>,
     connected: bool,
     /// Edge-triggered readiness that was not fully drained, because the far
@@ -172,27 +186,74 @@ impl Upstream {
     fn dial(
         registry: &Registry,
         token: Token,
-        proxy: SocketAddr,
+        exit: &mut Exit,
         command: Command,
         target: SocketAddrV4,
-        credentials: Option<(String, String)>,
-    ) -> std::io::Result<Self> {
-        let mut stream = TcpStream::connect(proxy)?;
+    ) -> Result<Self, String> {
+        let (mut stream, handshake, outgoing, claim) = match exit {
+            Exit::Proxy {
+                address,
+                credentials,
+            } => {
+                let stream = TcpStream::connect(*address).map_err(|error| error.to_string())?;
+                let (handshake, greeting) = Handshake::start(command, target, credentials.clone());
+                (stream, Some(handshake), greeting, None)
+            }
+            Exit::Adapter(adapter) => {
+                let (socket, claim) = adapter.socket(socket2::Type::STREAM)?;
+                match socket.connect(&SocketAddr::V4(target).into()) {
+                    Ok(()) => {}
+                    // WSAEWOULDBLOCK, as a non-blocking connect reports itself.
+                    Err(error)
+                        if error.kind() == ErrorKind::WouldBlock
+                            || error.raw_os_error() == Some(10036) => {}
+                    Err(error) => return Err(format!("could not connect to {target}: {error}")),
+                }
+                (
+                    TcpStream::from_std(socket.into()),
+                    None,
+                    Vec::new(),
+                    Some(claim),
+                )
+            }
+        };
         let _ = stream.set_nodelay(true);
-        registry.register(&mut stream, token, Interest::READABLE | Interest::WRITABLE)?;
-        let (handshake, greeting) = Handshake::start(command, target, credentials);
+        registry
+            .register(&mut stream, token, Interest::READABLE | Interest::WRITABLE)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             stream,
             token,
-            handshake: Some(handshake),
-            outgoing: greeting,
+            connecting: claim.is_some(),
+            _claim: claim,
+            handshake,
+            outgoing,
             connected: false,
             read_pending: true,
             watching_writes: true,
-            registry: registry.try_clone()?,
+            registry: registry.try_clone().map_err(|error| error.to_string())?,
             write_retry_at: None,
             closed: false,
         })
+    }
+
+    /// Whether an adapter connection has opened: `None` while it is still
+    /// waiting on the far end.
+    fn poll_connect(&mut self) -> Option<Result<(), String>> {
+        match self.stream.take_error() {
+            Ok(Some(error)) | Err(error) => return Some(Err(error.to_string())),
+            Ok(None) => {}
+        }
+        match self.stream.peer_addr() {
+            Ok(_) => {
+                self.connecting = false;
+                self.connected = true;
+                self.flush();
+                Some(Ok(()))
+            }
+            Err(error) if error.kind() == ErrorKind::NotConnected => None,
+            Err(error) => Some(Err(error.to_string())),
+        }
     }
 
     /// Writes what is queued. Errors close the stream.
@@ -339,6 +400,12 @@ enum UdpState {
         socket: UdpSocket,
         token: Token,
     },
+    /// A socket pinned to the adapter, sending straight to each destination.
+    Direct {
+        socket: UdpSocket,
+        token: Token,
+        _claim: Claim,
+    },
     Refused {
         until: Instant,
     },
@@ -347,6 +414,7 @@ enum UdpState {
 struct UdpAssociation {
     state: UdpState,
     last_used: Instant,
+    idle_after: Duration,
 }
 
 /// One TCP stream to a resolver, carrying one lookup at a time.
@@ -376,8 +444,19 @@ struct DnsQuery {
     retried: bool,
 }
 
+/// Through a proxy the probe opens a stream; through an adapter it asks
+/// over UDP, the way the adapter carries everything else.
+enum ProbeTransport {
+    Stream(Upstream),
+    Datagram {
+        socket: UdpSocket,
+        token: Token,
+        _claim: Claim,
+    },
+}
+
 struct Probe {
-    upstream: Upstream,
+    transport: ProbeTransport,
     request: Vec<u8>,
     dns: DnsProbe,
     started: Instant,
@@ -574,7 +653,7 @@ impl Stack {
                 };
                 let destination = SocketAddrV4::new(ip.destination, udp.destination_port);
                 let payload = udp.payload.to_vec();
-                if udp.destination_port == DNS_PORT {
+                if udp.destination_port == DNS_PORT && self.config.exit.is_proxy() {
                     self.lookup(udp.source_port, *destination.ip(), payload);
                 } else {
                     self.send_udp(udp.source_port, destination, payload);
@@ -610,10 +689,9 @@ impl Stack {
         match Upstream::dial(
             self.poll.registry(),
             token,
-            self.config.proxy,
+            &mut self.config.exit,
             Command::Connect,
             key.remote,
-            self.config.credentials.clone(),
         ) {
             Ok(upstream) => {
                 self.tcp.insert(
@@ -631,7 +709,11 @@ impl Stack {
             }
             Err(error) => {
                 self.owners.remove(&token);
-                log_warn!("could not reach the SOCKS5 proxy: {error}");
+                if self.config.exit.is_proxy() {
+                    log_warn!("could not reach the SOCKS5 proxy: {error}");
+                } else {
+                    crate::log_debug!("could not open a connection on the adapter: {error}");
+                }
                 refuse(self);
             }
         }
@@ -691,28 +773,39 @@ impl Stack {
                     self.remove_udp(quietest);
                 }
             }
-            let token = self.token(Owner::UdpControl(local_port));
-            let state = match Upstream::dial(
-                self.poll.registry(),
-                token,
-                self.config.proxy,
-                Command::UdpAssociate,
-                SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-                self.config.credentials.clone(),
-            ) {
-                Ok(control) => UdpState::Dialing {
-                    control,
-                    queue: Vec::new(),
-                },
-                Err(_) => UdpState::Refused {
-                    until: now + UDP_RETRY_AFTER,
-                },
+            let state = if self.config.exit.is_proxy() {
+                let token = self.token(Owner::UdpControl(local_port));
+                match Upstream::dial(
+                    self.poll.registry(),
+                    token,
+                    &mut self.config.exit,
+                    Command::UdpAssociate,
+                    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+                ) {
+                    Ok(control) => UdpState::Dialing {
+                        control,
+                        queue: Vec::new(),
+                    },
+                    Err(_) => {
+                        self.owners.remove(&token);
+                        UdpState::Refused {
+                            until: now + UDP_RETRY_AFTER,
+                        }
+                    }
+                }
+            } else {
+                self.open_direct_udp(local_port)
             };
             self.udp.insert(
                 local_port,
                 UdpAssociation {
                     state,
                     last_used: now,
+                    idle_after: if destination.port() == DNS_PORT {
+                        DNS_SOCKET_IDLE
+                    } else {
+                        UDP_IDLE
+                    },
                 },
             );
         }
@@ -732,12 +825,68 @@ impl Stack {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
+            UdpState::Direct { socket, .. } => {
+                if socket
+                    .send_to(&payload, SocketAddr::V4(destination))
+                    .is_ok()
+                {
+                    self.shared
+                        .counters
+                        .udp_sent
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
             UdpState::Refused { until } if now >= *until => {
                 self.udp.remove(&local_port);
                 self.send_udp(local_port, destination, payload);
             }
             UdpState::Refused { .. } => {
                 self.shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A pinned UDP socket for one local port, or a short refusal while the
+    /// adapter has none to give.
+    fn open_direct_udp(&mut self, local_port: u16) -> UdpState {
+        let Exit::Adapter(adapter) = &mut self.config.exit else {
+            unreachable!("only an adapter exit opens direct sockets");
+        };
+        let opened = adapter
+            .socket(socket2::Type::DGRAM)
+            .and_then(|(socket, claim)| {
+                let mut socket = UdpSocket::from_std(socket.into());
+                let token = Token(self.next_token);
+                self.poll
+                    .registry()
+                    .register(&mut socket, token, Interest::READABLE)
+                    .map_err(|error| error.to_string())?;
+                Ok((socket, token, claim))
+            });
+        match opened {
+            Ok((socket, token, claim)) => {
+                self.next_token = self.next_token.wrapping_add(1).max(1);
+                self.owners.insert(token, Owner::UdpData(local_port));
+                UdpState::Direct {
+                    socket,
+                    token,
+                    _claim: claim,
+                }
+            }
+            Err(error) => {
+                self.shared
+                    .counters
+                    .udp_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                if !self.udp_refusal_logged {
+                    self.udp_refusal_logged = true;
+                    log_warn!(
+                        "the adapter could not open a UDP socket ({error}); its UDP traffic is lost"
+                    );
+                }
+                UdpState::Refused {
+                    until: Instant::now() + ADAPTER_RETRY_AFTER,
+                }
             }
         }
     }
@@ -815,10 +964,9 @@ impl Stack {
         let upstream = match Upstream::dial(
             self.poll.registry(),
             token,
-            self.config.proxy,
+            &mut self.config.exit,
             Command::Connect,
             SocketAddrV4::new(resolver, DNS_PORT),
-            self.config.credentials.clone(),
         ) {
             Ok(upstream) => upstream,
             Err(_) => {
@@ -848,25 +996,52 @@ impl Stack {
         self.next_probe += 1;
         let id = self.next_probe;
         let token = self.token(Owner::Probe(id));
-        if let Ok(upstream) = Upstream::dial(
-            self.poll.registry(),
-            token,
-            self.config.proxy,
-            Command::Connect,
-            SocketAddrV4::new(self.config.probe_target, PROBE_PORT),
-            self.config.credentials.clone(),
-        ) {
-            self.probes.insert(
-                id,
-                Probe {
-                    upstream,
-                    request,
-                    dns: DnsProbe::new(),
-                    started: Instant::now(),
-                },
-            );
-        } else {
-            self.owners.remove(&token);
+        let target = SocketAddrV4::new(self.config.probe_target, PROBE_PORT);
+        let dns = DnsProbe::new();
+        let transport = match &mut self.config.exit {
+            exit @ Exit::Proxy { .. } => {
+                Upstream::dial(self.poll.registry(), token, exit, Command::Connect, target)
+                    .map(ProbeTransport::Stream)
+            }
+            Exit::Adapter(adapter) => {
+                adapter
+                    .socket(socket2::Type::DGRAM)
+                    .and_then(|(socket, claim)| {
+                        let mut socket = UdpSocket::from_std(socket.into());
+                        self.poll
+                            .registry()
+                            .register(&mut socket, token, Interest::READABLE)
+                            .map_err(|error| error.to_string())?;
+                        if let Err(error) = socket
+                            .connect(SocketAddr::V4(target))
+                            .and_then(|()| socket.send(dns.message()))
+                        {
+                            let _ = self.poll.registry().deregister(&mut socket);
+                            return Err(error.to_string());
+                        }
+                        Ok(ProbeTransport::Datagram {
+                            socket,
+                            token,
+                            _claim: claim,
+                        })
+                    })
+            }
+        };
+        match transport {
+            Ok(transport) => {
+                self.probes.insert(
+                    id,
+                    Probe {
+                        transport,
+                        request,
+                        dns,
+                        started: Instant::now(),
+                    },
+                );
+            }
+            Err(_) => {
+                self.owners.remove(&token);
+            }
         }
     }
 
@@ -890,13 +1065,15 @@ impl Stack {
     }
 
     fn udp_control_ready(&mut self, port: u16) {
-        let proxy = self.config.proxy;
+        let Exit::Proxy { address: proxy, .. } = self.config.exit else {
+            return;
+        };
         let Some(association) = self.udp.get_mut(&port) else {
             return;
         };
         let control = match &mut association.state {
             UdpState::Dialing { control, .. } | UdpState::Ready { control, .. } => control,
-            UdpState::Refused { .. } => return,
+            UdpState::Direct { .. } | UdpState::Refused { .. } => return,
         };
         control.flush();
         let (data, finished) = control.read(4096, &mut self.buffer);
@@ -991,8 +1168,28 @@ impl Stack {
         let client = SocketAddrV4::new(self.config.client, port);
         let mut replies = Vec::new();
         if let Some(UdpAssociation {
+            state: UdpState::Direct { socket, .. },
+            last_used,
+            ..
+        }) = self.udp.get_mut(&port)
+        {
+            loop {
+                match socket.recv_from(&mut self.buffer) {
+                    Ok((length, SocketAddr::V4(from))) => {
+                        *last_used = Instant::now();
+                        self.shared.upstream_activity.store(true, Ordering::Relaxed);
+                        replies.push(build_udp(from, client, &self.buffer[..length]));
+                    }
+                    Ok((_, SocketAddr::V6(_))) => {}
+                    // An ICMP error about an earlier datagram; the socket is fine.
+                    Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+                    Err(_) => break,
+                }
+            }
+        } else if let Some(UdpAssociation {
             state: UdpState::Ready { socket, .. },
             last_used,
+            ..
         }) = self.udp.get_mut(&port)
         {
             loop {
@@ -1130,27 +1327,17 @@ impl Stack {
         let Some(probe) = self.probes.get_mut(&id) else {
             return;
         };
-        probe.upstream.flush();
-        let (data, finished) = probe.upstream.read(65_537, &mut self.buffer);
-        let answered = if probe.upstream.handshake.is_some() {
-            match probe.upstream.advance(&data) {
-                Ok(Some((_, leftover))) => {
-                    // Local proxies can accept CONNECT while their upstream is
-                    // dead. Send DNS immediately so sing-box sniffs it as DNS.
-                    probe
-                        .upstream
-                        .outgoing
-                        .extend_from_slice(&probe.dns.framed());
-                    probe.upstream.flush();
-                    probe.dns.receive(&leftover)
-                }
-                Ok(None) => None,
-                Err(_) => Some(false),
+        let (answered, finished) = match &mut probe.transport {
+            ProbeTransport::Datagram { socket, .. } => match socket.recv(&mut self.buffer) {
+                Ok(length) => (Some(probe.dns.answers(&self.buffer[..length])), false),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => (None, false),
+                Err(_) => (Some(false), true),
+            },
+            ProbeTransport::Stream(upstream) => {
+                Self::probe_stream(upstream, &mut probe.dns, &mut self.buffer)
             }
-        } else {
-            probe.dns.receive(&data)
         };
-        if answered.is_none() && !finished && !probe.upstream.closed {
+        if answered.is_none() && !finished {
             return;
         }
         let reply = if answered == Some(true) {
@@ -1158,12 +1345,53 @@ impl Stack {
         } else {
             None
         };
-        if let Some(mut probe) = self.probes.remove(&id) {
-            probe.upstream.deregister(self.poll.registry());
-            self.owners.remove(&probe.upstream.token);
-        }
+        self.remove_probe(id);
         if let Some(reply) = reply {
             self.emit(reply);
+        }
+    }
+
+    /// Reads a probe's proxy stream: `(verdict, finished)`.
+    fn probe_stream(
+        upstream: &mut Upstream,
+        dns: &mut DnsProbe,
+        buffer: &mut [u8],
+    ) -> (Option<bool>, bool) {
+        upstream.flush();
+        let (data, finished) = upstream.read(65_537, buffer);
+        let answered = if upstream.handshake.is_some() {
+            match upstream.advance(&data) {
+                Ok(Some((_, leftover))) => {
+                    // Local proxies can accept CONNECT while their upstream is
+                    // dead. Send DNS immediately so sing-box sniffs it as DNS.
+                    upstream.outgoing.extend_from_slice(&dns.framed());
+                    upstream.flush();
+                    dns.receive(&leftover)
+                }
+                Ok(None) => None,
+                Err(_) => Some(false),
+            }
+        } else {
+            dns.receive(&data)
+        };
+        (answered, finished || upstream.closed)
+    }
+
+    fn remove_probe(&mut self, id: u64) {
+        let Some(probe) = self.probes.remove(&id) else {
+            return;
+        };
+        match probe.transport {
+            ProbeTransport::Stream(mut upstream) => {
+                upstream.deregister(self.poll.registry());
+                self.owners.remove(&upstream.token);
+            }
+            ProbeTransport::Datagram {
+                mut socket, token, ..
+            } => {
+                let _ = self.poll.registry().deregister(&mut socket);
+                self.owners.remove(&token);
+            }
         }
     }
 
@@ -1190,6 +1418,17 @@ impl Stack {
         let mut refused = Vec::new();
         for key in keys {
             let flow = self.tcp.get_mut(&key).unwrap();
+            if flow.upstream.connecting {
+                match flow.upstream.poll_connect() {
+                    Some(Ok(())) => accepted.push((key, Vec::new())),
+                    Some(Err(error)) => refused.push((key, error)),
+                    None if flow.started.elapsed() > DIAL_TIMEOUT => {
+                        refused.push((key, "the far end did not answer in time".to_owned()))
+                    }
+                    None => {}
+                }
+                continue;
+            }
             flow.upstream.flush();
             if flow.upstream.handshake.is_some() {
                 let (data, closed) = flow.upstream.read(4096, &mut self.buffer);
@@ -1323,6 +1562,12 @@ impl Stack {
                 let _ = self.poll.registry().deregister(&mut socket);
                 self.owners.remove(&token);
             }
+            UdpState::Direct {
+                mut socket, token, ..
+            } => {
+                let _ = self.poll.registry().deregister(&mut socket);
+                self.owners.remove(&token);
+            }
             UdpState::Refused { .. } => {}
         }
     }
@@ -1334,7 +1579,7 @@ impl Stack {
             .iter()
             .filter(|(_, association)| match association.state {
                 UdpState::Refused { until } => now >= until,
-                _ => now.duration_since(association.last_used) > UDP_IDLE,
+                _ => now.duration_since(association.last_used) > association.idle_after,
             })
             .map(|(port, _)| *port)
             .collect();
@@ -1384,10 +1629,7 @@ impl Stack {
             .map(|(id, _)| *id)
             .collect();
         for id in stale {
-            if let Some(mut probe) = self.probes.remove(&id) {
-                probe.upstream.deregister(self.poll.registry());
-                self.owners.remove(&probe.upstream.token);
-            }
+            self.remove_probe(id);
         }
     }
 
@@ -1398,8 +1640,9 @@ impl Stack {
         self.last_summary = Instant::now();
         let counters = &self.shared.counters;
         log_info!(
-            "SOCKS5 stack: tcp open={} opened={} refused={} cancelled={} udp assoc={} sent={} refused={} \
+            "{} stack: tcp open={} opened={} refused={} cancelled={} udp assoc={} sent={} refused={} \
              dns answered={} failed={} dropped={} turns={}",
+            self.config.exit.label(),
             self.tcp.len(),
             counters.tcp_opened.load(Ordering::Relaxed),
             counters.tcp_refused.load(Ordering::Relaxed),
@@ -1423,8 +1666,9 @@ impl Stack {
         for (_, mut dns) in self.dns.drain() {
             dns.upstream.deregister(self.poll.registry());
         }
-        for (_, mut probe) in self.probes.drain() {
-            probe.upstream.deregister(self.poll.registry());
+        let probes: Vec<u64> = self.probes.keys().copied().collect();
+        for id in probes {
+            self.remove_probe(id);
         }
         self.udp.clear();
     }
@@ -1509,6 +1753,8 @@ mod tests {
             stream,
             token: Token(1),
             handshake: None,
+            connecting: false,
+            _claim: None,
             outgoing: Vec::new(),
             connected: false,
             read_pending: true,

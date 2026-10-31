@@ -11,6 +11,8 @@ use std::time::Duration;
 pub const KIND_WIREGUARD: &str = "wireguard";
 pub const KIND_SOCKS5: &str = "socks5";
 pub const KIND_L2TP: &str = "l2tp";
+/// Another VPN app's adapter; see [`crate::vpn_adapter`].
+pub const KIND_ADAPTER: &str = "adapter";
 /// Only the client speaks OpenVPN. The relay links this crate for its frame and
 /// session types and is built without the feature, so the kind is gated with it.
 #[cfg(feature = "openvpn")]
@@ -77,6 +79,14 @@ pub enum NodeSpec {
         #[serde(default)]
         label: Option<String>,
     },
+    /// Another VPN app's connected adapter, found by name each time a socket
+    /// opens. It carries whatever that app's own transport carries.
+    #[serde(rename = "adapter")]
+    Adapter {
+        adapter: String,
+        #[serde(default)]
+        label: Option<String>,
+    },
     /// L2TP/IPsec credentials are consumed by the privileged service. It then
     /// attaches the temporary profile and coordinates of the connected Windows
     /// RAS adapter so a relay worker can recover it after a drop.
@@ -131,6 +141,7 @@ impl NodeSpec {
             Self::WireGuard { .. } => KIND_WIREGUARD,
             Self::Socks5 { .. } => KIND_SOCKS5,
             Self::L2tp { .. } => KIND_L2TP,
+            Self::Adapter { .. } => KIND_ADAPTER,
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => KIND_OPENVPN,
         }
@@ -147,6 +158,9 @@ impl NodeSpec {
                 &self.socks5_config().ok_or("node is not a SOCKS5 node")?,
                 relay,
             )?)),
+            Self::Adapter { adapter, .. } => Ok(Box::new(
+                crate::vpn_adapter::AdapterRelayPath::open(adapter, relay)?,
+            )),
             Self::L2tp {
                 dial_error: Some(error),
                 ..
@@ -229,6 +243,13 @@ impl NodeSpec {
                 .socks5_config()
                 .ok_or("node is not a SOCKS5 node")?
                 .validate(),
+            Self::Adapter { adapter, .. } => {
+                if adapter.trim().is_empty() {
+                    Err("network adapter node is missing the adapter's name".into())
+                } else {
+                    Ok(())
+                }
+            }
             Self::L2tp {
                 server,
                 username,
@@ -275,8 +296,7 @@ impl NodeSpec {
         match self {
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => None,
-            Self::WireGuard { .. } => None,
-            Self::L2tp { .. } => None,
+            Self::WireGuard { .. } | Self::L2tp { .. } | Self::Adapter { .. } => None,
             Self::Socks5 {
                 host,
                 port,
@@ -302,7 +322,7 @@ impl NodeSpec {
             Self::OpenVpn { config, .. } => crate::openvpn::OpenVpnConfig::parse(config)
                 .ok()
                 .map(|parsed| parsed.tun_mtu),
-            Self::Socks5 { .. } | Self::L2tp { .. } => None,
+            Self::Socks5 { .. } | Self::L2tp { .. } | Self::Adapter { .. } => None,
         }?;
         crate::mtu::configured_tunnel_mtu(value)
     }
@@ -311,8 +331,7 @@ impl NodeSpec {
     /// loopback and never enters the tunnel, but whatever it forwards to does.
     pub fn is_loopback_proxy(&self) -> bool {
         match self {
-            Self::WireGuard { .. } => false,
-            Self::L2tp { .. } => false,
+            Self::WireGuard { .. } | Self::L2tp { .. } | Self::Adapter { .. } => false,
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => false,
             Self::Socks5 { host, .. } => {
@@ -325,9 +344,24 @@ impl NodeSpec {
         }
     }
 
+    /// Whether the node's own connection leaves this PC through the routing
+    /// table: a proxy here, reached over loopback or at one of this PC's own
+    /// addresses (Windscribe's gateway listens on the LAN address), or the VPN
+    /// app behind an adapter. All-traffic mode would capture that connection
+    /// and loop it back into the node.
+    pub fn exits_through_this_pc(&self) -> bool {
+        match self {
+            Self::Adapter { .. } => true,
+            Self::Socks5 { host, .. } => self.is_loopback_proxy() || is_this_pc(host),
+            _ => false,
+        }
+    }
+
     pub fn label(&self) -> Option<String> {
         let label = match self {
-            Self::WireGuard { label, .. } | Self::Socks5 { label, .. } => label.as_deref()?,
+            Self::WireGuard { label, .. }
+            | Self::Socks5 { label, .. }
+            | Self::Adapter { label, .. } => label.as_deref()?,
             Self::L2tp { label, .. } => label.as_deref()?,
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { label, .. } => label.as_deref()?,
@@ -342,6 +376,7 @@ impl NodeSpec {
             Self::WireGuard { .. } => format!("WireGuard route {route}"),
             Self::Socks5 { .. } => format!("SOCKS5 route {route}"),
             Self::L2tp { .. } => format!("L2TP route {route}"),
+            Self::Adapter { .. } => format!("Adapter route {route}"),
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => format!("OpenVPN route {route}"),
         }
@@ -376,14 +411,34 @@ impl NodeSpec {
                 )?,
             ))),
             // The VPN terminates captured traffic in a stack of its own and
-            // replays it through the proxy; game traffic cannot be treated so.
+            // replays it through the proxy or adapter; game traffic cannot be
+            // treated so.
             #[cfg(all(windows, feature = "socks-server"))]
             Self::Socks5 { .. } if crate::role::Role::current() == crate::role::Role::Vpn => {
-                Ok(DirectPath::Socks5(Box::new(crate::tun2socks::Socks5Stack::open(
-                    &self.socks5_config().ok_or("node is not a SOCKS5 node")?,
-                    crate::BENCHMARK_TARGET,
-                )?)))
+                Ok(DirectPath::Forwarding(Box::new(
+                    crate::tun2socks::ForwardingStack::open_socks5(
+                        &self.socks5_config().ok_or("node is not a SOCKS5 node")?,
+                        crate::BENCHMARK_TARGET,
+                    )?,
+                )))
             }
+            #[cfg(all(windows, feature = "socks-server"))]
+            Self::Adapter { adapter, .. }
+                if crate::role::Role::current() == crate::role::Role::Vpn =>
+            {
+                Ok(DirectPath::Forwarding(Box::new(
+                    crate::tun2socks::ForwardingStack::open_adapter(
+                        adapter,
+                        crate::BENCHMARK_TARGET,
+                    )?,
+                )))
+            }
+            Self::Adapter { .. } => Err(
+                "a network adapter node cannot carry a direct game session, because game \
+                 traffic would have to be re-sent rather than routed. Use it in relay mode, \
+                 or as a VPN node."
+                    .into(),
+            ),
             Self::Socks5 { .. } => Err(
                 "a SOCKS5 proxy cannot carry a direct session on its own. Use a WireGuard, \
                  OpenVPN or L2TP/IPsec node for direct mode, or set up a relay to reach this proxy through."
@@ -407,7 +462,7 @@ impl NodeSpec {
             Self::L2tp { .. } => true,
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => true,
-            Self::Socks5 { .. } => false,
+            Self::Socks5 { .. } | Self::Adapter { .. } => false,
         }
     }
 
@@ -416,6 +471,7 @@ impl NodeSpec {
             Self::WireGuard { .. } => "WireGuard configuration".to_owned(),
             Self::Socks5 { host, port, .. } => format!("SOCKS5 proxy {host}:{port}"),
             Self::L2tp { server, .. } => format!("L2TP/IPsec server {server}"),
+            Self::Adapter { adapter, .. } => format!("network adapter {}", adapter.trim()),
             #[cfg(feature = "openvpn")]
             Self::OpenVpn { .. } => "OpenVPN configuration".to_owned(),
         }
@@ -461,6 +517,7 @@ impl NodeSpec {
             }
             Self::Socks5 { .. } if self.is_loopback_proxy() => Vec::new(),
             Self::Socks5 { host, port, .. } => resolve_all_ipv4((host.trim(), *port)),
+            Self::Adapter { .. } => Vec::new(),
             Self::L2tp {
                 server, runtime, ..
             } => {
@@ -483,6 +540,22 @@ impl NodeSpec {
         addresses.dedup();
         addresses
     }
+}
+
+/// A literal IPv4 address assigned to one of this PC's interfaces.
+#[cfg(windows)]
+fn is_this_pc(host: &str) -> bool {
+    host.trim().parse::<Ipv4Addr>().is_ok_and(|address| {
+        crate::netconfig::interface_index_for_address(address)
+            .ok()
+            .flatten()
+            .is_some()
+    })
+}
+
+#[cfg(not(windows))]
+fn is_this_pc(_host: &str) -> bool {
+    false
 }
 
 fn resolve_all_ipv4(target: impl std::net::ToSocketAddrs) -> Vec<Ipv4Addr> {
@@ -514,6 +587,8 @@ pub enum PathIdentity {
     /// Two tunnels to the same L2TP server share the same provider path and do
     /// not add useful redundancy, even when Windows assigns distinct adapters.
     L2tp { server: Ipv4Addr },
+    /// Two nodes naming one adapter leave through the same connection.
+    Adapter { name: String },
     /// The same provider account reached at the same server: the second session
     /// commonly displaces the first.
     #[cfg(feature = "openvpn")]
@@ -773,14 +848,15 @@ pub enum DirectPath {
     WireGuard(Box<DirectWireGuardPath>),
     #[cfg(feature = "openvpn")]
     OpenVpn(Box<UserSpaceOpenVpnPath>),
+    /// A SOCKS5 proxy or another VPN's adapter, behind a stack in this process.
     #[cfg(all(windows, feature = "socks-server"))]
-    Socks5(Box<crate::tun2socks::Socks5Stack>),
+    Forwarding(Box<crate::tun2socks::ForwardingStack>),
 }
 
 impl DirectPath {
     pub fn take_upstream_activity(&self) -> bool {
         #[cfg(all(windows, feature = "socks-server"))]
-        if let Self::Socks5(path) = self {
+        if let Self::Forwarding(path) = self {
             return path.take_upstream_activity();
         }
         false
@@ -825,6 +901,16 @@ impl DirectPath {
         false
     }
 
+    /// Whether the path ends in a stack in this process rather than a network,
+    /// so only a probe it actually forwarded shows the far side answers.
+    pub fn terminates_locally(&self) -> bool {
+        #[cfg(all(windows, feature = "socks-server"))]
+        if let Self::Forwarding(_) = self {
+            return true;
+        }
+        false
+    }
+
     /// Health probes must survive the stream queue's realtime shedding.
     pub fn send_probe(&mut self, packet: &[u8]) -> Result<(), String> {
         match self {
@@ -832,7 +918,7 @@ impl DirectPath {
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(path) => path.send_probe(packet),
             #[cfg(all(windows, feature = "socks-server"))]
-            Self::Socks5(path) => path.send_packet(packet),
+            Self::Forwarding(path) => path.send_packet(packet),
         }
     }
 
@@ -842,7 +928,7 @@ impl DirectPath {
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(_) => KIND_OPENVPN,
             #[cfg(all(windows, feature = "socks-server"))]
-            Self::Socks5(_) => KIND_SOCKS5,
+            Self::Forwarding(path) => path.kind(),
         }
     }
 
@@ -854,7 +940,7 @@ impl DirectPath {
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(path) => path.address(),
             #[cfg(all(windows, feature = "socks-server"))]
-            Self::Socks5(path) => path.address(),
+            Self::Forwarding(path) => path.address(),
         }
     }
 
@@ -864,7 +950,7 @@ impl DirectPath {
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(path) => path.endpoint(),
             #[cfg(all(windows, feature = "socks-server"))]
-            Self::Socks5(path) => path.endpoint(),
+            Self::Forwarding(path) => path.endpoint(),
         }
     }
 
@@ -879,7 +965,7 @@ impl DirectPath {
                 IpAddr::V6(_) => None,
             },
             #[cfg(all(windows, feature = "socks-server"))]
-            Self::Socks5(path) => path.bypass_ipv4(),
+            Self::Forwarding(path) => path.bypass_ipv4(),
         }
     }
 
@@ -892,7 +978,7 @@ impl DirectPath {
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(path) => path.handshake_latency_ms(),
             #[cfg(all(windows, feature = "socks-server"))]
-            Self::Socks5(path) => path.handshake_latency_ms(),
+            Self::Forwarding(path) => path.handshake_latency_ms(),
         }
     }
 
@@ -902,7 +988,7 @@ impl DirectPath {
             #[cfg(feature = "openvpn")]
             Self::OpenVpn(path) => path.send_inner(packet),
             #[cfg(all(windows, feature = "socks-server"))]
-            Self::Socks5(path) => path.send_packet(packet),
+            Self::Forwarding(path) => path.send_packet(packet),
         }
     }
 
@@ -922,7 +1008,7 @@ impl DirectPath {
                 Ok(packets)
             }
             #[cfg(all(windows, feature = "socks-server"))]
-            Self::Socks5(path) => path.receive_packets(timeout),
+            Self::Forwarding(path) => path.receive_packets(timeout),
         }
     }
 }
@@ -1244,6 +1330,13 @@ mod tests {
             }
             .is_loopback_proxy()
         );
+        // A gateway on this PC's own LAN address is just as local.
+        assert!(socks5_node("127.0.0.1").exits_through_this_pc());
+        assert!(!socks5_node("203.0.113.8").exits_through_this_pc());
+        #[cfg(windows)]
+        if let Some(local) = crate::netconfig::ipv4_interfaces().first() {
+            assert!(socks5_node(&local.address.to_string()).exits_through_this_pc());
+        }
     }
 
     #[test]

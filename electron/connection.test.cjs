@@ -63,6 +63,15 @@ test('a proxy is refused with the reason and the alternative', () => {
   assert.match(error, /Choose a WireGuard, OpenVPN or L2TP node/)
 })
 
+test('another VPN app’s adapter needs a relay for game traffic too', () => {
+  const { node, error } = directNodeSelection([{ id: 'w', kind: 'adapter', name: 'Windscribe', enabled: true }])
+  assert.equal(node, null)
+  assert.match(error, /^Windscribe is another VPN app's adapter/)
+  assert.match(error, /relay/)
+  const adapter = { id: 'w', kind: 'adapter', name: 'Windscribe', enabled: true, groupId: null }
+  assert.equal(directSelectionAfterSwitch([adapter, wireguard('a', false)]), 'a')
+})
+
 test('switching to direct mode keeps an already enabled tunnelling node', () => {
   const tunnels = [proxy('p', true), wireguard('a', false), wireguard('b', true)]
   assert.equal(directSelectionAfterSwitch(tunnels), 'b')

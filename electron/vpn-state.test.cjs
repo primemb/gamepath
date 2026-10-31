@@ -16,6 +16,7 @@ const {
   createRule,
   ruleConflicts,
   activeGameRules,
+  trafficModeLimitation,
 } = require('./vpn-state.cjs')
 
 const wireguard = { id: 'vpn-node', kind: 'wireguard', name: 'Home', endpoint: 'vpn.example:51820' }
@@ -198,4 +199,15 @@ test('a rule is judged by the node it is assigned, not the default node', () => 
   const vpn = threeNodes([{ id: 'chat', kind: 'application', value: 'C:\\Apps\\chat.exe', nodeId: 'office' }])
   assert.match(assignedLimitation(vpn, vpn.rules[0]), /cannot select applications/)
   assert.equal(assignedLimitation(vpn, { ...vpn.rules[0], nodeId: 'proxy' }), null)
+})
+
+test('a node that leaves through this PC carries selected targets only', () => {
+  const adapter = { kind: 'adapter', name: 'Windscribe', adapter: 'Windscribe' }
+  const localProxy = { kind: 'socks5', name: 'Throne', host: '127.0.0.1', port: 2080 }
+  const remoteProxy = { kind: 'socks5', name: 'Remote', host: 'proxy.example', port: 1080 }
+  assert.match(trafficModeLimitation(adapter, 'all'), /^Windscribe runs on this PC/)
+  assert.match(trafficModeLimitation(localProxy, 'all'), /split-tunnel mode/)
+  assert.equal(trafficModeLimitation(adapter, 'split'), null)
+  assert.equal(trafficModeLimitation(remoteProxy, 'all'), null)
+  assert.equal(trafficModeLimitation(null, 'all'), null)
 })

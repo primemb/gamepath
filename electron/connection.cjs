@@ -66,6 +66,12 @@ function directNodeSelection(enabledTunnels) {
       error: `${node.name} is a SOCKS5 proxy, which needs a relay to forward to. Choose a WireGuard, OpenVPN or L2TP node for direct mode, or set up a relay.`,
     }
   }
+  if (node.kind === 'adapter') {
+    return {
+      node: null,
+      error: `${node.name} is another VPN app's adapter, which carries game traffic only through a relay. Choose a WireGuard, OpenVPN or L2TP node for direct mode, set up a relay, or use the adapter as a VPN node.`,
+    }
+  }
   return { node, error: null }
 }
 
@@ -84,7 +90,7 @@ function directNodeSelection(enabledTunnels) {
  */
 function directSelectionAfterSwitch(tunnels, groups = []) {
   const enabledGroupIds = new Set(groups.filter((group) => group.enabled).map((group) => group.id))
-  const usable = (tunnel) => tunnel.kind !== 'socks5'
+  const usable = (tunnel) => tunnel.kind !== 'socks5' && tunnel.kind !== 'adapter'
   const reachable = (tunnel) => !tunnel.groupId || enabledGroupIds.has(tunnel.groupId)
   const chosen =
     tunnels.find((tunnel) => tunnel.enabled && usable(tunnel) && reachable(tunnel)) ??

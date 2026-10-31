@@ -197,7 +197,7 @@ struct App {
     iface: Interface,
     device: AppDevice,
     sockets: SocketSet<'static>,
-    stack: Socks5Stack,
+    stack: ForwardingStack,
     /// Packets that came back and were not TCP, for the raw tests.
     other: Vec<Vec<u8>>,
 }
@@ -210,7 +210,10 @@ impl App {
             username: None,
             password: None,
         };
-        let stack = Socks5Stack::open(&config, RESOLVER).unwrap();
+        Self::over(ForwardingStack::open_socks5(&config, RESOLVER).unwrap())
+    }
+
+    fn over(stack: ForwardingStack) -> Self {
         let mut device = AppDevice {
             rx: VecDeque::new(),
             tx: Vec::new(),
@@ -656,7 +659,9 @@ fn a_proxy_that_refuses_the_login_is_reported_when_the_path_opens() {
         username: None,
         password: None,
     };
-    let error = Socks5Stack::open(&config, RESOLVER).err().unwrap();
+    let error = ForwardingStack::open_socks5(&config, RESOLVER)
+        .err()
+        .unwrap();
     assert!(
         error.contains("authentication") || error.contains("method"),
         "{error}"
@@ -768,4 +773,88 @@ fn a_proxy_test_logs_in_and_reaches_out_through_it() {
         .err()
         .unwrap();
     assert!(error.contains("connection refused"), "{error}");
+}
+
+/// Loopback stands in for another VPN's adapter: a real interface the
+/// stack's sockets are bound and pinned to, with echo servers behind it.
+fn loopback_adapter() -> crate::vpn_adapter::Adapter {
+    crate::vpn_adapter::Adapter {
+        name: "Loopback".into(),
+        address: Ipv4Addr::LOCALHOST,
+        interface_index: 1,
+    }
+}
+
+#[test]
+fn an_adapter_exit_carries_tcp_and_udp_from_sockets_capture_leaves_alone() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0_u8; 64];
+        let read = stream.read(&mut buffer).unwrap();
+        stream.write_all(&buffer[..read]).unwrap();
+        thread::sleep(Duration::from_millis(500));
+    });
+    let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_port = echo.local_addr().unwrap().port();
+    let (seen_tx, seen_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 64];
+        let (length, from) = echo.recv_from(&mut buffer).unwrap();
+        let std::net::SocketAddr::V4(from) = from else {
+            unreachable!()
+        };
+        seen_tx.send(from).unwrap();
+        echo.send_to(&buffer[..length], from).unwrap();
+    });
+
+    let mut app = App::over(ForwardingStack::on_adapter(loopback_adapter(), RESOLVER));
+    let mut socket = tcp_socket();
+    socket
+        .connect(
+            app.iface.context(),
+            (IpAddress::Ipv4(Ipv4Addr::LOCALHOST), tcp_port),
+            40_100,
+        )
+        .unwrap();
+    let handle = app.sockets.add(socket);
+    assert!(app.until(|app| app.sockets.get::<tcp::Socket>(handle).may_send()));
+    app.sockets
+        .get_mut::<tcp::Socket>(handle)
+        .send_slice(b"through the adapter")
+        .unwrap();
+    let mut echoed = Vec::new();
+    assert!(app.until(|app| {
+        let socket = app.sockets.get_mut::<tcp::Socket>(handle);
+        let mut buffer = [0_u8; 64];
+        while let Ok(read) = socket.recv_slice(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            echoed.extend_from_slice(&buffer[..read]);
+        }
+        echoed == b"through the adapter"
+    }));
+
+    let server = SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp_port);
+    let client = SocketAddrV4::new(CLIENT_ADDRESS, 41_100);
+    app.stack
+        .send_packet(&build_udp(client, server, b"ping"))
+        .unwrap();
+    assert!(app.until(|app| {
+        app.other.iter().any(|packet| {
+            let ip = parse_ipv4(packet).unwrap();
+            let udp = parse_udp(ip.payload).unwrap();
+            ip.source == *server.ip()
+                && udp.source_port == server.port()
+                && udp.destination_port == client.port()
+                && udp.payload == b"ping"
+        })
+    }));
+    assert!(app.stack.take_upstream_activity());
+    // The datagram left from a socket the stack claimed, so capture would
+    // never select it back into the stack.
+    let sent_from = seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(is_exit_socket(17, sent_from));
 }

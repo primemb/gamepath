@@ -183,6 +183,47 @@ pub fn bind_to_interface(
     ))
 }
 
+/// Whether a send error means this socket can never carry anything again.
+///
+/// A socket bound to a VPN adapter's address and pinned to its interface with
+/// `IP_UNICAST_IF` (the L2TP relay socket, an adapter node's sockets). When
+/// Windows tears that adapter down - which happens on every L2TP redial, and
+/// whenever another VPN app reconnects - the socket
+/// outlives it and every send fails from then on. That is a different thing
+/// from a datagram being dropped, and it needs a different answer: no probe
+/// will succeed either, so waiting for three of them to time out only buys the
+/// user three seconds of traffic pushed into a socket that cannot carry it.
+///
+/// Observed live as `WSAEINVAL` (10022), reported to the user as "L2TP relay
+/// send failed: An invalid argument was supplied".
+///
+/// The list is deliberately short. `WSAECONNRESET` and `WSAEHOSTUNREACH` are
+/// left out because Windows raises those from an ICMP message about an earlier
+/// datagram - the socket is fine and the next send may well work, which is the
+/// same reason [`crate::socks5`] swallows them on receive.
+#[cfg(windows)]
+pub fn is_interface_gone(error: &std::io::Error) -> bool {
+    /// The bound local address no longer exists.
+    const WSAEINVAL: i32 = 10022;
+    /// The handle is no longer a socket.
+    const WSAENOTSOCK: i32 = 10038;
+    /// The interface underneath it was removed.
+    const WSAEADDRNOTAVAIL: i32 = 10049;
+    /// The network subsystem or that interface has gone down.
+    const WSAENETDOWN: i32 = 10050;
+    /// The connection was broken by the interface being reset.
+    const WSAENETRESET: i32 = 10052;
+    matches!(
+        error.raw_os_error(),
+        Some(WSAEINVAL | WSAENOTSOCK | WSAEADDRNOTAVAIL | WSAENETDOWN | WSAENETRESET)
+    )
+}
+
+#[cfg(not(windows))]
+pub fn is_interface_gone(_error: &std::io::Error) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -317,5 +358,33 @@ mod tests {
             crypto.open_client(&frames[0]).unwrap(),
             (header, b"private-game-packet".to_vec())
         );
+    }
+
+    /// The distinction the whole flag rests on: some send errors mean the
+    /// socket is finished, and most do not.
+    #[cfg(windows)]
+    #[test]
+    fn a_vanished_adapter_is_fatal_but_an_icmp_reply_is_not() {
+        use super::is_interface_gone;
+        use std::io::Error;
+
+        // What a user actually saw, reported as "L2TP relay send failed: An
+        // invalid argument was supplied": the RAS adapter went away underneath
+        // a socket still bound to its address.
+        assert!(is_interface_gone(&Error::from_raw_os_error(10022)));
+        assert!(is_interface_gone(&Error::from_raw_os_error(10038)));
+        assert!(is_interface_gone(&Error::from_raw_os_error(10049)));
+        assert!(is_interface_gone(&Error::from_raw_os_error(10050)));
+        assert!(is_interface_gone(&Error::from_raw_os_error(10052)));
+
+        // Windows raises these from an ICMP message about a datagram already
+        // sent. The socket is fine and the next send may well succeed, so
+        // tearing the path down for one would be the more expensive mistake.
+        assert!(!is_interface_gone(&Error::from_raw_os_error(10054)));
+        assert!(!is_interface_gone(&Error::from_raw_os_error(10065)));
+        assert!(!is_interface_gone(&Error::from_raw_os_error(10051)));
+
+        // An error carrying no OS code cannot be classified, so it is not.
+        assert!(!is_interface_gone(&Error::other("no code")));
     }
 }

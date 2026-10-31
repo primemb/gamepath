@@ -733,7 +733,7 @@ struct Registry {
     /// such an address reaches nothing but a proxy.
     fake_ip_node: Option<u8>,
     /// The proxies' own processes, when they run on this machine.
-    proxies: Vec<crate::proxy_identity::ProxyIdentity>,
+    proxies: Vec<(u8, crate::proxy_identity::ProxyIdentity)>,
     /// See `PacketCaptureRequest::own_hostnames`.
     own_hostnames: HashSet<String>,
     /// The hostname rule each address was learned for, so a connection it
@@ -890,6 +890,27 @@ impl Registry {
     fn is_proxy_node(&self, node: u8) -> bool {
         self.proxy_nodes & 1_u64.checked_shl(u32::from(node)).unwrap_or(0) != 0
     }
+
+    fn is_proxy_upstream(&self, node: u8, fields: Ipv4Fields) -> bool {
+        is_proxy_upstream(&self.proxies, node, fields)
+    }
+}
+
+fn is_proxy_upstream(
+    proxies: &[(u8, crate::proxy_identity::ProxyIdentity)],
+    node: u8,
+    fields: Ipv4Fields,
+) -> bool {
+    fields.protocol == 6
+        && proxies.iter().any(|(proxy_node, proxy)| {
+            *proxy_node == node
+                && proxy.owns_tcp_flow(
+                    fields.source,
+                    fields.source_port,
+                    fields.destination,
+                    fields.destination_port,
+                )
+        })
 }
 
 /// Session choices a split capture is started with, beyond its rules.
@@ -1148,7 +1169,12 @@ impl SplitPacketCapture {
             fake_ip_node,
             proxies: proxies
                 .iter()
-                .filter_map(|(_, proxy)| crate::proxy_identity::ProxyIdentity::for_endpoint(*proxy))
+                .filter_map(|(node, proxy)| {
+                    Some((
+                        *node,
+                        crate::proxy_identity::ProxyIdentity::for_endpoint(*proxy)?,
+                    ))
+                })
                 .collect(),
             own_hostnames: own_hostnames
                 .iter()
@@ -1602,7 +1628,7 @@ fn close_preexisting_connections(
     let carried = return_paths.lock().unwrap();
     let mut paths: HashMap<u32, Option<String>> = HashMap::new();
     let mut closed = 0;
-    for connection in crate::tcp_reset::established() {
+    for connection in crate::tcp_reset::connections() {
         let fields = Ipv4Fields {
             source: *connection.local.ip(),
             destination: *connection.remote.ip(),
@@ -1615,12 +1641,22 @@ fn close_preexisting_connections(
         {
             continue;
         }
-        let by_process = paths
+        let owner = paths
             .entry(connection.process_id)
             .or_insert_with(|| process_path(connection.process_id))
-            .as_deref()
-            .is_some_and(|path| path_matches(path, &registry.applications, &registry.folders));
-        if (by_process || table.lookup(fields).is_some()) && crate::tcp_reset::close(&connection) {
+            .as_deref();
+        let by_process =
+            owner.is_some_and(|path| path_matches(path, &registry.applications, &registry.folders));
+        let selected = table.lookup(fields);
+        let node = selected.map_or_else(
+            || owner.map_or(0, |path| registry.targets.for_path(path)),
+            |found| found.node,
+        );
+        if (by_process || selected.is_some())
+            && !registry.is_proxy_upstream(node, fields)
+            && !is_exit_socket(fields)
+            && crate::tcp_reset::close(&connection)
+        {
             closed += 1;
         }
     }
@@ -1826,7 +1862,15 @@ fn run_selected_capture(
             && registry.is_direct(fields.destination);
         let mut application = application;
         let mut uncertain_dns_owner = false;
-        if !selected && matches!(fields.protocol, 6 | 17) && fields.destination_port == 53 {
+        // A socket an adapter node opened is already leaving through that
+        // node's VPN; selected again, it would loop back into the stack. It
+        // belongs to no application, so no socket table is searched for it.
+        let exit_socket = is_exit_socket(fields);
+        if !selected
+            && !exit_socket
+            && matches!(fields.protocol, 6 | 17)
+            && fields.destination_port == 53
+        {
             match dns_socket_process(fields) {
                 Some((pid, path))
                     if path_matches(&path, &registry.applications, &registry.folders) =>
@@ -1856,6 +1900,7 @@ fn run_selected_capture(
         // Resolve ownership before that first datagram can leave directly.
         if !selected
             && !direct
+            && !exit_socket
             && fields.protocol == 17
             && (!registry.applications.is_empty() || !registry.folders.is_empty())
             && (crate::netutil::is_globally_routable_ipv4(fields.destination)
@@ -1907,14 +1952,25 @@ fn run_selected_capture(
         let question = lookup_name(packet, fields);
         // GamePath resolving its own nodes: left exactly as it would go with
         // this session off, whichever session's capture sees it first.
-        let own_lookup = registry.proxies.iter().any(|proxy| {
-            matches!(fields.protocol, 6 | 17)
-                && fields.destination_port == 53
-                && proxy.owns_port(fields.protocol, fields.source_port)
-        }) || (question
-            .as_deref()
-            .is_some_and(|name| registry.own_hostnames.contains(name))
-            && !registry.lookup_is_from_an_application(fields.protocol, fields.source_port));
+        let own_lookup = exit_socket
+            || (fields.destination_port == 53
+                && registry
+                    .proxies
+                    .iter()
+                    .any(|(_, proxy)| match fields.protocol {
+                        6 => proxy.owns_tcp_flow(
+                            fields.source,
+                            fields.source_port,
+                            fields.destination,
+                            fields.destination_port,
+                        ),
+                        17 => proxy.owns_udp_port(fields.source_port),
+                        _ => false,
+                    }))
+            || (question
+                .as_deref()
+                .is_some_and(|name| registry.own_hostnames.contains(name))
+                && !registry.lookup_is_from_an_application(fields.protocol, fields.source_port));
         let rule_selected = selected;
         // Discord and Chrome resolve with their own DNS client. Taken here, a
         // VPN app's lookups went out through the game's tunnel, and a game
@@ -2015,7 +2071,13 @@ fn run_selected_capture(
         }
         // CONNECT and the first TCP SYN can run on different scheduler threads.
         // Briefly hold only an unmatched SYN so the socket observer can classify it.
-        if !selected && !direct && !dns_packet && first_fragment.is_none() && is_tcp_syn(packet) {
+        if !selected
+            && !direct
+            && !dns_packet
+            && !exit_socket
+            && first_fragment.is_none()
+            && is_tcp_syn(packet)
+        {
             if let Some((matched_process_id, path)) =
                 tcp_socket_process(fields, &registry.applications, &registry.folders)
             {
@@ -2063,6 +2125,12 @@ fn run_selected_capture(
                 }
                 continue;
             }
+        }
+        // A local proxy's upstream sockets must not be sent back into that
+        // same proxy when an IP or hostname rule matches their destination,
+        // nor an adapter node's sockets into any node.
+        if selected && (exit_socket || (!dns_packet && registry.is_proxy_upstream(node, fields))) {
+            selected = false;
         }
         // A rule says which traffic the user wants carried; it cannot say the
         // relay is able to carry it. A private, link-local or multicast
@@ -2706,6 +2774,10 @@ fn run_pending_syns(
         }
         let table = selector_table(&registry);
         if let Some(found) = table.lookup(item.fields) {
+            if registry.is_proxy_upstream(found.node, item.fields) {
+                send_bypass(&handle, &registry, &item.packet, &item.address);
+                continue;
+            }
             route_selected_packet(
                 &handle,
                 &mut sender,
@@ -3744,6 +3816,21 @@ fn destination_label(registry: &Registry, address: Ipv4Addr) -> Option<Arc<str>>
         .cloned()
 }
 
+/// See [`gamepath_engine::tun2socks::is_exit_socket`].
+#[cfg(feature = "socks-server")]
+fn is_exit_socket(fields: Ipv4Fields) -> bool {
+    matches!(fields.protocol, 6 | 17)
+        && gamepath_engine::tun2socks::is_exit_socket(
+            fields.protocol,
+            std::net::SocketAddrV4::new(fields.source, fields.source_port),
+        )
+}
+
+#[cfg(not(feature = "socks-server"))]
+fn is_exit_socket(_fields: Ipv4Fields) -> bool {
+    false
+}
+
 fn bypass_clause(addresses: &[Ipv4Addr]) -> String {
     let parts = addresses
         .iter()
@@ -3993,6 +4080,31 @@ fn hostname_matches(name: &str, target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn proxy_upstream_bypasses_only_its_own_node() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy =
+            crate::proxy_identity::ProxyIdentity::for_endpoint(listener.local_addr().unwrap())
+                .unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let fields = Ipv4Fields {
+            source: Ipv4Addr::LOCALHOST,
+            destination: Ipv4Addr::LOCALHOST,
+            protocol: 6,
+            source_port: stream.local_addr().unwrap().port(),
+            destination_port: listener.local_addr().unwrap().port(),
+        };
+        let proxies = [(1, proxy)];
+        assert!(is_proxy_upstream(&proxies, 1, fields));
+        assert!(!is_proxy_upstream(&proxies, 0, fields));
+        let other = Ipv4Fields {
+            destination_port: fields.destination_port.wrapping_add(1),
+            ..fields
+        };
+        assert!(!is_proxy_upstream(&proxies, 1, other));
+    }
 
     #[test]
     fn only_lsass_certificate_checks_over_http_are_carried() {

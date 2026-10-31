@@ -7,6 +7,7 @@ import { RelayCard } from '../components/connection/RelayCard'
 import { errorMessage, type Notify } from '../components/Toast'
 import { AddRelayModal, RelayModal } from '../modals/RelayModal'
 import { VpsModal } from '../modals/VpsModal'
+import { needsRelay } from '../lib/nodes'
 import { RelayShareModal } from '../modals/RelayShareModal'
 import { RelayImportModal } from '../modals/RelayImportModal'
 import { RelayAccessModal } from '../modals/RelayAccessModal'
@@ -40,7 +41,7 @@ export function ConnectionView({
   const direct = state.connectionMode === 'direct'
   // Every tunnelling kind routes packets itself, so each can be the single hop
   // of a direct session; a proxy cannot.
-  const routingNodes = state.tunnels.filter((item) => item.kind !== 'socks5').length
+  const routingNodes = state.tunnels.filter((item) => !needsRelay(item.kind)).length
   // Point at the mode the user's current setup can actually start in.
   const recommendedMode: ConnectionMode | null =
     relay?.status === 'ready' ? 'relay' : routingNodes > 0 ? 'direct' : null

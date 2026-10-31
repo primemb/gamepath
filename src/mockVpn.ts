@@ -1,5 +1,15 @@
 import { nodeNames } from './lib/vpn'
-import type { AppState, DirectListInfo, VpnApi, VpnNode, VpnRule, VpnSession, VpnState } from './types'
+import type {
+  AdapterProbeResult,
+  AppState,
+  DirectListInfo,
+  NetworkAdapter,
+  VpnApi,
+  VpnNode,
+  VpnRule,
+  VpnSession,
+  VpnState,
+} from './types'
 
 /** The lists the desktop app downloads, as they look before the first download. */
 const directCatalog = (): DirectListInfo[] => [
@@ -107,6 +117,27 @@ const TICK_MS = 3000
  * The VPN half of the mock API. It shares the mock's state so the game
  * session can pause it, exactly as the real one does.
  */
+/** Windscribe's OpenVPN adapter, as the engine lists it. */
+export const mockAdapter: NetworkAdapter = {
+  name: 'WindscribeOpenVPN',
+  description: 'OpenVPN Data Channel Offload',
+  address: '10.141.184.93',
+  interfaceIndex: 91,
+  hardware: false,
+}
+
+export const mockAdapterProbe = (adapter: string): AdapterProbeResult => ({
+  reachable: true,
+  udp: true,
+  check: {
+    adapter: adapter.toLowerCase().startsWith('windscribe') ? mockAdapter.name : adapter,
+    address: mockAdapter.address,
+    latencyMs: 85,
+    udpLatencyMs: 86,
+    publicAddress: '198.51.100.25',
+  },
+})
+
 export function createMockVpn(get: () => AppState, snapshot: () => AppState): VpnApi {
   const listeners = new Set<(vpn: VpnState) => void>()
   let tick = 0
@@ -313,6 +344,21 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
       dataLatencyMs: 61,
     }),
     testSocks5: async () => ({ reachable: true, proxy: '203.0.113.20:1080', setupLatencyMs: 42, latencyMs: 96 }),
+    addAdapter: async (input) =>
+      addNode({
+        id: crypto.randomUUID(),
+        kind: 'adapter',
+        name: input.label || input.adapter,
+        endpoint: input.adapter,
+        adapter: input.adapter,
+        address: 'Network adapter',
+        dns: 'System default',
+        enabled: true,
+        importedAt: new Date().toISOString(),
+        hasPrivateKey: false,
+      }),
+    testAdapter: async (input, nodeId) =>
+      mockAdapterProbe(input?.adapter ?? vpn().nodes.find((node) => node.id === nodeId)?.adapter ?? 'Windscribe'),
     selectNode: async (id) =>
       mutate((state) => {
         const node = state.nodes.find((item) => item.id === id)

@@ -20,6 +20,7 @@ const { parseWireGuardConfig } = require('./wireguard.cjs')
 const { parseOpenVpnConfig } = require('./openvpn.cjs')
 const { parseSocks5Node } = require('./socks5.cjs')
 const { parseL2tpNode } = require('./l2tp.cjs')
+const { parseAdapterNode } = require('./adapter.cjs')
 const {
   activeTunnels,
   enforceDirectSelection,
@@ -496,6 +497,32 @@ function registerIpc() {
       tunnel.port,
       JSON.parse(safeStorage.decryptString(Buffer.from(stored, 'base64'))),
     )
+  })
+
+  ipcMain.handle('adapters:list', () => {
+    if (engineBridge?.status.status !== 'ready') throw new Error('The native routing engine is unavailable')
+    return engineBridge.request('network-adapters', {}, 10000)
+  })
+
+  ipcMain.handle('node:add-adapter', (_event, input) => {
+    const { node, secret } = parseAdapterNode(input ?? {}, crypto.randomUUID())
+    const taken = state.tunnels.find(
+      (item) => item.kind === 'adapter' && item.adapter.toLowerCase() === node.adapter.toLowerCase(),
+    )
+    if (taken)
+      throw new Error(`${taken.name} already uses ${node.adapter}. Two routes through one VPN carry no extra path.`)
+    registerTunnel(node)
+    state.encryptedConfigs[node.id] = encryptConfig(secret)
+    saveState()
+    return { state: publicState(), nodeId: node.id }
+  })
+
+  // The adapter is tested directly, with no relay: a connection out through
+  // it, and a STUN exchange that only real UDP forwarding answers.
+  ipcMain.handle('node:test-adapter', async (_event, input) => {
+    if (engineBridge?.status.status !== 'ready') throw new Error('The native routing engine is unavailable')
+    const { node } = parseAdapterNode(input ?? {}, 'probe')
+    return engineBridge.request('probe-adapter', { adapter: node.adapter }, 20000)
   })
 
   const probeL2tp = (credentials) => {

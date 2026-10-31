@@ -1,4 +1,4 @@
-import { createMockVpn, seedVpn } from './mockVpn'
+import { createMockVpn, mockAdapter, mockAdapterProbe, seedVpn } from './mockVpn'
 import type { AppState, GamePathApi, LanProxyStatus, RelayClientAccess } from './types'
 
 let previewRelayClients: RelayClientAccess[] = []
@@ -206,6 +206,26 @@ export const mockApi: GamePathApi = {
       latencyMs: 41,
     }
   },
+  listNetworkAdapters: async () => [mockAdapter],
+  addAdapterNode: async (input) => {
+    const node = {
+      id: crypto.randomUUID(),
+      kind: 'adapter' as const,
+      name: input.label?.trim() || input.adapter,
+      endpoint: input.adapter,
+      adapter: input.adapter,
+      address: 'Network adapter',
+      dns: 'System default',
+      enabled: true,
+      groupId: null,
+      importedAt: new Date().toISOString(),
+      hasPrivateKey: false,
+      hasCredentials: false,
+    }
+    state.tunnels.push(node)
+    return { state: snapshot(), nodeId: node.id }
+  },
+  testAdapterNode: async (input) => mockAdapterProbe(input.adapter),
   addL2tpNode: async (input) => {
     const node = {
       id: crypto.randomUUID(),

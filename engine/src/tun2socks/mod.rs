@@ -1,21 +1,28 @@
-//! A SOCKS5 proxy as the single hop of a direct session.
+//! A SOCKS5 proxy, or another VPN app's adapter, as the single hop of a
+//! direct session.
 //!
 //! A proxy speaks in connections and datagrams, not packets, so it cannot be
-//! handed captured traffic the way a WireGuard or OpenVPN server can. This
-//! puts a small TCP/IP stack in front of it: captured packets are answered
-//! here and their contents replayed through the proxy, and the proxy's
-//! answers are turned back into packets. To the session above, it is one more
-//! path that takes and returns IPv4 packets.
+//! handed captured traffic the way a WireGuard or OpenVPN server can. Nor can
+//! an adapter another app owns: GamePath has no way to put packets into it,
+//! only sockets bound to it. This puts a small TCP/IP stack in front of
+//! either: captured packets are answered here and their contents replayed
+//! through the exit, and its answers are turned back into packets. To the
+//! session above, it is one more path that takes and returns IPv4 packets.
 //!
 //! Only the VPN uses this. Game traffic is UDP that has to reach its server
 //! as sent, with its timing intact, which re-originating it would not keep.
 
+mod exit;
 mod handshake;
 mod packet;
 mod probe;
 mod stack;
 
+pub use exit::is_exit_socket;
+
+use crate::relay_path::{KIND_ADAPTER, KIND_SOCKS5};
 use crate::socks5::{Socks5NodeConfig, negotiate_method, resolve_proxy};
+use exit::{AdapterExit, Exit};
 use stack::{Shared, Stack, StackConfig, WAKER};
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -34,18 +41,31 @@ const QUEUE_LIMIT: usize = 4096;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(8);
 /// Terminated here, so the stack's MTU is only what the capture side sends.
 const STACK_MTU: usize = 1500;
+/// Where an adapter's first connection is opened to prove it carries one:
+/// HTTPS on the benchmark target, which answers it as well as DNS.
+const ADAPTER_CHECK_PORT: u16 = 443;
 
-pub struct Socks5Stack {
+pub struct ForwardingStack {
     shared: Arc<Shared>,
     outbound: mpsc::Receiver<Vec<u8>>,
     worker: Option<JoinHandle<()>>,
-    proxy: SocketAddr,
+    kind: &'static str,
+    endpoint: SocketAddr,
+    bypass: Option<Ipv4Addr>,
     setup_latency_ms: f64,
 }
 
-impl Socks5Stack {
+/// What a stack reports about its exit, measured before it starts.
+struct Details {
+    kind: &'static str,
+    endpoint: SocketAddr,
+    bypass: Option<Ipv4Addr>,
+    setup_latency_ms: f64,
+}
+
+impl ForwardingStack {
     /// Checks the proxy answers and accepts the login, then starts the stack.
-    pub fn open(config: &Socks5NodeConfig, probe_target: Ipv4Addr) -> Result<Self, String> {
+    pub fn open_socks5(config: &Socks5NodeConfig, probe_target: Ipv4Addr) -> Result<Self, String> {
         config.validate()?;
         let proxy = resolve_proxy(&config.host, config.port)?;
         let started = Instant::now();
@@ -56,7 +76,85 @@ impl Socks5Stack {
         negotiate_method(&mut control, config)?;
         let setup_latency_ms = started.elapsed().as_secs_f64() * 1000.0;
         drop(control);
+        let credentials = config
+            .credentials()
+            .map(|(username, password)| (username.to_owned(), password.to_owned()));
+        let stack = Self::start(
+            Exit::Proxy {
+                address: proxy,
+                credentials,
+            },
+            probe_target,
+            Details {
+                kind: KIND_SOCKS5,
+                endpoint: proxy,
+                bypass: stack::proxy_bypass(proxy),
+                setup_latency_ms,
+            },
+        )?;
+        crate::log_info!(
+            "SOCKS5 VPN path ready through {}, login answered in {:.0} ms",
+            crate::log::fingerprint(proxy.to_string().as_bytes()),
+            setup_latency_ms
+        );
+        Ok(stack)
+    }
 
+    /// Finds the adapter and proves it carries a connection, then starts the
+    /// stack. A named adapter that is up but whose app has lost its server
+    /// fails here rather than after the user has turned the VPN on.
+    pub fn open_adapter(wanted: &str, probe_target: Ipv4Addr) -> Result<Self, String> {
+        let mut exit = AdapterExit::new(wanted, crate::vpn_adapter::find(wanted)?);
+        let started = Instant::now();
+        let (socket, claim) = exit.socket(socket2::Type::STREAM)?;
+        socket
+            .connect_timeout(
+                &SocketAddr::from((probe_target, ADAPTER_CHECK_PORT)).into(),
+                SETUP_TIMEOUT,
+            )
+            .map_err(|error| {
+                format!(
+                    "{} did not carry a test connection ({error}); is that VPN app connected?",
+                    exit.adapter().name
+                )
+            })?;
+        let setup_latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        drop((socket, claim));
+        let adapter = exit.adapter().clone();
+        let stack = Self::start(
+            Exit::Adapter(exit),
+            probe_target,
+            Details {
+                kind: KIND_ADAPTER,
+                endpoint: SocketAddr::from((adapter.address, 0)),
+                bypass: None,
+                setup_latency_ms,
+            },
+        )?;
+        crate::log_info!(
+            "adapter VPN path ready through {} ({}), a test connection opened in {:.0} ms",
+            adapter.name,
+            adapter.address,
+            setup_latency_ms
+        );
+        Ok(stack)
+    }
+
+    /// A stack on `adapter` as it is, without looking it up or testing it.
+    #[cfg(test)]
+    fn on_adapter(adapter: crate::vpn_adapter::Adapter, probe_target: Ipv4Addr) -> Self {
+        let endpoint = SocketAddr::from((adapter.address, 0));
+        let exit = Exit::Adapter(AdapterExit::new(&adapter.name.clone(), adapter));
+        let details = Details {
+            kind: KIND_ADAPTER,
+            endpoint,
+            bypass: None,
+            setup_latency_ms: 0.0,
+        };
+        Self::start(exit, probe_target, details).unwrap()
+    }
+
+    fn start(exit: Exit, probe_target: Ipv4Addr, details: Details) -> Result<Self, String> {
         let poll = mio::Poll::new()
             .map_err(|error| format!("could not start the SOCKS5 stack: {error}"))?;
         let waker = mio::Waker::new(poll.registry(), WAKER)
@@ -69,15 +167,11 @@ impl Socks5Stack {
             upstream_activity: AtomicBool::new(false),
         });
         let (outbound_tx, outbound) = mpsc::sync_channel(QUEUE_LIMIT);
-        let credentials = config
-            .credentials()
-            .map(|(username, password)| (username.to_owned(), password.to_owned()));
         let stack = Stack::new(
             StackConfig {
                 client: CLIENT_ADDRESS,
                 gateway: GATEWAY_ADDRESS,
-                proxy,
-                credentials,
+                exit,
                 probe_target,
                 mtu: STACK_MTU,
             },
@@ -86,24 +180,25 @@ impl Socks5Stack {
             outbound_tx,
         );
         let worker = std::thread::Builder::new()
-            .name("gamepath-socks5-stack".into())
+            .name("gamepath-forwarding-stack".into())
             .spawn(move || {
                 crate::thread_priority::raise_current_for_data_plane();
                 stack.run();
             })
             .map_err(|error| format!("could not start the SOCKS5 stack: {error}"))?;
-        crate::log_info!(
-            "SOCKS5 VPN path ready through {}, login answered in {:.0} ms",
-            crate::log::fingerprint(proxy.to_string().as_bytes()),
-            setup_latency_ms
-        );
         Ok(Self {
             shared,
             outbound,
             worker: Some(worker),
-            proxy,
-            setup_latency_ms,
+            kind: details.kind,
+            endpoint: details.endpoint,
+            bypass: details.bypass,
+            setup_latency_ms: details.setup_latency_ms,
         })
+    }
+
+    pub fn kind(&self) -> &'static str {
+        self.kind
     }
 
     pub fn address(&self) -> Ipv4Addr {
@@ -111,11 +206,11 @@ impl Socks5Stack {
     }
 
     pub fn endpoint(&self) -> SocketAddr {
-        self.proxy
+        self.endpoint
     }
 
     pub fn bypass_ipv4(&self) -> Option<Ipv4Addr> {
-        stack::proxy_bypass(self.proxy)
+        self.bypass
     }
 
     pub fn handshake_latency_ms(&self) -> Option<f64> {
@@ -131,7 +226,7 @@ impl Socks5Stack {
     pub fn send_packet(&mut self, packet: &[u8]) -> Result<(), String> {
         let mut inbox = self.shared.inbox.lock().unwrap();
         if inbox.len() >= QUEUE_LIMIT {
-            return Err("the SOCKS5 stack is not keeping up".into());
+            return Err("the forwarding stack is not keeping up".into());
         }
         let was_empty = inbox.is_empty();
         inbox.push_back(packet.to_vec());
@@ -149,7 +244,7 @@ impl Socks5Stack {
             Ok(packet) => vec![packet],
             Err(mpsc::RecvTimeoutError::Timeout) => return Ok(Vec::new()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("the SOCKS5 stack stopped".into());
+                return Err("the forwarding stack stopped".into());
             }
         };
         packets.extend(self.outbound.try_iter().take(255));
@@ -217,7 +312,7 @@ pub fn probe(
     }
 }
 
-impl Drop for Socks5Stack {
+impl Drop for ForwardingStack {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         let _ = self.shared.waker.wake();

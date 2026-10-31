@@ -13,6 +13,7 @@ import { VpnTargetModal } from '../components/vpn/VpnTargetModal'
 import { VpnTrafficCard } from '../components/vpn/VpnTrafficCard'
 import { vpnTabs, type VpnTab } from '../lib/views'
 import { assignedTargets, nodeLive, vpnLive, vpnOn } from '../lib/vpn'
+import { AdapterModal, describeAdapterProbe } from '../modals/AdapterModal'
 import { L2tpModal } from '../modals/L2tpModal'
 import { OpenVpnLoginModal } from '../modals/OpenVpnLoginModal'
 import { Socks5Modal } from '../modals/Socks5Modal'
@@ -24,6 +25,7 @@ const describeProxyProbe = (probe: VpnProxyProbe) =>
 type Modal =
   | { kind: 'socks5' }
   | { kind: 'l2tp' }
+  | { kind: 'adapter' }
   | { kind: 'openvpn-login'; file: OpenVpnCandidate }
   | { kind: 'target'; initial: RuleKind }
   | null
@@ -74,7 +76,7 @@ export function VpnView({
   }
 
   const chooseNode = (kind: NodeKind) => {
-    if (kind === 'socks5' || kind === 'l2tp') {
+    if (kind === 'socks5' || kind === 'l2tp' || kind === 'adapter') {
       setModal({ kind })
       return
     }
@@ -103,6 +105,11 @@ export function VpnView({
     try {
       if (node.kind === 'socks5') {
         notify(describeProxyProbe(await api.vpn.testSocks5(undefined, node.id)), 'success')
+        return
+      }
+      if (node.kind === 'adapter') {
+        const probe = await api.vpn.testAdapter(undefined, node.id)
+        notify(describeAdapterProbe(probe), probe.udp ? 'success' : 'warning')
         return
       }
       const probe = await api.vpn.testL2tp(undefined, node.id)
@@ -204,6 +211,14 @@ export function VpnView({
           testLabel="Test proxy"
           resultTitle="The proxy works"
           describeResult={describeProxyProbe}
+        />
+      )}
+      {modal?.kind === 'adapter' && (
+        <AdapterModal
+          intro="The VPN sends its targets out through another VPN app’s connection, such as Windscribe, so that app’s own protocol and anti-censorship settings carry them, TCP and UDP alike. Keep the app connected; GamePath follows it when it reconnects. Use split-tunnel mode with it."
+          onClose={() => setModal(null)}
+          onAdd={async (input) => saved(await api.vpn.addAdapter(input), 'VPN app')}
+          onTest={(input) => api.vpn.testAdapter(input)}
         />
       )}
       {modal?.kind === 'l2tp' && (

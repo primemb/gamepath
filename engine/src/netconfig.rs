@@ -1391,3 +1391,65 @@ pub fn lan_ipv4_addresses() -> Vec<LanAddress> {
     });
     addresses
 }
+
+/// An interface that is up and holds a usable IPv4 address.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterfaceAddress {
+    pub address: Ipv4Addr,
+    pub interface_index: u32,
+    pub name: String,
+    pub description: String,
+    /// See [`LanAddress::hardware`].
+    pub hardware: bool,
+}
+
+/// Every connected interface with a usable IPv4 address: loopback and
+/// link-local (`169.254.0.0/16`, what an adapter holds while it has no
+/// connection) are left out.
+pub fn ipv4_interfaces() -> Vec<InterfaceAddress> {
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    if unsafe { GetUnicastIpAddressTable(AF_INET, &mut table) } != NO_ERROR || table.is_null() {
+        return Vec::new();
+    }
+    let mut interfaces = Vec::new();
+    // SAFETY: the call succeeded with a non-null table, so `NumEntries` rows
+    // are initialised; nothing borrowed from them outlives the free below.
+    unsafe {
+        let count = (*table).NumEntries as usize;
+        for row in std::slice::from_raw_parts((*table).Table.as_ptr(), count) {
+            let Some(address) = ipv4_from(&row.Address) else {
+                continue;
+            };
+            if address.is_loopback()
+                || address.is_link_local()
+                || row.DadState != IpDadStatePreferred
+            {
+                continue;
+            }
+            let mut interface: MIB_IF_ROW2 = std::mem::zeroed();
+            interface.InterfaceIndex = row.InterfaceIndex;
+            if GetIfEntry2(&mut interface) != NO_ERROR || interface.OperStatus != IfOperStatusUp {
+                continue;
+            }
+            interfaces.push(InterfaceAddress {
+                address,
+                interface_index: row.InterfaceIndex,
+                name: wide_to_string(&interface.Alias),
+                description: wide_to_string(&interface.Description),
+                hardware: interface.InterfaceAndOperStatusFlags._bitfield & 1 != 0,
+            });
+        }
+        FreeMibTable(table.cast());
+    }
+    interfaces.sort_by_key(|interface| (interface.hardware, interface.interface_index));
+    interfaces
+}
+
+fn wide_to_string(value: &[u16]) -> String {
+    let length = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..length])
+}

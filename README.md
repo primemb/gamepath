@@ -90,6 +90,7 @@ cargo test --locked --manifest-path relay/Cargo.toml
 - Import any number of OpenVPN `.ovpn` files, over UDP or TCP, and run several at once without an adapter or a driver.
 - Add L2TP/IPsec nodes backed by the native Windows RAS client, and test the real connection before saving.
 - Add any number of SOCKS5 proxy nodes, alone or beside WireGuard routes, and test each one for real UDP support before saving it.
+- Use another VPN app's connection, such as Windscribe, as a node: GamePath sends traffic out through that app's network adapter, so its own protocol and anti-censorship carry it, UDP included.
 - Share a running session with a console, phone or second PC through a built-in SOCKS5 and HTTP proxy on the local network.
 - Enable, disable, and remove individual routes.
 - Choose all-system traffic or split-tunnel rules.
@@ -328,6 +329,27 @@ the default route the proxy itself needs, and its forwarded traffic would be
 captured and looped back. Split-tunnel mode captures only the chosen targets, so
 a local proxy is fine there.
 
+## VPN app nodes
+
+Another VPN app on this PC (Windscribe, or any app that leaves a Windows network adapter behind) can be a node.
+GamePath binds its sockets to that adapter's address and pins them to it with `IP_UNICAST_IF`, so they leave
+through the app's own connection whatever the routing table says. The app keeps its own protocol, server and
+anti-censorship settings; GamePath only uses the connection it made. Unlike the app's SOCKS5 proxy gateway, this
+carries UDP: Windscribe's gateway refuses `UDP ASSOCIATE`, while its adapter answers STUN.
+
+- **Named, not numbered.** The node stores the adapter's name, or the start of it. `Windscribe` matches
+  `WindscribeOpenVPN`, `WindscribeWireguard` or `Windscribe IKEv2`, whichever is connected, and the adapter is
+  looked up again whenever the app reconnects with a new address.
+- **Test** opens a TCP connection through the adapter and sends a STUN request, which only real UDP forwarding
+  answers, and shows the address traffic leaves from.
+- **In relay mode** the node is one more route to your relay, wrapped in the app's tunnel. **In the VPN section**
+  it carries selected apps, sites and IP ranges, TCP and UDP alike, with name lookups sent through it as well.
+  A direct game session cannot use it: GamePath can open connections through another app's adapter but not put
+  captured packets into it, so game traffic would have to be re-sent rather than routed.
+- **Split-tunnel mode only.** All-traffic mode would capture the app's own connection to its server and loop it
+  back into the node.
+- Keep the app connected. When it drops, the node stops answering and comes back as soon as the app reconnects.
+
 ## Console sharing
 
 Turn on **Console sharing** and every session also opens a proxy on this PC's local network address,
@@ -357,7 +379,7 @@ The **VPN** section is a second connection for everyday apps, running beside the
 way: a browser, a chat client or a launcher's store can use a VPN while the game uses its own tunnel, and
 everything else keeps the normal connection.
 
-- **A default node, connected directly.** WireGuard, OpenVPN, L2TP/IPsec or SOCKS5. Nothing is duplicated and
+- **A default node, connected directly.** WireGuard, OpenVPN, L2TP/IPsec, SOCKS5 or another VPN app's adapter. Nothing is duplicated and
   no relay is involved. Save multiple nodes and choose which is the default; choosing another reconnects a
   running VPN through it. Removing an unused node leaves the connection alone.
 - **Its own targets.** Applications, folders, websites and IP ranges, exactly like the game's split rules, or

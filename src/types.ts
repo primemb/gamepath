@@ -1,4 +1,4 @@
-export type NodeKind = 'wireguard' | 'socks5' | 'openvpn' | 'l2tp'
+export type NodeKind = 'wireguard' | 'socks5' | 'openvpn' | 'l2tp' | 'adapter'
 
 /**
  * How traffic reaches the Internet. `relay` combines every enabled node at a
@@ -40,6 +40,8 @@ export type Tunnel = {
   protocol?: 'udp' | 'tcp'
   /** OpenVPN nodes only: whether the file uses `auth-user-pass`. */
   wantsCredentials?: boolean
+  /** Adapter nodes only: the adapter name, or the start of it, to leave through. */
+  adapter?: string
 }
 
 /** Why one chosen file could not be used. */
@@ -89,6 +91,31 @@ export type Socks5ProbeResult = {
   proxy: string
   setupLatencyMs: number
   latencyMs: number
+}
+
+export type AdapterNodeInput = { adapter: string; label?: string }
+
+/** A connected network adapter a node could leave through. */
+export type NetworkAdapter = {
+  name: string
+  description: string
+  address: string
+  interfaceIndex: number
+  /** A physical network card rather than a VPN app's software adapter. */
+  hardware: boolean
+}
+
+export type AdapterProbeResult = {
+  reachable: boolean
+  udp: boolean
+  check: {
+    adapter: string
+    address: string
+    latencyMs: number
+    udpLatencyMs: number | null
+    /** What the far side saw: the VPN app's exit, not this PC's address. */
+    publicAddress: string | null
+  }
 }
 
 export type L2tpNodeInput = {
@@ -370,6 +397,9 @@ export type VpnApi = {
   testL2tp: (input?: L2tpNodeInput, nodeId?: string) => Promise<L2tpProbeResult>
   /** Logs in to the proxy and opens a connection out through it. */
   testSocks5: (input?: Socks5NodeInput, nodeId?: string) => Promise<VpnProxyProbe>
+  addAdapter: (input: AdapterNodeInput) => Promise<AppState>
+  /** Opens a connection and a STUN exchange through the adapter. */
+  testAdapter: (input?: AdapterNodeInput, nodeId?: string) => Promise<AdapterProbeResult>
   selectNode: (id: string) => Promise<AppState>
   removeNode: (id?: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
@@ -582,6 +612,9 @@ export type GamePathApi = {
   addL2tpNode: (input: L2tpNodeInput) => Promise<{ state: AppState; nodeId: string }>
   testL2tpNode: (input: L2tpNodeInput) => Promise<L2tpProbeResult>
   testSavedL2tpNode: (id: string) => Promise<L2tpProbeResult>
+  listNetworkAdapters: () => Promise<NetworkAdapter[]>
+  addAdapterNode: (input: AdapterNodeInput) => Promise<{ state: AppState; nodeId: string }>
+  testAdapterNode: (input: AdapterNodeInput) => Promise<AdapterProbeResult>
   setTunnelEnabled: (id: string, enabled: boolean) => Promise<AppState>
   setTunnelGroup: (id: string, groupId: string | null) => Promise<AppState>
   removeTunnel: (id: string) => Promise<AppState>

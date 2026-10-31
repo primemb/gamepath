@@ -98,6 +98,7 @@ export const vpnNodeKinds: { kind: NodeKind; label: string; hint: string }[] = [
   { kind: 'openvpn', label: 'OpenVPN', hint: 'Import an .ovpn file' },
   { kind: 'socks5', label: 'SOCKS5', hint: 'Proxy address and login' },
   { kind: 'l2tp', label: 'L2TP/IPsec', hint: 'Server, key and login' },
+  { kind: 'adapter', label: 'VPN app', hint: 'Windscribe or another app’s adapter' },
 ]
 
 /** Bytes per second from the session's cumulative counters, per poll. */

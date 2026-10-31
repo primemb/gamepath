@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import {
+  AppWindow,
   ChevronDown,
   FolderPlus,
   HardDrive,
@@ -16,11 +17,12 @@ import { api } from '../api'
 import { NodeCard } from '../components/NodeCard'
 import { Toggle } from '../components/Toggle'
 import { errorMessage, type Notify } from '../components/Toast'
+import { AdapterModal } from '../modals/AdapterModal'
 import { GroupModal } from '../modals/GroupModal'
 import { L2tpModal } from '../modals/L2tpModal'
 import { OpenVpnLoginModal } from '../modals/OpenVpnLoginModal'
 import { Socks5Modal } from '../modals/Socks5Modal'
-import { activeNodes, nodeSections, type NodeSection } from '../lib/nodes'
+import { activeNodes, needsRelay, nodeSections, type NodeSection } from '../lib/nodes'
 import type { AppState, NodeGroup, OpenVpnCandidate, OpenVpnRejection } from '../types'
 
 type OpenVpnLogin = { files: OpenVpnCandidate[]; rejected: OpenVpnRejection[] }
@@ -158,6 +160,7 @@ export function RoutesView({
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set())
   const [showSocks5, setShowSocks5] = useState(false)
   const [showL2tp, setShowL2tp] = useState(false)
+  const [showAdapter, setShowAdapter] = useState(false)
   const [openVpnLogin, setOpenVpnLogin] = useState<OpenVpnLogin | null>(null)
   const [creatingGroup, setCreatingGroup] = useState(false)
   const [renamingGroup, setRenamingGroup] = useState<NodeGroup | null>(null)
@@ -165,7 +168,7 @@ export function RoutesView({
   const direct = state.connectionMode === 'direct'
   const sections = nodeSections(state.tunnels, state.nodeGroups)
   const carrying = activeNodes(state.tunnels, state.nodeGroups).filter(
-    (node) => !(direct && node.kind === 'socks5'),
+    (node) => !(direct && needsRelay(node.kind)),
   ).length
 
   const toggleCollapsed = (key: string) =>
@@ -233,6 +236,11 @@ export function RoutesView({
           <Share2 size={15} aria-hidden="true" /> SOCKS5
         </button>
       )}
+      {!direct && (
+        <button className="button secondary" onClick={() => setShowAdapter(true)}>
+          <AppWindow size={15} aria-hidden="true" /> VPN app
+        </button>
+      )}
       <button className="button secondary" onClick={() => setShowL2tp(true)}>
         <ShieldCheck size={15} aria-hidden="true" /> L2TP
       </button>
@@ -256,7 +264,7 @@ export function RoutesView({
         </div>
         <p className="node-fleet-copy">
           {direct
-            ? 'Direct mode sends your traffic through one WireGuard, OpenVPN or L2TP/IPsec node. SOCKS5 proxies need a relay.'
+            ? 'Direct mode sends your traffic through one WireGuard, OpenVPN or L2TP/IPsec node. SOCKS5 proxies and other VPN apps need a relay.'
             : 'Each carrying node moves relay traffic through its own VPN or proxy hop. Group nodes to switch a whole set on or off at once.'}
         </p>
         <div className="node-fleet-actions">
@@ -295,7 +303,11 @@ export function RoutesView({
                       groupEnabled={section.group ? section.group.enabled : true}
                       direct={direct}
                       onTest={() =>
-                        tunnel.kind === 'l2tp' ? api.testSavedL2tpNode(tunnel.id) : api.testSavedSocks5Node(tunnel.id)
+                        tunnel.kind === 'l2tp'
+                          ? api.testSavedL2tpNode(tunnel.id)
+                          : tunnel.kind === 'adapter'
+                            ? api.testAdapterNode({ adapter: tunnel.adapter ?? tunnel.endpoint })
+                            : api.testSavedSocks5Node(tunnel.id)
                       }
                       onToggle={(enabled) =>
                         guard(async () => setState(await api.setTunnelEnabled(tunnel.id, enabled)))
@@ -370,6 +382,18 @@ export function RoutesView({
             setShowSocks5(false)
           }}
           onTest={(input) => api.testSocks5Node(input)}
+        />
+      )}
+      {showAdapter && (
+        <AdapterModal
+          intro="Relay traffic leaves through another VPN app’s connection, such as Windscribe, so that app’s own protocol and anti-censorship settings carry it to your relay, UDP included. Keep the app connected; GamePath follows it when it reconnects. It works in split-tunnel mode."
+          onClose={() => setShowAdapter(false)}
+          onAdd={async (input) => {
+            const result = await api.addAdapterNode(input)
+            setState(result.state)
+            setShowAdapter(false)
+          }}
+          onTest={(input) => api.testAdapterNode(input)}
         />
       )}
       {showL2tp && (

@@ -22,4 +22,9 @@ test('each node kind becomes the tagged node the engine expects', () => {
     ...l2tp,
     label: 'L2TP',
   })
+  assert.deepEqual(nodeSpec({ kind: 'adapter', name: 'Windscribe', adapter: 'Windscribe' }, '{}'), {
+    kind: 'adapter',
+    adapter: 'Windscribe',
+    label: 'Windscribe',
+  })
 })

@@ -5,7 +5,15 @@ export const nodeKindLabels: Record<NodeKind, string> = {
   openvpn: 'OpenVPN',
   l2tp: 'L2TP/IPsec',
   socks5: 'SOCKS5',
+  adapter: 'VPN app',
 }
+
+/**
+ * Nodes that carry game traffic only through a relay: a proxy forwards
+ * connections, and another VPN app's adapter only takes sockets, so neither
+ * can route the packets a direct game session captures.
+ */
+export const needsRelay = (kind: NodeKind) => kind === 'socks5' || kind === 'adapter'
 
 /**
  * Whether a node is currently carrying traffic.

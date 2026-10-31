@@ -310,7 +310,7 @@ fn open_socket(runtime: &L2tpRuntime, relay: SocketAddrV4) -> Result<UdpSocket, 
 impl RelayPath for L2tpRelayPath {
     fn send_frame(&mut self, frame: &[u8]) -> Result<(), String> {
         self.socket.send(frame).map(|_| ()).map_err(|error| {
-            if is_fatal_send_error(&error) {
+            if crate::transport::is_interface_gone(&error) {
                 self.transport_failed = true;
             }
             format!("L2TP relay send failed: {error}")
@@ -368,46 +368,6 @@ impl RelayPath for L2tpRelayPath {
     fn transport_failed(&self) -> bool {
         self.transport_failed
     }
-}
-
-/// Whether a send error means this socket can never carry anything again.
-///
-/// The relay socket is bound to the RAS adapter's address and pinned to its
-/// interface with `IP_UNICAST_IF`. When Windows tears that adapter down - which
-/// happens on every redial, and on this provider rather often - the socket
-/// outlives it and every send fails from then on. That is a different thing
-/// from a datagram being dropped, and it needs a different answer: no probe
-/// will succeed either, so waiting for three of them to time out only buys the
-/// user three seconds of traffic pushed into a socket that cannot carry it.
-///
-/// Observed live as `WSAEINVAL` (10022), reported to the user as "L2TP relay
-/// send failed: An invalid argument was supplied".
-///
-/// The list is deliberately short. `WSAECONNRESET` and `WSAEHOSTUNREACH` are
-/// left out because Windows raises those from an ICMP message about an earlier
-/// datagram - the socket is fine and the next send may well work, which is the
-/// same reason [`crate::socks5`] swallows them on receive.
-#[cfg(windows)]
-fn is_fatal_send_error(error: &std::io::Error) -> bool {
-    /// The bound local address no longer exists.
-    const WSAEINVAL: i32 = 10022;
-    /// The handle is no longer a socket.
-    const WSAENOTSOCK: i32 = 10038;
-    /// The interface underneath it was removed.
-    const WSAEADDRNOTAVAIL: i32 = 10049;
-    /// The network subsystem or that interface has gone down.
-    const WSAENETDOWN: i32 = 10050;
-    /// The connection was broken by the interface being reset.
-    const WSAENETRESET: i32 = 10052;
-    matches!(
-        error.raw_os_error(),
-        Some(WSAEINVAL | WSAENOTSOCK | WSAEADDRNOTAVAIL | WSAENETDOWN | WSAENETRESET)
-    )
-}
-
-#[cfg(not(windows))]
-fn is_fatal_send_error(_error: &std::io::Error) -> bool {
-    false
 }
 
 #[cfg(windows)]
@@ -529,34 +489,4 @@ fn configure_mtu(interface_index: u32, mtu: u16) -> Result<(), String> {
 fn add_route(relay: Ipv4Addr, interface_index: u32) -> Result<(), String> {
     crate::netconfig::add_l2tp_relay_route(relay, interface_index)
         .map_err(|error| format!("could not route the relay through reconnected L2TP: {error}"))
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::is_fatal_send_error;
-    use std::io::Error;
-
-    /// The distinction the whole flag rests on: some send errors mean the
-    /// socket is finished, and most do not.
-    #[test]
-    fn a_vanished_adapter_is_fatal_but_an_icmp_reply_is_not() {
-        // What a user actually saw, reported as "L2TP relay send failed: An
-        // invalid argument was supplied": the RAS adapter went away underneath
-        // a socket still bound to its address.
-        assert!(is_fatal_send_error(&Error::from_raw_os_error(10022)));
-        assert!(is_fatal_send_error(&Error::from_raw_os_error(10038)));
-        assert!(is_fatal_send_error(&Error::from_raw_os_error(10049)));
-        assert!(is_fatal_send_error(&Error::from_raw_os_error(10050)));
-        assert!(is_fatal_send_error(&Error::from_raw_os_error(10052)));
-
-        // Windows raises these from an ICMP message about a datagram already
-        // sent. The socket is fine and the next send may well succeed, so
-        // tearing the path down for one would be the more expensive mistake.
-        assert!(!is_fatal_send_error(&Error::from_raw_os_error(10054)));
-        assert!(!is_fatal_send_error(&Error::from_raw_os_error(10065)));
-        assert!(!is_fatal_send_error(&Error::from_raw_os_error(10051)));
-
-        // An error carrying no OS code cannot be classified, so it is not.
-        assert!(!is_fatal_send_error(&Error::other("no code")));
-    }
 }

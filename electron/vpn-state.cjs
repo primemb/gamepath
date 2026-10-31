@@ -12,7 +12,7 @@
 const { defaultDirect, normalizeDirect } = require('./vpn-direct-state.cjs')
 
 const RULE_KINDS = ['application', 'folder', 'hostname', 'ip']
-const NODE_KINDS = ['wireguard', 'openvpn', 'l2tp', 'socks5']
+const NODE_KINDS = ['wireguard', 'openvpn', 'l2tp', 'socks5', 'adapter']
 /** Most nodes one VPN session runs; the service's `MAX_VPN_NODES`. */
 const MAX_VPN_NODES = 8
 
@@ -149,6 +149,18 @@ function nodeSetLimitation(nodes) {
 }
 
 /**
+ * Why `node` cannot carry the VPN in `trafficMode`, or null. A proxy on this
+ * PC, or the VPN app behind an adapter, reaches its own server through the
+ * routing table, which all-traffic mode would capture and loop back into it.
+ */
+function trafficModeLimitation(node, trafficMode) {
+  if (trafficMode !== 'all' || !node) return null
+  const localProxy = node.kind === 'socks5' && /^(localhost$|127\.|\[?::1\]?$)/i.test(String(node.host ?? ''))
+  if (node.kind !== 'adapter' && !localProxy) return null
+  return `${node.name} runs on this PC, so it carries selected targets only. Use split-tunnel mode with it, or choose another node for all traffic.`
+}
+
+/**
  * Why `kind`/`value` cannot be routed by `node` in `trafficMode`, or null.
  *
  * L2TP/IPsec is routed by Windows itself, and Windows routes cannot tell one
@@ -217,6 +229,7 @@ function activeGameRules(rules, ruleGroups) {
 }
 
 module.exports = {
+  trafficModeLimitation,
   RULE_KINDS,
   MAX_VPN_NODES,
   defaultVpn,
