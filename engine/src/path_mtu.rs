@@ -18,6 +18,7 @@ const PRECISION: u16 = 8;
 const ECHO_HEADERS: u16 = 28;
 const FIRST_ECHO_TIMEOUT: Duration = Duration::from_millis(800);
 const MIN_ECHO_TIMEOUT: Duration = Duration::from_millis(150);
+const RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// The path MTU to `destination`, at most `link_mtu`, or `None` when it could
 /// not be established inside `budget` (an endpoint that ignores echo requests
@@ -25,14 +26,32 @@ const MIN_ECHO_TIMEOUT: Duration = Duration::from_millis(150);
 pub fn measure(destination: Ipv4Addr, link_mtu: u16, budget: Duration) -> Option<u16> {
     let deadline = Instant::now() + budget;
     let mut timeout = FIRST_ECHO_TIMEOUT;
-    search(link_mtu, |size| {
-        let remaining = deadline.checked_duration_since(Instant::now())?;
-        let answered = echo(destination, size, timeout.min(remaining))?;
-        if let Some(round_trip) = answered {
-            timeout = (round_trip * 3).clamp(MIN_ECHO_TIMEOUT, FIRST_ECHO_TIMEOUT);
-        }
-        Some(answered.is_some())
+    retry_unknown(deadline, || {
+        search(link_mtu, |size| {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            if remaining.is_zero() {
+                return None;
+            }
+            let answered = echo(destination, size, timeout.min(remaining))?;
+            if let Some(round_trip) = answered {
+                timeout = (round_trip * 3).clamp(MIN_ECHO_TIMEOUT, FIRST_ECHO_TIMEOUT);
+            }
+            Some(answered.is_some())
+        })
     })
+}
+
+fn retry_unknown(deadline: Instant, mut attempt: impl FnMut() -> Option<u16>) -> Option<u16> {
+    loop {
+        if let Some(mtu) = attempt() {
+            return Some(mtu);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining <= RETRY_DELAY {
+            return None;
+        }
+        std::thread::sleep(RETRY_DELAY);
+    }
 }
 
 /// `fits(size)` says whether a `size`-byte packet got through, or `None` to
@@ -49,7 +68,12 @@ fn search(link_mtu: u16, mut fits: impl FnMut(u16) -> Option<bool>) -> Option<u1
     let (mut fitting, mut too_big) = (FLOOR, link_mtu);
     while too_big - fitting > PRECISION {
         let middle = fitting + (too_big - fitting) / 2;
-        if fits(middle)? {
+        let Some(answered) = fits(middle) else {
+            // A confirmed fitting packet is safer than discarding the entire
+            // measurement when the startup deadline expires mid-search.
+            return Some(fitting);
+        };
+        if answered {
             fitting = middle;
         } else {
             too_big = middle;
@@ -174,13 +198,24 @@ mod tests {
     }
 
     #[test]
-    fn running_out_of_time_is_unknown() {
+    fn running_out_of_time_keeps_the_last_confirmed_size() {
         let mut echoes = 0;
         let result = search(1500, |size| {
             echoes += 1;
             (echoes < 4).then_some(size <= 1400)
         });
-        assert_eq!(result, None);
+        assert_eq!(result, Some(1390));
+    }
+
+    #[test]
+    fn a_transient_unknown_result_is_retried() {
+        let mut attempts = 0;
+        let result = retry_unknown(Instant::now() + Duration::from_secs(1), || {
+            attempts += 1;
+            (attempts == 2).then_some(1424)
+        });
+        assert_eq!(result, Some(1424));
+        assert_eq!(attempts, 2);
     }
 
     #[test]

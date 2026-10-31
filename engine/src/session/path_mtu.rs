@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 /// Total startup budget, including time already spent handshaking.
 const MEASURE_BUDGET: Duration = Duration::from_secs(2);
+const PROBE_BUDGET: Duration = Duration::from_millis(1800);
 
 pub(crate) struct SessionMtu {
     derived: EffectiveMtu,
@@ -70,7 +71,7 @@ impl SessionMtu {
                         .min_by_key(|(_, mtu)| *mtu);
                     let Some((endpoint, path)) = narrowest else {
                         log_info!(
-                            "path MTU: endpoints do not answer echo requests; keeping the {link_mtu}-byte interface MTU"
+                            "path MTU: could not establish a path size; keeping the {link_mtu}-byte interface MTU"
                         );
                         return;
                     };
@@ -122,7 +123,7 @@ fn measure_paths(endpoints: &[Ipv4Addr], link_mtu: u16) -> Vec<(Ipv4Addr, Option
             .map(|&endpoint| {
                 (
                     endpoint,
-                    scope.spawn(move || path_mtu::measure(endpoint, link_mtu, MEASURE_BUDGET)),
+                    scope.spawn(move || path_mtu::measure(endpoint, link_mtu, PROBE_BUDGET)),
                 )
             })
             .collect::<Vec<_>>();
