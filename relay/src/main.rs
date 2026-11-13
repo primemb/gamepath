@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use gamepath_engine::auth::{EnrollmentToken, SessionCrypto};
 use gamepath_engine::fec::{self, Decoder, Encoder, Offer};
 use gamepath_engine::ipv4_fragments::{Reassembler, is_fragment, split_for_tunnel};
-use gamepath_engine::mtu::{LINK_MTU, relay_tun_mtu};
+use gamepath_engine::mtu::{LINK_MTU, relay_reply_mtu};
 use gamepath_engine::protocol::{
     FLAG_CONTROL, FLAG_PATH_UNHEALTHY, FLAG_REPAIR, FLAG_SERVER_TO_CLIENT, FrameHeader, HEADER_LEN,
 };
@@ -143,7 +143,8 @@ struct SessionState {
     /// loss repair never offers, and its session carries no repairs either way.
     repair: Option<RepairState>,
     /// Largest reply that crosses the client's link whole, from its latest
-    /// offer. Unknown until the first one, and replies then go out as they are.
+    /// offer. Unknown until the first one, and replies are then split to what
+    /// every client transport carries.
     reply_mtu: Option<u16>,
     /// Datagrams the client split to cross its link, rebuilt before the TUN.
     fragments: Reassembler,
@@ -461,10 +462,11 @@ fn serve(
         DeviceBuilder::new()
             .name(tun_name)
             .ipv4(tun_address, tun_prefix, None)
-            // Sized from what a client's transports add on the way back,
-            // not from the physical link: a packet written here is sealed and
-            // re-encapsulated before it reaches anyone.
-            .mtu(relay_tun_mtu(LINK_MTU))
+            // Takes any reply the uplink delivers. `forward_reply` splits each
+            // one to what the client's link carries; a TUN sized to that
+            // instead made Linux refuse larger Don't Fragment replies before
+            // the relay saw them (see `relay_reply_mtu`).
+            .mtu(LINK_MTU)
             .build_sync()?,
     );
     start_reload(clients_dir, Arc::clone(&clients))?;
@@ -652,7 +654,7 @@ fn serve(
 /// own link and transports, which can be well under what this relay assumes;
 /// a repair of a reply near that size would not fit the client's link.
 fn reply_repair_limit(offer: Offer) -> usize {
-    usize::from(offer.mtu.min(relay_tun_mtu(LINK_MTU)))
+    usize::from(offer.mtu.min(relay_reply_mtu(LINK_MTU)))
 }
 
 fn apply_path_policy(
@@ -876,10 +878,13 @@ fn forward_reply(
     // Split to what crosses the client's link whole. Observed live on an
     // Iranian uplink: anything over ~1430 bytes vanished, Don't Fragment or
     // not, with no ICMP answer. The client reassembles before delivery, so
-    // the application receives the reply whole either way.
-    let pieces = session
+    // the application receives the reply whole either way. Before the
+    // client's offer arrives, every transport's size is the safe one: the
+    // TUN takes full-size replies, so nothing else bounds them.
+    let reply_mtu = session
         .reply_mtu
-        .and_then(|mtu| split_for_tunnel(packet, usize::from(mtu)));
+        .unwrap_or_else(|| relay_reply_mtu(LINK_MTU));
+    let pieces = split_for_tunnel(packet, usize::from(reply_mtu));
     match pieces {
         Some(pieces) => {
             for piece in &pieces {
@@ -992,8 +997,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_reply_too_large_for_the_clients_link_arrives_split_and_rebuilds_whole() {
+    const DONT_FRAGMENT: u16 = 0x4000;
+
+    /// A UDP reply from a game server to the test client's tunnel address.
+    fn server_reply(identification: u16, flags: u16, length: u16) -> Vec<u8> {
+        let mut reply = vec![0_u8; usize::from(length)];
+        reply[0] = 0x45;
+        reply[2..4].copy_from_slice(&length.to_be_bytes());
+        reply[4..6].copy_from_slice(&identification.to_be_bytes());
+        reply[6..8].copy_from_slice(&flags.to_be_bytes());
+        reply[8] = 57;
+        reply[9] = 17;
+        reply[12..16].copy_from_slice(&[57, 129, 90, 115]);
+        reply[16..20].copy_from_slice(&[10, 203, 0, 2]);
+        let checksum = gamepath_engine::icmp::internet_checksum(&reply[..20]);
+        reply[10..12].copy_from_slice(&checksum.to_be_bytes());
+        reply
+    }
+
+    /// Forwards `reply` to a client whose session knows `reply_mtu`, and
+    /// returns the datagram the client rebuilds with the largest piece that
+    /// crossed its link.
+    fn forwarded(reply_mtu: Option<u16>, reply: &[u8]) -> (Vec<u8>, usize) {
         let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
         let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         client_socket
@@ -1002,35 +1027,46 @@ mod tests {
         let mut client = relay_client();
         let session = client.admit_session(7, Instant::now());
         session.observe_endpoint(client_socket.local_addr().unwrap());
-        session.reply_mtu = Some(1228);
+        session.reply_mtu = reply_mtu;
         let clients = Mutex::new(HashMap::from([([0; 16], client)]));
         let crypto = SessionCrypto::new(&[0; 32], 7).unwrap();
+        forward_reply(&relay, &clients, &Condvar::new(), reply);
+        let mut reassembler = Reassembler::default();
+        let mut largest = 0;
+        loop {
+            let mut frame = [0_u8; 2048];
+            let length = client_socket.recv(&mut frame).unwrap();
+            let (_, piece) = crypto.open_server(&frame[..length]).unwrap();
+            largest = largest.max(piece.len());
+            if !is_fragment(&piece) {
+                return (piece, largest);
+            }
+            if let Some(whole) = reassembler.push(&piece, Instant::now()) {
+                return (whole, largest);
+            }
+        }
+    }
+
+    #[test]
+    fn a_reply_too_large_for_the_clients_link_arrives_split_and_rebuilds_whole() {
         // Plain, then Don't Fragment: Linux game servers set DF on UDP, and a
         // refused DF reply was lost for good.
-        for (identification, flags) in [(0x0101_u16, 0_u16), (0x0102, 0x4000)] {
-            let mut reply = vec![0_u8; 1280];
-            reply[0] = 0x45;
-            reply[2..4].copy_from_slice(&1280_u16.to_be_bytes());
-            reply[4..6].copy_from_slice(&identification.to_be_bytes());
-            reply[6..8].copy_from_slice(&flags.to_be_bytes());
-            reply[8] = 57;
-            reply[9] = 17;
-            reply[12..16].copy_from_slice(&[57, 129, 90, 115]);
-            reply[16..20].copy_from_slice(&[10, 203, 0, 2]);
-            let checksum = gamepath_engine::icmp::internet_checksum(&reply[..20]);
-            reply[10..12].copy_from_slice(&checksum.to_be_bytes());
-            forward_reply(&relay, &clients, &Condvar::new(), &reply);
-            let mut reassembler = Reassembler::default();
-            let mut rebuilt = None;
-            for _ in 0..2 {
-                let mut frame = [0_u8; 2048];
-                let length = client_socket.recv(&mut frame).unwrap();
-                let (_, piece) = crypto.open_server(&frame[..length]).unwrap();
-                assert!(piece.len() <= 1228);
-                rebuilt = reassembler.push(&piece, Instant::now());
-            }
-            assert_eq!(rebuilt, Some(reply));
+        for (identification, flags) in [(0x0101_u16, 0_u16), (0x0102, DONT_FRAGMENT)] {
+            let reply = server_reply(identification, flags, 1280);
+            let (rebuilt, largest) = forwarded(Some(1228), &reply);
+            assert!(largest <= 1228);
+            assert_eq!(rebuilt, reply);
         }
+    }
+
+    #[test]
+    fn a_full_size_reply_before_the_clients_offer_fits_every_transport() {
+        // Steam Datagram Relay's own size: the TUN once refused these with
+        // "fragmentation needed", and Wardogs never joined a server.
+        let reply = server_reply(0x0103, DONT_FRAGMENT, 1328);
+        let (rebuilt, largest) = forwarded(None, &reply);
+        assert!(largest <= usize::from(relay_reply_mtu(LINK_MTU)));
+        assert_eq!(rebuilt, reply);
     }
 
     #[test]
@@ -1185,7 +1221,7 @@ mod tests {
         };
         assert_eq!(
             reply_repair_limit(wide),
-            usize::from(relay_tun_mtu(LINK_MTU))
+            usize::from(relay_reply_mtu(LINK_MTU))
         );
         let mut repair = RepairState::new(narrow);
         let now = Instant::now();

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Activity, ArrowLeftRight, Link2, MessageCircle, Network, Server, ShieldCheck, Zap } from 'lucide-react'
 import { api } from '../api'
+import { OptimisticDnsCard } from '../components/OptimisticDnsCard'
 import { Toggle } from '../components/Toggle'
 import { errorMessage, type Notify } from '../components/Toast'
 import type { Language } from '../lib/language'
@@ -42,6 +43,8 @@ export function SettingsView({
       : 'If your relay stops answering through every node for 30 seconds while your internet works, this session moves to the standby relay. It never moves back by itself. Applies from the next session.'
   const configureFailover = (next: typeof failover) =>
     guard(async () => setState(await api.configureRelayFailover(next)))
+
+  const setOptimisticDns = (enabled: boolean) => guard(async () => setState(await api.setOptimisticDns(enabled)))
 
   const startup = state.startWithWindows ?? { available: false, enabled: false }
   const setStartWithWindows = (enabled: boolean) => guard(async () => setState(await api.setStartWithWindows(enabled)))
@@ -163,6 +166,8 @@ export function SettingsView({
           />
         </div>
       </div>
+
+      <OptimisticDnsCard state={state} onChange={setOptimisticDns} />
 
       <div className="settings-card">
         <div>

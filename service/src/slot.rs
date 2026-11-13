@@ -75,6 +75,8 @@ pub(crate) struct SessionSlot {
     /// Remembered so a live rule edit reapplies the session's DNS choice
     /// rather than silently reverting it to the default.
     pub(crate) remote_dns: bool,
+    /// The optimistic DNS cache, kept for live rule edits like `remote_dns`.
+    pub(crate) dns_cache: bool,
     pub(crate) kill_switch: bool,
     /// Names of GamePath's own nodes and relays, whose lookups this slot's
     /// capture leaves alone.
@@ -114,6 +116,7 @@ impl SessionSlot {
             route_count: 0,
             traffic_mode: String::new(),
             remote_dns: false,
+            dns_cache: true,
             kill_switch: false,
             own_hostnames: Vec::new(),
             session_rules: Value::Null,

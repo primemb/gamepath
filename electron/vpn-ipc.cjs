@@ -112,6 +112,7 @@ function createVpnFeature({
         trafficMode: settings.trafficMode,
         rules,
         remoteDns: settings.remoteDns,
+        dnsCache: state().optimisticDns !== false,
         ownHostnames: ownHostnames(state()),
         killSwitch: settings.killSwitch,
         direct: direct.spec(),

@@ -269,6 +269,10 @@ ExecStartPre=+/usr/local/lib/gamepath-relay-allow-docker-forward ${GAMEPATH_UPLI
 ExecStart=/usr/local/bin/gamepath-relay serve --bind ${GAMEPATH_BIND} --clients-dir ${GAMEPATH_CLIENTS} --tun-name gptun0 --tun-address 10.203.0.1 --tun-prefix 24
 Restart=on-failure
 RestartSec=2
+# ProtectSystem=strict leaves /var/log read-only; systemd creates this one for
+# the gamepath user, and takes over an earlier root-owned copy.
+LogsDirectory=gamepath
+LogsDirectoryMode=0750
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=true

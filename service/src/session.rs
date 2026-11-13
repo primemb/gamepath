@@ -69,6 +69,7 @@ fn capture_request(slot: &SessionSlot, rules: &Value, foreign: &SlotSummary) -> 
         "trafficMode": slot.traffic_mode,
         "rules": rules,
         "remoteDns": remote_dns,
+        "dnsCache": slot.dns_cache,
         "killSwitch": slot.kill_switch,
         "ownHostnames": slot.own_hostnames,
         "foreignBypass": foreign.bypass,
@@ -204,6 +205,7 @@ fn start_slot(
     }
     runtime.traffic_mode = traffic_mode.clone();
     runtime.remote_dns = remote_dns;
+    runtime.dns_cache = payload["dnsCache"].as_bool().unwrap_or(true);
     runtime.kill_switch = id == SlotId::Vpn && payload["killSwitch"].as_bool() == Some(true);
     runtime.own_hostnames = own_hostnames(payload);
     runtime.direct = direct_list(id, payload);
@@ -1005,6 +1007,22 @@ mod tests {
         };
         let request = capture_request(&slot, &json!([]), &game);
         assert_eq!(request["otherSessionActive"], json!(true));
+    }
+
+    /// A live rule edit replaces the capture with this request, so the
+    /// session's cache choice has to travel with it.
+    #[test]
+    fn the_dns_cache_choice_reaches_every_capture_request() {
+        let mut slot = SessionSlot::new(SlotId::Vpn);
+        assert_eq!(
+            capture_request(&slot, &json!([]), &SlotSummary::idle(None))["dnsCache"],
+            json!(true)
+        );
+        slot.dns_cache = false;
+        assert_eq!(
+            capture_request(&slot, &json!([]), &SlotSummary::idle(None))["dnsCache"],
+            json!(false)
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod adapter;
 pub mod auth;
 pub mod direct_list;
 pub mod dns;
+pub mod dns_cache;
 pub mod dns_policy;
 pub mod fec;
 pub mod fragment_router;

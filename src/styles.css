@@ -2373,6 +2373,119 @@ html[dir='rtl'] .toggle.is-on span {
   cursor: default;
 }
 
+.settings-card.settings-card-stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+}
+.settings-card-stacked > div.settings-card-row {
+  justify-content: space-between;
+  gap: 18px;
+}
+.settings-card-row > div {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+}
+.settings-card-row .toggle,
+.settings-card-row .setting-icon {
+  flex-shrink: 0;
+}
+.settings-card-stacked > div.dns-cache-panel {
+  display: grid;
+  align-items: stretch;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.settings-card .dns-cache-note,
+.settings-card .dns-cache-empty {
+  color: #697486;
+}
+.settings-card .dns-cache-note.is-pending {
+  color: #f2c66d;
+}
+.dns-cache-rows {
+  display: grid;
+  gap: 8px;
+}
+.dns-cache-row {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  display: grid;
+  grid-template-columns: 40px minmax(120px, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.dns-cache-session {
+  color: #c8d0dc;
+  font-size: 10px;
+  font-weight: 600;
+}
+.dns-cache-share {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 9px;
+}
+.dns-cache-share b {
+  color: var(--cyan);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.dns-cache-meter {
+  height: 5px;
+  border-radius: 99px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+}
+.dns-cache-meter i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--cyan), var(--green));
+  transform-origin: left center;
+}
+html[dir='rtl'] .dns-cache-meter i {
+  background: linear-gradient(270deg, var(--cyan), var(--green));
+  transform-origin: right center;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .dns-cache-meter i {
+    transition: transform 400ms ease-out;
+  }
+}
+.dns-cache-figures {
+  margin: 0;
+  display: flex;
+  gap: 20px;
+}
+.dns-cache-figures > div {
+  display: grid;
+  gap: 3px;
+}
+.dns-cache-figures dt {
+  color: #697486;
+  font-size: 9px;
+}
+.dns-cache-figures dd {
+  margin: 0;
+  color: #e6ebf2;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 900px) {
+  .dns-cache-row {
+    grid-template-columns: 40px 1fr;
+  }
+  .dns-cache-figures {
+    grid-column: 1 / -1;
+  }
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;

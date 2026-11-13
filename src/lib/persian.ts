@@ -10,6 +10,21 @@ export const persian: Record<string, string> = {
     'وقتی گره پاسخ نمی‌دهد، برنامه‌های انتخاب‌شده مسدود می‌شوند. DNS راه دور همیشه در تونل خود می‌ماند، حتی وقتی این کلید خاموش باشد.',
   'Selected traffic can use your normal connection when the node is unavailable. Remote DNS still stays on its tunnel.':
     'وقتی گره در دسترس نیست، ترافیک انتخاب‌شده می‌تواند از اتصال عادی استفاده کند. DNS راه دور همچنان در تونل خود می‌ماند.',
+  'Optimistic DNS': 'DNS خوش‌بینانه',
+  'Answers repeated lookups instantly from names your tunnel already resolved, and refreshes them in the background. Sites and launchers open faster and keep resolving through a brief reconnect. Only answers that came through your tunnel are reused.':
+    'درخواست‌های تکراری را فوراً با نام‌هایی که تونل شما قبلاً پیدا کرده پاسخ می‌دهد و آن‌ها را در پس‌زمینه تازه می‌کند. سایت‌ها و لانچرها سریع‌تر باز می‌شوند و در یک اتصال دوباره کوتاه هم نام‌ها را پیدا می‌کنند. فقط پاسخ‌هایی که از تونل شما آمده‌اند دوباره استفاده می‌شوند.',
+  'Reconnect to apply this to the running session.': 'برای اعمال روی اتصال فعلی، دوباره وصل شوید.',
+  'Applies when a session connects. Game and VPN each keep their own answers.':
+    'هنگام اتصال اعمال می‌شود. بازی و VPN هر کدام پاسخ‌های خود را نگه می‌دارند.',
+  'Connect the game or VPN to see how many lookups it answers instantly.':
+    'بازی یا VPN را وصل کنید تا ببینید چند درخواست فوراً پاسخ داده می‌شود.',
+  'Off: every lookup waits for the resolver through the tunnel.':
+    'خاموش: هر درخواست منتظر پاسخ DNS از طریق تونل می‌ماند.',
+  'Lookups answered from cache': 'درخواست‌های پاسخ‌داده‌شده از حافظه',
+  'from cache': 'از حافظه',
+  'Answered instantly': 'پاسخ فوری',
+  'Kept working while refreshing': 'پاسخ هنگام تازه‌سازی',
+  'Names remembered': 'نام‌های ذخیره‌شده',
   'Statistics for': 'آمار برای',
   Game: 'بازی',
   'Carried by the VPN': 'منتقل‌شده از طریق VPN',

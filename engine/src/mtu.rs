@@ -137,13 +137,17 @@ fn path_packet_budget(mode: SessionMode, kind: &str, link_mtu: u16) -> u16 {
     (inner / 16 * 16).saturating_sub(overlay)
 }
 
-/// MTU for the relay's own TUN interface.
+/// Largest reply the relay can send back that fits inside the smallest tunnel
+/// any client might be using. The relay does not know which transports a given
+/// client opened, so this is the worst case across all of them: replies are
+/// split to it until the client's own offer names its link's size.
 ///
-/// Whatever the relay writes there is sealed and sent back to the client, so it
-/// has to fit inside the smallest tunnel any client might be using. The relay
-/// does not know which transports a given client opened, so this is the worst
-/// case across all of them.
-pub fn relay_tun_mtu(link_mtu: u16) -> u16 {
+/// It is not the relay TUN's MTU. Sized to this, the TUN made Linux refuse
+/// every larger Don't Fragment reply with "fragmentation needed" before the
+/// relay could split it. Measured live on Wardogs: Steam Datagram Relay
+/// answers with 1328-byte DF datagrams, all 471 in one join were refused at a
+/// 1285-byte TUN, and the join never completed.
+pub fn relay_reply_mtu(link_mtu: u16) -> u16 {
     EffectiveMtu::for_session(
         SessionMode::Relay,
         ["openvpn", "wireguard", "socks5", "l2tp"],
@@ -375,8 +379,8 @@ mod tests {
     }
 
     #[test]
-    fn the_relay_tun_fits_inside_every_client_transport() {
-        let relay = relay_tun_mtu(LINK_MTU);
+    fn a_relay_reply_fits_inside_every_client_transport() {
+        let relay = relay_reply_mtu(LINK_MTU);
         // An adapter path is sized to fit the relay as it is, so relays that
         // predate it need no update to carry it.
         for kind in ["wireguard", "socks5", "openvpn", "l2tp", "adapter"] {
@@ -443,7 +447,7 @@ mod tests {
                 }
             }
         }
-        assert!(relay_tun_mtu(1280) >= MIN_TUNNEL_MTU);
+        assert!(relay_reply_mtu(1280) >= MIN_TUNNEL_MTU);
     }
 
     #[test]

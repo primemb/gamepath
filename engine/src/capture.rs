@@ -8,13 +8,14 @@
 use crate::ipc::PacketCaptureRequest;
 use crate::netutil::ipv6_exposure;
 use crate::session::{DataReceiver, SenderCache, WireGuardSessionManager};
+use gamepath_engine::dns_cache::{self, DnsCache, Outcome};
 use gamepath_engine::policy::compile as compile_policy;
 use gamepath_engine::{log_info, log_warn};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub(crate) struct PacketCaptureManager {
@@ -29,6 +30,9 @@ pub(crate) struct PacketCaptureManager {
     /// The request the running capture was started with, so a change to the
     /// other session's tunnel can be applied without the caller resending it.
     last_request: Option<Value>,
+    /// Outlives a capture replaced by a rule edit, and its answers with it:
+    /// entries are kept by node, and a session's nodes never change under it.
+    dns_cache: Option<Arc<DnsCache>>,
 }
 
 #[cfg(windows)]
@@ -279,6 +283,7 @@ impl PacketCaptureManager {
                 .map(crate::split_capture::SplitPacketCapture::into_carried)
         };
         self.last_request = Some(payload);
+        let dns_cache = self.dns_cache(input.dns_cache);
         let (virtual_ipv4, bypass_ips, data_receiver, nodes, relay_reassembles) = {
             let manager = sessions.lock().unwrap();
             (
@@ -334,6 +339,7 @@ impl PacketCaptureManager {
                         && !input.other_session_active,
                     direct: input.direct.clone(),
                     relay_reassembles,
+                    dns_cache,
                 },
             )?;
             let target_count = split.target_count();
@@ -405,27 +411,8 @@ impl PacketCaptureManager {
             .unwrap()
             .packet_diagnostics()
             .ok_or("start the multipath session before packet capture")?;
-        let uplink_diagnostics = Arc::clone(&diagnostics);
-        let uplink_sessions = Arc::clone(&sessions);
-        let uplink_stop = Arc::clone(&stop);
-        let uplink_session = Arc::clone(&session);
-        let uplink = thread::Builder::new()
-            .name("gamepath-wintun-uplink".into())
-            .spawn(move || {
-                gamepath_engine::thread_priority::raise_current_for_data_plane();
-                run_wintun_uplink(
-                    uplink_session,
-                    uplink_sessions,
-                    virtual_ipv4,
-                    effective_mtu,
-                    relay_reassembles,
-                    uplink_stop,
-                    uplink_diagnostics,
-                )
-            })
-            .map_err(|error| format!("could not start Wintun uplink: {error}"))?;
-        // Before the downlink starts, so answers for direct names are learned
-        // from the first lookup on.
+        // Before either link starts, so answers for direct names are learned
+        // from the first lookup on, cached answers included.
         let direct = (gamepath_engine::role::Role::current() == gamepath_engine::role::Role::Vpn)
             .then(|| {
                 let mut protected = gamepath_engine::dns::FALLBACK_RESOLVERS.to_vec();
@@ -440,6 +427,30 @@ impl PacketCaptureManager {
         let direct_router = direct
             .as_ref()
             .map(crate::direct_routes::DirectRoutes::router);
+        let uplink_diagnostics = Arc::clone(&diagnostics);
+        let uplink_sessions = Arc::clone(&sessions);
+        let uplink_stop = Arc::clone(&stop);
+        let uplink_session = Arc::clone(&session);
+        let uplink_cache = dns_cache.as_ref().map(|cache| CachedLookups {
+            cache: Arc::clone(cache),
+            direct: direct_router.clone(),
+        });
+        let uplink = thread::Builder::new()
+            .name("gamepath-wintun-uplink".into())
+            .spawn(move || {
+                gamepath_engine::thread_priority::raise_current_for_data_plane();
+                run_wintun_uplink(
+                    uplink_session,
+                    uplink_sessions,
+                    virtual_ipv4,
+                    effective_mtu,
+                    relay_reassembles,
+                    uplink_stop,
+                    uplink_diagnostics,
+                    uplink_cache,
+                )
+            })
+            .map_err(|error| format!("could not start Wintun uplink: {error}"))?;
         let downlink_stop = Arc::clone(&stop);
         let downlink_session = Arc::clone(&session);
         let downlink = thread::Builder::new()
@@ -453,6 +464,7 @@ impl PacketCaptureManager {
                     diagnostics,
                     direct_router,
                     effective_mtu.unfragmented() - 40,
+                    dns_cache,
                 )
             })
             .map_err(|error| format!("could not start Wintun downlink: {error}"))?;
@@ -675,6 +687,7 @@ impl PacketCaptureManager {
                 "backend": "wintun",
                 "adapterIndex": capture.adapter_index,
                 "direct": capture.direct.as_ref().map(crate::direct_routes::DirectRoutes::status),
+                "dnsCache": self.dns_cache.as_ref().map(|cache| cache.status()),
             });
         }
         #[cfg(windows)]
@@ -687,6 +700,7 @@ impl PacketCaptureManager {
                 "targetCount": capture.target_count(),
                 "dnsServers": self.split_dns_servers(),
                 "diagnostics": diagnostics,
+                "dnsCache": self.dns_cache.as_ref().map(|cache| cache.status()),
             });
         }
         json!({ "state": "idle" })
@@ -694,6 +708,7 @@ impl PacketCaptureManager {
 
     pub(crate) fn stop(&mut self) -> Value {
         self.last_request = None;
+        self.dns_cache = None;
         #[cfg(windows)]
         {
             crate::teardown::step("DNS guard");
@@ -762,6 +777,21 @@ impl PacketCaptureManager {
         json!({ "state": "idle" })
     }
 
+    /// The session's cache, created on first use, or `None` with the setting off.
+    fn dns_cache(&mut self, enabled: bool) -> Option<Arc<DnsCache>> {
+        if !enabled {
+            self.dns_cache = None;
+            return None;
+        }
+        let cache = self.dns_cache.get_or_insert_with(|| {
+            log_info!("optimistic DNS: repeated tunnelled lookups are answered at once and refreshed behind the answer");
+            Arc::new(DnsCache::new(dns_cache::stale_limit(
+                gamepath_engine::role::Role::current(),
+            )))
+        });
+        Some(Arc::clone(cache))
+    }
+
     #[cfg(windows)]
     fn dns_mode(&self) -> Option<bool> {
         self.active_split
@@ -809,6 +839,7 @@ impl Drop for WindowsPacketCapture {
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn run_wintun_uplink(
     session: Arc<wintun::Session>,
     sessions: Arc<Mutex<WireGuardSessionManager>>,
@@ -817,6 +848,7 @@ fn run_wintun_uplink(
     relay_reassembles: bool,
     stop: Arc<AtomicBool>,
     diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
+    cached: Option<CachedLookups>,
 ) {
     let mut sender = SenderCache::new(sessions);
     // The adapter keeps the 1280-byte floor, so Windows hands over packets
@@ -845,6 +877,12 @@ fn run_wintun_uplink(
             );
             continue;
         }
+        if cached
+            .as_ref()
+            .is_some_and(|cached| cached.answer(&session, &bytes, &diagnostics))
+        {
+            continue;
+        }
         gamepath_engine::tcp_mss::clamp_with_checksum(&mut bytes, limit - 40);
         // A relay rebuilds what is split, Don't Fragment included, as split
         // mode relies on too. Without one the sender is answered as a router
@@ -869,6 +907,48 @@ fn run_wintun_uplink(
                 let _ = sender.send(&bytes, 0);
             }
         }
+    }
+}
+
+/// The all-traffic uplink's view of the cache. An answer it delivers never
+/// crosses the downlink, so it teaches the VPN's direct list itself.
+#[cfg(windows)]
+struct CachedLookups {
+    cache: Arc<DnsCache>,
+    direct: Option<Arc<crate::direct_routes::DirectRouter>>,
+}
+
+#[cfg(windows)]
+impl CachedLookups {
+    /// Answers a lookup from the cache. True when nothing is left to send.
+    fn answer(
+        &self,
+        session: &Arc<wintun::Session>,
+        packet: &[u8],
+        diagnostics: &gamepath_engine::packet_diagnostics::PacketDiagnostics,
+    ) -> bool {
+        let Some(query) =
+            dns_cache::datagram(packet).filter(|query| query.destination.port() == 53)
+        else {
+            return false;
+        };
+        // Every all-traffic packet leaves through the first node.
+        let outcome = self.cache.on_query(
+            0,
+            query.source,
+            *query.destination.ip(),
+            query.message,
+            Instant::now(),
+        );
+        let Outcome::Answer { reply, forward } = outcome else {
+            return false;
+        };
+        let answer = dns_cache::reply_packet(&query, &reply);
+        if let Some(direct) = &self.direct {
+            direct.learn(&answer);
+        }
+        deliver(session, &answer, diagnostics);
+        !forward
     }
 }
 
@@ -899,6 +979,7 @@ fn run_wintun_downlink(
     diagnostics: Arc<gamepath_engine::packet_diagnostics::PacketDiagnostics>,
     direct: Option<Arc<crate::direct_routes::DirectRouter>>,
     tcp_mss: u16,
+    dns_cache: Option<Arc<DnsCache>>,
 ) {
     while !stop.load(Ordering::Acquire) {
         let mut reply = match data_receiver.receive(Duration::from_millis(250)) {
@@ -924,6 +1005,21 @@ fn run_wintun_downlink(
         // connects to the address it was just given.
         if let Some(direct) = &direct {
             direct.learn(&reply);
+        }
+        if let Some(cache) = &dns_cache {
+            let deliver_it = dns_cache::datagram(&reply)
+                .filter(|answer| answer.source.port() == 53)
+                .is_none_or(|answer| {
+                    cache.on_response(
+                        answer.destination,
+                        *answer.source.ip(),
+                        answer.message,
+                        Instant::now(),
+                    )
+                });
+            if !deliver_it {
+                continue;
+            }
         }
         // The server sizes its segments from this, not from the adapter.
         gamepath_engine::tcp_mss::clamp_with_checksum(&mut reply, tcp_mss);

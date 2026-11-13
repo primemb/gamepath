@@ -2,6 +2,7 @@
 
 use crate::session::{DataReceiver, SenderCache, SessionNodes, WireGuardSessionManager};
 use gamepath_engine::direct_list::{DirectList, DirectSpec, MAX_LEARNED};
+use gamepath_engine::dns_cache::{DnsCache, Outcome as DnsOutcome};
 use gamepath_engine::fragment_router::{
     Action as FragmentAction, FragmentRouter, Route as FragmentRoute, Ticket as FragmentTicket,
 };
@@ -706,6 +707,7 @@ struct Registry {
     kill_switch: bool,
     /// See `SplitOptions::relay_reassembles`.
     relay_reassembles: bool,
+    dns_cache: Option<Arc<DnsCache>>,
     /// Packets dropped by the kill switch.
     held_packets: AtomicU64,
     /// Remote DNS: lookups to a LAN resolver are answered by
@@ -931,6 +933,8 @@ pub struct SplitOptions {
     /// A relay rebuilds what this capture splits, so a Don't Fragment packet
     /// too large for the link is split rather than refused.
     pub relay_reassembles: bool,
+    /// Answers repeated remote lookups, see [`gamepath_engine::dns_cache`].
+    pub dns_cache: Option<Arc<DnsCache>>,
 }
 
 /// What a replaced capture hands its successor. A rule edit, or the other
@@ -1091,6 +1095,7 @@ impl SplitPacketCapture {
             reset_existing,
             direct,
             relay_reassembles,
+            dns_cache,
         } = options;
         let plan = compile("split", rules)?;
         let direct = DirectList::compile(&direct);
@@ -1154,6 +1159,7 @@ impl SplitPacketCapture {
             bypass: bypass_clause(bypass_ips),
             kill_switch,
             relay_reassembles,
+            dns_cache,
             held_packets: AtomicU64::new(0),
             redirect_dns: AtomicBool::new(remote_dns),
             dns_own_apps_only: AtomicBool::new(own_apps_only),
@@ -1345,6 +1351,7 @@ impl SplitPacketCapture {
             let capture_returns = Arc::clone(&return_paths);
             let capture_pending = pending_tx.clone();
             let capture_bypass = bypass_tx.clone();
+            let capture_answers = Arc::clone(&send_handle);
             let worker = thread::Builder::new()
                 .name(format!("gamepath-windivert-selected-{}", index + 1))
                 .spawn(move || {
@@ -1357,6 +1364,7 @@ impl SplitPacketCapture {
                         capture_registry,
                         capture_pending,
                         capture_bypass,
+                        capture_answers,
                     )
                 })
                 .map_err(|error| format!("could not start selected packet capture: {error}"))?;
@@ -1763,6 +1771,9 @@ fn run_selected_capture(
     registry: Arc<Registry>,
     pending_syns: mpsc::SyncSender<PendingSyn>,
     bypass: mpsc::SyncSender<Bypass>,
+    // The reply injector's handle: an answer injected below it would be
+    // invisible to the hostname tracker, see `INJECT_PRIORITY`.
+    answers: Arc<Handle>,
 ) {
     let mut packet_buffer = vec![0_u8; 65_535];
     let mut tunnel_buffer = Vec::with_capacity(65_535);
@@ -2182,6 +2193,12 @@ fn run_selected_capture(
             }
             continue;
         }
+        if remote_dns
+            && first_fragment.is_none()
+            && answer_from_cache(&answers, &registry, packet, address, fields, node)
+        {
+            continue;
+        }
         let hold_on_failure = registry.kill_switch || remote_dns;
         let carried = route_selected_packet(
             &handle,
@@ -2219,6 +2236,69 @@ fn run_selected_capture(
             );
         }
     }
+}
+
+/// Answers a remote lookup from the cache, injected as if from the resolver
+/// it asked. True when nothing is left to send; a refresh still goes out.
+fn answer_from_cache(
+    answers: &Handle,
+    registry: &Registry,
+    packet: &[u8],
+    address: Address,
+    fields: Ipv4Fields,
+    node: u8,
+) -> bool {
+    let Some(cache) = &registry.dns_cache else {
+        return false;
+    };
+    let Some(query) =
+        gamepath_engine::dns_cache::datagram(packet).filter(|query| query.destination.port() == 53)
+    else {
+        return false;
+    };
+    let outcome = cache.on_query(
+        node,
+        query.source,
+        fields.destination,
+        query.message,
+        Instant::now(),
+    );
+    let DnsOutcome::Answer { reply, forward } = outcome else {
+        return false;
+    };
+    let mut answer = gamepath_engine::dns_cache::reply_packet(&query, &reply);
+    let network = address.network_data();
+    let mut inbound = Address::inbound(network.interface_index, network.subinterface_index);
+    let injected = answers
+        .checksums(&mut answer, &mut inbound)
+        .and_then(|()| answers.send(&answer, &inbound));
+    if let Err(error) = &injected {
+        registry.packet_diagnostics.record_error(
+            gamepath_engine::packet_diagnostics::Reason::ReturnInject,
+            &answer,
+            error,
+        );
+        // Unanswered, the lookup still has to reach the resolver.
+        return false;
+    }
+    !forward
+}
+
+/// False for the reply to a refresh, whose client already has its answer.
+fn cache_accepts_reply(registry: &Registry, packet: &[u8]) -> bool {
+    let Some(cache) = &registry.dns_cache else {
+        return true;
+    };
+    gamepath_engine::dns_cache::datagram(packet)
+        .filter(|reply| reply.source.port() == 53)
+        .is_none_or(|reply| {
+            cache.on_response(
+                reply.destination,
+                *reply.source.ip(),
+                reply.message,
+                Instant::now(),
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3361,6 +3441,9 @@ fn run_reply_injector(
         packet[16..20].copy_from_slice(&path.local_ip.octets());
         if let Some(resolver) = path.resolver {
             packet[12..16].copy_from_slice(&resolver.octets());
+        }
+        if !cache_accepts_reply(&registry, &packet) {
+            continue;
         }
         gamepath_engine::tcp_mss::clamp(&mut packet, registry.limits(path.node).tcp_mss);
         let mut address = Address::inbound(path.interface_index, path.subinterface_index);

@@ -142,7 +142,7 @@ pub fn read_answer(response: &[u8], id: u16) -> Option<Answer> {
 
 /// The offset just past the name starting at `at`, following the wire format's
 /// compression: a pointer ends the name in two bytes wherever it points.
-fn skip_name(message: &[u8], mut at: usize) -> Option<usize> {
+pub(crate) fn skip_name(message: &[u8], mut at: usize) -> Option<usize> {
     loop {
         let length = *message.get(at)?;
         match length {

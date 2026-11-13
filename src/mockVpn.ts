@@ -176,6 +176,7 @@ export function createMockVpn(get: () => AppState, snapshot: () => AppState): Vp
         state: 'capturing',
         backend: 'windivert',
         trafficMode: vpn().trafficMode,
+        dnsCache: { entries: 312, answered: 640, staleAnswered: 118, refreshed: 126, forwarded: 205 },
         diagnostics: {
           matchedSockets: 2,
           captureFilterCount: 2,

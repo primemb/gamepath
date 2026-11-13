@@ -102,6 +102,7 @@ let state: AppState = {
   ruleGroups: [{ id: 'group-competitive', name: 'Competitive games', enabled: true }],
   trafficMode: 'split',
   remoteDns: true,
+  optimisticDns: true,
   relayFailover: { enabled: false, standbyRelayId: null },
   connectionMode: 'relay',
   routingStrategy: 'smart',
@@ -340,6 +341,10 @@ export const mockApi: GamePathApi = {
     state.remoteDns = enabled
     return snapshot()
   },
+  setOptimisticDns: async (enabled) => {
+    state.optimisticDns = enabled
+    return snapshot()
+  },
   setStartWithWindows: async (enabled) => {
     state.startWithWindows = { available: true, enabled }
     return snapshot()
@@ -570,6 +575,7 @@ export const mockApi: GamePathApi = {
               tcpMss: 1316,
               transportOverhead: 144,
               ipv6: { carried: false, systemHasRoute: false },
+              dnsCache: { entries: 86, answered: 214, staleAnswered: 37, refreshed: 41, forwarded: 92 },
               diagnostics: {
                 matchedSockets: 3,
                 captureFilterCount: 3,

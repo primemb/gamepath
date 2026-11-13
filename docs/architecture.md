@@ -232,6 +232,7 @@ UDP has no MSS to clamp, so split mode does for UDP what a tunnel adapter with t
 - **The size split mode enforces is what crosses unfragmented** (`EffectiveMtu::unfragmented`): the link's budget after encapsulation, which on a narrow link is under the 1280 floor the tunnel MTU keeps. Measured live: a 1445-byte path carrying L2TP routes (215 bytes) leaves 1230, and a 1280-byte packet would leave as 1495. It never goes under 1228, QUIC's mandatory 1200 bytes of UDP payload with its headers (RFC 9000 §14). The TCP MSS clamp, in both directions, uses the same figure.
 - **A selected packet larger than that, without Don't Fragment, is split before it enters the tunnel** (`ipv4_fragments::fragment`), as an adapter with that MTU would make Windows split it; the far end reassembles. Split mode takes packets before any adapter sees them, so without this nothing does. Measured live on an Iranian uplink: anything over ~1430 bytes vanished whether Don't Fragment was set or not, and no "fragmentation needed" came back, so the 1209-1280-byte datagrams the floor let through plus 159-215 bytes of encapsulation simply never arrived. Steam/Unreal games such as Wardogs send their state as non-DF UDP of that size and turned the loss into lag that probes, being small, never saw. All-traffic mode does the same in its Wintun uplink: the adapter keeps the 1280 floor, so Windows hands over packets up to that size, and the engine answers, splits or clamps them to `unfragmented` exactly as split mode does (`tcp_mss::clamp_with_checksum` recomputes the TCP checksum there, since no WinDivert pass follows).
 - **In a relay session a Don't Fragment packet is split too, not answered** (`SplitOptions::relay_reassembles`, `ipv4_fragments::split_for_tunnel`): the relay rebuilds it before it leaves the VPS, so the server receives it whole with DF intact, as a plain tunnel with room for it would deliver it. Answering it instead lowered Windows' path MTU for the game server to 1228, and Overwatch's larger sends then failed: its ping climbed to 2000 ms on GamePath while a plain WireGuard tunnel with a 1300-byte MTU to the same node played normally. The answer below remains for direct sessions, where nothing on the far side rebuilds a split packet.
+- **The relay's TUN takes full-size replies** (`LINK_MTU`), and the relay splits each one to the client's offered size, or to `relay_reply_mtu` (what every client transport carries) before the offer arrives. The TUN was once sized to `relay_reply_mtu` itself (1285 bytes), so Linux answered every larger Don't Fragment reply with "fragmentation needed" before the relay saw it. Measured live on Wardogs, which joins through Steam Datagram Relay: Valve's relays answer with 1328-byte DF datagrams, all 471 in one join were refused at the relay, and the game timed out back to its menu while the same machine joined normally without GamePath. At 1500 every reply reached the client, 458 of 6052 of them over 1285 bytes.
 - **A selected Don't Fragment packet larger than that is answered, not sent**: ICMP "fragmentation needed" carrying the size, quoting the packet as the application sent it, built as WinDivert's driver builds its own (`windivert_inject_packet_too_big`). Windows records the smaller path MTU for that destination, so a later oversized send can fail with `WSAEMSGSIZE` (measured: a 1500-byte Don't Fragment send refused with 10040 once the path MTU was known), and RakNet treats exactly that error as "use the next size". The send that triggered it has already succeeded from the application's view, so the first probe to a new destination is lost and RakNet's own retry moves on. Without the answer the packet would simply vanish, the failure WinDivert issue #278 describes; if the answer cannot be injected, the packet is carried after all.
 - **ICMP errors that come back through the tunnel are matched by the packet they quote**, rewritten to the local address and delivered. A router's "fragmentation needed" or "unreachable" for a tunnelled packet is addressed to the virtual address, and matched by its own header, as an echo reply is, it fit no flow: the log's `ICMP ... -> :0` replies with no flow were these. Path MTU discovery now works beyond the relay too.
 - **Fragments are handled in both directions.** Inbound, a datagram is reassembled before flow matching and injection; duplicate copies are accepted only when identical. Outbound, the first fragment's transport checksum is corrected incrementally (RFC 1624). One capture-wide `fragment_router` coordinates all readers using source, destination, protocol and IP ID. It reserves the first fragment's verdict before classification or sending, and buffers later fragments whose verdict is unknown for at most 100 ms. Once known, every piece follows the same tunnel/redirect, bypass or discard decision. Unknown, expired or failed selected fragments never fail open. Storage is bounded to 64 datagrams, 64 waiting pieces per datagram and 1 MiB total; known verdicts last 5 s. A generation ticket prevents an older worker from overwriting a reused ID's new verdict. Capture replacement transfers this state with the reply table. Narrow kernel filters also admit fragments so DNS fragments lacking ports cannot escape the classifier. Ordinary unfragmented packets do not acquire the fragment lock.
@@ -1613,6 +1614,36 @@ route instead of waiting for a dead proxy stream to time out. Live capture
 replacement transfers these flows without ending them. Applications that cache
 proxy fake-IP DNS answers themselves can still need to resolve the name again;
 flushing Windows' cache cannot clear an application's private cache.
+
+### Optimistic DNS cache
+
+Windows' DNS Client caches by TTL, so a lookup reaching capture is one Windows no longer holds. Popular names
+carry 20-300 s TTLs, so a revisited site paid one tunnel round trip per name — 100-300 ms from a filtered
+uplink to its relay — before its first connection opened. `dns_cache` answers repeated UDP lookups from the
+replies the tunnel already returned, the way sing-box's `optimistic` cache and RFC 8767 serve-stale do:
+
+- **Fresh** entries are answered with the remaining TTL. Within the last tenth of the TTL (at least 2 s) the
+  query is also forwarded, and its reply refreshes the entry and is dropped, so a name in steady use never
+  expires and the client never sees two answers.
+- **Expired** entries are answered immediately with a 5 s TTL and refreshed behind the answer, for up to
+  1 h past expiry in the game and 24 h in the VPN. A refresh outstanding for 4 s is presumed lost and may be
+  resent. A failed refresh (SERVFAIL, timeout) keeps the old entry: during an outage the last real address is
+  the best one available, which is what keeps a launcher resolving through a path failover.
+- **Negative** answers (NXDOMAIN or NODATA with an SOA) are kept for at most 60 s and never served stale.
+- **Never kept:** truncated, failed, zero-TTL and fake-IP (198.18.0.0/15) answers, and queries carrying EDNS
+  options (client subnet, cookies) a reused answer could not honour.
+
+Remote DNS stays fail closed. An entry is only stored from a reply to a query the cache saw leave through the
+tunnel, keyed by client socket, resolver and id, so nothing in it ever came from the local resolver. Entries
+are keyed by node, query type and the RD/CD/EDNS/DO flags: a CDN or matchmaking name answers by where the
+lookup exits, and an EDNS answer must not reach a client that did not ask for one. The cache belongs to the
+capture manager, so a live rule edit keeps it, and it is dropped when the session stops.
+
+In split mode an answer is injected through the reply injector's priority-1000 handle, so the hostname tracker
+sees it and hostname rules and the VPN's direct list keep learning addresses from cached answers. In
+all-traffic mode the uplink answers through Wintun and feeds the answer to the direct router itself, since it
+never crosses the downlink. TCP lookups and native L2TP sessions are not cached. Capture status reports
+`dnsCache` counters (`answered`, `staleAnswered`, `refreshed`, `forwarded`, `entries`).
 
 A capture restart (a live rule edit, or the other session starting or stopping) hands the new capture its
 predecessor's reply table, routed-connection list and usage counters (`CarriedFlows`), under the same capture

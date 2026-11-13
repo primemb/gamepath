@@ -143,6 +143,10 @@ pub(crate) struct PacketCaptureRequest {
     /// choosing it; someone who never heard of the setting should be protected.
     #[serde(default = "enabled")]
     pub(crate) remote_dns: bool,
+    /// Answer repeated tunnelled lookups from an optimistic cache, see
+    /// [`gamepath_engine::dns_cache`].
+    #[serde(default = "enabled")]
+    pub(crate) dns_cache: bool,
     /// Drop rule-selected traffic the session cannot carry rather than let it
     /// out on the normal connection. Off unless asked for, which is how every
     /// session behaved before the setting existed.
@@ -250,6 +254,17 @@ mod tests {
                     .unwrap();
             assert_eq!(request.remote_dns, asked);
         }
+    }
+
+    /// On unless switched off, including for a service that predates it.
+    #[test]
+    fn the_dns_cache_is_on_unless_switched_off() {
+        let request: PacketCaptureRequest =
+            serde_json::from_value(json!({ "trafficMode": "all" })).unwrap();
+        assert!(request.dns_cache);
+        let request: PacketCaptureRequest =
+            serde_json::from_value(json!({ "trafficMode": "all", "dnsCache": false })).unwrap();
+        assert!(!request.dns_cache);
     }
 
     #[test]

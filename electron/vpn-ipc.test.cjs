@@ -103,6 +103,17 @@ test('connecting sends the node, rules and settings to the vpn slot', async () =
   assert.ok(start.ownHostnames.includes('proxy.example'))
   assert.equal(state.vpn.wantConnected, true)
   assert.equal(result.vpn.session.status, 'connected')
+  // Optimistic DNS is on unless the shared setting turns it off.
+  assert.equal(start.dnsCache, true)
+})
+
+test('the VPN follows the shared optimistic DNS setting', async () => {
+  const { state, invoke, calls } = harness()
+  state.optimisticDns = false
+  await invoke('vpn:add-socks5', socks5)
+  await invoke('vpn:add-rule', { kind: 'application', value: 'C:\\Apps\\chat.exe' })
+  await invoke('vpn:connect')
+  assert.equal(calls.find((call) => call.command === 'start-session').payload.dnsCache, false)
 })
 
 test('a split VPN with nothing selected says what to do instead of connecting', async () => {

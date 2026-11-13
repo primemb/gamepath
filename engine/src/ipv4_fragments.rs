@@ -3,10 +3,10 @@
 //! Only the first fragment carries the ports a flow is matched by, and
 //! WinDivert's checksum helper refuses a TCP or UDP fragment outright.
 //!
-//! Inbound, the relay's tunnel interface fragments any reply larger than its
-//! MTU, which a game negotiating 1492-byte packets (RakNet, used by Rust)
-//! triggers on every large snapshot. Observed live: every fragmented reply
-//! from a Rust server was lost, half as injection errors and half as "no
+//! Inbound, the relay splits any reply larger than what the client's link
+//! carries whole, which a game negotiating 1492-byte packets (RakNet, used by
+//! Rust) triggers on every large snapshot. Observed live: every fragmented
+//! reply from a Rust server was lost, half as injection errors and half as "no
 //! flow", and the join never completed. [`Reassembler`] rebuilds the datagram
 //! so the injector delivers it whole, as a VPN adapter would.
 //!

@@ -102,6 +102,10 @@ test('the remote DNS setting reaches packet capture in both traffic modes', () =
   assert.match(main, /remoteDns: state\.remoteDns !== false/)
   assert.match(service, /payload\["remoteDns"\]\.as_bool\(\)\.unwrap_or\(true\)/)
   assert.match(service, /"remoteDns": remote_dns/)
+  // Optimistic DNS takes the same path, defaulting on at every hop.
+  assert.match(main, /dnsCache: state\.optimisticDns !== false/)
+  assert.match(service, /payload\["dnsCache"\]\.as_bool\(\)\.unwrap_or\(true\)/)
+  assert.match(service, /"dnsCache": slot\.dns_cache/)
 
   // And a live split rule edit has to reapply the session's choice rather
   // than rebuild the payload from the default.

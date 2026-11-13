@@ -428,6 +428,17 @@ export type VpnApi = {
   onChanged: (callback: (vpn: VpnState) => void) => () => void
 }
 
+export type DnsCacheStats = {
+  entries: number
+  /** Lookups answered from a fresh entry. */
+  answered: number
+  /** Lookups answered from an expired entry while it was refreshed. */
+  staleAnswered: number
+  refreshed: number
+  /** Lookups that went to the resolver. */
+  forwarded: number
+}
+
 export type AppState = {
   clientVersion?: string
   /** Read from Windows each time; unavailable outside the installed app. */
@@ -438,6 +449,8 @@ export type AppState = {
   ruleGroups: SplitRuleGroup[]
   trafficMode: 'all' | 'split'
   remoteDns: boolean
+  /** Repeated lookups answered at once from a cache refreshed through the tunnel; read at connect. */
+  optimisticDns: boolean
   connectionMode: ConnectionMode
   /** Smart uses the best two paths, more while one is unstable; manual duplicates across every healthy path. */
   routingStrategy: 'smart' | 'manual'
@@ -513,6 +526,8 @@ export type AppState = {
        * has a working IPv6 route, which keeps using the normal connection.
        */
       ipv6?: { carried: boolean; systemHasRoute: boolean }
+      /** Absent or null while the session runs with optimistic DNS off. */
+      dnsCache?: DnsCacheStats | null
       diagnostics?: {
         matchedSockets: number
         captureFilterCount: number
@@ -633,6 +648,7 @@ export type GamePathApi = {
   removeRuleGroup: (id: string) => Promise<AppState>
   setTrafficMode: (mode: 'all' | 'split') => Promise<AppState>
   setRemoteDns: (enabled: boolean) => Promise<AppState>
+  setOptimisticDns: (enabled: boolean) => Promise<AppState>
   setStartWithWindows: (enabled: boolean) => Promise<AppState>
   configureLanProxy: (input: LanProxySettingsInput) => Promise<AppState>
   setConnectionMode: (mode: ConnectionMode) => Promise<AppState>

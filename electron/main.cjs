@@ -70,6 +70,9 @@ const defaultState = () => ({
   // filtered connection the local resolver hands back poisoned answers while
   // the tunnel beside it is healthy, which reads as the tunnel failing.
   remoteDns: true,
+  // Repeated lookups answered at once and refreshed through the tunnel. Shared
+  // by the game and the VPN; each session reads it when it connects.
+  optimisticDns: true,
   connectionMode: 'relay',
   routingStrategy: 'smart',
   lanProxy: defaultLanProxy(),
@@ -890,6 +893,13 @@ function registerIpc() {
     return publicState()
   })
 
+  ipcMain.handle('dns:set-optimistic', (_event, enabled) => {
+    state.optimisticDns = Boolean(enabled)
+    logger.info(`optimistic DNS ${state.optimisticDns ? 'on' : 'off'}`)
+    saveState()
+    return publicState()
+  })
+
   ipcMain.handle('relay:set', (_event, id) => {
     if (state.relays.some((relay) => relay.id === id)) state.activeRelayId = state.activeRelayId === id ? null : id
     saveState()
@@ -1336,6 +1346,7 @@ async function startSession({ relay: relayOverride = null, movedFrom = null, wat
           nodes,
           trafficMode: state.trafficMode,
           remoteDns: state.remoteDns !== false,
+          dnsCache: state.optimisticDns !== false,
           ownHostnames: ownHostnames(state),
           rules,
           lanProxy: lanProxyPayload(),
