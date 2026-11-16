@@ -2,7 +2,7 @@
 
 use crate::session::{DataReceiver, SenderCache, SessionNodes, WireGuardSessionManager};
 use gamepath_engine::direct_list::{DirectList, DirectSpec, MAX_LEARNED};
-use gamepath_engine::dns_cache::{DnsCache, Outcome as DnsOutcome};
+use gamepath_engine::dns_cache::{Delivery as DnsDelivery, DnsCache, Outcome as DnsOutcome};
 use gamepath_engine::fragment_router::{
     Action as FragmentAction, FragmentRouter, Route as FragmentRoute, Ticket as FragmentTicket,
 };
@@ -2193,11 +2193,15 @@ fn run_selected_capture(
             }
             continue;
         }
-        if remote_dns
-            && first_fragment.is_none()
-            && answer_from_cache(&answers, &registry, packet, address, fields, node)
-        {
-            continue;
+        if remote_dns && first_fragment.is_none() {
+            match answer_from_cache(&answers, &registry, packet, address, fields, node) {
+                Cached::Answered => continue,
+                // The app already has its answer and closes its socket, which
+                // removes every flow it owns. Owned by nobody, the refresh's
+                // reply still finds its way back to the cache.
+                Cached::Refresh => process_id = None,
+                Cached::Missed => {}
+            }
         }
         let hold_on_failure = registry.kill_switch || remote_dns;
         let carried = route_selected_packet(
@@ -2238,8 +2242,17 @@ fn run_selected_capture(
     }
 }
 
+enum Cached {
+    /// Answered from the cache; nothing is left to send.
+    Answered,
+    /// Answered from the cache, and the query still goes out to refresh it.
+    Refresh,
+    /// Not answered: the query goes out for its client.
+    Missed,
+}
+
 /// Answers a remote lookup from the cache, injected as if from the resolver
-/// it asked. True when nothing is left to send; a refresh still goes out.
+/// it asked.
 fn answer_from_cache(
     answers: &Handle,
     registry: &Registry,
@@ -2247,58 +2260,98 @@ fn answer_from_cache(
     address: Address,
     fields: Ipv4Fields,
     node: u8,
-) -> bool {
+) -> Cached {
     let Some(cache) = &registry.dns_cache else {
-        return false;
+        return Cached::Missed;
     };
     let Some(query) =
         gamepath_engine::dns_cache::datagram(packet).filter(|query| query.destination.port() == 53)
     else {
-        return false;
+        return Cached::Missed;
     };
+    let network = address.network_data();
+    let route = (u64::from(network.interface_index) << 32) | u64::from(network.subinterface_index);
     let outcome = cache.on_query(
         node,
         query.source,
         fields.destination,
         query.message,
+        route,
         Instant::now(),
     );
     let DnsOutcome::Answer { reply, forward } = outcome else {
-        return false;
+        return Cached::Missed;
     };
     let mut answer = gamepath_engine::dns_cache::reply_packet(&query, &reply);
-    let network = address.network_data();
-    let mut inbound = Address::inbound(network.interface_index, network.subinterface_index);
-    let injected = answers
-        .checksums(&mut answer, &mut inbound)
-        .and_then(|()| answers.send(&answer, &inbound));
+    if !inject_answer(answers, registry, &mut answer, route) {
+        // Unanswered, the lookup still has to reach its resolver for its client.
+        return Cached::Missed;
+    }
+    if forward {
+        Cached::Refresh
+    } else {
+        Cached::Answered
+    }
+}
+
+/// Injects a DNS answer inbound on the interface `route` names, as
+/// [`answer_from_cache`] encodes it.
+fn inject_answer(handle: &Handle, registry: &Registry, answer: &mut [u8], route: u64) -> bool {
+    let mut inbound = Address::inbound((route >> 32) as u32, route as u32);
+    let injected = handle
+        .checksums(answer, &mut inbound)
+        .and_then(|()| handle.send(answer, &inbound));
     if let Err(error) = &injected {
         registry.packet_diagnostics.record_error(
             gamepath_engine::packet_diagnostics::Reason::ReturnInject,
-            &answer,
+            answer,
             error,
         );
-        // Unanswered, the lookup still has to reach the resolver.
-        return false;
     }
-    !forward
+    injected.is_ok()
 }
 
-/// False for the reply to a refresh, whose client already has its answer.
-fn cache_accepts_reply(registry: &Registry, packet: &[u8]) -> bool {
+/// Answers every lookup the resolver has kept waiting past its deadline with
+/// the older answer the cache holds.
+fn deliver_rescued(handle: &Handle, registry: &Registry) {
+    let Some(cache) = &registry.dns_cache else {
+        return;
+    };
+    for rescued in cache.overdue(Instant::now()) {
+        let mut answer = gamepath_engine::dns_cache::reply_from(
+            rescued.resolver,
+            rescued.client,
+            &rescued.reply,
+        );
+        inject_answer(handle, registry, &mut answer, rescued.route);
+    }
+}
+
+/// Settles a reply with the cache. False when it must not be delivered: its
+/// client already has an answer. A failed reply may become an older answer.
+fn settle_with_cache(registry: &Registry, packet: &mut Vec<u8>) -> bool {
     let Some(cache) = &registry.dns_cache else {
         return true;
     };
-    gamepath_engine::dns_cache::datagram(packet)
+    let delivery = gamepath_engine::dns_cache::datagram(packet)
         .filter(|reply| reply.source.port() == 53)
-        .is_none_or(|reply| {
-            cache.on_response(
+        .map(|reply| {
+            let delivery = cache.on_response(
                 reply.destination,
                 *reply.source.ip(),
                 reply.message,
                 Instant::now(),
-            )
-        })
+            );
+            (*reply.source.ip(), reply.destination, delivery)
+        });
+    match delivery {
+        Some((_, _, DnsDelivery::Drop)) => false,
+        Some((resolver, client, DnsDelivery::Replace(older))) => {
+            *packet = gamepath_engine::dns_cache::reply_from(resolver, client, &older);
+            true
+        }
+        _ => true,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3372,6 +3425,7 @@ fn run_reply_injector(
 ) {
     let mut fragments = gamepath_engine::ipv4_fragments::Reassembler::default();
     while !stop.load(Ordering::Acquire) {
+        deliver_rescued(&handle, &registry);
         let received = data_receiver.receive(Duration::from_millis(20));
         let mut packet = match received {
             Ok(Some(packet)) => {
@@ -3442,7 +3496,7 @@ fn run_reply_injector(
         if let Some(resolver) = path.resolver {
             packet[12..16].copy_from_slice(&resolver.octets());
         }
-        if !cache_accepts_reply(&registry, &packet) {
+        if !settle_with_cache(&registry, &mut packet) {
             continue;
         }
         gamepath_engine::tcp_mss::clamp(&mut packet, registry.limits(path.node).tcp_mss);

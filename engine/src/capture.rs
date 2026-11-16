@@ -8,7 +8,7 @@
 use crate::ipc::PacketCaptureRequest;
 use crate::netutil::ipv6_exposure;
 use crate::session::{DataReceiver, SenderCache, WireGuardSessionManager};
-use gamepath_engine::dns_cache::{self, DnsCache, Outcome};
+use gamepath_engine::dns_cache::{self, Delivery, DnsCache, Outcome};
 use gamepath_engine::policy::compile as compile_policy;
 use gamepath_engine::{log_info, log_warn};
 use serde_json::{Value, json};
@@ -932,12 +932,14 @@ impl CachedLookups {
         else {
             return false;
         };
-        // Every all-traffic packet leaves through the first node.
+        // Every all-traffic packet leaves through the first node, and every
+        // answer goes back into the adapter, so there is no route to keep.
         let outcome = self.cache.on_query(
             0,
             query.source,
             *query.destination.ip(),
             query.message,
+            0,
             Instant::now(),
         );
         let Outcome::Answer { reply, forward } = outcome else {
@@ -981,8 +983,27 @@ fn run_wintun_downlink(
     tcp_mss: u16,
     dns_cache: Option<Arc<DnsCache>>,
 ) {
+    let learn_and_deliver = |reply: &[u8]| {
+        // Before delivery, so the route exists by the time the application
+        // connects to the address it was just given.
+        if let Some(direct) = &direct {
+            direct.learn(reply);
+        }
+        deliver(&session, reply, &diagnostics);
+    };
     while !stop.load(Ordering::Acquire) {
-        let mut reply = match data_receiver.receive(Duration::from_millis(250)) {
+        if let Some(cache) = &dns_cache {
+            for rescued in cache.overdue(Instant::now()) {
+                learn_and_deliver(&dns_cache::reply_from(
+                    rescued.resolver,
+                    rescued.client,
+                    &rescued.reply,
+                ));
+            }
+        }
+        // Short enough that a rescued lookup is not left waiting much past
+        // its deadline while the tunnel is quiet.
+        let mut reply = match data_receiver.receive(Duration::from_millis(100)) {
             Ok(Some(packet)) => packet,
             Ok(None) => continue,
             Err(error) => {
@@ -1001,29 +1022,29 @@ fn run_wintun_downlink(
             );
             continue;
         }
-        // Before delivery, so the route exists by the time the application
-        // connects to the address it was just given.
-        if let Some(direct) = &direct {
-            direct.learn(&reply);
-        }
         if let Some(cache) = &dns_cache {
-            let deliver_it = dns_cache::datagram(&reply)
+            let delivery = dns_cache::datagram(&reply)
                 .filter(|answer| answer.source.port() == 53)
-                .is_none_or(|answer| {
-                    cache.on_response(
+                .map(|answer| {
+                    let delivery = cache.on_response(
                         answer.destination,
                         *answer.source.ip(),
                         answer.message,
                         Instant::now(),
-                    )
+                    );
+                    (*answer.source.ip(), answer.destination, delivery)
                 });
-            if !deliver_it {
-                continue;
+            match delivery {
+                Some((_, _, Delivery::Drop)) => continue,
+                Some((resolver, client, Delivery::Replace(older))) => {
+                    reply = dns_cache::reply_from(resolver, client, &older);
+                }
+                _ => {}
             }
         }
         // The server sizes its segments from this, not from the adapter.
         gamepath_engine::tcp_mss::clamp_with_checksum(&mut reply, tcp_mss);
-        deliver(&session, &reply, &diagnostics);
+        learn_and_deliver(&reply);
     }
 }
 

@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const HEADER_LEN: usize = 12;
@@ -41,6 +42,16 @@ const OPCODE_MASK: u16 = 0x7800;
 /// not ask again at once, short enough that the refreshed answer replaces it
 /// within seconds if the address moved.
 const STALE_TTL: u32 = 5;
+/// An expired answer is served at once only while it is younger than one more
+/// TTL, within these bounds: its address is then very likely still in service.
+/// Serving every expired answer at once sent a new site's shared CDN names to
+/// addresses that had since moved, so pages loaded slowly or by halves the
+/// first time and normally on reload.
+const OPTIMISTIC_WINDOW: (Duration, Duration) = (Duration::from_secs(30), Duration::from_secs(300));
+/// How long a lookup holding only an older answer waits for the resolver
+/// before that answer is used instead: RFC 8767's client response timer, well
+/// inside the time Windows and browsers give a lookup before failing it.
+const RESCUE_DELAY: Duration = Duration::from_millis(1500);
 /// "No such name" is kept briefly and never served once expired: a name that
 /// has just been created must not stay missing.
 const NEGATIVE_TTL_LIMIT: u32 = 60;
@@ -105,7 +116,12 @@ pub fn datagram(packet: &[u8]) -> Option<Datagram<'_>> {
 /// The IPv4/UDP datagram carrying `message` back to whoever sent `query`, as
 /// if from the resolver it asked.
 pub fn reply_packet(query: &Datagram<'_>, message: &[u8]) -> Vec<u8> {
-    let (from, to) = (query.destination, query.source);
+    reply_from(*query.destination.ip(), query.source, message)
+}
+
+/// `message` as a UDP datagram from port 53 of `resolver` to `client`.
+pub fn reply_from(resolver: Ipv4Addr, client: SocketAddrV4, message: &[u8]) -> Vec<u8> {
+    let (from, to) = (SocketAddrV4::new(resolver, DNS_PORT), client);
     let udp_length = 8 + message.len();
     let total = 20 + udp_length;
     let mut packet = Vec::with_capacity(total);
@@ -146,6 +162,26 @@ pub enum Outcome {
     Answer { reply: Vec<u8>, forward: bool },
 }
 
+/// What to do with a reply on its way to its client.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Deliver,
+    /// Its client was already answered from the cache.
+    Drop,
+    /// The resolver failed a client holding an older answer: send that instead.
+    Replace(Vec<u8>),
+}
+
+/// An older answer for a client the resolver left waiting too long.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Rescued {
+    pub client: SocketAddrV4,
+    pub resolver: Ipv4Addr,
+    pub reply: Vec<u8>,
+    /// As given to [`DnsCache::on_query`].
+    pub route: u64,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct Key {
     node: u8,
@@ -181,16 +217,32 @@ impl Entry {
 
 type PendingKey = (SocketAddrV4, Ipv4Addr, u16);
 
+enum Mode {
+    /// Nothing was answered: the reply is the client's, and fills the cache.
+    Fill,
+    /// The client was answered from the cache: the reply only refreshes it.
+    Refresh,
+    /// The client waits for the resolver, holding an older answer to fall
+    /// back on at `deadline`, or as soon as the resolver fails.
+    Rescue {
+        deadline: Instant,
+        query: Box<[u8]>,
+        route: u64,
+    },
+}
+
 struct Pending {
     key: Key,
     sent: Instant,
-    refresh: bool,
+    mode: Mode,
 }
 
 #[derive(Default)]
 struct Counters {
     answered: u64,
     stale_answered: u64,
+    /// Older answers sent because the resolver failed or was too slow.
+    rescued: u64,
     refreshed: u64,
     forwarded: u64,
 }
@@ -205,6 +257,9 @@ struct Inner {
 pub struct DnsCache {
     inner: Mutex<Inner>,
     stale_limit: Duration,
+    /// Whether any client may be waiting on a rescue, so [`DnsCache::overdue`]
+    /// can be called on every packet without taking the lock.
+    rescues: AtomicBool,
 }
 
 impl DnsCache {
@@ -212,16 +267,20 @@ impl DnsCache {
         Self {
             inner: Mutex::default(),
             stale_limit,
+            rescues: AtomicBool::new(false),
         }
     }
 
     /// A UDP query from `client` to `resolver`, about to leave through `node`.
+    /// `route` is whatever the caller needs to reach `client` later, handed
+    /// back with a [`Rescued`] answer.
     pub fn on_query(
         &self,
         node: u8,
         client: SocketAddrV4,
         resolver: Ipv4Addr,
         message: &[u8],
+        route: u64,
         now: Instant,
     ) -> Outcome {
         let Some(key) = query_key(node, message) else {
@@ -230,6 +289,7 @@ impl DnsCache {
         let id = u16::from_be_bytes([message[0], message[1]]);
         let mut inner = self.inner.lock().unwrap();
         let mut served = None;
+        let mut rescue = false;
         if let Some(entry) = inner.entries.get_mut(&key) {
             let age = now.saturating_duration_since(entry.stored);
             let ttl = Duration::from_secs(u64::from(entry.ttl));
@@ -246,9 +306,11 @@ impl DnsCache {
                     record_ttl.min(lifetime).saturating_sub(elapsed).max(1)
                 })
                 .map(|reply| (reply, refresh, false));
-            } else if !entry.negative && age - ttl < self.stale_limit {
+            } else if !entry.negative && age - ttl < optimistic_window(ttl) {
                 served =
                     answer(entry, message, |_| STALE_TTL).map(|reply| (reply, !refreshing, true));
+            } else if !entry.negative && age - ttl < self.stale_limit {
+                rescue = true;
             }
             if let Some((_, refresh, _)) = &served {
                 entry.last_used = now;
@@ -265,38 +327,47 @@ impl DnsCache {
                     inner.counters.answered += 1;
                 }
                 if forward {
-                    inner.track((client, resolver, id), key, true, now);
+                    inner.track((client, resolver, id), key, Mode::Refresh, now);
                 }
                 Outcome::Answer { reply, forward }
+            }
+            None if rescue => {
+                inner.counters.forwarded += 1;
+                let mode = Mode::Rescue {
+                    deadline: now + RESCUE_DELAY,
+                    query: message.into(),
+                    route,
+                };
+                inner.track((client, resolver, id), key, mode, now);
+                self.rescues.store(true, Ordering::Release);
+                Outcome::Forward
             }
             None => {
                 inner.entries.remove(&key);
                 inner.counters.forwarded += 1;
-                inner.track((client, resolver, id), key, false, now);
+                inner.track((client, resolver, id), key, Mode::Fill, now);
                 Outcome::Forward
             }
         }
     }
 
-    /// A UDP reply from `resolver` on its way to `client`. False when it
-    /// answers a refresh, whose client was already answered from the cache,
-    /// and must not be delivered.
+    /// A UDP reply from `resolver` on its way to `client`.
     pub fn on_response(
         &self,
         client: SocketAddrV4,
         resolver: Ipv4Addr,
         message: &[u8],
         now: Instant,
-    ) -> bool {
+    ) -> Delivery {
         if message.len() < HEADER_LEN
             || u16::from_be_bytes([message[2], message[3]]) & FLAG_RESPONSE == 0
         {
-            return true;
+            return Delivery::Deliver;
         }
         let id = u16::from_be_bytes([message[0], message[1]]);
         let mut inner = self.inner.lock().unwrap();
         let Some(pending) = inner.pending.remove(&(client, resolver, id)) else {
-            return true;
+            return Delivery::Deliver;
         };
         let verdict = read_question(message)
             .filter(|question| {
@@ -304,13 +375,14 @@ impl DnsCache {
             })
             .filter(|_| message.len() <= MESSAGE_LIMIT)
             .and_then(|question| Some((question.end, cacheable(message, question.end)?)));
+        let resolved = verdict.is_some();
         match verdict {
             Some((question_end, (ttl, negative))) => {
-                if pending.refresh {
+                if matches!(pending.mode, Mode::Refresh) {
                     inner.counters.refreshed += 1;
                 }
                 inner.store(
-                    pending.key,
+                    pending.key.clone(),
                     message,
                     question_end,
                     ttl,
@@ -327,7 +399,65 @@ impl DnsCache {
                 }
             }
         }
-        !pending.refresh
+        match pending.mode {
+            Mode::Refresh => Delivery::Drop,
+            Mode::Fill => Delivery::Deliver,
+            Mode::Rescue { .. } if resolved => Delivery::Deliver,
+            Mode::Rescue { query, .. } => {
+                match inner.fall_back(&pending.key, &query, now, self.stale_limit) {
+                    Some(reply) => Delivery::Replace(reply),
+                    None => Delivery::Deliver,
+                }
+            }
+        }
+    }
+
+    /// Older answers for every client the resolver has kept waiting past its
+    /// deadline. The resolver's late reply still refreshes the entry, and is
+    /// dropped: its client already has an answer.
+    pub fn overdue(&self, now: Instant) -> Vec<Rescued> {
+        if !self.rescues.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let due: Vec<PendingKey> = inner
+            .pending
+            .iter()
+            .filter(|(_, pending)| matches!(pending.mode, Mode::Rescue { deadline, .. } if deadline <= now))
+            .map(|(key, _)| *key)
+            .collect();
+        let mut rescued = Vec::new();
+        for pending_key in due {
+            let Some(pending) = inner.pending.get_mut(&pending_key) else {
+                continue;
+            };
+            let Mode::Rescue { query, route, .. } =
+                std::mem::replace(&mut pending.mode, Mode::Refresh)
+            else {
+                continue;
+            };
+            let key = pending.key.clone();
+            match inner.fall_back(&key, &query, now, self.stale_limit) {
+                Some(reply) => rescued.push(Rescued {
+                    client: pending_key.0,
+                    resolver: pending_key.1,
+                    reply,
+                    route,
+                }),
+                // Nothing left to fall back on: the reply stays the client's.
+                None => {
+                    if let Some(pending) = inner.pending.get_mut(&pending_key) {
+                        pending.mode = Mode::Fill;
+                    }
+                }
+            }
+        }
+        let waiting = inner
+            .pending
+            .values()
+            .any(|pending| matches!(pending.mode, Mode::Rescue { .. }));
+        self.rescues.store(waiting, Ordering::Release);
+        rescued
     }
 
     pub fn status(&self) -> Value {
@@ -336,6 +466,7 @@ impl DnsCache {
             "entries": inner.entries.len(),
             "answered": inner.counters.answered,
             "staleAnswered": inner.counters.stale_answered,
+            "rescued": inner.counters.rescued,
             "refreshed": inner.counters.refreshed,
             "forwarded": inner.counters.forwarded,
         })
@@ -343,7 +474,7 @@ impl DnsCache {
 }
 
 impl Inner {
-    fn track(&mut self, pending: PendingKey, key: Key, refresh: bool, now: Instant) {
+    fn track(&mut self, pending: PendingKey, key: Key, mode: Mode, now: Instant) {
         if self.pending.len() >= PENDING_LIMIT {
             self.pending
                 .retain(|_, entry| now.saturating_duration_since(entry.sent) < REFRESH_TIMEOUT);
@@ -354,10 +485,29 @@ impl Inner {
                 Pending {
                     key,
                     sent: now,
-                    refresh,
+                    mode,
                 },
             );
         }
+    }
+
+    /// The older answer to `query` a rescue falls back on, if one is left.
+    fn fall_back(
+        &mut self,
+        key: &Key,
+        query: &[u8],
+        now: Instant,
+        stale_limit: Duration,
+    ) -> Option<Vec<u8>> {
+        let entry = self
+            .entries
+            .get_mut(key)
+            .filter(|entry| !entry.negative && !entry.expired_for_good(now, stale_limit))?;
+        let reply = answer(entry, query, |_| STALE_TTL)?;
+        entry.last_used = now;
+        self.counters.stale_answered += 1;
+        self.counters.rescued += 1;
+        Some(reply)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -403,6 +553,10 @@ impl Inner {
 /// Refreshed this close to expiry, so a name in steady use never expires.
 fn refresh_ahead(ttl: Duration) -> Duration {
     (ttl / 10).max(Duration::from_secs(2))
+}
+
+fn optimistic_window(ttl: Duration) -> Duration {
+    ttl.clamp(OPTIMISTIC_WINDOW.0, OPTIMISTIC_WINDOW.1)
 }
 
 struct Question {
@@ -597,6 +751,27 @@ mod tests {
     const RESOLVER: Ipv4Addr = Ipv4Addr::new(10, 203, 0, 1);
     const LIMIT: Duration = Duration::from_secs(3600);
 
+    fn ask(
+        cache: &DnsCache,
+        node: u8,
+        client: SocketAddrV4,
+        resolver: Ipv4Addr,
+        query: &[u8],
+        now: Instant,
+    ) -> Outcome {
+        cache.on_query(node, client, resolver, query, 0, now)
+    }
+
+    fn delivered(
+        cache: &DnsCache,
+        client: SocketAddrV4,
+        resolver: Ipv4Addr,
+        reply: &[u8],
+        now: Instant,
+    ) -> bool {
+        cache.on_response(client, resolver, reply, now) == Delivery::Deliver
+    }
+
     fn client(port: u16) -> SocketAddrV4 {
         SocketAddrV4::new(Ipv4Addr::new(10, 203, 0, 2), port)
     }
@@ -651,10 +826,10 @@ mod tests {
     /// client would receive from that exchange.
     fn learn(cache: &DnsCache, port: u16, query: &[u8], response: &[u8], now: Instant) -> bool {
         assert_eq!(
-            cache.on_query(NODE, client(port), RESOLVER, query, now),
+            ask(cache, NODE, client(port), RESOLVER, query, now),
             Outcome::Forward
         );
-        cache.on_response(client(port), RESOLVER, response, now)
+        delivered(cache, client(port), RESOLVER, response, now)
     }
 
     fn answered(outcome: Outcome) -> (Vec<u8>, bool) {
@@ -678,7 +853,8 @@ mod tests {
         ));
 
         let second = query(2, "Example.COM");
-        let (reply, forward) = answered(cache.on_query(
+        let (reply, forward) = answered(ask(
+            &cache,
             NODE,
             client(5001),
             RESOLVER,
@@ -710,15 +886,17 @@ mod tests {
             start
         ));
 
-        let later = start + Duration::from_secs(120);
+        // Expired by 40 s: inside one more TTL, so still served at once.
+        let later = start + Duration::from_secs(100);
         let second = query(2, "example.com");
         let (reply_now, forward) =
-            answered(cache.on_query(NODE, client(5001), RESOLVER, &second, later));
+            answered(ask(&cache, NODE, client(5001), RESOLVER, &second, later));
         assert!(forward);
         assert_eq!(ttls(&reply_now), [STALE_TTL]);
         // A second lookup while the refresh is out is answered without
         // sending another.
-        let (_, again) = answered(cache.on_query(
+        let (_, again) = answered(ask(
+            &cache,
             NODE,
             client(5002),
             RESOLVER,
@@ -729,8 +907,15 @@ mod tests {
 
         // The refresh is stored and swallowed: its client already has an answer.
         let refreshed = reply(&second, 60, &[[2, 2, 2, 2]]);
-        assert!(!cache.on_response(client(5001), RESOLVER, &refreshed, later));
-        let (current, _) = answered(cache.on_query(
+        assert!(!delivered(
+            &cache,
+            client(5001),
+            RESOLVER,
+            &refreshed,
+            later
+        ));
+        let (current, _) = answered(ask(
+            &cache,
             NODE,
             client(5003),
             RESOLVER,
@@ -740,6 +925,97 @@ mod tests {
         assert_eq!(&current[current.len() - 4..], &[2, 2, 2, 2]);
         assert_eq!(cache.status()["refreshed"], 1);
         assert_eq!(cache.status()["staleAnswered"], 2);
+    }
+
+    /// Learns a 60 s answer for 1.1.1.1 and asks again ten minutes later,
+    /// long past the window an expired answer is trusted at once.
+    fn ask_long_after(cache: &DnsCache) -> (Vec<u8>, Instant) {
+        let start = Instant::now();
+        let first = query(1, "cdn.example");
+        learn(
+            cache,
+            5000,
+            &first,
+            &reply(&first, 60, &[[1, 1, 1, 1]]),
+            start,
+        );
+        let later = start + Duration::from_secs(600);
+        let second = query(2, "cdn.example");
+        assert_eq!(
+            cache.on_query(NODE, client(5001), RESOLVER, &second, 7, later),
+            Outcome::Forward
+        );
+        (second, later)
+    }
+
+    #[test]
+    fn a_long_expired_answer_waits_for_the_resolver_first() {
+        let cache = DnsCache::new(LIMIT);
+        let (second, later) = ask_long_after(&cache);
+        let current = reply(&second, 60, &[[2, 2, 2, 2]]);
+        assert_eq!(
+            cache.on_response(client(5001), RESOLVER, &current, later),
+            Delivery::Deliver
+        );
+        assert!(cache.overdue(later + RESCUE_DELAY).is_empty());
+        let (cached, _) = answered(ask(
+            &cache,
+            NODE,
+            client(5002),
+            RESOLVER,
+            &query(3, "cdn.example"),
+            later,
+        ));
+        assert_eq!(&cached[cached.len() - 4..], &[2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn a_failing_resolver_is_answered_for_with_the_older_address() {
+        let cache = DnsCache::new(LIMIT);
+        let (second, later) = ask_long_after(&cache);
+        let mut servfail = second.clone();
+        servfail[2] = 0x81;
+        servfail[3] = 0x82;
+        let Delivery::Replace(older) = cache.on_response(client(5001), RESOLVER, &servfail, later)
+        else {
+            panic!("expected the older answer");
+        };
+        assert_eq!(&older[..2], &second[..2]);
+        assert_eq!(&older[older.len() - 4..], &[1, 1, 1, 1]);
+        assert_eq!(ttls(&older), [STALE_TTL]);
+        assert_eq!(cache.status()["rescued"], 1);
+    }
+
+    #[test]
+    fn a_silent_resolver_is_answered_for_at_the_deadline() {
+        let cache = DnsCache::new(LIMIT);
+        let (second, later) = ask_long_after(&cache);
+        assert!(cache.overdue(later + RESCUE_DELAY / 2).is_empty());
+        let rescued = cache.overdue(later + RESCUE_DELAY);
+        assert_eq!(rescued.len(), 1);
+        assert_eq!(rescued[0].client, client(5001));
+        assert_eq!(rescued[0].resolver, RESOLVER);
+        assert_eq!(rescued[0].route, 7);
+        assert_eq!(
+            &rescued[0].reply[rescued[0].reply.len() - 4..],
+            &[1, 1, 1, 1]
+        );
+        // Only once, and the late reply refreshes without reaching the client.
+        assert!(cache.overdue(later + RESCUE_DELAY * 2).is_empty());
+        let late = reply(&second, 60, &[[2, 2, 2, 2]]);
+        assert_eq!(
+            cache.on_response(client(5001), RESOLVER, &late, later + RESCUE_DELAY * 2),
+            Delivery::Drop
+        );
+        let (cached, _) = answered(ask(
+            &cache,
+            NODE,
+            client(5002),
+            RESOLVER,
+            &query(3, "cdn.example"),
+            later + RESCUE_DELAY * 2,
+        ));
+        assert_eq!(&cached[cached.len() - 4..], &[2, 2, 2, 2]);
     }
 
     #[test]
@@ -756,13 +1032,14 @@ mod tests {
         );
         let later = start + Duration::from_secs(30);
         let second = query(2, "example.com");
-        answered(cache.on_query(NODE, client(5001), RESOLVER, &second, later));
+        answered(ask(&cache, NODE, client(5001), RESOLVER, &second, later));
         let mut servfail = second.clone();
         servfail[2] = 0x81;
         servfail[3] = 0x82;
-        assert!(!cache.on_response(client(5001), RESOLVER, &servfail, later));
+        assert!(!delivered(&cache, client(5001), RESOLVER, &servfail, later));
         // And the next lookup may try again straight away.
-        let (_, forward) = answered(cache.on_query(
+        let (_, forward) = answered(ask(
+            &cache,
             NODE,
             client(5002),
             RESOLVER,
@@ -785,7 +1062,8 @@ mod tests {
             start,
         );
         let later = start + Duration::from_secs(30);
-        let (_, forward) = answered(cache.on_query(
+        let (_, forward) = answered(ask(
+            &cache,
             NODE,
             client(5001),
             RESOLVER,
@@ -793,7 +1071,8 @@ mod tests {
             later,
         ));
         assert!(forward);
-        let (_, forward) = answered(cache.on_query(
+        let (_, forward) = answered(ask(
+            &cache,
             NODE,
             client(5002),
             RESOLVER,
@@ -815,7 +1094,8 @@ mod tests {
             &reply(&first, 100, &[[1, 1, 1, 1]]),
             start,
         );
-        let early = answered(cache.on_query(
+        let early = answered(ask(
+            &cache,
             NODE,
             client(5001),
             RESOLVER,
@@ -824,8 +1104,14 @@ mod tests {
         ));
         assert!(!early.1);
         let late = start + Duration::from_secs(95);
-        let (reply, forward) =
-            answered(cache.on_query(NODE, client(5002), RESOLVER, &query(3, "example.com"), late));
+        let (reply, forward) = answered(ask(
+            &cache,
+            NODE,
+            client(5002),
+            RESOLVER,
+            &query(3, "example.com"),
+            late,
+        ));
         assert!(forward);
         assert_eq!(ttls(&reply), [5]);
     }
@@ -842,7 +1128,8 @@ mod tests {
             &reply(&first, 60, &[[1, 1, 1, 1]]),
             start,
         );
-        let outcome = cache.on_query(
+        let outcome = ask(
+            &cache,
             NODE,
             client(5001),
             RESOLVER,
@@ -864,7 +1151,8 @@ mod tests {
             &reply(&first, 300, &[[1, 1, 1, 1]]),
             start,
         );
-        let other_node = cache.on_query(
+        let other_node = ask(
+            &cache,
             1,
             client(5001),
             RESOLVER,
@@ -890,7 +1178,7 @@ mod tests {
         edns[11] = 1;
         edns.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(
-            cache.on_query(NODE, client(5001), RESOLVER, &edns, start),
+            ask(&cache, NODE, client(5001), RESOLVER, &edns, start),
             Outcome::Forward
         );
         // One carrying an option (client subnet, a cookie) is never cached.
@@ -927,7 +1215,8 @@ mod tests {
         let start = Instant::now();
         let first = query(1, "missing.example");
         learn(&cache, 5000, &first, &nxdomain(&first, 3600, 900), start);
-        let (reply, forward) = answered(cache.on_query(
+        let (reply, forward) = answered(ask(
+            &cache,
             NODE,
             client(5001),
             RESOLVER,
@@ -938,7 +1227,8 @@ mod tests {
         assert_eq!(reply[3] & 0x0f, 3);
         assert_eq!(ttls(&reply), [50]);
         let expired = start + Duration::from_secs(u64::from(NEGATIVE_TTL_LIMIT));
-        let outcome = cache.on_query(
+        let outcome = ask(
+            &cache,
             NODE,
             client(5002),
             RESOLVER,
@@ -952,7 +1242,8 @@ mod tests {
     fn a_reply_the_cache_did_not_send_for_is_delivered_untouched() {
         let cache = DnsCache::new(LIMIT);
         let first = query(1, "example.com");
-        assert!(cache.on_response(
+        assert!(delivered(
+            &cache,
             client(5000),
             RESOLVER,
             &reply(&first, 300, &[[1, 1, 1, 1]]),
@@ -1009,7 +1300,14 @@ mod tests {
             );
         }
         assert_eq!(cache.status()["entries"], ENTRY_LIMIT);
-        let first = cache.on_query(NODE, client(5001), RESOLVER, &query(2, "n0.example"), start);
+        let first = ask(
+            &cache,
+            NODE,
+            client(5001),
+            RESOLVER,
+            &query(2, "n0.example"),
+            start,
+        );
         assert_eq!(first, Outcome::Forward);
     }
 }

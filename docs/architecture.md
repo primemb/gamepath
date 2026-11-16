@@ -1625,10 +1625,16 @@ replies the tunnel already returned, the way sing-box's `optimistic` cache and R
 - **Fresh** entries are answered with the remaining TTL. Within the last tenth of the TTL (at least 2 s) the
   query is also forwarded, and its reply refreshes the entry and is dropped, so a name in steady use never
   expires and the client never sees two answers.
-- **Expired** entries are answered immediately with a 5 s TTL and refreshed behind the answer, for up to
-  1 h past expiry in the game and 24 h in the VPN. A refresh outstanding for 4 s is presumed lost and may be
-  resent. A failed refresh (SERVFAIL, timeout) keeps the old entry: during an outage the last real address is
-  the best one available, which is what keeps a launcher resolving through a path failover.
+- **Recently expired** entries, expired by less than one more TTL (bounded to 30 s-5 min), are answered
+  immediately with a 5 s TTL and refreshed behind the answer. A refresh outstanding for 4 s is presumed lost
+  and may be resent. A failed refresh (SERVFAIL, timeout) keeps the old entry.
+- **Older** entries, up to 1 h past expiry in the game and 24 h in the VPN, are only a fallback (RFC 8767's
+  client response timer). The query goes to the resolver, and its answer is delivered and cached; if the
+  resolver fails, or has not answered within 1.5 s, the client gets the older answer instead and the late reply
+  only refreshes the entry. The first version served every expired entry at once, and a new site's shared CDN
+  names then reached addresses that had moved: pages loaded slowly or by halves the first time and normally on
+  reload. During an outage the last real address is still the best one available, which is what keeps a
+  launcher resolving through a path failover.
 - **Negative** answers (NXDOMAIN or NODATA with an SOA) are kept for at most 60 s and never served stale.
 - **Never kept:** truncated, failed, zero-TTL and fake-IP (198.18.0.0/15) answers, and queries carrying EDNS
   options (client subnet, cookies) a reused answer could not honour.
@@ -1639,11 +1645,17 @@ are keyed by node, query type and the RD/CD/EDNS/DO flags: a CDN or matchmaking 
 lookup exits, and an EDNS answer must not reach a client that did not ask for one. The cache belongs to the
 capture manager, so a live rule edit keeps it, and it is dropped when the session stops.
 
+A refresh sent on behalf of a selected application is owned by no process. Chromium-based apps resolve with
+their own DNS client and close the lookup socket as soon as the cached answer arrives, which removes every
+flow they own, so the refresh reply used to arrive with no flow and the entry was never refreshed.
+
 In split mode an answer is injected through the reply injector's priority-1000 handle, so the hostname tracker
 sees it and hostname rules and the VPN's direct list keep learning addresses from cached answers. In
 all-traffic mode the uplink answers through Wintun and feeds the answer to the direct router itself, since it
 never crosses the downlink. TCP lookups and native L2TP sessions are not cached. Capture status reports
-`dnsCache` counters (`answered`, `staleAnswered`, `refreshed`, `forwarded`, `entries`).
+`dnsCache` counters (`answered`, `staleAnswered`, `rescued`, `refreshed`, `forwarded`, `entries`). Overdue
+fallback answers are sent by the split reply injector and the all-traffic downlink, which wake at least every
+20 ms and 100 ms.
 
 A capture restart (a live rule edit, or the other session starting or stopping) hands the new capture its
 predecessor's reply table, routed-connection list and usage counters (`CarriedFlows`), under the same capture

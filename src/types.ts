@@ -434,6 +434,8 @@ export type DnsCacheStats = {
   answered: number
   /** Lookups answered from an expired entry while it was refreshed. */
   staleAnswered: number
+  /** Of those, older answers sent because the resolver failed or was slow. */
+  rescued?: number
   refreshed: number
   /** Lookups that went to the resolver. */
   forwarded: number
