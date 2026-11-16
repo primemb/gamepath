@@ -39,8 +39,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: node scripts/validate-release-tag.cjs
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+        run: rustup toolchain install stable 1.91.0 --profile minimal --no-self-update
       - run: rustup default stable
+      - name: Check engine minimum Rust version
+        run: cargo +1.91.0 check --locked --manifest-path engine/Cargo.toml
+      - name: Check service minimum Rust version
+        run: cargo +1.91.0 check --locked --manifest-path service/Cargo.toml
       - run: npm ci
       - name: Validate client and build native components
         run: npm run check
@@ -79,8 +83,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+        run: rustup toolchain install stable 1.91.0 --profile minimal --no-self-update
       - run: rustup default stable
+      - run: bash -n deploy/install-relay.sh
+      - name: Check relay minimum Rust version
+        run: cargo +1.91.0 check --locked --manifest-path relay/Cargo.toml
       - run: cargo test --locked --manifest-path relay/Cargo.toml
       - run: cargo build --locked --release --manifest-path relay/Cargo.toml
 

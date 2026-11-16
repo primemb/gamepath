@@ -1,6 +1,6 @@
 {
   "name": "gamepath-client",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "author": "GamePath",
   "private": true,
   "type": "module",
@@ -11,7 +11,7 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && electron .\"",
     "engine:build": "node scripts/build-engine.cjs",
     "service:build": "node scripts/build-service.cjs",
-    "relay:msrv": "cargo +1.85.0 check --manifest-path relay/Cargo.toml --ignore-rust-version",
+    "relay:msrv": "cargo +1.91.0 check --locked --manifest-path relay/Cargo.toml",
     "relay:configure": "electron scripts/configure-relay.cjs",
     "relay:test": "electron scripts/test-relay.cjs",
     "socks5:test": "electron scripts/test-socks5-relay.cjs",

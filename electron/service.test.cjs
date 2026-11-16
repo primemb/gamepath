@@ -125,6 +125,13 @@ test('the declared MSRV matches the toolchain the relay is built with', () => {
   const pinned = script.match(/RUST_TOOLCHAIN="(\d+)\.(\d+)\.(\d+)"/)
   assert.ok(pinned, 'install-relay.sh must pin a toolchain')
   const [, pinnedMajor, pinnedMinor] = pinned
+  const version = `${pinned[1]}.${pinned[2]}.${pinned[3]}`
+  const root = path.join(__dirname, '..')
+  const scripts = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).scripts
+  assert.ok(scripts['relay:msrv'].includes(`cargo +${version} check --locked`))
+  assert.ok(!scripts['relay:msrv'].includes('--ignore-rust-version'))
+  assert.doesNotMatch(script, /USE_RUSTUP|apt-get install[^\n]*cargo rustc/)
+  assert.match(script, /"\$CARGO" "\+\$RUST_TOOLCHAIN" build --release --locked/)
 
   // The relay compiles from source on its own host with that pinned toolchain,
   // so no crate it pulls in may need anything newer. Cargo and clippy both read

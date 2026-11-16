@@ -38,7 +38,7 @@ These indicators keep updating when the app is minimized or hidden in the tray.
 - Windows x64, with administrator access for the network service and packet capture.
 - Your own compatible node configurations; VPN subscriptions are not included.
 - For relay mode: a Debian 13+ or Ubuntu 22.04+ VPS with root access for setup.
-- To build from source: Node.js 24 LTS, npm, stable Rust with the MSVC toolchain,
+- To build from source: Node.js 24 LTS, npm, Rust 1.91 or newer with the MSVC toolchain,
   and Visual Studio Build Tools with Desktop development with C++ and a Windows SDK.
   CI uses Windows Server 2022 runners.
 

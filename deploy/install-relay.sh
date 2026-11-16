@@ -6,7 +6,7 @@ BIND_ADDRESS="0.0.0.0"
 CLIENT_NAME="windows-client"
 ENROLLMENT_OUTPUT="/root/gamepath-${CLIENT_NAME}.enroll"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUST_TOOLCHAIN="1.85.0"
+RUST_TOOLCHAIN="1.91.0"
 
 usage() {
   cat <<'EOF'
@@ -62,16 +62,12 @@ case "${ID:-}" in
       echo "Unsupported Debian release: ${PRETTY_NAME:-Debian ${VERSION_ID:-unknown}}. Debian 13 or newer is required." >&2
       exit 1
     fi
-    USE_RUSTUP=0
     ;;
   ubuntu)
     if ! dpkg --compare-versions "${VERSION_ID:-0}" ge 22.04; then
       echo "Unsupported Ubuntu release: ${PRETTY_NAME:-Ubuntu ${VERSION_ID:-unknown}}. Ubuntu 22.04 or newer is required." >&2
       exit 1
     fi
-    # Ubuntu LTS repositories can ship a compiler older than the Rust 2024
-    # edition required by the relay. Keep a pinned toolchain isolated here.
-    USE_RUSTUP=1
     ;;
   *)
     echo "Unsupported Linux distribution: ${PRETTY_NAME:-${ID:-unknown}}. Use Debian 13+ or Ubuntu 22.04+." >&2
@@ -84,23 +80,22 @@ echo "GAMEPATH_PROGRESS:dependencies"
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl nftables iproute2 build-essential pkg-config
 
-if (( USE_RUSTUP == 1 )); then
-  export RUSTUP_HOME=/var/cache/gamepath/rustup
-  export CARGO_HOME=/var/cache/gamepath/cargo
-  install -d -m 0755 "$RUSTUP_HOME" "$CARGO_HOME"
+# Distro packages can be older than our minimum on either supported OS.
+# Keep GamePath's compiler isolated, and select it explicitly on every build.
+export RUSTUP_HOME=/var/cache/gamepath/rustup
+export CARGO_HOME=/var/cache/gamepath/cargo
+install -d -m 0755 "$RUSTUP_HOME" "$CARGO_HOME"
+if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
   RUSTUP_INIT="$(mktemp)"
   trap 'rm -f "$RUSTUP_INIT"' EXIT
   curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
     https://sh.rustup.rs -o "$RUSTUP_INIT"
-  sh "$RUSTUP_INIT" -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN" --no-modify-path
+  sh "$RUSTUP_INIT" -y --profile minimal --default-toolchain none --no-modify-path
   rm -f "$RUSTUP_INIT"
   trap - EXIT
-  CARGO="$CARGO_HOME/bin/cargo"
-else
-  # Debian 13 ships Rust 1.85, the minimum compiler accepted by the relay.
-  apt-get install -y --no-install-recommends cargo rustc
-  CARGO=cargo
 fi
+"$CARGO_HOME/bin/rustup" toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+CARGO="$CARGO_HOME/bin/cargo"
 
 if ! id gamepath >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/gamepath --create-home --shell /usr/sbin/nologin gamepath
@@ -111,7 +106,7 @@ install -d -m 0755 -o gamepath -g gamepath /var/lib/gamepath
 install -d -m 0755 /var/cache/gamepath/cargo-target
 export CARGO_TARGET_DIR=/var/cache/gamepath/cargo-target
 echo "GAMEPATH_PROGRESS:compile"
-"$CARGO" build --release --locked --manifest-path "$REPO_ROOT/relay/Cargo.toml"
+"$CARGO" "+$RUST_TOOLCHAIN" build --release --locked --manifest-path "$REPO_ROOT/relay/Cargo.toml"
 install -m 0755 "$CARGO_TARGET_DIR/release/gamepath-relay" /usr/local/bin/gamepath-relay
 
 echo "GAMEPATH_PROGRESS:network"

@@ -13,6 +13,9 @@ use std::io::{Read, Write};
 use std::net::{SocketAddrV4, TcpListener, UdpSocket};
 use std::thread;
 
+#[path = "window_tests.rs"]
+mod windows;
+
 const TARGET: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
 const RESOLVER: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 const REFUSED_PORT: u16 = 9;

@@ -1432,6 +1432,12 @@ watching it was woken by its own next read attempt, every turn: a paused video h
 as 225,000 writable events a second on one flow. Now it turns about 150 times a second (`turns=` in the
 per-minute summary), and a write that would block is retried after 5 ms rather than on every event.
 
+GamePath requires Rust 1.91 and uses upstream smoltcp 0.14. The previous 0.12 receive-window calculation
+panicked when received data crossed the rounded-down advertised window edge. An Imgur upload reproduced
+that panic and ended the forwarding thread, leaving capture and remote DNS active with nothing to carry
+their packets. The packet-level regression exercises the scaled receive window across sequence wraparound;
+the corrected accounting comes from upstream, without a local library fork.
+
 The path worker does not shed stale packets into this stack. Shedding suits a network path, where a packet
 that waited 50 ms is worth less than the latency it adds; here the queue waits only on local processing, and a
 dropped segment is resent by TCP, adding the load that made it wait. Measured: a busy VPN spiralled to 289,000
@@ -1690,7 +1696,7 @@ carries can ever be given the same one. Later fragments of a diverted datagram c
 their first fragment by IP identification. With no proxy running, the tap costs one relaxed load per
 packet.
 
-smoltcp is pinned to 0.12, the last release inside the 1.85 MSRV, with its build-time buffers raised: a
+smoltcp 0.14 supports the Rust 1.91 minimum, with its build-time buffers raised: a
 full 64 KiB UDP datagram in each direction, four reassembly slots, and 16 out-of-order TCP segments
 rather than 4, which matters on the lossy paths this client is used on. Nagle is off and congestion
 control is CUBIC. Hostnames are resolved through the same egress, racing every resolver the session can
